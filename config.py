@@ -2,7 +2,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'port': 3306,
     'user': 'root',
-    'password': '',
+    'password': 'root',
     'database': 'lucky_number',
     'charset': 'utf8mb4'
 }
