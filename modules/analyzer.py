@@ -1,8 +1,10 @@
 import logging
 import os
 import json
-from collections import defaultdict
+import math
+from collections import defaultdict, Counter
 from datetime import datetime
+from typing import List, Dict, Tuple, Optional, Any
 
 # 确保日志目录存在
 os.makedirs('logs', exist_ok=True)
@@ -17,675 +19,1022 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 class ProbabilityAnalyzer:
     """
-    概率分析器类
-    
-    负责对七星彩数据进行多维度分析，包括频率统计、间隔分析、概率计算等
-    支持整合走势图数据进行综合分析
+    七星彩概率分析器（专业版）
+
+    基于统计学原理对七星彩历史数据进行多维度分析。
+    重要声明：彩票开奖是独立随机事件，本分析仅提供历史数据统计描述，
+    不构成任何投注建议，所有号码的理论中奖概率均等。
     """
-    
+
     def __init__(self):
         self.positions = 7
-        self.main_range = range(0, 10)
-        self.special_range = range(0, 16)
-    
-    def analyze_frequency(self, data):
+        self.main_range = list(range(0, 10))      # 前6位 0-9
+        self.special_range = list(range(0, 15))   # 特别号 0-14
+        self.position_names = ['第一位', '第二位', '第三位', '第四位',
+                               '第五位', '第六位', '特别号']
+
+    # ==================== 基础频率分析 ====================
+
+    def analyze_frequency(self, data: List[Dict]) -> Dict:
         """
-        分析号码出现频率
-        
-        Args:
-            data: 数据列表
-        
+        分析各号码在每个位置的出现频率与理论期望对比
+
         Returns:
-            频率分析结果字典
+            包含观测频率、理论概率、偏离度的字典
         """
-        freq = defaultdict(lambda: [0] * self.positions)
-        
-        for item in data:
-            numbers = item['numbers']
-            for i in range(min(self.positions, len(numbers))):
-                num = numbers[i]
-                if i < 6:
-                    if 0 <= num <= 9:
-                        freq[num][i] += 1
-                else:
-                    freq[num][i] += 1
-        
         total = len(data)
-        freq_prob = {}
-        
-        for num in sorted(freq.keys()):
-            prob_list = []
-            for i in range(self.positions):
-                prob = freq[num][i] / total if total > 0 else 0
-                prob_list.append(round(prob, 4))
-            freq_prob[num] = {
-                'frequency': freq[num],
-                'probability': prob_list
-            }
-        
-        return freq_prob
-    
-    def analyze_interval(self, data):
-        """
-        分析号码间隔周期
-        
-        Args:
-            data: 数据列表
-        
-        Returns:
-            间隔统计结果字典
-        """
-        last_occurrence = {}
-        intervals = defaultdict(list)
-        
-        sorted_data = sorted(data, key=lambda x: x['issue'])
-        
-        for idx, item in enumerate(sorted_data):
-            numbers = item['numbers']
-            for i in range(min(self.positions, len(numbers))):
-                num = numbers[i]
-                key = (num, i)
-                
-                if key in last_occurrence:
-                    interval = idx - last_occurrence[key]
-                    intervals[key].append(interval)
-                
-                last_occurrence[key] = idx
-        
-        interval_stats = {}
-        for (num, pos), interval_list in intervals.items():
-            if interval_list:
-                avg_interval = sum(interval_list) / len(interval_list)
-                max_interval = max(interval_list)
-                min_interval = min(interval_list)
-                interval_stats[(num, pos)] = {
-                    'count': len(interval_list),
-                    'avg': round(avg_interval, 2),
-                    'max': max_interval,
-                    'min': min_interval
+        if total == 0:
+            return {}
+
+        # 初始化计数器: freq[pos][num] = count
+        freq = {pos: Counter() for pos in range(self.positions)}
+
+        for item in data:
+            numbers = item.get('numbers', [])
+            for pos in range(min(self.positions, len(numbers))):
+                try:
+                    num = int(numbers[pos])
+                    freq[pos][num] += 1
+                except (ValueError, TypeError):
+                    continue
+
+        result = {}
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            num_range = self.special_range if pos == 6 else self.main_range
+            theory_prob = 1.0 / len(num_range)
+
+            pos_stats = {}
+            for num in num_range:
+                observed_count = freq[pos].get(num, 0)
+                observed_prob = observed_count / total if total > 0 else 0
+                # 计算偏离度 (Observed - Expected) / Expected
+                deviation = (observed_prob - theory_prob) / theory_prob if theory_prob > 0 else 0
+
+                pos_stats[num] = {
+                    'frequency': observed_count,
+                    'observed_probability': round(observed_prob, 6),
+                    'theoretical_probability': round(theory_prob, 6),
+                    'deviation_rate': round(deviation, 4),  # 偏离率
+                    'expected_count': round(total * theory_prob, 2)
                 }
-        
-        return interval_stats
-    
-    def analyze_hezhi(self, data):
-        """
-        分析和值分布
-        
-        Args:
-            data: 数据列表
-        
-        Returns:
-            和值统计结果字典
-        """
-        hezhi_counts = defaultdict(int)
-        hezhi_type_counts = defaultdict(int)
-        
-        for item in data:
-            hezhi = item.get('hezhi', '')
-            hezhi_type = item.get('hezhi_type', '')
-            
-            if hezhi.isdigit():
-                hezhi_counts[int(hezhi)] += 1
-            
-            if hezhi_type:
-                hezhi_type_counts[hezhi_type] += 1
-        
-        total = len(data)
-        hezhi_prob = {}
-        for hezhi, count in hezhi_counts.items():
-            hezhi_prob[hezhi] = {
-                'count': count,
-                'probability': round(count / total, 4) if total > 0 else 0
+
+            result[pos] = {
+                'position_name': pos_name,
+                'total_samples': total,
+                'number_stats': pos_stats,
+                'most_frequent': freq[pos].most_common(3) if freq[pos] else [],
+                'least_frequent': freq[pos].most_common()[-3:] if len(freq[pos]) >= 3 else []
             }
-        
-        return {
-            'hezhi_distribution': hezhi_prob,
-            'hezhi_type_distribution': dict(hezhi_type_counts)
-        }
-    
-    def analyze_odd_even(self, data):
+
+        return result
+
+    # ==================== 遗漏值分析（核心指标）====================
+
+    def analyze_omission(self, data: List[Dict]) -> Dict:
         """
-        分析奇偶比分布
-        
-        Args:
-            data: 数据列表
-        
+        分析号码遗漏值（自上次出现以来的期数）
+
+        遗漏值是彩票分析的核心指标，反映号码的"冷热度"。
+        当前遗漏越大，理论上该号码在近期出现的概率（从独立事件角度仍均等）。
+
         Returns:
-            奇偶比统计结果字典
+            各位置各号码的当前遗漏、最大遗漏、平均遗漏
         """
-        ratio_counts = defaultdict(int)
-        pattern_counts = defaultdict(int)
-        
-        for item in data:
-            ratio = item.get('odd_even_ratio', '')
-            pattern = item.get('odd_even_pattern', '')
-            
-            if ratio:
-                ratio_counts[ratio] += 1
-            
-            if pattern:
-                pattern_counts[pattern] += 1
-        
-        total = len(data)
-        ratio_prob = {}
-        for ratio, count in ratio_counts.items():
-            ratio_prob[ratio] = {
-                'count': count,
-                'probability': round(count / total, 4) if total > 0 else 0
+        if not data:
+            return {}
+
+        # 按期号排序（升序，从旧到新）
+        sorted_data = sorted(data, key=lambda x: x.get('issue', ''))
+        total_periods = len(sorted_data)
+
+        result = {}
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            num_range = self.special_range if pos == 6 else self.main_range
+
+            # 记录每个号码每次出现的索引
+            occurrence_indices = {num: [] for num in num_range}
+
+            for idx, item in enumerate(sorted_data):
+                numbers = item.get('numbers', [])
+                if pos < len(numbers):
+                    try:
+                        num = int(numbers[pos])
+                        if num in occurrence_indices:
+                            occurrence_indices[num].append(idx)
+                    except (ValueError, TypeError):
+                        continue
+
+            num_stats = {}
+            for num in num_range:
+                indices = occurrence_indices[num]
+                current_omission = total_periods - 1 - indices[-1] if indices else total_periods
+
+                # 计算遗漏间隔列表
+                gaps = []
+                for i in range(1, len(indices)):
+                    gaps.append(indices[i] - indices[i - 1] - 1)
+
+                max_omission = max(gaps) if gaps else current_omission
+                avg_omission = sum(gaps) / len(gaps) if gaps else current_omission
+
+                # 遗漏偏差率 = 当前遗漏 / 平均遗漏
+                omission_ratio = current_omission / avg_omission if avg_omission > 0 else 0
+
+                num_stats[num] = {
+                    'current_omission': current_omission,
+                    'max_omission': max_omission,
+                    'avg_omission': round(avg_omission, 2),
+                    'omission_ratio': round(omission_ratio, 4),
+                    'total_occurrences': len(indices),
+                    'occurrence_rate': round(len(indices) / total_periods, 4) if total_periods > 0 else 0
+                }
+
+            result[pos] = {
+                'position_name': pos_name,
+                'total_periods': total_periods,
+                'number_stats': num_stats
             }
-        
-        return {
-            'ratio_distribution': ratio_prob,
-            'pattern_distribution': dict(pattern_counts)
-        }
-    
-    def analyze_span(self, data):
+
+        return result
+
+    # ==================== 冷热号分级分析 ====================
+
+    def analyze_hot_cold(self, data: List[Dict], recent_n: int = 30) -> Dict:
         """
-        分析跨度分布
-        
+        基于遗漏值和近期频率进行冷热号分级
+
+        分级标准：
+        - 热号：当前遗漏 <= 平均遗漏的50%，或近期出现频率高于理论值
+        - 温号：当前遗漏在平均遗漏的50%-150%之间
+        - 冷号：当前遗漏 > 平均遗漏的150%，或长期未出现
+
         Args:
-            data: 数据列表
-        
+            data: 历史数据
+            recent_n: 近期统计期数
+
         Returns:
-            跨度统计结果字典
+            各位置冷热号分级结果
         """
-        span_counts = defaultdict(int)
-        
-        for item in data:
-            span = item.get('span', '')
-            if span.isdigit():
-                span_counts[int(span)] += 1
-        
-        total = len(data)
-        span_prob = {}
-        for span, count in span_counts.items():
-            span_prob[span] = {
-                'count': count,
-                'probability': round(count / total, 4) if total > 0 else 0
-            }
-        
-        return span_prob
-    
-    def analyze_repeats(self, data):
-        """
-        分析重号规律
-        
-        Args:
-            data: 数据列表
-        
-        Returns:
-            重号统计结果字典
-        """
-        repeat_counts = defaultdict(int)
-        consecutive_repeats = []
-        
-        for i in range(1, len(data)):
-            prev_numbers = set(data[i-1]['numbers'])
-            curr_numbers = set(data[i]['numbers'])
-            repeats = prev_numbers & curr_numbers
-            repeat_counts[len(repeats)] += 1
-            consecutive_repeats.append(len(repeats))
-        
-        total = len(data) - 1 if len(data) > 1 else 1
-        repeat_prob = {}
-        for repeat_count, count in repeat_counts.items():
-            repeat_prob[repeat_count] = {
-                'count': count,
-                'probability': round(count / total, 4) if total > 0 else 0
-            }
-        
-        if consecutive_repeats:
-            avg_repeats = sum(consecutive_repeats) / len(consecutive_repeats)
-            max_repeats = max(consecutive_repeats)
-            min_repeats = min(consecutive_repeats)
-        else:
-            avg_repeats = 0
-            max_repeats = 0
-            min_repeats = 0
-        
-        return {
-            'repeat_distribution': repeat_prob,
-            'avg_repeats': round(avg_repeats, 2),
-            'max_repeats': max_repeats,
-            'min_repeats': min_repeats
-        }
-    
-    def analyze_consecutive(self, data):
-        """
-        分析连号规律
-        
-        Args:
-            data: 数据列表
-        
-        Returns:
-            连号统计结果字典
-        """
-        consecutive_counts = defaultdict(int)
-        
-        for item in data:
-            numbers = sorted(item['numbers'][:6])
-            consecutive_streaks = []
-            current_streak = 1
-            
-            for i in range(1, 6):
-                if numbers[i] == numbers[i-1] + 1:
-                    current_streak += 1
+        omission_data = self.analyze_omission(data)
+        if not omission_data:
+            return {}
+
+        # 计算近期频率
+        recent_data = sorted(data, key=lambda x: x.get('issue', ''))[-recent_n:] if len(data) >= recent_n else data
+        recent_freq = {pos: Counter() for pos in range(self.positions)}
+
+        for item in recent_data:
+            numbers = item.get('numbers', [])
+            for pos in range(min(self.positions, len(numbers))):
+                try:
+                    num = int(numbers[pos])
+                    recent_freq[pos][num] += 1
+                except (ValueError, TypeError):
+                    continue
+
+        result = {}
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            num_range = self.special_range if pos == 6 else self.main_range
+            theory_prob = 1.0 / len(num_range)
+            theory_recent_count = recent_n * theory_prob
+
+            hot_numbers = []
+            warm_numbers = []
+            cold_numbers = []
+
+            for num in num_range:
+                om_stats = omission_data[pos]['number_stats'].get(num, {})
+                current_omission = om_stats.get('current_omission', 0)
+                avg_omission = om_stats.get('avg_omission', 1)
+                recent_count = recent_freq[pos].get(num, 0)
+
+                # 遗漏比率
+                omission_ratio = current_omission / avg_omission if avg_omission > 0 else 0
+                # 近期频率比率
+                freq_ratio = recent_count / theory_recent_count if theory_recent_count > 0 else 0
+
+                # 综合评分 (越高越热)
+                heat_score = freq_ratio * 0.6 + (1 / (1 + omission_ratio)) * 0.4
+
+                if heat_score >= 1.2 or omission_ratio <= 0.5:
+                    category = 'hot'
+                    hot_numbers.append({
+                        'number': num,
+                        'heat_score': round(heat_score, 4),
+                        'current_omission': current_omission,
+                        'recent_count': recent_count
+                    })
+                elif heat_score <= 0.6 or omission_ratio >= 1.5:
+                    category = 'cold'
+                    cold_numbers.append({
+                        'number': num,
+                        'heat_score': round(heat_score, 4),
+                        'current_omission': current_omission,
+                        'recent_count': recent_count
+                    })
                 else:
-                    if current_streak > 1:
-                        consecutive_streaks.append(current_streak)
-                    current_streak = 1
-            if current_streak > 1:
-                consecutive_streaks.append(current_streak)
-            
-            max_consecutive = max(consecutive_streaks) if consecutive_streaks else 1
-            consecutive_counts[max_consecutive] += 1
-        
-        total = len(data)
-        consecutive_prob = {}
-        for streak, count in consecutive_counts.items():
-            consecutive_prob[streak] = {
-                'count': count,
-                'probability': round(count / total, 4) if total > 0 else 0
+                    category = 'warm'
+                    warm_numbers.append({
+                        'number': num,
+                        'heat_score': round(heat_score, 4),
+                        'current_omission': current_omission,
+                        'recent_count': recent_count
+                    })
+
+            # 按热度排序
+            hot_numbers.sort(key=lambda x: x['heat_score'], reverse=True)
+            cold_numbers.sort(key=lambda x: x['heat_score'])
+            warm_numbers.sort(key=lambda x: x['heat_score'], reverse=True)
+
+            result[pos] = {
+                'position_name': pos_name,
+                'hot_numbers': hot_numbers,
+                'warm_numbers': warm_numbers,
+                'cold_numbers': cold_numbers,
+                'theory_recent_count': round(theory_recent_count, 2)
             }
-        
-        return consecutive_prob
-    
-    def analyze_trend_data(self, trend_data, history_data):
+
+        return result
+
+    # ==================== 012路分析 ====================
+
+    def analyze_012_path(self, data: List[Dict]) -> Dict:
         """
-        分析走势图数据，提取趋势特征
-        
-        Args:
-            trend_data: 走势图数据列表
-            history_data: 历史开奖数据列表
-        
+        分析012路分布（除3余数分析）
+
+        012路是彩票分析的标准方法：
+        - 0路：号码 % 3 == 0 (0, 3, 6, 9)
+        - 1路：号码 % 3 == 1 (1, 4, 7)
+        - 2路：号码 % 3 == 2 (2, 5, 8)
+
         Returns:
-            趋势分析结果字典
+            各位置012路分布统计
         """
-        if not trend_data:
-            return {'error': '没有走势图数据'}
-        
-        # 将趋势数据转换为字典便于查找
-        trend_dict = {item['issue']: item.get('trend', []) for item in trend_data}
-        
-        trend_features = {
-            'hot_numbers': [],
-            'cold_numbers': [],
-            'trending_up': [],
-            'trending_down': [],
-            'stable_numbers': [],
-            'recent_patterns': []
-        }
-        
-        # 分析近期趋势
-        recent_issues = sorted(trend_dict.keys())[-20:]
-        
-        for pos in range(6):
-            pos_trends = []
-            for issue in recent_issues:
-                if issue in trend_dict and len(trend_dict[issue]) > pos:
+        if not data:
+            return {}
+
+        total = len(data)
+        result = {}
+
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            path_counts = {0: Counter(), 1: Counter(), 2: Counter()}
+
+            for item in data:
+                numbers = item.get('numbers', [])
+                if pos < len(numbers):
                     try:
-                        val = int(trend_dict[issue][pos])
-                        pos_trends.append(val)
-                    except:
-                        pass
-            
-            if pos_trends:
-                # 计算趋势指标
-                avg_value = sum(pos_trends) / len(pos_trends)
-                variance = sum((x - avg_value) ** 2 for x in pos_trends) / len(pos_trends)
-                std_dev = variance ** 0.5
-                
-                # 识别热门和冷门号码
-                num_counts = defaultdict(int)
-                for issue in recent_issues:
-                    if issue in trend_dict and len(trend_dict[issue]) > pos:
-                        try:
-                            num = int(trend_dict[issue][pos])
-                            num_counts[num] += 1
-                        except:
-                            pass
-                
-                if num_counts:
-                    sorted_nums = sorted(num_counts.items(), key=lambda x: x[1], reverse=True)
-                    hot_num = sorted_nums[0][0]
-                    cold_num = sorted_nums[-1][0]
-                    
-                    trend_features['hot_numbers'].append({
-                        'position': pos + 1,
-                        'number': hot_num,
-                        'frequency': sorted_nums[0][1],
-                        'trend_type': 'hot'
-                    })
-                    trend_features['cold_numbers'].append({
-                        'position': pos + 1,
-                        'number': cold_num,
-                        'frequency': sorted_nums[-1][1],
-                        'trend_type': 'cold'
-                    })
-        
-        # 结合历史数据验证趋势
-        if history_data:
-            for feature in trend_features['hot_numbers']:
-                pos = feature['position'] - 1
-                num = feature['number']
-                count = sum(1 for item in history_data[-30:] if pos < len(item['numbers']) and item['numbers'][pos] == num)
-                feature['validation_count'] = count
-                feature['validation_rate'] = round(count / 30, 2) if 30 > 0 else 0
-        
-        return trend_features
-    
-    def analyze_data_comparison(self, history_data, trend_data):
+                        num = int(numbers[pos])
+                        path = num % 3
+                        path_counts[path][num] += 1
+                    except (ValueError, TypeError):
+                        continue
+
+            path_stats = {}
+            for path in [0, 1, 2]:
+                count = sum(path_counts[path].values())
+                path_stats[path] = {
+                    'count': count,
+                    'probability': round(count / total, 4) if total > 0 else 0,
+                    'numbers': sorted(list(path_counts[path].keys())),
+                    'number_freq': dict(path_counts[path])
+                }
+
+            result[pos] = {
+                'position_name': pos_name,
+                'path_stats': path_stats,
+                'total_samples': total
+            }
+
+        return result
+
+    # ==================== 大小比分析 ====================
+
+    def analyze_big_small(self, data: List[Dict]) -> Dict:
         """
-        数据对比分析：比较历史数据和走势图数据的一致性
-        
-        Args:
-            history_data: 历史开奖数据列表
-            trend_data: 走势图数据列表
-        
+        分析大小号分布
+
+        七星彩标准：
+        - 前6位：小号 0-4，大号 5-9
+        - 特别号：小号 0-7，大号 8-14（或按 0-6/7-14）
+
         Returns:
-            数据对比分析结果字典
+            大小号分布统计
         """
-        if not history_data or not trend_data:
-            return {'error': '数据不足，无法进行对比分析'}
-        
-        trend_dict = {item['issue']: item.get('trend', []) for item in trend_data}
-        
-        comparison_results = {
-            'matching_rate': 0.0,
-            'position_accuracy': [],
-            'trend_confirmation': [],
-            'discrepancies': []
-        }
-        
-        matched_count = 0
-        total_count = 0
-        
-        for item in history_data[:50]:
-            issue = item['issue']
-            if issue in trend_dict:
-                trend_values = trend_dict[issue]
-                numbers = item['numbers']
-                
-                for pos in range(min(6, len(numbers), len(trend_values))):
+        if not data:
+            return {}
+
+        total = len(data)
+        result = {}
+
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            # 特别号的大小分界
+            big_small_threshold = 7 if pos == 6 else 5
+
+            big_count = 0
+            small_count = 0
+            big_numbers = Counter()
+            small_numbers = Counter()
+
+            for item in data:
+                numbers = item.get('numbers', [])
+                if pos < len(numbers):
                     try:
-                        trend_num = int(trend_values[pos])
-                        actual_num = numbers[pos]
-                        total_count += 1
-                        if trend_num == actual_num:
-                            matched_count += 1
-                    except:
-                        pass
-        
-        comparison_results['matching_rate'] = round(matched_count / total_count, 4) if total_count > 0 else 0
-        
-        # 位置准确率分析
-        for pos in range(6):
-            pos_matched = 0
-            pos_total = 0
-            
-            for item in history_data[:50]:
-                issue = item['issue']
-                if issue in trend_dict:
-                    trend_values = trend_dict[issue]
-                    numbers = item['numbers']
-                    
-                    if pos < len(numbers) and pos < len(trend_values):
-                        try:
-                            trend_num = int(trend_values[pos])
-                            actual_num = numbers[pos]
-                            pos_total += 1
-                            if trend_num == actual_num:
-                                pos_matched += 1
-                        except:
-                            pass
-            
-            comparison_results['position_accuracy'].append({
-                'position': pos + 1,
-                'accuracy': round(pos_matched / pos_total, 4) if pos_total > 0 else 0,
-                'matched': pos_matched,
-                'total': pos_total
-            })
-        
-        return comparison_results
-    
-    def calculate_probability(self, data, trend_data=None):
+                        num = int(numbers[pos])
+                        if num >= big_small_threshold:
+                            big_count += 1
+                            big_numbers[num] += 1
+                        else:
+                            small_count += 1
+                            small_numbers[num] += 1
+                    except (ValueError, TypeError):
+                        continue
+
+            result[pos] = {
+                'position_name': pos_name,
+                'big_small_threshold': big_small_threshold,
+                'big_count': big_count,
+                'small_count': small_count,
+                'big_probability': round(big_count / total, 4) if total > 0 else 0,
+                'small_probability': round(small_count / total, 4) if total > 0 else 0,
+                'big_numbers': dict(big_numbers.most_common()),
+                'small_numbers': dict(small_numbers.most_common()),
+                'total_samples': total
+            }
+
+        return result
+
+    # ==================== 奇偶比分析（增强版）====================
+
+    def analyze_odd_even(self, data: List[Dict]) -> Dict:
         """
-        综合计算概率分析结果，整合走势图数据
-        
+        分析奇偶分布（增强版）
+
+        Returns:
+            各位置奇偶分布及组合模式
+        """
+        if not data:
+            return {}
+
+        total = len(data)
+        result = {}
+
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            odd_count = 0
+            even_count = 0
+            odd_numbers = Counter()
+            even_numbers = Counter()
+
+            for item in data:
+                numbers = item.get('numbers', [])
+                if pos < len(numbers):
+                    try:
+                        num = int(numbers[pos])
+                        if num % 2 == 1:
+                            odd_count += 1
+                            odd_numbers[num] += 1
+                        else:
+                            even_count += 1
+                            even_numbers[num] += 1
+                    except (ValueError, TypeError):
+                        continue
+
+            result[pos] = {
+                'position_name': pos_name,
+                'odd_count': odd_count,
+                'even_count': even_count,
+                'odd_probability': round(odd_count / total, 4) if total > 0 else 0,
+                'even_probability': round(even_count / total, 4) if total > 0 else 0,
+                'odd_numbers': dict(odd_numbers.most_common()),
+                'even_numbers': dict(even_numbers.most_common()),
+                'total_samples': total
+            }
+
+        # 整体奇偶比分析（前6位）
+        overall_patterns = Counter()
+        for item in data:
+            numbers = item.get('numbers', [])
+            if len(numbers) >= 6:
+                try:
+                    pattern = ''.join(['O' if int(n) % 2 == 1 else 'E' for n in numbers[:6]])
+                    overall_patterns[pattern] += 1
+                except (ValueError, TypeError):
+                    continue
+
+        result['overall'] = {
+            'pattern_distribution': dict(overall_patterns.most_common(10)),
+            'total_samples': total
+        }
+
+        return result
+
+    # ==================== 和值分析（增强版）====================
+
+    def analyze_hezhi(self, data: List[Dict]) -> Dict:
+        """
+        分析和值分布（增强版）
+
+        七星彩前6位和值范围：0-54
+        特别号单独分析
+
+        Returns:
+            和值统计、区间分布、理论对比
+        """
+        if not data:
+            return {}
+
+        hezhi_values = []
+        hezhi_with_special = []
+
+        for item in data:
+            numbers = item.get('numbers', [])
+            if len(numbers) >= 6:
+                try:
+                    main_sum = sum(int(n) for n in numbers[:6])
+                    hezhi_values.append(main_sum)
+                    if len(numbers) >= 7:
+                        total_sum = main_sum + int(numbers[6])
+                        hezhi_with_special.append(total_sum)
+                except (ValueError, TypeError):
+                    continue
+
+        if not hezhi_values:
+            return {}
+
+        total = len(hezhi_values)
+        avg_hezhi = sum(hezhi_values) / total
+        max_hezhi = max(hezhi_values)
+        min_hezhi = min(hezhi_values)
+
+        # 和值区间分布
+        ranges = {
+            '0-9': 0, '10-19': 0, '20-29': 0, '30-39': 0,
+            '40-49': 0, '50-54': 0
+        }
+        for h in hezhi_values:
+            if h <= 9:
+                ranges['0-9'] += 1
+            elif h <= 19:
+                ranges['10-19'] += 1
+            elif h <= 29:
+                ranges['20-29'] += 1
+            elif h <= 39:
+                ranges['30-39'] += 1
+            elif h <= 49:
+                ranges['40-49'] += 1
+            else:
+                ranges['50-54'] += 1
+
+        # 理论期望值（前6位，每个位置期望4.5）
+        theory_avg = 27.0
+
+        return {
+            'total_samples': total,
+            'avg_hezhi': round(avg_hezhi, 2),
+            'max_hezhi': max_hezhi,
+            'min_hezhi': min_hezhi,
+            'theory_avg': theory_avg,
+            'deviation_from_theory': round(avg_hezhi - theory_avg, 2),
+            'range_distribution': {k: {'count': v, 'probability': round(v / total, 4)} for k, v in ranges.items()},
+            'hezhi_values': hezhi_values  # 原始数据供进一步分析
+        }
+
+    # ==================== 跨度分析（增强版）====================
+
+    def analyze_span(self, data: List[Dict]) -> Dict:
+        """
+        分析跨度分布（最大值 - 最小值）
+
+        Returns:
+            跨度统计
+        """
+        if not data:
+            return {}
+
+        spans = []
+        for item in data:
+            numbers = item.get('numbers', [])
+            if len(numbers) >= 6:
+                try:
+                    main_numbers = [int(n) for n in numbers[:6]]
+                    span = max(main_numbers) - min(main_numbers)
+                    spans.append(span)
+                except (ValueError, TypeError):
+                    continue
+
+        if not spans:
+            return {}
+
+        total = len(spans)
+        span_counts = Counter(spans)
+
+        return {
+            'total_samples': total,
+            'avg_span': round(sum(spans) / total, 2),
+            'max_span': max(spans),
+            'min_span': min(spans),
+            'span_distribution': {str(k): {'count': v, 'probability': round(v / total, 4)}
+                                  for k, v in sorted(span_counts.items())}
+        }
+
+    # ==================== 重号分析 ====================
+
+    def analyze_repeats(self, data: List[Dict]) -> Dict:
+        """
+        分析相邻期重号情况
+
+        Returns:
+            重号统计
+        """
+        if len(data) < 2:
+            return {}
+
+        sorted_data = sorted(data, key=lambda x: x.get('issue', ''))
+        repeat_counts = Counter()
+        consecutive_repeats = []
+
+        for i in range(1, len(sorted_data)):
+            prev_numbers = set(int(n) for n in sorted_data[i - 1].get('numbers', []) if str(n).isdigit())
+            curr_numbers = set(int(n) for n in sorted_data[i].get('numbers', []) if str(n).isdigit())
+            repeats = len(prev_numbers & curr_numbers)
+            repeat_counts[repeats] += 1
+            consecutive_repeats.append(repeats)
+
+        total_pairs = len(sorted_data) - 1
+
+        return {
+            'total_pairs': total_pairs,
+            'repeat_distribution': {str(k): {'count': v, 'probability': round(v / total_pairs, 4)}
+                                    for k, v in sorted(repeat_counts.items())},
+            'avg_repeats': round(sum(consecutive_repeats) / len(consecutive_repeats), 2) if consecutive_repeats else 0,
+            'max_repeats': max(consecutive_repeats) if consecutive_repeats else 0,
+            'min_repeats': min(consecutive_repeats) if consecutive_repeats else 0
+        }
+
+    # ==================== 连号分析 ====================
+
+    def analyze_consecutive(self, data: List[Dict]) -> Dict:
+        """
+        分析连号情况
+
+        Returns:
+            连号统计
+        """
+        if not data:
+            return {}
+
+        streak_counts = Counter()
+        all_streaks = []
+
+        for item in data:
+            numbers = item.get('numbers', [])
+            if len(numbers) >= 6:
+                try:
+                    main_numbers = sorted([int(n) for n in numbers[:6]])
+                    current_streak = 1
+                    max_streak = 1
+
+                    for i in range(1, 6):
+                        if main_numbers[i] == main_numbers[i - 1] + 1:
+                            current_streak += 1
+                            max_streak = max(max_streak, current_streak)
+                        else:
+                            if current_streak > 1:
+                                all_streaks.append(current_streak)
+                            current_streak = 1
+
+                    if current_streak > 1:
+                        all_streaks.append(current_streak)
+
+                    streak_counts[max_streak] += 1
+                except (ValueError, TypeError):
+                    continue
+
+        total = len(data)
+
+        return {
+            'total_samples': total,
+            'consecutive_distribution': {str(k): {'count': v, 'probability': round(v / total, 4)}
+                                         for k, v in sorted(streak_counts.items())},
+            'avg_max_streak': round(sum(streak_counts.keys()) / len(streak_counts), 2) if streak_counts else 0,
+            'has_consecutive_probability': round(sum(v for k, v in streak_counts.items() if k > 1) / total, 4) if total > 0 else 0
+        }
+
+    # ==================== 号码相关性分析 ====================
+
+    def analyze_position_correlation(self, data: List[Dict]) -> Dict:
+        """
+        分析不同位置之间的号码相关性
+
+        Returns:
+            位置间相关性矩阵
+        """
+        if not data:
+            return {}
+
+        # 提取各位置号码序列
+        position_series = {pos: [] for pos in range(self.positions)}
+
+        for item in data:
+            numbers = item.get('numbers', [])
+            for pos in range(min(self.positions, len(numbers))):
+                try:
+                    position_series[pos].append(int(numbers[pos]))
+                except (ValueError, TypeError):
+                    position_series[pos].append(None)
+
+        # 计算皮尔逊相关系数
+        import statistics
+
+        def pearson_correlation(x, y):
+            """计算皮尔逊相关系数"""
+            # 过滤None值
+            pairs = [(a, b) for a, b in zip(x, y) if a is not None and b is not None]
+            if len(pairs) < 2:
+                return 0
+
+            x_vals = [p[0] for p in pairs]
+            y_vals = [p[1] for p in pairs]
+
+            try:
+                mean_x = statistics.mean(x_vals)
+                mean_y = statistics.mean(y_vals)
+
+                numerator = sum((a - mean_x) * (b - mean_y) for a, b in pairs)
+                denom_x = sum((a - mean_x) ** 2 for a in x_vals) ** 0.5
+                denom_y = sum((b - mean_y) ** 2 for b in y_vals) ** 0.5
+
+                if denom_x == 0 or denom_y == 0:
+                    return 0
+                return numerator / (denom_x * denom_y)
+            except:
+                return 0
+
+        correlation_matrix = {}
+        for i in range(self.positions):
+            correlation_matrix[i] = {}
+            for j in range(self.positions):
+                if i == j:
+                    correlation_matrix[i][j] = 1.0
+                else:
+                    corr = pearson_correlation(position_series[i], position_series[j])
+                    correlation_matrix[i][j] = round(corr, 4)
+
+        return {
+            'position_names': self.position_names,
+            'correlation_matrix': correlation_matrix,
+            'total_samples': len(data),
+            'note': '相关系数接近0表示位置间基本独立，符合随机性假设'
+        }
+
+    # ==================== 随机性检验 ====================
+
+    def analyze_randomness(self, data: List[Dict]) -> Dict:
+        """
+        对数据进行基础随机性检验
+
+        Returns:
+            随机性检验结果
+        """
+        if not data:
+            return {}
+
+        total = len(data)
+
+        # 1. 频率均匀性检验（卡方检验近似）
+        freq_result = self.analyze_frequency(data)
+        chi_square_stats = {}
+
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            num_range = self.special_range if pos == 6 else self.main_range
+            theory_prob = 1.0 / len(num_range)
+            expected = total * theory_prob
+
+            chi_sq = 0
+            for num in num_range:
+                observed = freq_result[pos]['number_stats'][num]['frequency']
+                if expected > 0:
+                    chi_sq += (observed - expected) ** 2 / expected
+
+            # 自由度 = 号码个数 - 1
+            df = len(num_range) - 1
+
+            chi_square_stats[pos] = {
+                'position_name': pos_name,
+                'chi_square': round(chi_sq, 4),
+                'degrees_of_freedom': df,
+                'expected_frequency': round(expected, 2),
+                'interpretation': '数据分布基本均匀' if chi_sq < df * 2 else '存在一定程度的分布偏差'
+            }
+
+        # 2. 连号随机性
+        consecutive_result = self.analyze_consecutive(data)
+        has_consecutive_prob = consecutive_result.get('has_consecutive_probability', 0)
+
+        # 理论上有连号的概率（近似）
+        theory_consecutive_prob = 0.55  # 经验值
+
+        return {
+            'chi_square_test': chi_square_stats,
+            'consecutive_analysis': {
+                'observed_prob': has_consecutive_prob,
+                'theory_approx': theory_consecutive_prob,
+                'interpretation': '连号出现频率正常' if abs(has_consecutive_prob - theory_consecutive_prob) < 0.15 else '连号出现频率偏离预期'
+            },
+            'overall_assessment': '历史数据整体呈现随机分布特征，各位置号码基本独立',
+            'disclaimer': '彩票开奖为独立随机事件，历史数据统计特征不代表未来趋势'
+        }
+
+    # ==================== 综合概率计算（新版）====================
+
+    def calculate_probability(self, data: List[Dict], trend_data: Optional[List[Dict]] = None) -> Dict:
+        """
+        综合计算概率分析结果（专业版）
+
+        重要说明：
+        1. 七星彩每位号码的理论出现概率均等（前6位各1/10，特别号1/15）
+        2. 本方法计算的是基于历史数据的统计特征，而非"预测概率"
+        3. 所有"概率"数值均为历史频率的统计描述
+
         Args:
-            data: 历史数据列表
-            trend_data: 走势图数据列表（可选）
-        
+            data: 历史开奖数据列表
+            trend_data: 走势图数据（已废弃，保留参数兼容）
+
         Returns:
             综合分析结果字典
         """
         if len(data) < 10:
             logger.warning('数据量不足，分析结果可能不准确')
-        
-        # 基础分析
+
+        total = len(data)
+
+        # 执行所有分析
         freq_result = self.analyze_frequency(data)
-        interval_result = self.analyze_interval(data)
-        hezhi_result = self.analyze_hezhi(data)
+        omission_result = self.analyze_omission(data)
+        hot_cold_result = self.analyze_hot_cold(data)
+        path_result = self.analyze_012_path(data)
+        big_small_result = self.analyze_big_small(data)
         odd_even_result = self.analyze_odd_even(data)
+        hezhi_result = self.analyze_hezhi(data)
         span_result = self.analyze_span(data)
         repeat_result = self.analyze_repeats(data)
         consecutive_result = self.analyze_consecutive(data)
-        
-        # 趋势分析（如果有走势图数据）
-        trend_analysis = {}
-        data_comparison = {}
-        
-        if trend_data:
-            trend_analysis = self.analyze_trend_data(trend_data, data)
-            data_comparison = self.analyze_data_comparison(data, trend_data)
-        
-        # 综合预测
-        predictions = {}
-        total = len(data)
-        
-        for num in range(0, 10):
-            prob_sum = 0
-            conf_sum = 0
-            trend_factor = 1.0
-            
-            # 检查趋势数据中的热度
-            if trend_analysis and 'hot_numbers' in trend_analysis:
-                for hot_item in trend_analysis['hot_numbers']:
-                    if hot_item['number'] == num:
-                        trend_factor = 1.2 + (hot_item.get('validation_rate') or 0) * 0.5
-                        break
-                for cold_item in trend_analysis['cold_numbers']:
-                    if cold_item['number'] == num:
-                        trend_factor = 0.8 - (1 - (cold_item.get('validation_rate') or 0)) * 0.3
-                        break
-            
-            for pos in range(6):
-                if num in freq_result:
-                    prob = freq_result[num]['probability'][pos]
-                    prob_sum += prob * trend_factor
-                    
-                    key = (num, pos)
-                    if key in interval_result:
-                        avg_interval = interval_result[key]['avg']
-                        last_idx = self._get_last_occurrence(data, num, pos)
-                        if last_idx is not None:
-                            since_last = len(data) - 1 - last_idx
-                            confidence = min(1.0, since_last / avg_interval) if avg_interval > 0 else 0.5
-                        else:
-                            confidence = 0.5
-                        conf_sum += confidence
-            
-            avg_prob = prob_sum / 6 if total > 0 else 0
-            avg_conf = conf_sum / 6 if total > 0 else 0.5
-            
-            predictions[num] = {
-                'probability': round(avg_prob, 4),
-                'confidence': round(avg_conf, 4),
-                'trend_factor': round(trend_factor, 2),
-                'expected_positions': self._predict_positions(freq_result, num)
+        correlation_result = self.analyze_position_correlation(data)
+        randomness_result = self.analyze_randomness(data)
+
+        # 构建位置级综合分析（按位置独立分析）
+        position_analysis = {}
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            num_range = self.special_range if pos == 6 else self.main_range
+            theory_prob = 1.0 / len(num_range)
+
+            number_analysis = {}
+            for num in num_range:
+                # 综合评分（多因子加权）
+                freq_stats = freq_result.get(pos, {}).get('number_stats', {}).get(num, {})
+                om_stats = omission_result.get(pos, {}).get('number_stats', {}).get(num, {})
+
+                observed_prob = freq_stats.get('observed_probability', 0)
+                deviation = freq_stats.get('deviation_rate', 0)
+                current_omission = om_stats.get('current_omission', 0)
+                avg_omission = om_stats.get('avg_omission', 1)
+                omission_ratio = om_stats.get('omission_ratio', 0)
+
+                # 综合热度评分 (0-100)
+                # 频率偏离度权重40%，遗漏偏差权重35%，出现率权重25%
+                heat_score = (
+                    (1 + deviation) * 40 +           # 频率偏离（正偏离=热）
+                    (1 / (1 + omission_ratio)) * 35 +  # 遗漏偏差（低遗漏=热）
+                    (observed_prob / theory_prob) * 25  # 出现率比率
+                )
+                heat_score = max(0, min(100, heat_score))
+
+                number_analysis[num] = {
+                    'observed_probability': observed_prob,
+                    'theoretical_probability': theory_prob,
+                    'deviation_rate': deviation,
+                    'current_omission': current_omission,
+                    'avg_omission': avg_omission,
+                    'omission_ratio': omission_ratio,
+                    'heat_score': round(heat_score, 2),
+                    'category': 'hot' if heat_score >= 60 else 'cold' if heat_score <= 40 else 'warm'
+                }
+
+            # 按热度排序
+            sorted_numbers = sorted(number_analysis.items(), key=lambda x: x[1]['heat_score'], reverse=True)
+
+            position_analysis[pos] = {
+                'position_name': pos_name,
+                'theory_prob': theory_prob,
+                'number_analysis': number_analysis,
+                'hot_numbers': [n for n, s in sorted_numbers if s['category'] == 'hot'],
+                'warm_numbers': [n for n, s in sorted_numbers if s['category'] == 'warm'],
+                'cold_numbers': [n for n, s in sorted_numbers if s['category'] == 'cold'],
+                'sorted_by_heat': [(n, s['heat_score']) for n, s in sorted_numbers]
             }
-        
-        sorted_predictions = dict(sorted(predictions.items(), key=lambda x: x[1]['probability'], reverse=True))
-        
+
         return {
             'frequency': freq_result,
-            'interval': interval_result,
-            'hezhi': hezhi_result,
+            'omission': omission_result,
+            'hot_cold': hot_cold_result,
+            'path_012': path_result,
+            'big_small': big_small_result,
             'odd_even': odd_even_result,
+            'hezhi': hezhi_result,
             'span': span_result,
             'repeats': repeat_result,
             'consecutive': consecutive_result,
-            'trend': trend_analysis,
-            'comparison': data_comparison,
-            'predictions': sorted_predictions,
+            'correlation': correlation_result,
+            'randomness': randomness_result,
+            'position_analysis': position_analysis,
             'total_samples': total,
-            'analysis_time': datetime.now().isoformat()
+            'analysis_time': datetime.now().isoformat(),
+            'methodology_note': '本分析基于历史数据统计，所有号码的理论出现概率均等。'
         }
-    
-    def _get_last_occurrence(self, data, num, pos):
-        for idx, item in enumerate(reversed(data)):
-            if pos < len(item['numbers']) and item['numbers'][pos] == num:
-                return len(data) - 1 - idx
-        return None
-    
-    def _predict_positions(self, freq_result, num):
-        if num not in freq_result:
-            return []
-        
-        prob_list = freq_result[num]['probability'][:6]
-        sorted_positions = sorted(range(6), key=lambda i: prob_list[i], reverse=True)
-        return [pos + 1 for pos in sorted_positions[:3]]
-    
-    def generate_report(self, analysis_result):
+
+    # ==================== 报告生成（兼容旧接口）====================
+
+    def generate_report(self, analysis_result: Dict) -> str:
         """
-        生成综合分析报告
-        
+        生成综合分析报告（兼容旧接口）
+
         Args:
             analysis_result: 分析结果字典
-        
+
         Returns:
             报告字符串
         """
         report = []
-        report.append('=' * 70)
-        report.append('        七星彩数字概率综合分析报告')
-        report.append('=' * 70)
+        report.append('=' * 80)
+        report.append('        七星彩数字概率综合分析报告（专业版）')
+        report.append('=' * 80)
         report.append(f'\n分析样本数: {analysis_result["total_samples"]} 期')
         report.append(f'分析时间: {analysis_result.get("analysis_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}')
-        report.append('-' * 70)
-        
-        # 一、数字出现频率统计
-        report.append('\n【一、数字出现频率统计】')
-        report.append('-' * 50)
-        for pos in range(6):
-            report.append(f'\n位置 {pos + 1} 号码频率:')
-            freq_list = []
-            for num in range(10):
-                if num in analysis_result['frequency']:
-                    freq = analysis_result['frequency'][num]['frequency'][pos]
-                    prob = analysis_result['frequency'][num]['probability'][pos]
-                    freq_list.append((num, freq, prob))
-            
-            freq_list.sort(key=lambda x: x[1], reverse=True)
-            for num, freq, prob in freq_list[:5]:
-                report.append(f'  {num}: 出现 {freq} 次, 概率 {prob:.2%}')
-        
-        # 二、数字概率预测排序
-        report.append('\n【二、数字概率预测排序】')
-        report.append('-' * 50)
-        report.append(f'{"数字":^6} {"概率":^10} {"置信度":^10} {"趋势因子":^12} {"推荐位置"}')
-        report.append('-' * 50)
-        for num, pred in analysis_result['predictions'].items():
-            positions = ','.join(map(str, pred['expected_positions']))
-            report.append(f'{num:^6} {pred["probability"]:^10.2%} {pred["confidence"]:^10.2%} {pred["trend_factor"]:^12.2f}  {positions}')
-        
-        # 三、间隔周期统计
-        report.append('\n【三、间隔周期统计】')
-        report.append('-' * 50)
-        interval_summary = []
-        for (num, pos), stats in analysis_result['interval'].items():
-            interval_summary.append((num, pos, stats['avg']))
-        
-        interval_summary.sort(key=lambda x: x[2], reverse=True)
-        report.append('近期可能出现的号码（间隔周期较长）:')
-        for num, pos, avg_interval in interval_summary[:10]:
-            report.append(f'  数字 {num} 在位置 {pos + 1}: 平均间隔 {avg_interval:.1f} 期')
-        
-        # 四、重号与连号分析
-        report.append('\n【四、重号与连号分析】')
-        report.append('-' * 50)
-        
-        if 'repeats' in analysis_result:
-            repeats = analysis_result['repeats']
-            report.append(f'\n重号统计:')
-            report.append(f'  平均重号数: {repeats["avg_repeats"]:.1f}')
-            report.append(f'  最大重号数: {repeats["max_repeats"]}')
-            report.append(f'  最小重号数: {repeats["min_repeats"]}')
-            
-            report.append('\n重号分布:')
-            for repeat_count, stats in sorted(repeats['repeat_distribution'].items()):
-                report.append(f'  {repeat_count}个重号: {stats["count"]}次 ({stats["probability"]:.2%})')
-        
-        if 'consecutive' in analysis_result:
-            report.append('\n连号分布:')
-            for streak, stats in sorted(analysis_result['consecutive'].items()):
-                report.append(f'  {streak}连号: {stats["count"]}次 ({stats["probability"]:.2%})')
-        
-        # 五、趋势分析（如果有走势图数据）
-        if 'trend' in analysis_result and analysis_result['trend']:
-            report.append('\n【五、走势图趋势分析】')
-            report.append('-' * 50)
-            
-            if 'hot_numbers' in analysis_result['trend']:
-                report.append('\n热门号码（近期高频出现）:')
-                for hot_item in analysis_result['trend']['hot_numbers']:
-                    report.append(f'  位置{hot_item["position"]} 数字{hot_item["number"]}: 出现{hot_item["frequency"]}次')
-            
-            if 'cold_numbers' in analysis_result['trend']:
-                report.append('\n冷门号码（近期低频出现）:')
-                for cold_item in analysis_result['trend']['cold_numbers']:
-                    report.append(f'  位置{cold_item["position"]} 数字{cold_item["number"]}: 出现{cold_item["frequency"]}次')
-        
-        # 六、数据对比分析
-        if 'comparison' in analysis_result and analysis_result['comparison'] and 'matching_rate' in analysis_result['comparison']:
-            report.append('\n【六、数据对比分析】')
-            report.append('-' * 50)
-            
-            comp = analysis_result['comparison']
-            report.append(f'\n走势图与开奖数据匹配率: {comp["matching_rate"]:.2%}')
-            
-            report.append('\n各位置准确率:')
-            for pos_acc in comp['position_accuracy']:
-                report.append(f'  位置{pos_acc["position"]}: {pos_acc["accuracy"]:.2%} ({pos_acc["matched"]}/{pos_acc["total"]})')
-        
-        report.append('\n' + '=' * 70)
+        report.append('-' * 80)
+        report.append('\n【重要声明】')
+        report.append('  彩票开奖为独立随机事件，每位号码的理论出现概率均等。')
+        report.append('  本报告仅提供历史数据的统计描述，不构成任何投注建议。')
+        report.append('-' * 80)
+
+        # 一、各位置号码频率统计
+        report.append('\n【一、各位置号码频率统计】')
+        report.append('-' * 60)
+        freq = analysis_result.get('frequency', {})
+        for pos in range(self.positions):
+            if pos not in freq:
+                continue
+            pos_name = freq[pos]['position_name']
+            report.append(f'\n{pos_name}:')
+            stats = freq[pos]['number_stats']
+            sorted_nums = sorted(stats.items(), key=lambda x: x[1]['frequency'], reverse=True)
+            for num, s in sorted_nums[:5]:
+                report.append(f'  数字 {num}: 出现 {s["frequency"]} 次, '
+                              f'观测概率 {s["observed_probability"]:.2%}, '
+                              f'偏离率 {s["deviation_rate"]:+.2%}')
+
+        # 二、遗漏值分析
+        report.append('\n【二、遗漏值分析】')
+        report.append('-' * 60)
+        omission = analysis_result.get('omission', {})
+        for pos in range(self.positions):
+            if pos not in omission:
+                continue
+            pos_name = omission[pos]['position_name']
+            stats = omission[pos]['number_stats']
+            # 按当前遗漏排序
+            sorted_by_omission = sorted(stats.items(), key=lambda x: x[1]['current_omission'], reverse=True)
+            report.append(f'\n{pos_name} - 当前遗漏最大的号码:')
+            for num, s in sorted_by_omission[:3]:
+                report.append(f'  数字 {num}: 当前遗漏 {s["current_omission"]} 期, '
+                              f'平均遗漏 {s["avg_omission"]} 期, '
+                              f'最大遗漏 {s["max_omission"]} 期')
+
+        # 三、冷热号分级
+        report.append('\n【三、冷热号分级】')
+        report.append('-' * 60)
+        hot_cold = analysis_result.get('hot_cold', {})
+        for pos in range(self.positions):
+            if pos not in hot_cold:
+                continue
+            pos_name = hot_cold[pos]['position_name']
+            report.append(f'\n{pos_name}:')
+            hot = hot_cold[pos].get('hot_numbers', [])
+            cold = hot_cold[pos].get('cold_numbers', [])
+            if hot:
+                report.append(f'  热号: {", ".join([str(n["number"]) for n in hot[:3]])}')
+            if cold:
+                report.append(f'  冷号: {", ".join([str(n["number"]) for n in cold[:3]])}')
+
+        # 四、012路分析
+        report.append('\n【四、012路分析】')
+        report.append('-' * 60)
+        path = analysis_result.get('path_012', {})
+        for pos in range(self.positions):
+            if pos not in path:
+                continue
+            pos_name = path[pos]['position_name']
+            path_stats = path[pos]['path_stats']
+            report.append(f'\n{pos_name}:')
+            for p in [0, 1, 2]:
+                s = path_stats.get(p, {})
+                report.append(f'  {p}路: 出现 {s.get("count", 0)} 次, '
+                              f'概率 {s.get("probability", 0):.2%}')
+
+        # 五、大小比与奇偶比
+        report.append('\n【五、大小比与奇偶比】')
+        report.append('-' * 60)
+        big_small = analysis_result.get('big_small', {})
+        odd_even = analysis_result.get('odd_even', {})
+        for pos in range(self.positions):
+            if pos in big_small and pos in odd_even:
+                pos_name = big_small[pos]['position_name']
+                bs = big_small[pos]
+                oe = odd_even[pos]
+                report.append(f'\n{pos_name}:')
+                report.append(f'  大号: {bs["big_count"]} 次 ({bs["big_probability"]:.2%}), '
+                              f'小号: {bs["small_count"]} 次 ({bs["small_probability"]:.2%})')
+                report.append(f'  奇数: {oe["odd_count"]} 次 ({oe["odd_probability"]:.2%}), '
+                              f'偶数: {oe["even_count"]} 次 ({oe["even_probability"]:.2%})')
+
+        # 六、和值与跨度
+        report.append('\n【六、和值与跨度分析】')
+        report.append('-' * 60)
+        hezhi = analysis_result.get('hezhi', {})
+        span = analysis_result.get('span', {})
+        if hezhi:
+            report.append(f'\n和值统计:')
+            report.append(f'  平均值: {hezhi.get("avg_hezhi", 0)} (理论期望: {hezhi.get("theory_avg", 27)})')
+            report.append(f'  范围: {hezhi.get("min_hezhi", 0)} - {hezhi.get("max_hezhi", 0)}')
+            report.append(f'  区间分布:')
+            for range_key, s in hezhi.get('range_distribution', {}).items():
+                report.append(f'    {range_key}: {s["count"]} 次 ({s["probability"]:.2%})')
+        if span:
+            report.append(f'\n跨度统计:')
+            report.append(f'  平均值: {span.get("avg_span", 0)}')
+            report.append(f'  范围: {span.get("min_span", 0)} - {span.get("max_span", 0)}')
+
+        # 七、位置相关性
+        report.append('\n【七、位置相关性分析】')
+        report.append('-' * 60)
+        corr = analysis_result.get('correlation', {})
+        report.append('\n各位置间皮尔逊相关系数矩阵（绝对值越大相关性越强）:')
+        matrix = corr.get('correlation_matrix', {})
+        for i in range(min(6, self.positions)):
+            row = []
+            for j in range(min(6, self.positions)):
+                val = matrix.get(i, {}).get(j, 0)
+                row.append(f'{val:+.3f}')
+            report.append(f'  位置{i + 1}: {" | ".join(row)}')
+        report.append('\n  注：相关系数接近0表示位置间基本独立，符合随机性假设。')
+
+        # 八、随机性检验
+        report.append('\n【八、随机性检验】')
+        report.append('-' * 60)
+        rand = analysis_result.get('randomness', {})
+        chi_sq = rand.get('chi_square_test', {})
+        report.append('\n卡方均匀性检验:')
+        for pos in range(self.positions):
+            if pos in chi_sq:
+                s = chi_sq[pos]
+                report.append(f'  {s["position_name"]}: χ² = {s["chi_square"]:.4f}, '
+                              f'自由度 = {s["degrees_of_freedom"]}, '
+                              f'结论: {s["interpretation"]}')
+
+        report.append('\n' + '=' * 80)
         report.append('          分析报告结束')
-        report.append('=' * 70)
-        
+        report.append('=' * 80)
+        report.append('\n【再次声明】')
+        report.append('  彩票开奖为独立随机事件，历史数据的统计规律不代表未来结果。')
+        report.append('  请理性购彩，量力而行。')
+
         return '\n'.join(report)
 
+
 if __name__ == '__main__':
+    # 测试代码
     from database import Database
-    
+
     db = Database()
     if db.connect():
         data = db.query_all_qxc_data()
-        # 查询走势图数据
-        try:
-            db.cursor.execute('SELECT * FROM qxc_trend_data')
-            trend_data = db.cursor.fetchall()
-            # 转换格式
-            trend_data = [{'issue': item['issue'], 'trend': json.loads(item['trend_values'])} for item in trend_data]
-        except:
-            trend_data = []
         db.disconnect()
-        
+
         if data:
             analyzer = ProbabilityAnalyzer()
-            result = analyzer.calculate_probability(data, trend_data)
+            result = analyzer.calculate_probability(data)
             report = analyzer.generate_report(result)
             print(report)
         else:
             print('数据库中没有数据')
+    else:
+        print('数据库连接失败')

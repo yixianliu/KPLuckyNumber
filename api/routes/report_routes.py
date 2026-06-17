@@ -3,7 +3,7 @@
 严格遵循数据库表结构定义
 """
 
-from fastapi import APIRouter, Query, Depends
+from fastapi import APIRouter, Query, Depends, Header
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import json
@@ -13,13 +13,30 @@ import uuid
 from modules.database import Database
 from modules.analyzer import ProbabilityAnalyzer
 from modules.report_generator import ReportGenerator
+from modules.head4_analyzer import Head4Analyzer
 from api.schemas import (
     ApiResponse, ReportQueryRequest, DetailedReportItem, FinalReportItem,
     DetailedReportCreateRequest, FinalReportCreateRequest, ReportStatus
 )
-from api.exceptions import DatabaseException
+from api.exceptions import DatabaseException, ValidationException
 
 router = APIRouter()
+
+
+def check_user_payment(db: Database, user_id: int, payment_type: str = "report_view") -> bool:
+    """检查用户是否已付费"""
+    try:
+        db.cursor.execute(
+            """
+            SELECT id FROM payment_records 
+            WHERE user_id = %s AND payment_type = %s AND status = 'success'
+            LIMIT 1
+            """,
+            (user_id, payment_type)
+        )
+        return db.cursor.fetchone() is not None
+    except Exception:
+        return False
 
 @router.post("/generate", summary="生成分析报告", description="生成概率分析报告")
 async def generate_report(
@@ -147,11 +164,89 @@ async def generate_report(
                 "generated_at": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
         raise DatabaseException(f"生成报告失败: {str(e)}", str(e))
+
+
+@router.post("/generate-head4", summary="生成头4分析报告", description="生成头4（前四位）分析报告")
+async def generate_head4_report(
+    use_trend: bool = Query(True, description="是否使用走势图数据")
+):
+    """
+    生成头4（前四位）分析报告
+    分析数据的前四位数字：第一位是头、第二第三位是中间、第四位是尾
+
+    Args:
+        use_trend: 是否使用走势图数据
+
+    Returns:
+        头4报告生成结果
+    """
+    try:
+        database = Database()
+        analyzer = Head4Analyzer()
+
+        if not database.connect():
+            raise DatabaseException("数据库连接失败")
+
+        # 查询历史数据
+        data = database.query_all_history_data()
+
+        database.disconnect()
+
+        if not data:
+            return ApiResponse(
+                success=False,
+                code=404,
+                message="数据库中没有数据，请先执行爬取操作",
+                data=None
+            )
+
+        # 执行头4分析
+        result = analyzer.calculate_head4_analysis(data)
+
+        # 生成报告内容
+        report_content = analyzer.generate_head4_report(result)
+
+        # 存储到数据库
+        if database.connect():
+            database.create_tables()
+            database.insert_head4_report(
+                report_content=report_content,
+                total_samples=result.get('total_samples', 0),
+                head_frequency_analysis=json.dumps(result.get('head_frequency', {})),
+                middle_frequency_analysis=json.dumps(result.get('middle_frequency', {})),
+                tail_frequency_analysis=json.dumps(result.get('tail_frequency', {})),
+                head_omission_analysis=json.dumps(result.get('head_omission', {})),
+                middle_omission_analysis=json.dumps(result.get('middle_omission', {})),
+                tail_omission_analysis=json.dumps(result.get('tail_omission', {})),
+                head_tail_combination=json.dumps(result.get('head_tail_combination', {})),
+                middle_features=json.dumps(result.get('middle_features', {})),
+                confidence_level=0.85
+            )
+            database.disconnect()
+
+        return ApiResponse(
+            success=True,
+            code=200,
+            message="头4分析报告生成成功",
+            data={
+                "type": "head4",
+                "status": "success",
+                "preview": report_content[:500] + "...",
+                "total_samples": len(data),
+                "generated_at": datetime.now().isoformat()
+            }
+        )
+
+    except DatabaseException as e:
+        raise e
+    except Exception as e:
+        raise DatabaseException(f"生成头4报告失败: {str(e)}", str(e))
+
 
 @router.get("/list", summary="获取报告列表", description="分页获取报告列表")
 async def get_report_list(
@@ -236,22 +331,57 @@ async def get_report_list(
     except Exception as e:
         raise DatabaseException(f"查询报告失败: {str(e)}", str(e))
 
-@router.get("/{report_id}", summary="获取报告详情", description="根据报告ID获取报告详情")
-async def get_report_by_id(report_id: int):
+@router.get("/{report_id}", summary="获取报告详情", description="根据报告ID获取报告详情（需付费后才能查看完整内容）")
+async def get_report_by_id(
+    report_id: int,
+    user_id: int,
+    x_token: Optional[str] = Header(None, alias="X-Token")
+):
     """
     根据报告ID获取报告详情
+    用户必须登录且已付费才能查看完整报告内容
     
     Args:
         report_id: 报告ID
+        user_id: 用户ID
+        x_token: 用户访问令牌
     
     Returns:
-        报告详情
+        报告详情（未付费返回预览内容）
     """
     try:
         database = Database()
         
         if not database.connect():
             raise DatabaseException("数据库连接失败")
+        
+        # 确保用户表存在
+        database.create_user_tables()
+        
+        # 验证用户身份
+        if x_token:
+            database.cursor.execute(
+                "SELECT id FROM users WHERE id = %s AND access_token = %s AND token_expire_at > NOW()",
+                (user_id, x_token)
+            )
+        else:
+            database.cursor.execute(
+                "SELECT id FROM users WHERE id = %s",
+                (user_id,)
+            )
+        
+        user = database.cursor.fetchone()
+        if not user:
+            database.disconnect()
+            return ApiResponse(
+                success=False,
+                code=401,
+                message="用户未登录或token已过期",
+                data=None
+            )
+        
+        # 检查用户是否已付费
+        is_paid = check_user_payment(database, user_id, "report_view")
         
         # 先查询最终报告表
         database.cursor.execute(
@@ -262,11 +392,37 @@ async def get_report_by_id(report_id: int):
         
         if result:
             database.disconnect()
+            
+            if not is_paid:
+                # 未付费，返回预览内容
+                return ApiResponse(
+                    success=True,
+                    code=200,
+                    message="查询成功（预览模式，请付费后查看完整内容）",
+                    data={
+                        "id": result['id'],
+                        "report_date": result['report_date'],
+                        "report_uuid": result['report_uuid'],
+                        "recommended_numbers": "****",
+                        "confidence_score": result['confidence_score'],
+                        "analysis_summary": "付费后可查看完整分析摘要",
+                        "key_conclusions": "付费后可查看关键结论",
+                        "status": result['status'],
+                        "is_preview": True,
+                        "is_paid": False,
+                        "created_at": result['created_at'].isoformat() if result.get('created_at') else None
+                    }
+                )
+            
             return ApiResponse(
                 success=True,
                 code=200,
                 message="查询成功",
-                data=FinalReportItem(**result).dict()
+                data={
+                    **FinalReportItem(**result).dict(),
+                    "is_preview": False,
+                    "is_paid": True
+                }
             )
         
         # 查询详细报告表
@@ -286,11 +442,34 @@ async def get_report_by_id(report_id: int):
                 data=None
             )
         
+        if not is_paid:
+            # 未付费，返回预览内容
+            return ApiResponse(
+                success=True,
+                code=200,
+                message="查询成功（预览模式，请付费后查看完整内容）",
+                data={
+                    "id": result['id'],
+                    "report_date": result['report_date'],
+                    "report_uuid": result['report_uuid'],
+                    "total_samples": result['total_samples'],
+                    "confidence_level": result['confidence_level'],
+                    "report_content": "付费后可查看完整报告内容...",
+                    "is_preview": True,
+                    "is_paid": False,
+                    "created_at": result['created_at'].isoformat() if result.get('created_at') else None
+                }
+            )
+        
         return ApiResponse(
             success=True,
             code=200,
             message="查询成功",
-            data=DetailedReportItem(**result).dict()
+            data={
+                **DetailedReportItem(**result).dict(),
+                "is_preview": False,
+                "is_paid": True
+            }
         )
     
     except DatabaseException as e:

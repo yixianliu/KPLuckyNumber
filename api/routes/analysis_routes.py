@@ -1,10 +1,10 @@
 """
-概率分析路由
-严格遵循数据库表结构定义
+概率分析路由（专业版）
+提供七星彩多维度统计分析API
 """
 
-from fastapi import APIRouter, Query, Depends
-from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, Query
+from typing import Optional
 from datetime import datetime
 import json
 
@@ -16,510 +16,512 @@ from api.exceptions import DatabaseException
 
 router = APIRouter()
 
-@router.get("/frequency", summary="号码频率分析", description="分析各号码在每个位置的出现频率")
+
+def _get_data_from_db():
+    """从数据库获取数据的通用函数"""
+    database = Database()
+    if not database.connect():
+        raise DatabaseException("数据库连接失败")
+
+    data = database.query_all_history_data()
+    database.disconnect()
+
+    if not data:
+        return None
+
+    return data
+
+
+@router.get("/frequency", summary="号码频率分析", description="分析各号码在每个位置的出现频率及与理论值的偏离")
 async def analyze_frequency():
     """
     分析各号码在每个位置的出现频率
-    
+
     Returns:
-        频率分析结果，包含各号码在每个位置的出现次数和概率
+        频率分析结果，包含观测频率、理论概率、偏离率
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行频率分析
         freq_result = analyzer.analyze_frequency(data)
-        
-        # 格式化结果
-        frequency_list = []
-        for num, stats in freq_result.items():
-            frequency_list.append({
-                "number": num,
-                "frequency": stats["frequency"],
-                "probability": stats["probability"]
-            })
-        
-        # 按概率排序
-        frequency_list.sort(key=lambda x: sum(x["probability"]), reverse=True)
-        
+
+        # 简化输出格式
+        simplified = {}
+        for pos, pos_data in freq_result.items():
+            simplified[pos] = {
+                "position_name": pos_data["position_name"],
+                "number_stats": pos_data["number_stats"]
+            }
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="分析成功",
+            success=True, code=200, message="分析成功",
             data={
                 "total_samples": len(data),
-                "frequency_analysis": frequency_list,
+                "frequency_analysis": simplified,
                 "analysis_time": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
         raise DatabaseException(f"分析失败: {str(e)}", str(e))
 
-@router.get("/interval", summary="间隔周期分析", description="分析号码的间隔周期分布")
-async def analyze_interval():
+
+@router.get("/omission", summary="遗漏值分析", description="分析各号码的当前遗漏、最大遗漏、平均遗漏")
+async def analyze_omission():
     """
-    分析号码的间隔周期分布
-    
+    分析号码遗漏值
+
     Returns:
-        间隔分析结果，包含号码在各位置的出现次数、平均间隔、最大间隔、最小间隔
+        遗漏分析结果，包含当前遗漏、最大遗漏、平均遗漏、遗漏比率
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行间隔分析
-        interval_result = analyzer.analyze_interval(data)
-        
-        # 格式化结果
-        interval_list = []
-        for (num, pos), stats in interval_result.items():
-            interval_list.append({
-                "number": num,
-                "position": pos + 1,
-                "count": stats["count"],
-                "avg_interval": stats["avg"],
-                "max_interval": stats["max"],
-                "min_interval": stats["min"]
-            })
-        
-        # 按平均间隔排序（降序）
-        interval_list.sort(key=lambda x: x["avg_interval"], reverse=True)
-        
+        omission_result = analyzer.analyze_omission(data)
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="分析成功",
+            success=True, code=200, message="分析成功",
             data={
                 "total_samples": len(data),
-                "interval_analysis": interval_list[:20],
+                "omission_analysis": omission_result,
                 "analysis_time": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
         raise DatabaseException(f"分析失败: {str(e)}", str(e))
 
-@router.get("/hezhi", summary="和值分析", description="分析和值分布情况")
-async def analyze_hezhi():
+
+@router.get("/hot_cold", summary="冷热号分析", description="基于遗漏值和近期频率进行冷热号分级")
+async def analyze_hot_cold(recent_n: int = Query(30, description="近期统计期数")):
     """
-    分析和值分布情况
-    
+    分析冷热号分级
+
+    Args:
+        recent_n: 近期统计期数，默认30期
+
     Returns:
-        和值分析结果，包含和值分布、和值类型分布
+        冷热号分级结果
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行和值分析
-        hezhi_result = analyzer.analyze_hezhi(data)
-        
+        hot_cold_result = analyzer.analyze_hot_cold(data, recent_n=recent_n)
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="分析成功",
+            success=True, code=200, message="分析成功",
             data={
                 "total_samples": len(data),
-                "hezhi_distribution": hezhi_result["hezhi_distribution"],
-                "hezhi_type_distribution": hezhi_result["hezhi_type_distribution"],
+                "recent_periods": recent_n,
+                "hot_cold_analysis": hot_cold_result,
                 "analysis_time": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
         raise DatabaseException(f"分析失败: {str(e)}", str(e))
+
+
+@router.get("/path_012", summary="012路分析", description="分析012路（除3余数）分布")
+async def analyze_path_012():
+    """
+    分析012路分布
+
+    Returns:
+        012路分析结果
+    """
+    try:
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
+        analyzer = ProbabilityAnalyzer()
+        path_result = analyzer.analyze_012_path(data)
+
+        return ApiResponse(
+            success=True, code=200, message="分析成功",
+            data={
+                "total_samples": len(data),
+                "path_012_analysis": path_result,
+                "analysis_time": datetime.now().isoformat()
+            }
+        )
+
+    except DatabaseException as e:
+        raise e
+    except Exception as e:
+        raise DatabaseException(f"分析失败: {str(e)}", str(e))
+
+
+@router.get("/big_small", summary="大小比分析", description="分析大小号分布")
+async def analyze_big_small():
+    """
+    分析大小号分布
+
+    Returns:
+        大小号分布分析结果
+    """
+    try:
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
+        analyzer = ProbabilityAnalyzer()
+        bs_result = analyzer.analyze_big_small(data)
+
+        return ApiResponse(
+            success=True, code=200, message="分析成功",
+            data={
+                "total_samples": len(data),
+                "big_small_analysis": bs_result,
+                "analysis_time": datetime.now().isoformat()
+            }
+        )
+
+    except DatabaseException as e:
+        raise e
+    except Exception as e:
+        raise DatabaseException(f"分析失败: {str(e)}", str(e))
+
 
 @router.get("/odd_even", summary="奇偶分析", description="分析奇偶比例分布")
 async def analyze_odd_even():
     """
     分析奇偶比例分布
-    
+
     Returns:
-        奇偶分析结果，包含奇偶比例分布、奇偶模式分布
+        奇偶分析结果，包含各位置奇偶分布及整体模式
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行奇偶分析
         odd_even_result = analyzer.analyze_odd_even(data)
-        
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="分析成功",
+            success=True, code=200, message="分析成功",
             data={
                 "total_samples": len(data),
-                "ratio_distribution": odd_even_result["ratio_distribution"],
-                "pattern_distribution": odd_even_result["pattern_distribution"],
+                "odd_even_analysis": odd_even_result,
                 "analysis_time": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
         raise DatabaseException(f"分析失败: {str(e)}", str(e))
+
+
+@router.get("/hezhi", summary="和值分析", description="分析和值分布情况")
+async def analyze_hezhi():
+    """
+    分析和值分布情况
+
+    Returns:
+        和值分析结果，包含和值分布、区间分布、理论对比
+    """
+    try:
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
+        analyzer = ProbabilityAnalyzer()
+        hezhi_result = analyzer.analyze_hezhi(data)
+
+        return ApiResponse(
+            success=True, code=200, message="分析成功",
+            data={
+                "total_samples": len(data),
+                "hezhi_analysis": hezhi_result,
+                "analysis_time": datetime.now().isoformat()
+            }
+        )
+
+    except DatabaseException as e:
+        raise e
+    except Exception as e:
+        raise DatabaseException(f"分析失败: {str(e)}", str(e))
+
 
 @router.get("/span", summary="跨度分析", description="分析跨度分布情况")
 async def analyze_span():
     """
     分析跨度分布情况
-    
+
     Returns:
-        跨度分析结果，包含跨度分布
+        跨度分析结果
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行跨度分析
         span_result = analyzer.analyze_span(data)
-        
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="分析成功",
+            success=True, code=200, message="分析成功",
             data={
                 "total_samples": len(data),
-                "span_distribution": span_result,
+                "span_analysis": span_result,
                 "analysis_time": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
         raise DatabaseException(f"分析失败: {str(e)}", str(e))
 
-@router.get("/repeats", summary="重号分析", description="分析重号规律")
+
+@router.get("/repeats", summary="重号分析", description="分析相邻期重号规律")
 async def analyze_repeats():
     """
     分析重号规律
-    
+
     Returns:
-        重号分析结果，包含重号分布、平均重号数、最大/最小重号数
+        重号分析结果
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行重号分析
         repeat_result = analyzer.analyze_repeats(data)
-        
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="分析成功",
+            success=True, code=200, message="分析成功",
             data={
                 "total_samples": len(data),
-                "repeat_distribution": repeat_result["repeat_distribution"],
-                "avg_repeats": repeat_result["avg_repeats"],
-                "max_repeats": repeat_result["max_repeats"],
-                "min_repeats": repeat_result["min_repeats"],
+                "repeat_analysis": repeat_result,
                 "analysis_time": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
         raise DatabaseException(f"分析失败: {str(e)}", str(e))
+
 
 @router.get("/consecutive", summary="连号分析", description="分析连号规律")
 async def analyze_consecutive():
     """
     分析连号规律
-    
+
     Returns:
-        连号分析结果，包含连号分布、平均连号数、最大/最小连号数
+        连号分析结果
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行连号分析
         consecutive_result = analyzer.analyze_consecutive(data)
-        
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="分析成功",
+            success=True, code=200, message="分析成功",
             data={
                 "total_samples": len(data),
-                "consecutive_distribution": consecutive_result["consecutive_distribution"],
-                "avg_consecutive": consecutive_result["avg_consecutive"],
-                "max_consecutive": consecutive_result["max_consecutive"],
-                "min_consecutive": consecutive_result["min_consecutive"],
+                "consecutive_analysis": consecutive_result,
                 "analysis_time": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
         raise DatabaseException(f"分析失败: {str(e)}", str(e))
 
-@router.get("/predict", summary="号码概率预测", description="基于历史数据进行号码概率预测")
-async def predict_numbers(use_trend: bool = Query(True, description="是否使用走势图数据")):
+
+@router.get("/correlation", summary="位置相关性分析", description="分析各位置号码的相关性")
+async def analyze_correlation():
     """
-    基于历史数据进行号码概率预测
-    
-    Args:
-        use_trend: 是否使用走势图数据
-    
+    分析位置间相关性
+
     Returns:
-        号码概率预测结果，包含预测号码列表、热门号码、冷门号码、推荐号码
+        位置间皮尔逊相关系数矩阵
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        
-        # 获取走势图数据
-        trend_data = []
-        if use_trend:
-            try:
-                database.cursor.execute('SELECT * FROM qxc_trend_data')
-                trend_raw = database.cursor.fetchall()
-                trend_data = [{'issue': item['issue'], 'trend': json.loads(item['trend_values'])} for item in trend_raw]
-            except Exception as e:
-                trend_data = []
-        
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行概率计算
-        result = analyzer.calculate_probability(data, trend_data if use_trend else None)
-        
-        # 格式化预测结果
-        predictions = []
-        for num, pred in result["predictions"].items():
-            predictions.append({
-                "number": num,
-                "probability": pred["probability"],
-                "confidence": pred["confidence"],
-                "trend_factor": pred["trend_factor"],
-                "expected_positions": pred["expected_positions"]
-            })
-        
-        # 获取热门和冷门号码
-        hot_numbers = []
-        cold_numbers = []
-        
-        if "trend" in result and result["trend"]:
-            if "hot_numbers" in result["trend"]:
-                hot_numbers = result["trend"]["hot_numbers"]
-            if "cold_numbers" in result["trend"]:
-                cold_numbers = result["trend"]["cold_numbers"]
-        
-        # 按概率排序获取推荐号码
-        sorted_predictions = sorted(predictions, key=lambda x: x["probability"], reverse=True)
-        top_recommendations = sorted_predictions[:7]  # 推荐7个号码（6位+特别号）
-        
+        corr_result = analyzer.analyze_position_correlation(data)
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="预测成功",
+            success=True, code=200, message="分析成功",
             data={
-                "total_samples": result["total_samples"],
-                "analysis_time": result["analysis_time"],
-                "use_trend_data": use_trend,
-                "predictions": predictions,
-                "hot_numbers": hot_numbers,
-                "cold_numbers": cold_numbers,
-                "top_recommendations": top_recommendations
+                "total_samples": len(data),
+                "correlation_analysis": corr_result,
+                "analysis_time": datetime.now().isoformat()
             }
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:
-        raise DatabaseException(f"预测失败: {str(e)}", str(e))
+        raise DatabaseException(f"分析失败: {str(e)}", str(e))
 
-@router.get("/comprehensive", summary="综合分析", description="执行所有维度的综合分析")
-async def comprehensive_analysis(use_trend: bool = Query(True, description="是否使用走势图数据")):
+
+@router.get("/randomness", summary="随机性检验", description="对历史数据进行随机性检验")
+async def analyze_randomness():
     """
-    执行所有维度的综合分析
-    
-    Args:
-        use_trend: 是否使用走势图数据
-    
+    执行随机性检验
+
     Returns:
-        综合分析结果，包含频率、间隔、和值、奇偶、跨度、重号、连号、趋势等分析结果
+        随机性检验结果，包含卡方检验、连号分析等
     """
     try:
-        database = Database()
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
         analyzer = ProbabilityAnalyzer()
-        
-        if not database.connect():
-            raise DatabaseException("数据库连接失败")
-        
-        data = database.query_all_history_data()
-        
-        # 获取走势图数据
-        trend_data = []
-        if use_trend:
-            try:
-                database.cursor.execute('SELECT * FROM qxc_trend_data')
-                trend_raw = database.cursor.fetchall()
-                trend_data = [{'issue': item['issue'], 'trend': json.loads(item['trend_values'])} for item in trend_raw]
-            except Exception as e:
-                trend_data = []
-        
-        database.disconnect()
-        
-        if not data:
-            return ApiResponse(
-                success=False,
-                code=404,
-                message="数据库中没有数据",
-                data=None
-            )
-        
-        # 执行综合概率计算
-        result = analyzer.calculate_probability(data, trend_data if use_trend else None)
-        
-        # 构建综合分析响应数据
+        rand_result = analyzer.analyze_randomness(data)
+
+        return ApiResponse(
+            success=True, code=200, message="检验完成",
+            data={
+                "total_samples": len(data),
+                "randomness_test": rand_result,
+                "analysis_time": datetime.now().isoformat()
+            }
+        )
+
+    except DatabaseException as e:
+        raise e
+    except Exception as e:
+        raise DatabaseException(f"检验失败: {str(e)}", str(e))
+
+
+@router.get("/position_analysis", summary="位置级综合分析", description="按位置进行综合分析")
+async def position_analysis():
+    """
+    按位置进行综合分析
+
+    Returns:
+        各位置的综合统计特征
+    """
+    try:
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
+        analyzer = ProbabilityAnalyzer()
+        result = analyzer.calculate_probability(data)
+
+        return ApiResponse(
+            success=True, code=200, message="分析成功",
+            data={
+                "total_samples": result["total_samples"],
+                "position_analysis": result.get("position_analysis", {}),
+                "analysis_time": result["analysis_time"]
+            }
+        )
+
+    except DatabaseException as e:
+        raise e
+    except Exception as e:
+        raise DatabaseException(f"分析失败: {str(e)}", str(e))
+
+
+@router.get("/comprehensive", summary="综合分析", description="执行所有维度的综合分析")
+async def comprehensive_analysis():
+    """
+    执行所有维度的综合分析
+
+    Returns:
+        综合分析结果，包含频率、遗漏、冷热、012路、大小、奇偶、和值、跨度、重号、连号、相关性、随机性等
+    """
+    try:
+        data = _get_data_from_db()
+        if data is None:
+            return ApiResponse(success=False, code=404, message="数据库中没有数据", data=None)
+
+        analyzer = ProbabilityAnalyzer()
+        result = analyzer.calculate_probability(data)
+
+        # 构建简化版综合分析响应（避免数据过大）
         comprehensive_data = {
             "total_samples": result["total_samples"],
             "analysis_time": result["analysis_time"],
-            "frequency": result.get("frequency", {}),
-            "interval": result.get("interval", {}),
+            "methodology_note": result.get("methodology_note", ""),
+            "position_analysis_summary": {
+                pos: {
+                    "position_name": data["position_name"],
+                    "hot_numbers": data.get("hot_numbers", [])[:3],
+                    "cold_numbers": data.get("cold_numbers", [])[:3],
+                    "theory_prob": data["theory_prob"]
+                }
+                for pos, data in result.get("position_analysis", {}).items()
+            },
+            "frequency_summary": {
+                pos: {
+                    "position_name": data["position_name"],
+                    "most_frequent": data.get("most_frequent", []),
+                    "least_frequent": data.get("least_frequent", [])
+                }
+                for pos, data in result.get("frequency", {}).items()
+            },
+            "omission_summary": {
+                pos: {
+                    "position_name": data["position_name"],
+                    "top_omissions": sorted(
+                        data.get("number_stats", {}).items(),
+                        key=lambda x: x[1].get("current_omission", 0),
+                        reverse=True
+                    )[:3]
+                }
+                for pos, data in result.get("omission", {}).items()
+            },
             "hezhi": result.get("hezhi", {}),
-            "odd_even": result.get("odd_even", {}),
             "span": result.get("span", {}),
             "repeats": result.get("repeats", {}),
             "consecutive": result.get("consecutive", {}),
-            "trend": result.get("trend", {}),
-            "comparison": result.get("comparison", {}),
-            "predictions": result.get("predictions", {})
+            "randomness": {
+                "overall_assessment": result.get("randomness", {}).get("overall_assessment", ""),
+                "chi_square_summary": {
+                    pos: {
+                        "position_name": data["position_name"],
+                        "chi_square": data["chi_square"],
+                        "interpretation": data["interpretation"]
+                    }
+                    for pos, data in result.get("randomness", {}).get("chi_square_test", {}).items()
+                }
+            },
+            "correlation": {
+                "note": result.get("correlation", {}).get("note", ""),
+                "position_names": result.get("correlation", {}).get("position_names", [])
+            }
         }
-        
+
         return ApiResponse(
-            success=True,
-            code=200,
-            message="综合分析成功",
+            success=True, code=200, message="综合分析成功",
             data=comprehensive_data
         )
-    
+
     except DatabaseException as e:
         raise e
     except Exception as e:

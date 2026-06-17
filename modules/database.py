@@ -165,6 +165,12 @@ class Database:
             # 添加表和字段注释（确保注释已添加）
             self._add_table_comments()
             
+            # 创建头4分析报告表
+            self._create_head4_report_table()
+            
+            # 创建用户相关表
+            self.create_user_tables()
+            
             self.connection.commit()
             logger.info('数据表创建成功（包含注释）')
             return True
@@ -321,6 +327,147 @@ class Database:
         except Exception as e:
             # 表可能不存在，忽略错误
             pass
+    
+    def _create_head4_report_table(self):
+        """创建头4分析报告表"""
+        try:
+            sql_head4_report = '''
+            CREATE TABLE IF NOT EXISTS qxc_head4_report (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
+                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '报告唯一标识',
+                head_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '头(第一位)频率分析结果',
+                middle_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '中间(第二、三位)频率分析结果',
+                tail_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '尾(第四位)频率分析结果',
+                head_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '头遗漏值分析结果',
+                middle_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '中间遗漏值分析结果',
+                tail_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '尾遗漏值分析结果',
+                head_tail_combination LONGTEXT NULL DEFAULT NULL COMMENT '头尾组合分析结果',
+                middle_features LONGTEXT NULL DEFAULT NULL COMMENT '中间位特征分析结果',
+                total_samples INT NULL DEFAULT NULL COMMENT '分析样本数',
+                confidence_level DECIMAL(5,2) NULL DEFAULT NULL COMMENT '置信水平',
+                report_content LONGTEXT NULL DEFAULT NULL COMMENT '报告内容',
+                frequency_chart LONGBLOB NULL DEFAULT NULL COMMENT '频率分布图',
+                probability_chart LONGBLOB NULL DEFAULT NULL COMMENT '概率分布图',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX report_uuid (report_uuid ASC) USING BTREE,
+                INDEX idx_report_date (report_date ASC) USING BTREE,
+                INDEX idx_report_uuid (report_uuid ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='七星彩头4（前四位）分析报告表';
+            '''
+            self.cursor.execute(sql_head4_report)
+            logger.info('头4分析报告表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建头4分析报告表失败: {e}')
+            return False
+
+    def insert_head4_report(self, report_content, total_samples,
+                           head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
+                           head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
+                           head_tail_combination, middle_features,
+                           confidence_level=None, frequency_chart=None, probability_chart=None):
+        """插入头4分析报告"""
+        try:
+            import uuid
+            report_date = datetime.now().strftime('%Y-%m-%d')
+            report_uuid = str(uuid.uuid4())
+
+            sql = '''
+            INSERT INTO qxc_head4_report
+            (report_date, report_uuid, head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
+             head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
+             head_tail_combination, middle_features, total_samples, confidence_level, report_content,
+             frequency_chart, probability_chart)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                head_frequency_analysis = VALUES(head_frequency_analysis),
+                middle_frequency_analysis = VALUES(middle_frequency_analysis),
+                tail_frequency_analysis = VALUES(tail_frequency_analysis),
+                head_omission_analysis = VALUES(head_omission_analysis),
+                middle_omission_analysis = VALUES(middle_omission_analysis),
+                tail_omission_analysis = VALUES(tail_omission_analysis),
+                head_tail_combination = VALUES(head_tail_combination),
+                middle_features = VALUES(middle_features),
+                total_samples = VALUES(total_samples),
+                confidence_level = VALUES(confidence_level),
+                report_content = VALUES(report_content),
+                frequency_chart = VALUES(frequency_chart),
+                probability_chart = VALUES(probability_chart),
+                updated_at = CURRENT_TIMESTAMP
+            '''
+
+            self.cursor.execute(sql, (
+                report_date, report_uuid,
+                head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
+                head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
+                head_tail_combination, middle_features,
+                total_samples, confidence_level, report_content,
+                frequency_chart, probability_chart
+            ))
+            self.connection.commit()
+            logger.info('成功插入头4分析报告')
+            return True
+        except Exception as e:
+            logger.error(f'插入头4分析报告失败: {e}')
+            return False
+
+    def create_user_tables(self):
+        """创建用户相关表（用户表和付费记录表）"""
+        try:
+            # 用户表
+            sql_users = '''
+            CREATE TABLE IF NOT EXISTS users (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                wx_openid VARCHAR(64) NOT NULL COMMENT '微信用户OpenID',
+                wx_unionid VARCHAR(64) NULL DEFAULT NULL COMMENT '微信用户UnionID',
+                nickname VARCHAR(100) NULL DEFAULT NULL COMMENT '用户昵称',
+                avatar_url VARCHAR(500) NULL DEFAULT NULL COMMENT '用户头像URL',
+                access_token VARCHAR(64) NULL DEFAULT NULL COMMENT '访问令牌',
+                token_expire_at TIMESTAMP NULL DEFAULT NULL COMMENT '令牌过期时间',
+                last_login_at TIMESTAMP NULL DEFAULT NULL COMMENT '最后登录时间',
+                login_count INT NULL DEFAULT 0 COMMENT '登录次数',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_wx_openid (wx_openid ASC) USING BTREE,
+                INDEX idx_access_token (access_token ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
+            '''
+            self.cursor.execute(sql_users)
+            
+            # 付费记录表
+            sql_payment = '''
+            CREATE TABLE IF NOT EXISTS payment_records (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                user_id INT NOT NULL COMMENT '用户ID',
+                order_no VARCHAR(64) NOT NULL COMMENT '商户订单号',
+                transaction_id VARCHAR(64) NULL DEFAULT NULL COMMENT '微信支付交易号',
+                amount DECIMAL(10,2) NOT NULL COMMENT '付费金额（元）',
+                payment_type VARCHAR(50) NOT NULL COMMENT '付费类型（report_view/vip_month/vip_year等）',
+                status ENUM('pending', 'success', 'failed', 'refunded') NULL DEFAULT 'pending' COMMENT '支付状态',
+                description VARCHAR(255) NULL DEFAULT NULL COMMENT '付费描述',
+                paid_at TIMESTAMP NULL DEFAULT NULL COMMENT '支付时间',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_order_no (order_no ASC) USING BTREE,
+                INDEX idx_user_id (user_id ASC) USING BTREE,
+                INDEX idx_payment_type (payment_type ASC) USING BTREE,
+                INDEX idx_status (status ASC) USING BTREE,
+                CONSTRAINT fk_payment_user FOREIGN KEY (user_id) 
+                    REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户付费记录表';
+            '''
+            self.cursor.execute(sql_payment)
+            
+            logger.info('用户相关表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建用户表失败: {e}')
+            return False
     
     def migrate_old_reports(self):
         """迁移历史报告数据到新表结构"""
@@ -811,6 +958,17 @@ class Database:
                 reports.append(r)
         except Exception as e:
             logger.error(f'查询详细报告失败: {e}')
+        
+        # 获取头4分析报告
+        try:
+            sql = 'SELECT * FROM qxc_head4_report ORDER BY created_at DESC'
+            self.cursor.execute(sql)
+            head4_reports = self.cursor.fetchall()
+            for r in head4_reports:
+                r['report_type'] = 'head4'
+                reports.append(r)
+        except Exception as e:
+            logger.error(f'查询头4报告失败: {e}')
         
         # 按创建时间排序
         reports.sort(key=lambda x: x['created_at'], reverse=True)
