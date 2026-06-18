@@ -67,22 +67,27 @@ class RedirectText:
         self.text_widget = text_widget
         self.buffer = ""
         self._lock = threading.Lock()
+        self.original_stdout = sys.stdout
 
     def write(self, string):
         with self._lock:
             self.buffer += string
-            if '\n' in string:
+            if '\n' in string or len(self.buffer) > 1024:
                 self.flush()
 
     def flush(self):
         with self._lock:
             if self.buffer:
-                self.text_widget.after(0, self._insert_text, self.buffer)
+                text_to_insert = self.buffer
                 self.buffer = ""
+                self.text_widget.after(0, self._insert_text, text_to_insert)
 
     def _insert_text(self, text):
-        self.text_widget.insert(tk.END, text)
-        self.text_widget.see(tk.END)
+        try:
+            self.text_widget.insert(tk.END, text)
+            self.text_widget.see(tk.END)
+        except tk.TclError:
+            pass
 
     def isatty(self):
         return False
@@ -474,18 +479,14 @@ class LotteryGUI:
 
     def _run_task(self, task_func):
         """在后台线程中运行任务"""
-        # 强制重置：如果running被卡住超过60秒，自动释放
         if self.running:
-            # 检查是否真的有线程在运行
             if self.current_task and self.current_task.is_alive():
                 messagebox.showwarning("提示", "当前有任务正在执行，请等待完成")
                 return
             else:
-                # 线程已结束但标志位没释放，强制重置
                 self.running = False
                 print("  [检测] 检测到任务标志位卡死，已自动重置\n")
 
-        # 立即输出反馈，让用户知道按钮被点击了
         now = datetime.now().strftime('%H:%M:%S')
         print(f"\n{'='*70}")
         print(f"  [{now}] 按钮已点击，正在启动任务...")
@@ -499,18 +500,15 @@ class LotteryGUI:
         self.task_status_label.config(text="任务运行中...", fg=COLORS['warning'])
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['warning'])
 
-        self.output_text.insert(tk.END, f"\n{'='*70}\n")
-        self.output_text.insert(tk.END, f"  [{now}] 开始执行任务...\n")
-        self.output_text.insert(tk.END, f"{'='*70}\n\n")
-        self.output_text.see(tk.END)
-
         def task_wrapper():
             try:
                 task_func()
             except Exception as e:
                 print(f"\n  [错误] 任务执行失败: {str(e)}")
                 import traceback
-                traceback.print_exc()
+                error_trace = traceback.format_exc()
+                print(f"\n  [错误详情]\n{error_trace}")
+                self.root.after(0, self._show_error_message, str(e), error_trace)
             finally:
                 self.root.after(0, self._task_finished)
 
@@ -536,6 +534,10 @@ class LotteryGUI:
         """清空输出面板"""
         self.output_text.delete(1.0, tk.END)
         self._show_welcome()
+
+    def _show_error_message(self, error_msg, error_trace):
+        """显示错误消息对话框（线程安全）"""
+        messagebox.showerror("任务执行失败", f"错误信息: {error_msg}\n\n请查看输出日志获取详细信息")
 
     # ==================== 七星彩完整流程 ====================
 

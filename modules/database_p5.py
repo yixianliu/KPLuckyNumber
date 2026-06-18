@@ -11,18 +11,15 @@ import json
 import os
 from datetime import datetime
 
-# 确保日志目录存在
 os.makedirs('logs', exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/database_p5.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler = logging.FileHandler('logs/database_p5.log', encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
 
 class P5Database:
@@ -40,17 +37,51 @@ class P5Database:
         """连接MySQL数据库"""
         try:
             from config import DB_CONFIG
-            self.connection = pymysql.connect(
-                host=DB_CONFIG['host'],
-                user=DB_CONFIG['user'],
-                password=DB_CONFIG['password'],
-                database=DB_CONFIG['database'],
-                charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor
-            )
-            self.cursor = self.connection.cursor()
-            logger.info('MySQL数据库连接成功（排列5）')
-            return True
+            db_name = DB_CONFIG['database']
+            
+            try:
+                self.connection = pymysql.connect(
+                    host=DB_CONFIG['host'],
+                    user=DB_CONFIG['user'],
+                    password=DB_CONFIG['password'],
+                    database=db_name,
+                    charset='utf8mb4',
+                    cursorclass=pymysql.cursors.DictCursor,
+                    connect_timeout=10
+                )
+                self.cursor = self.connection.cursor()
+                logger.info('MySQL数据库连接成功（排列5）')
+                return True
+            except pymysql.err.OperationalError as e:
+                if "Unknown database" in str(e):
+                    logger.info(f'数据库 {db_name} 不存在，尝试自动创建...')
+                    conn = pymysql.connect(
+                        host=DB_CONFIG['host'],
+                        user=DB_CONFIG['user'],
+                        password=DB_CONFIG['password'],
+                        charset='utf8mb4',
+                        cursorclass=pymysql.cursors.DictCursor,
+                        connect_timeout=10
+                    )
+                    cursor = conn.cursor()
+                    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    
+                    self.connection = pymysql.connect(
+                        host=DB_CONFIG['host'],
+                        user=DB_CONFIG['user'],
+                        password=DB_CONFIG['password'],
+                        database=db_name,
+                        charset='utf8mb4',
+                        cursorclass=pymysql.cursors.DictCursor,
+                        connect_timeout=10
+                    )
+                    self.cursor = self.connection.cursor()
+                    logger.info(f'数据库 {db_name} 创建成功并已连接（排列5）')
+                    return True
+                raise
         except Exception as e:
             logger.error(f'MySQL数据库连接失败: {e}')
             return False
