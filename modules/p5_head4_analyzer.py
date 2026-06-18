@@ -419,8 +419,13 @@ class P5Head4Analyzer:
 
     # ==================== 报告生成 ====================
 
-    def generate_head4_report(self, analysis_result: Dict) -> str:
-        """生成排列5头4分析报告"""
+    def generate_head4_report(self, analysis_result: Dict, top10_combinations: Optional[List[Dict]] = None) -> str:
+        """生成排列5头4分析报告
+
+        Args:
+            analysis_result: 头4综合分析结果字典
+            top10_combinations: 最优10组数字组合列表，由 generate_top10_combinations 方法生成
+        """
         report = []
         report.append('=' * 80)
         report.append('        排列5头4（前四位）分析报告')
@@ -523,6 +528,16 @@ class P5Head4Analyzer:
         for num, s in sorted_tail_om[:3]:
             report.append(f'  数字 {num}: 当前遗漏 {s["current_omission"]} 期, '
                           f'平均遗漏 {s["avg_omission"]} 期')
+
+        # 七、最优10组数字组合（如果提供）
+        if top10_combinations:
+            report.append('\n【七、最优10组数字组合推荐】')
+            report.append('-' * 60)
+            report.append('\n基于频率、遗漏和近期热度综合评分，推荐以下组合：\n')
+            for item in top10_combinations:
+                report.append(f"  第{item['rank']:>2}名: {item['combination']}  "
+                              f"综合得分: {item['score']:.4f}")
+            report.append('\n  说明：综合得分 = 头位得分*0.3 + 中间得分*0.4 + 尾位得分*0.3')
 
         report.append('\n' + '=' * 80)
         report.append('          排列5头4分析报告结束')

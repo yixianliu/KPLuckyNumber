@@ -1,7 +1,20 @@
-"""彩票数字概率统计分析系统 - GUI界面"""
+"""彩票数字概率统计分析系统 - GUI界面 (重构版)
+
+核心架构改进:
+1. 业务逻辑完全隔离到独立线程，UI主线程永不阻塞
+2. 使用 queue.Queue 实现线程间通信，替代 sys.stdout 重定向
+3. 所有UI更新通过 root.after() 调度到主线程执行
+4. 任务状态机管理，防止并发冲突和状态卡死
+5. 异常捕获和自动恢复机制
+"""
 
 import sys
 import os
+import threading
+import queue
+import traceback
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
 # 前置检测：确保tkinter可用
@@ -20,9 +33,6 @@ except ImportError:
     print("=" * 60)
     input("\n  按回车键退出...")
     sys.exit(1)
-
-import threading
-from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -60,41 +70,133 @@ COLORS = {
 }
 
 
-class RedirectText:
-    """重定向标准输出到文本控件（线程安全）"""
+class TaskManager:
+    """任务管理器 - 完全隔离业务线程与UI线程"""
 
-    def __init__(self, text_widget):
-        self.text_widget = text_widget
-        self.buffer = ""
+    def __init__(self, gui_instance):
+        self.gui = gui_instance
+        self._task_queue = queue.Queue()
+        self._running = False
+        self._current_future = None
+        self._executor = ThreadPoolExecutor(max_workers=1)
         self._lock = threading.Lock()
-        self.original_stdout = sys.stdout
+        self._cancelled = False
 
-    def write(self, string):
-        with self._lock:
-            self.buffer += string
-            if '\n' in string or len(self.buffer) > 1024:
-                self.flush()
+        # 启动UI更新轮询
+        self._poll_ui_updates()
 
-    def flush(self):
-        with self._lock:
-            if self.buffer:
-                text_to_insert = self.buffer
-                self.buffer = ""
-                self.text_widget.after(0, self._insert_text, text_to_insert)
-
-    def _insert_text(self, text):
+    def _poll_ui_updates(self):
+        """轮询任务队列，将业务线程的输出更新到UI"""
         try:
-            self.text_widget.insert(tk.END, text)
-            self.text_widget.see(tk.END)
-        except tk.TclError:
+            while True:
+                msg = self._task_queue.get_nowait()
+                msg_type = msg.get('type', 'log')
+
+                if msg_type == 'log':
+                    self.gui._append_log(msg['text'])
+                elif msg_type == 'progress':
+                    self.gui._update_progress_ui(
+                        msg.get('value', 0),
+                        msg.get('text', '')
+                    )
+                elif msg_type == 'status':
+                    self.gui._update_status_ui(
+                        msg.get('text', ''),
+                        msg.get('color', COLORS['text_muted'])
+                    )
+                elif msg_type == 'finished':
+                    self._on_task_finished()
+                elif msg_type == 'error':
+                    self._on_task_error(msg.get('error', '未知错误'))
+                elif msg_type == 'stats':
+                    self.gui._update_stats_ui(msg.get('text', ''))
+        except queue.Empty:
             pass
 
-    def isatty(self):
-        return False
+        # 每50ms轮询一次，保证UI响应性
+        self.gui.root.after(50, self._poll_ui_updates)
+
+    def log(self, text):
+        """线程安全日志输出"""
+        self._task_queue.put({'type': 'log', 'text': text})
+
+    def progress(self, value, text=""):
+        """线程安全进度更新"""
+        self._task_queue.put({'type': 'progress', 'value': value, 'text': text})
+
+    def status(self, text, color=COLORS['text_muted']):
+        """线程安全状态更新"""
+        self._task_queue.put({'type': 'status', 'text': text, 'color': color})
+
+    def stats(self, text):
+        """线程安全统计更新"""
+        self._task_queue.put({'type': 'stats', 'text': text})
+
+    def finished(self):
+        """标记任务完成"""
+        self._task_queue.put({'type': 'finished'})
+
+    def error(self, err_text):
+        """标记任务出错"""
+        self._task_queue.put({'type': 'error', 'error': err_text})
+
+    def is_running(self):
+        with self._lock:
+            return self._running
+
+    def submit(self, task_func, task_name="任务"):
+        """提交任务到线程池执行"""
+        with self._lock:
+            if self._running:
+                return False
+            self._running = True
+            self._cancelled = False
+
+        # UI立即反馈 - 在主线程执行
+        self.gui._on_task_started(task_name)
+
+        # 在线程池中执行业务逻辑
+        self._current_future = self._executor.submit(self._task_wrapper, task_func)
+        return True
+
+    def _task_wrapper(self, task_func):
+        """任务包装器 - 捕获所有异常"""
+        try:
+            task_func(self)
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            self.log(f"\n  [错误] 任务执行失败: {str(e)}\n")
+            self.log(f"  [错误详情]\n{error_detail}\n")
+            self.error(str(e))
+        finally:
+            if not self._cancelled:
+                self.finished()
+
+    def _on_task_finished(self):
+        """任务完成回调（在主线程执行）"""
+        with self._lock:
+            self._running = False
+        self.gui._on_task_finished()
+
+    def _on_task_error(self, error_msg):
+        """任务错误回调（在主线程执行）"""
+        with self._lock:
+            self._running = False
+        self.gui._on_task_error(error_msg)
+
+    def cancel(self):
+        """取消当前任务"""
+        self._cancelled = True
+        with self._lock:
+            self._running = False
+
+    def shutdown(self):
+        """关闭线程池"""
+        self._executor.shutdown(wait=False)
 
 
 class LotteryGUI:
-    """彩票数据分析GUI主界面 - 现代化深色主题"""
+    """彩票数据分析GUI主界面 - 完全线程安全重构版"""
 
     def __init__(self, root):
         self.root = root
@@ -103,16 +205,15 @@ class LotteryGUI:
         self.root.minsize(1000, 700)
         self.root.configure(bg=COLORS['bg_primary'])
 
-        self._setup_window_style()
+        # 任务管理器
+        self.task_mgr = TaskManager(self)
 
-        self.current_task = None
-        self.running = False
+        # UI状态
         self._buttons = []
-        self.progress_value = 0
-        self.progress_label = None
+        self._current_task_name = ""
 
+        self._setup_window_style()
         self._build_ui()
-        self._redirect_stdout()
 
     def _setup_window_style(self):
         """配置窗口样式"""
@@ -127,6 +228,10 @@ class LotteryGUI:
                         background=COLORS['accent_qxc'],
                         troughcolor=COLORS['bg_card'],
                         borderwidth=0)
+
+    # ============================================================
+    # UI构建
+    # ============================================================
 
     def _build_ui(self):
         """构建现代化用户界面"""
@@ -143,18 +248,15 @@ class LotteryGUI:
         header.pack(fill=tk.X)
         header.pack_propagate(False)
 
-        # 左侧：图标 + 标题
         left = tk.Frame(header, bg=COLORS['bg_secondary'])
         left.pack(side=tk.LEFT, fill=tk.Y, padx=15)
 
-        # 图标Canvas
         icon = tk.Canvas(left, width=36, height=36, bg=COLORS['bg_secondary'],
                          highlightthickness=0)
         icon.pack(side=tk.LEFT, pady=12)
         icon.create_rectangle(2, 2, 16, 34, fill=COLORS['accent_qxc'], outline='', width=0)
         icon.create_rectangle(20, 2, 34, 34, fill=COLORS['accent_p5'], outline='', width=0)
 
-        # 标题文字区域
         title_box = tk.Frame(left, bg=COLORS['bg_secondary'])
         title_box.pack(side=tk.LEFT, padx=(10, 0), pady=8)
 
@@ -168,7 +270,6 @@ class LotteryGUI:
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_muted']).pack(anchor=tk.W)
 
-        # 右侧：时间
         self.time_label = tk.Label(header, text="",
                                    font=('Consolas', 10),
                                    bg=COLORS['bg_secondary'],
@@ -186,44 +287,39 @@ class LotteryGUI:
         content = tk.Frame(parent, bg=COLORS['bg_primary'])
         content.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
 
-        # 左侧控制面板
         left = tk.Frame(content, bg=COLORS['bg_primary'], width=320)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         left.pack_propagate(False)
 
         self._build_control_panel(left)
 
-        # 右侧输出面板
         right = tk.Frame(content, bg=COLORS['bg_primary'])
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self._build_output_panel(right)
 
     def _build_control_panel(self, parent):
-        """构建左侧控制面板 - 仅两个执行按钮"""
+        """构建左侧控制面板"""
         # 七星彩执行卡片
         qxc_card = self._create_card(parent, "七星彩", COLORS['accent_qxc'])
         qxc_card.pack(fill=tk.X, pady=(0, 10))
-
-        # 执行按钮（大号醒目）
         self._add_big_button(qxc_card, "执行全部流程", COLORS['accent_qxc'],
-                             lambda: self._run_task(self._execute_qxc_all))
+                             lambda: self._on_button_click("七星彩全部流程", self._execute_qxc_all))
 
         # 排列5执行卡片
         p5_card = self._create_card(parent, "排列5", COLORS['accent_p5'])
         p5_card.pack(fill=tk.X, pady=(0, 10))
-
         self._add_big_button(p5_card, "执行全部流程", COLORS['accent_p5'],
-                             lambda: self._run_task(self._execute_p5_all))
+                             lambda: self._on_button_click("排列5全部流程", self._execute_p5_all))
 
         # 通用操作卡片
         common_card = self._create_card(parent, "通用操作", COLORS['accent_common'])
         common_card.pack(fill=tk.X, pady=(0, 10))
 
         self._add_action_button(common_card, "数据概览", COLORS['accent_common'],
-                                lambda: self._run_task(self._view_data_summary))
+                                lambda: self._on_button_click("数据概览", self._view_data_summary))
         self._add_action_button(common_card, "数据库检测", COLORS['accent_common'],
-                                lambda: self._run_task(self._check_database))
+                                lambda: self._on_button_click("数据库检测", self._check_database))
         self._add_action_button(common_card, "清空输出", COLORS['accent_danger'],
                                 self._clear_output)
 
@@ -314,7 +410,6 @@ class LotteryGUI:
                         padx=15, pady=12)
         btn.pack(fill=tk.X)
 
-        # 悬停效果 - 使用更简洁的方式，避免闭包问题
         light_color = self._lighten_color(color, 1.15)
         btn.bind('<Enter>', lambda e: btn.config(bg=light_color))
         btn.bind('<Leave>', lambda e: btn.config(bg=color))
@@ -355,8 +450,7 @@ class LotteryGUI:
         return f'#{r:02x}{g:02x}{b:02x}'
 
     def _build_output_panel(self, parent):
-        """构建右侧输出面板 - 修复滚动条"""
-        # 标题栏
+        """构建右侧输出面板"""
         header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=35)
         header.pack(fill=tk.X, pady=(0, 2))
         header.pack_propagate(False)
@@ -373,11 +467,9 @@ class LotteryGUI:
                                         padx=6, pady=1)
         self.log_level_label.pack(side=tk.RIGHT, padx=12, pady=6)
 
-        # 文本区域容器（用于放置滚动条）
         text_container = tk.Frame(parent, bg=COLORS['bg_input'])
         text_container.pack(fill=tk.BOTH, expand=True)
 
-        # 滚动条
         scrollbar = tk.Scrollbar(text_container, bg=COLORS['bg_card'],
                                  troughcolor=COLORS['bg_secondary'],
                                  activebackground=COLORS['border'],
@@ -385,7 +477,6 @@ class LotteryGUI:
                                  width=12)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 文本区域
         self.output_text = tk.Text(text_container,
                                    wrap=tk.WORD,
                                    font=('Consolas', 10),
@@ -405,9 +496,9 @@ class LotteryGUI:
     def _show_welcome(self):
         """显示欢迎信息"""
         welcome = f"""
-{'=' * 70}
+{'='*70}
   欢迎使用 彩票数字概率统计分析系统
-{'=' * 70}
+{'='*70}
 
   系统功能:
     [七星彩] 执行全部流程（爬取 + 分析 + 头4分析）
@@ -421,7 +512,7 @@ class LotteryGUI:
 
   当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-{'=' * 70}
+{'='*70}
 """
         self.output_text.insert(tk.END, welcome)
         self.output_text.see(tk.END)
@@ -452,72 +543,42 @@ class LotteryGUI:
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_muted']).pack(side=tk.LEFT, padx=5, pady=4)
 
-    def _redirect_stdout(self):
-        """重定向标准输出到文本控件"""
-        self.stdout_redirector = RedirectText(self.output_text)
-        sys.stdout = self.stdout_redirector
+    # ============================================================
+    # 按钮点击处理 - 所有按钮统一入口
+    # ============================================================
 
-    def _set_buttons_state(self, state):
-        """设置按钮状态"""
-        for btn in self._buttons:
-            if state == tk.DISABLED:
-                btn.config(state=tk.DISABLED)
-            else:
-                btn.config(state=tk.NORMAL)
+    def _on_button_click(self, task_name, task_func):
+        """统一按钮点击处理"""
+        if self.task_mgr.is_running():
+            messagebox.showwarning("提示", "当前有任务正在执行，请等待完成")
+            return
 
-    def _update_progress(self, value, text=""):
-        """更新进度条和百分比显示（线程安全）"""
+        # 提交任务到线程池
+        success = self.task_mgr.submit(task_func, task_name)
+        if not success:
+            messagebox.showwarning("提示", "任务提交失败，请重试")
 
-        def _do_update():
-            self.progress['value'] = value
-            self.progress_label.config(text=f"{value}%")
-            if text:
-                self.task_status_label.config(text=text)
-            self.root.update_idletasks()
+    # ============================================================
+    # 任务生命周期回调（主线程执行）
+    # ============================================================
 
-        self.root.after(0, _do_update)
-
-    def _run_task(self, task_func):
-        """在后台线程中运行任务"""
-        if self.running:
-            if self.current_task and self.current_task.is_alive():
-                messagebox.showwarning("提示", "当前有任务正在执行，请等待完成")
-                return
-            else:
-                self.running = False
-                print("  [检测] 检测到任务标志位卡死，已自动重置\n")
-
-        now = datetime.now().strftime('%H:%M:%S')
-        print(f"\n{'='*70}")
-        print(f"  [{now}] 按钮已点击，正在启动任务...")
-        print(f"{'='*70}\n")
-
-        self.running = True
+    def _on_task_started(self, task_name):
+        """任务开始时的UI更新（主线程）"""
+        self._current_task_name = task_name
         self._set_buttons_state(tk.DISABLED)
         self.progress['value'] = 0
         self.progress_label.config(text="0%")
         self.status_var.set("正在执行...")
-        self.task_status_label.config(text="任务运行中...", fg=COLORS['warning'])
+        self.task_status_label.config(text=f"{task_name} 运行中...", fg=COLORS['warning'])
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['warning'])
 
-        def task_wrapper():
-            try:
-                task_func()
-            except Exception as e:
-                print(f"\n  [错误] 任务执行失败: {str(e)}")
-                import traceback
-                error_trace = traceback.format_exc()
-                print(f"\n  [错误详情]\n{error_trace}")
-                self.root.after(0, self._show_error_message, str(e), error_trace)
-            finally:
-                self.root.after(0, self._task_finished)
+        now = datetime.now().strftime('%H:%M:%S')
+        self._append_log(f"\n{'='*70}\n")
+        self._append_log(f"  [{now}] 开始执行: {task_name}\n")
+        self._append_log(f"{'='*70}\n\n")
 
-        self.current_task = threading.Thread(target=task_wrapper, daemon=True)
-        self.current_task.start()
-
-    def _task_finished(self):
-        """任务完成后的回调"""
-        self.running = False
+    def _on_task_finished(self):
+        """任务完成时的UI更新（主线程）"""
         self._set_buttons_state(tk.NORMAL)
         self.progress['value'] = 100
         self.progress_label.config(text="100%")
@@ -525,55 +586,90 @@ class LotteryGUI:
         self.task_status_label.config(text="就绪", fg=COLORS['text_muted'])
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['success'])
 
-        self.output_text.insert(tk.END, f"\n{'=' * 70}\n")
-        self.output_text.insert(tk.END, f"  [{datetime.now().strftime('%H:%M:%S')}] 任务执行完成\n")
-        self.output_text.insert(tk.END, f"{'=' * 70}\n\n")
+        now = datetime.now().strftime('%H:%M:%S')
+        self._append_log(f"\n{'='*70}\n")
+        self._append_log(f"  [{now}] 任务执行完成\n")
+        self._append_log(f"{'='*70}\n\n")
+
+    def _on_task_error(self, error_msg):
+        """任务出错时的UI更新（主线程）"""
+        self._set_buttons_state(tk.NORMAL)
+        self.status_var.set("错误")
+        self.task_status_label.config(text="执行出错", fg=COLORS['accent_danger'])
+        self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['accent_danger'])
+        messagebox.showerror("任务执行失败", f"错误: {error_msg}\n\n请查看输出日志获取详细信息")
+
+    # ============================================================
+    # UI更新方法（主线程安全）
+    # ============================================================
+
+    def _append_log(self, text):
+        """追加日志到输出面板"""
+        self.output_text.insert(tk.END, text)
         self.output_text.see(tk.END)
+
+    def _update_progress_ui(self, value, text=""):
+        """更新进度条（主线程）"""
+        self.progress['value'] = value
+        self.progress_label.config(text=f"{value}%")
+        if text:
+            self.task_status_label.config(text=text)
+
+    def _update_status_ui(self, text, color):
+        """更新状态标签（主线程）"""
+        self.task_status_label.config(text=text, fg=color)
+
+    def _update_stats_ui(self, text):
+        """更新统计面板（主线程）"""
+        self.stats_content.config(text=text)
+
+    def _set_buttons_state(self, state):
+        """设置按钮状态"""
+        for btn in self._buttons:
+            btn.config(state=state)
 
     def _clear_output(self):
         """清空输出面板"""
         self.output_text.delete(1.0, tk.END)
         self._show_welcome()
 
-    def _show_error_message(self, error_msg, error_trace):
-        """显示错误消息对话框（线程安全）"""
-        messagebox.showerror("任务执行失败", f"错误信息: {error_msg}\n\n请查看输出日志获取详细信息")
+    # ============================================================
+    # 业务逻辑方法（在后台线程执行，通过task_mgr与UI通信）
+    # ============================================================
 
-    # ==================== 七星彩完整流程 ====================
-
-    def _execute_qxc_all(self):
-        """执行七星彩全部流程：爬取 + 分析报告 + 头4分析"""
-        print("=== 七星彩完整流程执行 ===\n")
+    def _execute_qxc_all(self, tm):
+        """执行七星彩全部流程（后台线程）"""
+        tm.log("=== 七星彩完整流程执行 ===\n")
 
         # 1. 爬取数据
-        self._update_progress(5, "正在爬取数据...")
-        print("【步骤 1/3】数据爬取\n")
+        tm.progress(5, "正在爬取数据...")
+        tm.log("【步骤 1/3】数据爬取\n")
         spider = QXCSpider()
         cleaner = DataCleaner()
         database = Database()
 
-        print('  正在爬取历史数据...')
+        tm.log('  正在爬取历史数据...')
         raw_data = spider.crawl_history_data()
-        print(f'  爬取到 {len(raw_data)} 条历史数据')
+        tm.log(f'  爬取到 {len(raw_data)} 条历史数据')
 
-        print('  正在清洗数据...')
+        tm.log('  正在清洗数据...')
         clean_data = cleaner.clean(raw_data)
-        print(f'  清洗后 {len(clean_data)} 条有效数据')
+        tm.log(f'  清洗后 {len(clean_data)} 条有效数据')
 
-        print('  正在存储到数据库...')
+        tm.log('  正在存储到数据库...')
         if database.connect():
             database.create_tables()
             count = database.insert_or_update_qxc_data(clean_data)
             total = database.get_qxc_data_count()
-            print(f'  成功存储 {count} 条数据，数据库共 {total} 条')
+            tm.log(f'  成功存储 {count} 条数据，数据库共 {total} 条')
             database.disconnect()
         else:
-            print('  数据库连接失败，跳过存储')
-        self._update_progress(33, "数据爬取完成")
+            tm.log('  数据库连接失败，跳过存储')
+        tm.progress(33, "数据爬取完成")
 
         # 2. 分析报告
-        self._update_progress(40, "正在生成分析报告...")
-        print("\n【步骤 2/3】分析报告生成\n")
+        tm.progress(40, "正在生成分析报告...")
+        tm.log("\n【步骤 2/3】分析报告生成\n")
         database = Database()
         analyzer = ProbabilityAnalyzer()
         generator = ReportGenerator()
@@ -582,13 +678,13 @@ class LotteryGUI:
             data = database.query_all_qxc_data()
             database.disconnect()
 
-            print(f'  分析 {len(data)} 期历史数据...')
+            tm.log(f'  分析 {len(data)} 期历史数据...')
             result = analyzer.calculate_probability(data)
 
-            print('  生成详细统计分析报告...')
+            tm.log('  生成详细统计分析报告...')
             report_result = generator.generate_detailed_report(result, analyzer)
 
-            print('  生成综合统计特征报告...')
+            tm.log('  生成综合统计特征报告...')
             report_result_opt = generator.generate_optimal_report(result)
 
             if database.connect():
@@ -611,12 +707,12 @@ class LotteryGUI:
                     report_result_opt.get('omission_chart')
                 )
                 database.disconnect()
-                print('  分析报告已存入数据库')
-        self._update_progress(66, "分析报告完成")
+                tm.log('  分析报告已存入数据库')
+        tm.progress(66, "分析报告完成")
 
         # 3. 头4分析
-        self._update_progress(75, "正在头4分析...")
-        print("\n【步骤 3/3】头4分析\n")
+        tm.progress(75, "正在头4分析...")
+        tm.log("\n【步骤 3/3】头4分析\n")
         database = Database()
         head4_analyzer = Head4Analyzer()
 
@@ -624,19 +720,19 @@ class LotteryGUI:
             data = database.query_all_qxc_data()
             database.disconnect()
 
-            print(f'  分析 {len(data)} 期历史数据的头4特征...')
+            tm.log(f'  分析 {len(data)} 期历史数据的头4特征...')
             result = head4_analyzer.calculate_head4_analysis(data)
 
-            print('  生成最优10组数字组合...')
+            tm.log('  生成最优10组数字组合...')
             top10 = head4_analyzer.generate_top10_combinations(data)
 
-            print('  生成头4分析报告...')
+            tm.log('  生成头4分析报告...')
             report_content = head4_analyzer.generate_head4_report(result, top10_combinations=top10)
 
-            print('\n  【最优10组数字组合】')
+            tm.log('\n  【最优10组数字组合】')
             for item in top10:
-                print(f"    第{item['rank']:>2}名: {item['combination']}  "
-                      f"得分: {item['score']:.4f}")
+                tm.log(f"    第{item['rank']:>2}名: {item['combination']}  "
+                       f"得分: {item['score']:.4f}")
 
             if database.connect():
                 database.create_tables()
@@ -658,46 +754,44 @@ class LotteryGUI:
                 )
                 database.insert_head4_top10(report_uuid, report_date, top10)
                 database.disconnect()
-                print('  头4分析报告及最优组合已存入数据库')
-        self._update_progress(100, "头4分析完成")
+                tm.log('  头4分析报告及最优组合已存入数据库')
+        tm.progress(100, "头4分析完成")
 
-        print('\n=== 七星彩全部流程执行完成 ===')
+        tm.log('\n=== 七星彩全部流程执行完成 ===')
 
-    # ==================== 排列5完整流程 ====================
-
-    def _execute_p5_all(self):
-        """执行排列5全部流程：爬取 + 分析报告 + 头4分析"""
-        print("=== 排列5完整流程执行 ===\n")
+    def _execute_p5_all(self, tm):
+        """执行排列5全部流程（后台线程）"""
+        tm.log("=== 排列5完整流程执行 ===\n")
 
         # 1. 爬取数据
-        self._update_progress(5, "正在爬取数据...")
-        print("【步骤 1/3】数据爬取\n")
+        tm.progress(5, "正在爬取数据...")
+        tm.log("【步骤 1/3】数据爬取\n")
         spider = P5Spider()
         database = P5Database()
 
-        print('  正在爬取历史数据...')
+        tm.log('  正在爬取历史数据...')
         history_data = spider.crawl_history_data()
-        print(f'  爬取到 {len(history_data)} 条历史数据')
+        tm.log(f'  爬取到 {len(history_data)} 条历史数据')
 
-        print('  正在爬取走势图数据...')
+        tm.log('  正在爬取走势图数据...')
         trend_data = spider.crawl_trend_data(record=120)
-        print(f'  爬取到 {len(trend_data)} 条走势图数据')
+        tm.log(f'  爬取到 {len(trend_data)} 条走势图数据')
 
-        print('  正在存储到数据库...')
+        tm.log('  正在存储到数据库...')
         if database.connect():
             database.create_tables()
             history_count = database.insert_history_data(history_data)
             trend_count = database.insert_trend_data(trend_data)
-            print(f'  成功存储 {history_count} 条历史数据')
-            print(f'  成功存储 {trend_count} 条走势图数据')
+            tm.log(f'  成功存储 {history_count} 条历史数据')
+            tm.log(f'  成功存储 {trend_count} 条走势图数据')
             database.disconnect()
         else:
-            print('  数据库连接失败，跳过存储')
-        self._update_progress(33, "数据爬取完成")
+            tm.log('  数据库连接失败，跳过存储')
+        tm.progress(33, "数据爬取完成")
 
         # 2. 分析报告
-        self._update_progress(40, "正在生成分析报告...")
-        print("\n【步骤 2/3】分析报告生成\n")
+        tm.progress(40, "正在生成分析报告...")
+        tm.log("\n【步骤 2/3】分析报告生成\n")
         database = P5Database()
         analyzer = P5Analyzer()
         generator = P5ReportGenerator()
@@ -707,31 +801,31 @@ class LotteryGUI:
             trend_data = database.get_trend_data()
             database.disconnect()
 
-            print(f'  分析 {len(history_data)} 期历史数据...')
+            tm.log(f'  分析 {len(history_data)} 期历史数据...')
             if trend_data:
-                print(f'  整合 {len(trend_data)} 条走势图数据...')
+                tm.log(f'  整合 {len(trend_data)} 条走势图数据...')
 
             result = analyzer.calculate_probability(
                 history_data,
                 trend_data if trend_data else None
             )
 
-            print('  生成详细分析报告...')
+            tm.log('  生成详细分析报告...')
             report_result = generator.generate_detailed_report(result, analyzer)
 
-            print('  生成最终最优报告...')
+            tm.log('  生成最终最优报告...')
             report_result_opt = generator.generate_optimal_report(result)
 
             if database.connect():
                 database.save_detailed_report(report_result)
                 database.save_final_report(report_result_opt)
                 database.disconnect()
-                print('  分析报告已存入数据库')
-        self._update_progress(66, "分析报告完成")
+                tm.log('  分析报告已存入数据库')
+        tm.progress(66, "分析报告完成")
 
         # 3. 头4分析
-        self._update_progress(75, "正在头4分析...")
-        print("\n【步骤 3/3】头4分析\n")
+        tm.progress(75, "正在头4分析...")
+        tm.log("\n【步骤 3/3】头4分析\n")
         database = P5Database()
         head4_analyzer = P5Head4Analyzer()
 
@@ -739,19 +833,19 @@ class LotteryGUI:
             history_data = database.get_history_data()
             database.disconnect()
 
-            print(f'  分析 {len(history_data)} 期历史数据的头4特征...')
+            tm.log(f'  分析 {len(history_data)} 期历史数据的头4特征...')
             result = head4_analyzer.calculate_head4_analysis(history_data)
 
-            print('  生成最优10组数字组合...')
+            tm.log('  生成最优10组数字组合...')
             top10 = head4_analyzer.generate_top10_combinations(history_data)
 
-            print('  生成头4分析报告...')
+            tm.log('  生成头4分析报告...')
             report_content = head4_analyzer.generate_head4_report(result, top10_combinations=top10)
 
-            print('\n  【最优10组数字组合】')
+            tm.log('\n  【最优10组数字组合】')
             for item in top10:
-                print(f"    第{item['rank']:>2}名: {item['combination']}  "
-                      f"得分: {item['score']:.4f}")
+                tm.log(f"    第{item['rank']:>2}名: {item['combination']}  "
+                       f"得分: {item['score']:.4f}")
 
             if database.connect():
                 database.create_tables()
@@ -773,50 +867,46 @@ class LotteryGUI:
                 )
                 database.insert_head4_top10(report_uuid, report_date, top10)
                 database.disconnect()
-                print('  头4分析报告及最优组合已存入数据库')
-        self._update_progress(100, "头4分析完成")
+                tm.log('  头4分析报告及最优组合已存入数据库')
+        tm.progress(100, "头4分析完成")
 
-        print('\n=== 排列5全部流程执行完成 ===')
+        tm.log('\n=== 排列5全部流程执行完成 ===')
 
-    # ==================== 通用功能 ====================
+    def _check_database(self, tm):
+        """检测并修复数据库表（后台线程）"""
+        tm.log("=== 数据库检测与修复 ===\n")
 
-    def _check_database(self):
-        """检测并修复数据库表"""
-        print("=== 数据库检测与修复 ===\n")
-
-        # 七星彩数据库检测
-        print("【七星彩数据库检测】")
+        tm.log("【七星彩数据库检测】")
         db = Database()
         result = db.check_and_repair_tables()
         if result['status'] == 'ok':
-            print(f"  状态: 正常")
-            print(f"  现有表: {', '.join(result['existing'])}")
+            tm.log(f"  状态: 正常")
+            tm.log(f"  现有表: {', '.join(result['existing'])}")
         elif result['status'] == 'repaired':
-            print(f"  状态: 已修复")
-            print(f"  修复表: {', '.join(result['missing'])}")
+            tm.log(f"  状态: 已修复")
+            tm.log(f"  修复表: {', '.join(result['missing'])}")
         else:
-            print(f"  状态: 错误 - {result['message']}")
+            tm.log(f"  状态: 错误 - {result['message']}")
 
-        print()
+        tm.log("")
 
-        # 排列5数据库检测
-        print("【排列5数据库检测】")
+        tm.log("【排列5数据库检测】")
         db5 = P5Database()
         result5 = db5.check_and_repair_tables()
         if result5['status'] == 'ok':
-            print(f"  状态: 正常")
-            print(f"  现有表: {', '.join(result5['existing'])}")
+            tm.log(f"  状态: 正常")
+            tm.log(f"  现有表: {', '.join(result5['existing'])}")
         elif result5['status'] == 'repaired':
-            print(f"  状态: 已修复")
-            print(f"  修复表: {', '.join(result5['missing'])}")
+            tm.log(f"  状态: 已修复")
+            tm.log(f"  修复表: {', '.join(result5['missing'])}")
         else:
-            print(f"  状态: 错误 - {result5['message']}")
+            tm.log(f"  状态: 错误 - {result5['message']}")
 
-        print('\n=== 数据库检测完成 ===')
+        tm.log('\n=== 数据库检测完成 ===')
 
-    def _view_data_summary(self):
-        """查看数据概览"""
-        print("=== 数据概览 ===\n")
+    def _view_data_summary(self, tm):
+        """查看数据概览（后台线程）"""
+        tm.log("=== 数据概览 ===\n")
 
         qxc_stats = {}
         p5_stats = {}
@@ -829,7 +919,7 @@ class LotteryGUI:
             try:
                 database.cursor.execute('SELECT COUNT(*) as count FROM qxc_trend_data')
                 trend_count = database.cursor.fetchone()['count']
-            except:
+            except Exception:
                 trend_count = 0
 
             try:
@@ -837,7 +927,7 @@ class LotteryGUI:
                 detailed_count = database.cursor.fetchone()['count']
                 database.cursor.execute('SELECT COUNT(*) as count FROM qxc_final_report')
                 final_count = database.cursor.fetchone()['count']
-            except:
+            except Exception:
                 detailed_count = 0
                 final_count = 0
 
@@ -846,7 +936,7 @@ class LotteryGUI:
                 head4_count = database.cursor.fetchone()['count']
                 database.cursor.execute('SELECT COUNT(*) as count FROM qxc_head4_top10')
                 head4_top10_count = database.cursor.fetchone()['count']
-            except:
+            except Exception:
                 head4_count = 0
                 head4_top10_count = 0
 
@@ -861,7 +951,7 @@ class LotteryGUI:
                 'head4_top10': head4_top10_count
             }
         else:
-            print('  【七星彩】数据库连接失败')
+            tm.log('  【七星彩】数据库连接失败')
 
         # 排列5数据
         database_p5 = P5Database()
@@ -869,13 +959,13 @@ class LotteryGUI:
             try:
                 database_p5.cursor.execute('SELECT COUNT(*) as count FROM p5_history_data')
                 history_count = database_p5.cursor.fetchone()['count']
-            except:
+            except Exception:
                 history_count = 0
 
             try:
                 database_p5.cursor.execute('SELECT COUNT(*) as count FROM p5_trend_data')
                 trend_count = database_p5.cursor.fetchone()['count']
-            except:
+            except Exception:
                 trend_count = 0
 
             try:
@@ -883,7 +973,7 @@ class LotteryGUI:
                 detailed_count = database_p5.cursor.fetchone()['count']
                 database_p5.cursor.execute('SELECT COUNT(*) as count FROM p5_final_report')
                 final_count = database_p5.cursor.fetchone()['count']
-            except:
+            except Exception:
                 detailed_count = 0
                 final_count = 0
 
@@ -892,7 +982,7 @@ class LotteryGUI:
                 head4_count = database_p5.cursor.fetchone()['count']
                 database_p5.cursor.execute('SELECT COUNT(*) as count FROM p5_head4_top10')
                 head4_top10_count = database_p5.cursor.fetchone()['count']
-            except:
+            except Exception:
                 head4_count = 0
                 head4_top10_count = 0
 
@@ -907,32 +997,32 @@ class LotteryGUI:
                 'head4_top10': head4_top10_count
             }
         else:
-            print('  【排列5】数据库连接失败')
+            tm.log('  【排列5】数据库连接失败')
 
-        print('  【七星彩数据统计】')
-        print(f'    历史开奖数据: {qxc_stats.get("history", 0)} 条')
-        print(f'    走势图数据: {qxc_stats.get("trend", 0)} 条')
-        print(f'    详细分析报告: {qxc_stats.get("detailed", 0)} 份')
-        print(f'    最终最优报告: {qxc_stats.get("final", 0)} 份')
-        print(f'    头4分析报告: {qxc_stats.get("head4", 0)} 份')
-        print(f'    头4最优组合: {qxc_stats.get("head4_top10", 0)} 组')
+        tm.log('  【七星彩数据统计】')
+        tm.log(f'    历史开奖数据: {qxc_stats.get("history", 0)} 条')
+        tm.log(f'    走势图数据: {qxc_stats.get("trend", 0)} 条')
+        tm.log(f'    详细分析报告: {qxc_stats.get("detailed", 0)} 份')
+        tm.log(f'    最终最优报告: {qxc_stats.get("final", 0)} 份')
+        tm.log(f'    头4分析报告: {qxc_stats.get("head4", 0)} 份')
+        tm.log(f'    头4最优组合: {qxc_stats.get("head4_top10", 0)} 组')
 
-        print()
-        print('  【排列5数据统计】')
-        print(f'    历史开奖数据: {p5_stats.get("history", 0)} 条')
-        print(f'    走势图数据: {p5_stats.get("trend", 0)} 条')
-        print(f'    详细分析报告: {p5_stats.get("detailed", 0)} 份')
-        print(f'    最优分析报告: {p5_stats.get("final", 0)} 份')
-        print(f'    头4分析报告: {p5_stats.get("head4", 0)} 份')
-        print(f'    头4最优组合: {p5_stats.get("head4_top10", 0)} 组')
+        tm.log("")
+        tm.log('  【排列5数据统计】')
+        tm.log(f'    历史开奖数据: {p5_stats.get("history", 0)} 条')
+        tm.log(f'    走势图数据: {p5_stats.get("trend", 0)} 条')
+        tm.log(f'    详细分析报告: {p5_stats.get("detailed", 0)} 份')
+        tm.log(f'    最优分析报告: {p5_stats.get("final", 0)} 份')
+        tm.log(f'    头4分析报告: {p5_stats.get("head4", 0)} 份')
+        tm.log(f'    头4最优组合: {p5_stats.get("head4_top10", 0)} 组')
 
         stats_text = (
             f"七星彩: {qxc_stats.get('history', 0)}条数据 | {qxc_stats.get('detailed', 0)}份报告\n"
             f"排列5: {p5_stats.get('history', 0)}条数据 | {p5_stats.get('detailed', 0)}份报告"
         )
-        self.stats_content.config(text=stats_text)
+        tm.stats(stats_text)
 
-        print('\n  数据概览查询完成！')
+        tm.log('\n  数据概览查询完成！')
 
 
 def main():
