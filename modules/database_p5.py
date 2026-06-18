@@ -178,14 +178,260 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5最终最优报告表';
             '''
             self.cursor.execute(sql_final_report)
-            
+
+            # 创建头4分析报告表
+            self._create_head4_report_table()
+
+            # 创建头4最优10组数字组合表
+            self._create_head4_top10_table()
+
             self.connection.commit()
             logger.info('排列5数据表创建成功')
             return True
         except Exception as e:
             logger.error(f'创建数据表失败: {e}')
             return False
-    
+
+    def _create_head4_report_table(self):
+        """创建排列5头4分析报告表"""
+        try:
+            sql_head4_report = '''
+            CREATE TABLE IF NOT EXISTS p5_head4_report (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
+                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '报告唯一标识',
+                head_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '头(万位)频率分析结果',
+                middle_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '中间(千位+百位)频率分析结果',
+                tail_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '尾(十位)频率分析结果',
+                head_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '头遗漏值分析结果',
+                middle_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '中间遗漏值分析结果',
+                tail_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '尾遗漏值分析结果',
+                head_tail_combination LONGTEXT NULL DEFAULT NULL COMMENT '头尾组合分析结果',
+                middle_features LONGTEXT NULL DEFAULT NULL COMMENT '中间位特征分析结果',
+                total_samples INT NULL DEFAULT NULL COMMENT '分析样本数',
+                confidence_level DECIMAL(5,2) NULL DEFAULT NULL COMMENT '置信水平',
+                report_content LONGTEXT NULL DEFAULT NULL COMMENT '报告内容',
+                frequency_chart LONGBLOB NULL DEFAULT NULL COMMENT '频率分布图',
+                probability_chart LONGBLOB NULL DEFAULT NULL COMMENT '概率分布图',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX report_uuid (report_uuid ASC) USING BTREE,
+                INDEX idx_report_date (report_date ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5头4分析报告表';
+            '''
+            self.cursor.execute(sql_head4_report)
+            logger.info('排列5头4分析报告表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建排列5头4分析报告表失败: {e}')
+            return False
+
+    def _create_head4_top10_table(self):
+        """创建排列5头4最优10组数字组合表"""
+        try:
+            sql_head4_top10 = '''
+            CREATE TABLE IF NOT EXISTS p5_head4_top10 (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '关联报告UUID',
+                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
+                rank_no INT NOT NULL COMMENT '排名(1-10)',
+                combination VARCHAR(20) NOT NULL COMMENT '组合(如:3-45-7)',
+                head_num INT NULL DEFAULT NULL COMMENT '头位数字(万位)',
+                middle_num INT NULL DEFAULT NULL COMMENT '中间组合数字(千位+百位)',
+                tail_num INT NULL DEFAULT NULL COMMENT '尾位数字(十位)',
+                score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '综合得分',
+                head_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '头位得分',
+                middle_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '中间组合得分',
+                tail_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '尾位得分',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                INDEX idx_report_uuid (report_uuid ASC) USING BTREE,
+                INDEX idx_report_date (report_date ASC) USING BTREE,
+                INDEX idx_rank_no (rank_no ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5头4最优10组数字组合表';
+            '''
+            self.cursor.execute(sql_head4_top10)
+            logger.info('排列5头4最优10组数字组合表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建排列5头4最优10组数字组合表失败: {e}')
+            return False
+
+    def insert_head4_report(self, report_content, total_samples,
+                            head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
+                            head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
+                            head_tail_combination, middle_features,
+                            confidence_level=None, frequency_chart=None, probability_chart=None):
+        """
+        插入排列5头4分析报告
+
+        Args:
+            report_content: 报告内容
+            total_samples: 分析样本数
+            head_frequency_analysis: 头(万位)频率分析结果
+            middle_frequency_analysis: 中间(千位+百位)频率分析结果
+            tail_frequency_analysis: 尾(十位)频率分析结果
+            head_omission_analysis: 头遗漏值分析结果
+            middle_omission_analysis: 中间遗漏值分析结果
+            tail_omission_analysis: 尾遗漏值分析结果
+            head_tail_combination: 头尾组合分析结果
+            middle_features: 中间位特征分析结果
+            confidence_level: 置信水平
+            frequency_chart: 频率分布图
+            probability_chart: 概率分布图
+
+        Returns:
+            True表示成功，False表示失败
+        """
+        try:
+            import uuid
+            report_date = datetime.now().strftime('%Y-%m-%d')
+            report_uuid = str(uuid.uuid4())
+
+            sql = '''
+            INSERT INTO p5_head4_report
+            (report_date, report_uuid, head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
+             head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
+             head_tail_combination, middle_features, total_samples, confidence_level, report_content,
+             frequency_chart, probability_chart)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                head_frequency_analysis = VALUES(head_frequency_analysis),
+                middle_frequency_analysis = VALUES(middle_frequency_analysis),
+                tail_frequency_analysis = VALUES(tail_frequency_analysis),
+                head_omission_analysis = VALUES(head_omission_analysis),
+                middle_omission_analysis = VALUES(middle_omission_analysis),
+                tail_omission_analysis = VALUES(tail_omission_analysis),
+                head_tail_combination = VALUES(head_tail_combination),
+                middle_features = VALUES(middle_features),
+                total_samples = VALUES(total_samples),
+                confidence_level = VALUES(confidence_level),
+                report_content = VALUES(report_content),
+                frequency_chart = VALUES(frequency_chart),
+                probability_chart = VALUES(probability_chart),
+                updated_at = CURRENT_TIMESTAMP
+            '''
+
+            self.cursor.execute(sql, (
+                report_date, report_uuid,
+                head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
+                head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
+                head_tail_combination, middle_features,
+                total_samples, confidence_level, report_content,
+                frequency_chart, probability_chart
+            ))
+            self.connection.commit()
+            logger.info('成功插入排列5头4分析报告')
+            return True
+        except Exception as e:
+            logger.error(f'插入排列5头4分析报告失败: {e}')
+            return False
+
+    def insert_head4_top10(self, report_uuid, report_date, combinations):
+        """
+        批量插入排列5头4最优10组数字组合数据
+
+        Args:
+            report_uuid: 关联的报告UUID
+            report_date: 报告日期
+            combinations: 组合列表，每项包含:
+                - rank: 排名(1-10)
+                - combination: 组合字符串(如:3-45-7)
+                - head: 头位数字(万位)
+                - middle: 中间组合数字(千位+百位)
+                - tail: 尾位数字(十位)
+                - score: 综合得分
+                - head_score: 头位得分
+                - middle_score: 中间组合得分
+                - tail_score: 尾位得分
+
+        Returns:
+            成功插入的记录数
+        """
+        try:
+            sql = '''
+            INSERT INTO p5_head4_top10
+            (report_uuid, report_date, rank_no, combination,
+             head_num, middle_num, tail_num,
+             score, head_score, middle_score, tail_score)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            '''
+
+            count = 0
+            for item in combinations:
+                try:
+                    self.cursor.execute(sql, (
+                        report_uuid,
+                        report_date,
+                        item['rank'],
+                        item['combination'],
+                        item['head'],
+                        item['middle'],
+                        item['tail'],
+                        item['score'],
+                        item['head_score'],
+                        item['middle_score'],
+                        item['tail_score']
+                    ))
+                    count += 1
+                except Exception as e:
+                    logger.error(f'插入排列5头4最优组合失败(排名{item.get("rank")}): {e}')
+
+            self.connection.commit()
+            logger.info(f'成功插入 {count} 条排列5头4最优组合数据')
+            return count
+        except Exception as e:
+            logger.error(f'批量插入排列5头4最优组合数据失败: {e}')
+            return 0
+
+    def check_and_repair_tables(self):
+        """检查排列5数据库表状态，自动修复缺失的表"""
+        try:
+            if not self.connection:
+                if not self.connect():
+                    return {'status': 'error', 'message': '数据库连接失败'}
+
+            required_tables = [
+                'p5_history_data', 'p5_trend_data',
+                'p5_detailed_report', 'p5_final_report',
+                'p5_head4_report', 'p5_head4_top10'
+            ]
+
+            # 获取当前数据库名称
+            self.cursor.execute("SELECT DATABASE()")
+            db_name_result = self.cursor.fetchone()
+            db_name = db_name_result['DATABASE()'] if db_name_result else None
+
+            # 获取现有表
+            self.cursor.execute("SHOW TABLES")
+            rows = self.cursor.fetchall()
+            if db_name:
+                existing_tables = [row[f'Tables_in_{db_name}'] for row in rows]
+            else:
+                existing_tables = [list(row.values())[0] for row in rows]
+
+            missing_tables = [t for t in required_tables if t not in existing_tables]
+
+            if missing_tables:
+                logger.info(f'检测到缺失的表: {missing_tables}，开始自动修复')
+                self.create_tables()
+                return {
+                    'status': 'repaired',
+                    'message': f'已自动修复 {len(missing_tables)} 个缺失的表',
+                    'missing': missing_tables,
+                    'existing': existing_tables
+                }
+            else:
+                return {
+                    'status': 'ok',
+                    'message': '所有表结构正常',
+                    'existing': existing_tables
+                }
+        except Exception as e:
+            logger.error(f'检查修复表失败: {e}')
+            return {'status': 'error', 'message': str(e)}
+
     def insert_history_data(self, data):
         """
         批量插入历史开奖数据

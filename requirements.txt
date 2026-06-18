@@ -9,3 +9,6 @@ pandas>=2.2.3
 matplotlib>=3.10.0
 python-multipart>=0.0.32
 psutil>=5.9.0
+
+# GUI依赖（tkinter为Python内置，无需额外安装）
+# 如需更好看的主题，可安装：ttkbootstrap>=1.10.0

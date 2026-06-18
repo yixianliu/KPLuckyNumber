@@ -38,7 +38,7 @@ class P5Spider:
     def __init__(self):
         """初始化爬虫配置"""
         self.base_url = 'https://www.55128.cn/kjh/tcp5-history-120.htm'
-        self.trend_url = 'https://www.55128.cn/zs/3_32.htm?record=120'
+        self.trend_url = 'https://www.55128.cn/zs/3_32.htm'
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',

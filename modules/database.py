@@ -167,7 +167,10 @@ class Database:
             
             # 创建头4分析报告表
             self._create_head4_report_table()
-            
+
+            # 创建头4最优10组数字组合表
+            self._create_head4_top10_table()
+
             # 创建用户相关表
             self.create_user_tables()
             
@@ -413,6 +416,142 @@ class Database:
         except Exception as e:
             logger.error(f'插入头4分析报告失败: {e}')
             return False
+
+    def _create_head4_top10_table(self):
+        """创建头4最优10组数字组合表"""
+        try:
+            sql_head4_top10 = '''
+            CREATE TABLE IF NOT EXISTS qxc_head4_top10 (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '关联报告UUID',
+                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
+                rank_no INT NOT NULL COMMENT '排名(1-10)',
+                combination VARCHAR(20) NOT NULL COMMENT '组合(如:3-45-7)',
+                head_num INT NULL DEFAULT NULL COMMENT '头位数字',
+                middle_num INT NULL DEFAULT NULL COMMENT '中间组合数字',
+                tail_num INT NULL DEFAULT NULL COMMENT '尾位数字',
+                score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '综合得分',
+                head_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '头位得分',
+                middle_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '中间组合得分',
+                tail_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '尾位得分',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                INDEX idx_report_uuid (report_uuid ASC) USING BTREE,
+                INDEX idx_report_date (report_date ASC) USING BTREE,
+                INDEX idx_rank_no (rank_no ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='七星彩头4最优10组数字组合表';
+            '''
+            self.cursor.execute(sql_head4_top10)
+            logger.info('头4最优10组数字组合表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建头4最优10组数字组合表失败: {e}')
+            return False
+
+    def insert_head4_top10(self, report_uuid, report_date, combinations):
+        """
+        批量插入头4最优10组数字组合数据
+
+        Args:
+            report_uuid: 关联的报告UUID
+            report_date: 报告日期
+            combinations: 组合列表，每项包含:
+                - rank: 排名(1-10)
+                - combination: 组合字符串(如:3-45-7)
+                - head: 头位数字
+                - middle: 中间组合数字
+                - tail: 尾位数字
+                - score: 综合得分
+                - head_score: 头位得分
+                - middle_score: 中间组合得分
+                - tail_score: 尾位得分
+
+        Returns:
+            成功插入的记录数
+        """
+        try:
+            sql = '''
+            INSERT INTO qxc_head4_top10
+            (report_uuid, report_date, rank_no, combination,
+             head_num, middle_num, tail_num,
+             score, head_score, middle_score, tail_score)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            '''
+
+            count = 0
+            for item in combinations:
+                try:
+                    self.cursor.execute(sql, (
+                        report_uuid,
+                        report_date,
+                        item['rank'],
+                        item['combination'],
+                        item['head'],
+                        item['middle'],
+                        item['tail'],
+                        item['score'],
+                        item['head_score'],
+                        item['middle_score'],
+                        item['tail_score']
+                    ))
+                    count += 1
+                except Exception as e:
+                    logger.error(f'插入头4最优组合失败(排名{item.get("rank")}): {e}')
+
+            self.connection.commit()
+            logger.info(f'成功插入 {count} 条头4最优组合数据')
+            return count
+        except Exception as e:
+            logger.error(f'批量插入头4最优组合数据失败: {e}')
+            return 0
+
+    def check_and_repair_tables(self):
+        """检查数据库表状态，自动修复缺失的表"""
+        try:
+            if not self.connection:
+                if not self.connect():
+                    return {'status': 'error', 'message': '数据库连接失败'}
+
+            required_tables = [
+                'qxc_history_data', 'qxc_trend_data',
+                'qxc_detailed_report', 'qxc_final_report',
+                'qxc_head4_report', 'qxc_head4_top10'
+            ]
+
+            # 获取当前数据库名称
+            self.cursor.execute("SELECT DATABASE()")
+            db_name_result = self.cursor.fetchone()
+            db_name = db_name_result['DATABASE()'] if db_name_result else None
+
+            # 获取现有表
+            self.cursor.execute("SHOW TABLES")
+            rows = self.cursor.fetchall()
+            if db_name:
+                existing_tables = [row[f'Tables_in_{db_name}'] for row in rows]
+            else:
+                existing_tables = [list(row.values())[0] for row in rows]
+
+            missing_tables = [t for t in required_tables if t not in existing_tables]
+
+            if missing_tables:
+                logger.info(f'检测到缺失的表: {missing_tables}，开始自动修复')
+                # 重新创建所有表
+                self.create_tables()
+                return {
+                    'status': 'repaired',
+                    'message': f'已自动修复 {len(missing_tables)} 个缺失的表',
+                    'missing': missing_tables,
+                    'existing': existing_tables
+                }
+            else:
+                return {
+                    'status': 'ok',
+                    'message': '所有表结构正常',
+                    'existing': existing_tables
+                }
+        except Exception as e:
+            logger.error(f'检查修复表失败: {e}')
+            return {'status': 'error', 'message': str(e)}
 
     def create_user_tables(self):
         """创建用户相关表（用户表和付费记录表）"""
