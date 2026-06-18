@@ -36,6 +36,124 @@ class P5Analyzer:
         self.number_range = range(0, 10)  # 每位号码范围0-9
         self.position_names = ['万位', '千位', '百位', '十位', '个位']
     
+    def validate_data(self, data):
+        """
+        验证数据完整性和正确性
+        
+        Args:
+            data: 数据列表
+        
+        Returns:
+            验证结果字典，包含clean_data、errors、warnings
+        """
+        clean_data = []
+        errors = []
+        warnings = []
+        
+        if not data:
+            return {
+                'valid': False,
+                'clean_data': [],
+                'errors': ['数据列表为空'],
+                'warnings': []
+            }
+        
+        for idx, item in enumerate(data):
+            try:
+                if not isinstance(item, dict):
+                    errors.append(f'第{idx+1}条数据不是字典类型')
+                    continue
+                
+                if 'issue' not in item or not item['issue']:
+                    errors.append(f'第{idx+1}条数据缺少期号')
+                    continue
+                
+                if 'numbers' not in item:
+                    errors.append(f'第{idx+1}条数据({item.get("issue", "")})缺少号码信息')
+                    continue
+                
+                numbers = item['numbers']
+                if not isinstance(numbers, list) or len(numbers) != 5:
+                    errors.append(f'第{idx+1}条数据({item.get("issue", "")})号码格式错误，应为5个数字的列表')
+                    continue
+                
+                valid_numbers = []
+                for pos, num in enumerate(numbers):
+                    try:
+                        num_int = int(num)
+                        if num_int < 0 or num_int > 9:
+                            errors.append(f'第{idx+1}条数据({item.get("issue", "")})第{pos+1}位号码{num_int}超出范围(0-9)')
+                            continue
+                        valid_numbers.append(num_int)
+                    except (ValueError, TypeError):
+                        errors.append(f'第{idx+1}条数据({item.get("issue", "")})第{pos+1}位号码{num}不是有效数字')
+                        continue
+                
+                if len(valid_numbers) != 5:
+                    continue
+                
+                clean_item = {
+                    'issue': str(item['issue']),
+                    'numbers': valid_numbers,
+                    'date': item.get('date', ''),
+                    'hezhi': item.get('hezhi'),
+                    'hezhi_feature': item.get('hezhi_feature'),
+                    'odd_even_ratio': item.get('odd_even_ratio'),
+                    'odd_even_pattern': item.get('odd_even_pattern'),
+                    'span': item.get('span')
+                }
+                
+                if not clean_item['date']:
+                    warnings.append(f'第{idx+1}条数据({item.get("issue", "")})缺少日期信息')
+                
+                if clean_item['hezhi'] is not None:
+                    try:
+                        hezhi_val = int(clean_item['hezhi'])
+                        expected_hezhi = sum(valid_numbers)
+                        if hezhi_val != expected_hezhi:
+                            warnings.append(f'第{idx+1}条数据({item.get("issue", "")})和值{hezhi_val}与实际计算{expected_hezhi}不一致，已修正')
+                            clean_item['hezhi'] = expected_hezhi
+                    except (ValueError, TypeError):
+                        clean_item['hezhi'] = sum(valid_numbers)
+                
+                if clean_item['span'] is not None:
+                    try:
+                        span_val = int(clean_item['span'])
+                        expected_span = max(valid_numbers) - min(valid_numbers)
+                        if span_val != expected_span:
+                            warnings.append(f'第{idx+1}条数据({item.get("issue", "")})跨度{span_val}与实际计算{expected_span}不一致，已修正')
+                            clean_item['span'] = expected_span
+                    except (ValueError, TypeError):
+                        clean_item['span'] = max(valid_numbers) - min(valid_numbers)
+                
+                clean_data.append(clean_item)
+            
+            except Exception as e:
+                errors.append(f'第{idx+1}条数据处理异常: {str(e)}')
+        
+        issue_set = set()
+        duplicate_issues = []
+        for item in clean_data:
+            if item['issue'] in issue_set:
+                duplicate_issues.append(item['issue'])
+            issue_set.add(item['issue'])
+        
+        if duplicate_issues:
+            warnings.append(f'检测到重复期号: {", ".join(set(duplicate_issues))}')
+        
+        if len(clean_data) < len(data):
+            warnings.append(f'共{len(data)}条数据，过滤后保留{len(clean_data)}条有效数据')
+        
+        return {
+            'valid': len(errors) == 0,
+            'clean_data': clean_data,
+            'errors': errors,
+            'warnings': warnings,
+            'total_input': len(data),
+            'total_valid': len(clean_data),
+            'validation_time': datetime.now().isoformat()
+        }
+    
     def analyze_frequency(self, data):
         """
         分析号码出现频率
@@ -260,6 +378,54 @@ class P5Analyzer:
             }
         
         return ratio_result
+    
+    def analyze_prime_composite(self, data):
+        """
+        分析质合比分布（质数: 2,3,5,7；合数: 0,4,6,8,9；1既不是质数也不是合数）
+        
+        Args:
+            data: 数据列表
+        
+        Returns:
+            质合比统计结果字典
+        """
+        primes = {2, 3, 5, 7}
+        composites = {0, 4, 6, 8, 9}
+        
+        ratio_counts = defaultdict(int)
+        prime_counts = defaultdict(int)
+        composite_counts = defaultdict(int)
+        
+        for item in data:
+            numbers = item['numbers']
+            prime_count = sum(1 for n in numbers if n in primes)
+            composite_count = sum(1 for n in numbers if n in composites)
+            ratio = f"{prime_count}:{composite_count}"
+            ratio_counts[ratio] += 1
+            
+            for pos, num in enumerate(numbers):
+                if num in primes:
+                    prime_counts[pos] += 1
+                elif num in composites:
+                    composite_counts[pos] += 1
+        
+        total = len(data)
+        ratio_result = {}
+        
+        for ratio, count in sorted(ratio_counts.items(), key=lambda x: x[1], reverse=True):
+            ratio_result[ratio] = {
+                'count': count,
+                'probability': round(count / total, 4) if total > 0 else 0
+            }
+        
+        return {
+            'ratio_distribution': ratio_result,
+            'prime_position_counts': dict(prime_counts),
+            'composite_position_counts': dict(composite_counts),
+            'total_primes': sum(prime_counts.values()),
+            'total_composites': sum(composite_counts.values()),
+            'prime_rate': round(sum(prime_counts.values()) / (total * self.positions), 4) if total > 0 else 0
+        }
     
     def analyze_repeats(self, data):
         """
@@ -525,6 +691,18 @@ class P5Analyzer:
         Returns:
             综合分析结果字典
         """
+        validation = self.validate_data(data)
+        data = validation['clean_data']
+        
+        if validation['errors']:
+            logger.warning(f'数据验证发现 {len(validation["errors"])} 个错误')
+            for err in validation['errors'][:5]:
+                logger.warning(f'  - {err}')
+        
+        if validation['warnings']:
+            for warn in validation['warnings'][:5]:
+                logger.info(f'数据验证警告: {warn}')
+        
         if len(data) < 10:
             logger.warning('数据量不足，分析结果可能不准确')
         
@@ -535,6 +713,7 @@ class P5Analyzer:
         odd_even_result = self.analyze_odd_even(data)
         span_result = self.analyze_span(data)
         big_small_result = self.analyze_big_small(data)
+        prime_composite_result = self.analyze_prime_composite(data)
         repeat_result = self.analyze_repeats(data)
         consecutive_result = self.analyze_consecutive(data)
         
@@ -601,12 +780,14 @@ class P5Analyzer:
             'odd_even': odd_even_result,
             'span': span_result,
             'big_small': big_small_result,
+            'prime_composite': prime_composite_result,
             'repeats': repeat_result,
             'consecutive': consecutive_result,
             'trend': trend_analysis,
             'comparison': data_comparison,
             'predictions': sorted_predictions,
             'total_samples': total,
+            'validation': validation,
             'analysis_time': datetime.now().isoformat()
         }
     

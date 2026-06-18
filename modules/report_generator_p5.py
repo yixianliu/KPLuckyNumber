@@ -7,6 +7,7 @@
 
 import os
 import logging
+from typing import Dict, Any
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -535,6 +536,108 @@ class P5ReportGenerator:
         except Exception as e:
             logger.error(f'保存报告失败: {e}')
             return None
+
+    def generate_prediction_report(self, prediction_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        生成下一期走势预测与号码预测报告
+
+        Args:
+            prediction_result: P5Predictor.predict()返回的预测结果
+
+        Returns:
+            包含报告文本和图表的字典
+        """
+        logger.info('开始生成排列5预测分析报告')
+
+        lines = []
+        lines.append('=' * 80)
+        lines.append('           排列5下一期走势预测与号码预测报告')
+        lines.append('=' * 80)
+        lines.append(f'\n预测目标期号: {prediction_result.get("target_issue", "下一期")}')
+        lines.append(f'基准期号: {prediction_result.get("base_issue", "未知")}')
+        lines.append(f'预测时间: {prediction_result.get("predict_time", datetime.now().isoformat())}')
+        lines.append(f'算法配置: {prediction_result.get("algorithm_summary", "默认配置")}')
+        lines.append('-' * 80)
+
+        # 一、各位置概率分布
+        lines.append('\n【一、各位置号码概率分布】')
+        lines.append('-' * 60)
+
+        fused = prediction_result.get('fused_probabilities', [])
+        position_names = self.position_names
+
+        for pos in range(5):
+            if pos >= len(fused):
+                continue
+            probs = fused[pos]
+            sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+            lines.append(f'\n{position_names[pos]} - 概率Top5:')
+            for num, prob in sorted_probs[:5]:
+                bar = '█' * int(prob * 50)
+                lines.append(f'  数字{num}: {prob:.4f} {bar}')
+
+        # 二、走势预测
+        lines.append('\n【二、走势预判】')
+        lines.append('-' * 60)
+        trend = prediction_result.get('trend_forecast', {})
+        for pos in range(5):
+            pos_key = f'position_{pos+1}'
+            if pos_key in trend:
+                tf = trend[pos_key]
+                lines.append(f'\n{position_names[pos]}:')
+                lines.append(f'  预测号码: {tf.get("predicted_number", "N/A")}')
+                lines.append(f'  预测形态: {tf.get("predicted_form", "N/A")}')
+                lines.append(f'  形态概率: {tf.get("form_probability", 0):.2%}')
+                momentum = tf.get("momentum", {})
+                lines.append(f'  动量方向: {momentum.get("direction", "N/A")}')
+                lines.append(f'  动量强度: {momentum.get("strength", 0):.4f}')
+
+        # 三、推荐组合
+        lines.append('\n【三、推荐号码组合】')
+        lines.append('-' * 60)
+        top_combos = prediction_result.get('top_combinations', [])
+        for combo in top_combos[:5]:
+            lines.append(f"  第{combo.get('rank', 0)}名: {combo.get('combination', '')} "
+                        f"概率={combo.get('joint_probability', 0):.6f}")
+
+        # 四、综合分析
+        lines.append('\n【四、综合分析结论】')
+        lines.append('-' * 60)
+        summary = prediction_result.get('summary', '')
+        if summary:
+            lines.append(summary)
+        else:
+            lines.append('请结合各位置概率分布和走势预判综合判断。')
+
+        lines.append('\n【五、重要声明】')
+        lines.append('-' * 60)
+        lines.append('1. 本报告基于历史数据统计学概率建模生成，不涉及任何赌博承诺。')
+        lines.append('2. 概率预测仅供参考研究，不保证中奖，请理性看待。')
+        lines.append('3. 彩票开奖为随机事件，历史规律不代表未来走势。')
+        lines.append('4. 建议持续跟踪预测准确率，动态调整参考策略。')
+
+        lines.append('\n' + '=' * 80)
+        lines.append(f'报告生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+        lines.append('=' * 80)
+
+        report_text = '\n'.join(lines)
+
+        # 生成图表
+        from modules.p5_predictor import P5Predictor
+        predictor = P5Predictor()
+        charts = predictor.generate_forecast_charts(prediction_result)
+
+        logger.info('预测分析报告生成完成')
+        return {
+            'report_type': 'prediction',
+            'report_content': report_text,
+            'probability_chart': charts.get('probability'),
+            'combination_chart': charts.get('combination'),
+            'trend_chart': charts.get('trend'),
+            'target_issue': prediction_result.get('target_issue', ''),
+            'top_combinations': prediction_result.get('top_combinations', []),
+            'fused_probabilities': prediction_result.get('fused_probabilities', [])
+        }
 
 
 def test_report_generator():

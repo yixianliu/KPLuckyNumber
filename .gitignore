@@ -2,3 +2,10 @@
 /logs/
 reports
 .idea
+api/ai_api.py
+ai_report_generator.py
+modules/ai_analyzer.py
+api/ai_api.py
+ai_report_generator.py
+api/ai_api.py
+modules/ai_analyzer.py

@@ -611,7 +611,10 @@ class Head4Analyzer:
                         'head': head_num,
                         'middle': middle_num,
                         'tail': tail_num,
-                        'score': round(total_score, 4)
+                        'score': round(total_score, 4),
+                        'head_score': round(head_score, 4),
+                        'middle_score': round(middle_score, 4),
+                        'tail_score': round(tail_score, 4)
                     })
 
         # 按综合得分降序排列，取前10组
@@ -628,7 +631,10 @@ class Head4Analyzer:
                 'middle': item['middle'],
                 'tail': item['tail'],
                 'combination': combination,
-                'score': item['score']
+                'score': item['score'],
+                'head_score': item['head_score'],
+                'middle_score': item['middle_score'],
+                'tail_score': item['tail_score']
             })
 
         logger.info(f'已生成最优{len(result)}组数字组合')
