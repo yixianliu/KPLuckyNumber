@@ -202,6 +202,9 @@ class Database:
             # 创建头4最优10组数字组合表
             self._create_head4_top10_table()
 
+            # 创建AI分析报告表
+            self._create_ai_report_table()
+
             # 创建用户相关表
             self.create_user_tables()
             
@@ -448,6 +451,57 @@ class Database:
             logger.error(f'插入头4分析报告失败: {e}')
             return False
 
+    def insert_ai_report(self, report_content, data_count, latest_issue,
+                         trend_analysis=None, probability_stats=None,
+                         recommended_numbers=None, recommended_combinations=None,
+                         confidence_scores=None, recommendation_reasons=None,
+                         key_conclusions=None, risk_warning=None, report_format='TEXT'):
+        """
+        插入AI分析报告
+
+        Args:
+            report_content: 完整报告内容
+            data_count: 分析数据条数
+            latest_issue: 最新期号
+            trend_analysis: 趋势分析结果
+            probability_stats: 概率统计数据
+            recommended_numbers: 推荐号码列表
+            recommended_combinations: 推荐组合列表
+            confidence_scores: 置信度分数列表
+            recommendation_reasons: 推荐理由
+            key_conclusions: 关键结论
+            risk_warning: 风险提示
+            report_format: 报告格式(JSON/HTML/TEXT)
+        """
+        try:
+            import uuid
+            report_uuid = str(uuid.uuid4())
+            report_date = datetime.now().strftime('%Y-%m-%d')
+
+            sql = '''
+            INSERT INTO qxc_ai_report (
+                report_date, report_uuid, data_count, latest_issue,
+                trend_analysis, probability_stats, recommended_numbers,
+                recommended_combinations, confidence_scores, recommendation_reasons,
+                key_conclusions, risk_warning, report_content, report_format
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            '''
+
+            self.cursor.execute(sql, (
+                report_date, report_uuid, data_count, latest_issue,
+                trend_analysis, probability_stats, recommended_numbers,
+                recommended_combinations, confidence_scores, recommendation_reasons,
+                key_conclusions, risk_warning, report_content, report_format
+            ))
+            self.connection.commit()
+            logger.info('成功插入AI分析报告')
+            return True
+        except Exception as e:
+            logger.error(f'插入AI分析报告失败: {e}')
+            return False
+
     def _create_head4_top10_table(self):
         """创建头4最优10组数字组合表"""
         try:
@@ -477,6 +531,41 @@ class Database:
             return True
         except Exception as e:
             logger.error(f'创建头4最优10组数字组合表失败: {e}')
+            return False
+
+    def _create_ai_report_table(self):
+        """创建AI分析报告表"""
+        try:
+            sql_ai_report = '''
+            CREATE TABLE IF NOT EXISTS qxc_ai_report (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
+                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '报告唯一标识',
+                data_count INT NULL DEFAULT NULL COMMENT '分析数据条数',
+                latest_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '最新期号',
+                trend_analysis LONGTEXT NULL DEFAULT NULL COMMENT '趋势分析结果',
+                probability_stats LONGTEXT NULL DEFAULT NULL COMMENT '概率统计数据',
+                recommended_numbers TEXT NULL DEFAULT NULL COMMENT '推荐号码列表',
+                recommended_combinations TEXT NULL DEFAULT NULL COMMENT '推荐组合列表',
+                confidence_scores TEXT NULL DEFAULT NULL COMMENT '置信度分数列表',
+                recommendation_reasons TEXT NULL DEFAULT NULL COMMENT '推荐理由',
+                key_conclusions TEXT NULL DEFAULT NULL COMMENT '关键结论',
+                risk_warning TEXT NULL DEFAULT NULL COMMENT '风险提示',
+                report_content LONGTEXT NULL DEFAULT NULL COMMENT '完整报告内容',
+                report_format TEXT NULL DEFAULT NULL COMMENT '报告格式(JSON/HTML/TEXT)',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX report_uuid (report_uuid ASC) USING BTREE,
+                INDEX idx_report_date (report_date ASC) USING BTREE,
+                INDEX idx_latest_issue (latest_issue ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='七星彩AI分析报告表';
+            '''
+            self.cursor.execute(sql_ai_report)
+            logger.info('AI分析报告表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建AI分析报告表失败: {e}')
             return False
 
     def insert_head4_top10(self, report_uuid, report_date, combinations):
@@ -745,7 +834,7 @@ class Database:
             return False
     
     def insert_or_update_history_data(self, data):
-        """插入或更新历史开奖数据"""
+        """插入历史开奖数据（仅插入不存在的数据，不更新已存在的数据）"""
         try:
             sql = '''
             INSERT INTO qxc_history_data 
@@ -753,23 +842,11 @@ class Database:
              hezhi, hezhi_type, odd_even_ratio, odd_even_pattern, span)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
-                draw_date = VALUES(draw_date),
-                num1 = VALUES(num1),
-                num2 = VALUES(num2),
-                num3 = VALUES(num3),
-                num4 = VALUES(num4),
-                num5 = VALUES(num5),
-                num6 = VALUES(num6),
-                special_num = VALUES(special_num),
-                hezhi = VALUES(hezhi),
-                hezhi_type = VALUES(hezhi_type),
-                odd_even_ratio = VALUES(odd_even_ratio),
-                odd_even_pattern = VALUES(odd_even_pattern),
-                span = VALUES(span),
-                updated_at = CURRENT_TIMESTAMP
+                id = id
             '''
             
-            count = 0
+            total_count = 0
+            inserted_count = 0
             for item in data:
                 try:
                     numbers = list(map(int, item['numbers']))
@@ -789,19 +866,21 @@ class Database:
                         item.get('odd_even_pattern', ''),
                         item.get('span', '')
                     ))
-                    count += 1
+                    total_count += 1
+                    if self.cursor.rowcount > 0:
+                        inserted_count += 1
                 except Exception as e:
                     logger.error(f'插入数据失败: {item["issue"]}, 错误: {e}')
             
             self.connection.commit()
-            logger.info(f'成功插入/更新 {count} 条开奖数据')
-            return count
+            logger.info(f'处理 {total_count} 条数据，新增 {inserted_count} 条，跳过 {total_count - inserted_count} 条已存在数据')
+            return inserted_count
         except Exception as e:
             logger.error(f'批量插入数据失败: {e}')
             return 0
     
     def insert_or_update_trend_data(self, data):
-        """插入或更新走势图数据"""
+        """插入走势图数据（仅插入不存在的数据，不更新已存在的数据）"""
         try:
             import json
             
@@ -809,22 +888,24 @@ class Database:
             INSERT INTO qxc_trend_data (issue, trend_values)
             VALUES (%s, %s)
             ON DUPLICATE KEY UPDATE
-                trend_values = VALUES(trend_values),
-                updated_at = CURRENT_TIMESTAMP
+                id = id
             '''
             
-            count = 0
+            total_count = 0
+            inserted_count = 0
             for item in data:
                 try:
                     trend_json = json.dumps(item.get('trend', []))
                     self.cursor.execute(sql, (item['issue'], trend_json))
-                    count += 1
+                    total_count += 1
+                    if self.cursor.rowcount > 0:
+                        inserted_count += 1
                 except Exception as e:
                     logger.error(f'插入走势图数据失败: {item["issue"]}, 错误: {e}')
             
             self.connection.commit()
-            logger.info(f'成功插入/更新 {count} 条走势图数据')
-            return count
+            logger.info(f'处理 {total_count} 条走势图数据，新增 {inserted_count} 条，跳过 {total_count - inserted_count} 条已存在数据')
+            return inserted_count
         except Exception as e:
             logger.error(f'批量插入走势图数据失败: {e}')
             return 0

@@ -13,6 +13,7 @@ import os
 import threading
 import queue
 import traceback
+import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -48,6 +49,8 @@ from modules.database_p5 import P5Database
 from modules.analyzer_p5 import P5Analyzer
 from modules.report_generator_p5 import P5ReportGenerator
 from modules.p5_head4_analyzer import P5Head4Analyzer
+from modules.p5_predictor import P5Predictor, P5PredictorConfig
+from modules.p5_prediction_tracker import P5PredictionTracker
 
 # ============================================================
 # 配色方案 - 现代化深色主题
@@ -305,12 +308,20 @@ class LotteryGUI:
         qxc_card.pack(fill=tk.X, pady=(0, 10))
         self._add_big_button(qxc_card, "执行全部流程", COLORS['accent_qxc'],
                              lambda: self._on_button_click("七星彩全部流程", self._execute_qxc_all))
+        self._add_action_button(qxc_card, "AI智能分析", '#8b5cf6',
+                                lambda: self._on_button_click("七星彩AI分析", self._execute_qxc_ai))
 
         # 排列5执行卡片
         p5_card = self._create_card(parent, "排列5", COLORS['accent_p5'])
         p5_card.pack(fill=tk.X, pady=(0, 10))
         self._add_big_button(p5_card, "执行全部流程", COLORS['accent_p5'],
                              lambda: self._on_button_click("排列5全部流程", self._execute_p5_all))
+        self._add_action_button(p5_card, "AI智能分析", '#8b5cf6',
+                                lambda: self._on_button_click("排列5AI分析", self._execute_p5_ai))
+        self._add_action_button(p5_card, "走势预测", '#f59e0b',
+                                lambda: self._on_button_click("排列5走势预测", self._execute_p5_prediction))
+        self._add_action_button(p5_card, "准确率跟踪", '#3b82f6',
+                                lambda: self._on_button_click("排列5准确率跟踪", self._execute_p5_accuracy))
 
         # 通用操作卡片
         common_card = self._create_card(parent, "通用操作", COLORS['accent_common'])
@@ -708,11 +719,71 @@ class LotteryGUI:
                 )
                 database.disconnect()
                 tm.log('  分析报告已存入数据库')
-        tm.progress(66, "分析报告完成")
+        tm.progress(50, "分析报告完成")
 
-        # 3. 头4分析
+        # 3. 走势预测
+        tm.progress(55, "正在走势预测...")
+        tm.log("\n【步骤 3/5】走势预测与号码预测\n")
+
+        try:
+            predictor = P5Predictor()
+            tracker = P5PredictionTracker()
+            pred_generator = P5ReportGenerator()
+
+            prediction_result = predictor.predict(history_data)
+            target_issue = prediction_result.get('target_issue', '下一期')
+            tm.log(f'  预测目标期号: {target_issue}')
+
+            fused = prediction_result.get('fused_probabilities', [])
+            position_names = ['万位', '千位', '百位', '十位', '个位']
+            tm.log('  各位置概率Top3:')
+            for pos in range(5):
+                if pos < len(fused):
+                    top3 = sorted(fused[pos].items(), key=lambda x: x[1], reverse=True)[:3]
+                    nums_str = ', '.join([f'{n}({p:.3f})' for n, p in top3])
+                    tm.log(f'    {position_names[pos]}: {nums_str}')
+
+            top_combos = prediction_result.get('top_combinations', [])
+            tm.log('\n  【推荐号码组合】')
+            for combo in top_combos[:3]:
+                tm.log(f"    第{combo.get('rank', 0)}名: {combo.get('combination', '')} "
+                        f"联合概率={combo.get('joint_probability', 0):.6f}")
+
+            pred_report = pred_generator.generate_prediction_report(prediction_result)
+            tracker.save_prediction(prediction_result)
+
+            if database.connect():
+                database.create_tables()
+                sql = '''
+                INSERT INTO p5_next_issue_forecast
+                (base_issue, next_issue, probability_chart, combination_chart, trend_chart, forecast_data)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                forecast_time = CURRENT_TIMESTAMP,
+                probability_chart = VALUES(probability_chart),
+                combination_chart = VALUES(combination_chart),
+                trend_chart = VALUES(trend_chart),
+                forecast_data = VALUES(forecast_data)
+                '''
+                database.cursor.execute(sql, (
+                    prediction_result.get('base_issue', ''),
+                    target_issue,
+                    pred_report.get('probability_chart'),
+                    pred_report.get('combination_chart'),
+                    pred_report.get('trend_chart'),
+                    json.dumps(prediction_result, ensure_ascii=False)
+                ))
+                database.connection.commit()
+                database.disconnect()
+                tm.log('  预测结果及图表已存入数据库')
+        except Exception as e:
+            tm.log(f'  预测步骤异常: {str(e)}')
+
+        tm.progress(66, "走势预测完成")
+
+        # 4. 头4分析
         tm.progress(75, "正在头4分析...")
-        tm.log("\n【步骤 3/3】头4分析\n")
+        tm.log("\n【步骤 4/5】头4分析\n")
         database = Database()
         head4_analyzer = Head4Analyzer()
 
@@ -743,19 +814,24 @@ class LotteryGUI:
                 database.insert_head4_report(
                     report_content,
                     result.get('total_samples', 0),
-                    result.get('head_frequency_analysis', ''),
-                    result.get('middle_frequency_analysis', ''),
-                    result.get('tail_frequency_analysis', ''),
-                    result.get('head_omission_analysis', ''),
-                    result.get('middle_omission_analysis', ''),
-                    result.get('tail_omission_analysis', ''),
-                    result.get('head_tail_combination', ''),
-                    result.get('middle_features', '')
+                    json.dumps(result.get('head_frequency_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('middle_frequency_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('tail_frequency_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('head_omission_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('middle_omission_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('tail_omission_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('head_tail_combination', {}), ensure_ascii=False),
+                    json.dumps(result.get('middle_features', {}), ensure_ascii=False)
                 )
                 database.insert_head4_top10(report_uuid, report_date, top10)
                 database.disconnect()
                 tm.log('  头4分析报告及最优组合已存入数据库')
         tm.progress(100, "头4分析完成")
+
+        # 4. AI智能分析
+        tm.progress(100, "正在进行AI分析...")
+        tm.log("\n【步骤 4/4】AI智能分析\n")
+        self._execute_qxc_ai_core(tm)
 
         tm.log('\n=== 七星彩全部流程执行完成 ===')
 
@@ -763,15 +839,29 @@ class LotteryGUI:
         """执行排列5全部流程（后台线程）"""
         tm.log("=== 排列5完整流程执行 ===\n")
 
-        # 1. 爬取数据
+        # 1. 爬取数据（增量更新）
         tm.progress(5, "正在爬取数据...")
-        tm.log("【步骤 1/3】数据爬取\n")
+        tm.log("【步骤 1/4】数据爬取（增量更新）\n")
         spider = P5Spider()
         database = P5Database()
 
-        tm.log('  正在爬取历史数据...')
-        history_data = spider.crawl_history_data()
-        tm.log(f'  爬取到 {len(history_data)} 条历史数据')
+        # 获取数据库中最新期号
+        last_issue = None
+        if database.connect():
+            last_issue = database.get_latest_issue()
+            tm.log(f'  数据库中最新期号: {last_issue if last_issue else "无"}')
+            database.disconnect()
+
+        # 执行增量爬取
+        tm.log('  正在执行增量爬取...')
+        history_data = spider.crawl_incremental_data(last_issue)
+        tm.log(f'  增量爬取到 {len(history_data)} 条新数据')
+
+        # 如果没有新数据，检查是否需要全量更新
+        if not history_data:
+            tm.log('  无新增数据，执行全量爬取...')
+            history_data = spider.crawl_history_data()
+            tm.log(f'  全量爬取到 {len(history_data)} 条数据')
 
         tm.log('  正在爬取走势图数据...')
         trend_data = spider.crawl_trend_data(record=120)
@@ -787,11 +877,11 @@ class LotteryGUI:
             database.disconnect()
         else:
             tm.log('  数据库连接失败，跳过存储')
-        tm.progress(33, "数据爬取完成")
+        tm.progress(25, "数据爬取完成")
 
         # 2. 分析报告
         tm.progress(40, "正在生成分析报告...")
-        tm.log("\n【步骤 2/3】分析报告生成\n")
+        tm.log("\n【步骤 2/4】分析报告生成\n")
         database = P5Database()
         analyzer = P5Analyzer()
         generator = P5ReportGenerator()
@@ -825,7 +915,7 @@ class LotteryGUI:
 
         # 3. 头4分析
         tm.progress(75, "正在头4分析...")
-        tm.log("\n【步骤 3/3】头4分析\n")
+        tm.log("\n【步骤 3/4】头4分析\n")
         database = P5Database()
         head4_analyzer = P5Head4Analyzer()
 
@@ -856,21 +946,253 @@ class LotteryGUI:
                 database.insert_head4_report(
                     report_content,
                     result.get('total_samples', 0),
-                    result.get('head_frequency_analysis', ''),
-                    result.get('middle_frequency_analysis', ''),
-                    result.get('tail_frequency_analysis', ''),
-                    result.get('head_omission_analysis', ''),
-                    result.get('middle_omission_analysis', ''),
-                    result.get('tail_omission_analysis', ''),
-                    result.get('head_tail_combination', ''),
-                    result.get('middle_features', '')
+                    json.dumps(result.get('head_frequency_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('middle_frequency_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('tail_frequency_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('head_omission_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('middle_omission_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('tail_omission_analysis', {}), ensure_ascii=False),
+                    json.dumps(result.get('head_tail_combination', {}), ensure_ascii=False),
+                    json.dumps(result.get('middle_features', {}), ensure_ascii=False)
                 )
                 database.insert_head4_top10(report_uuid, report_date, top10)
                 database.disconnect()
                 tm.log('  头4分析报告及最优组合已存入数据库')
         tm.progress(100, "头4分析完成")
 
+        # 4. AI智能分析
+        tm.progress(100, "正在进行AI分析...")
+        tm.log("\n【步骤 5/5】AI智能分析\n")
+        self._execute_p5_ai_core(tm)
+
         tm.log('\n=== 排列5全部流程执行完成 ===')
+
+    def _execute_qxc_ai(self, tm):
+        """执行七星彩AI智能分析（后台线程）"""
+        tm.log("=== 七星彩AI智能分析 ===\n")
+        self._execute_qxc_ai_core(tm)
+        tm.log('\n=== 七星彩AI智能分析完成 ===')
+
+    def _execute_p5_ai(self, tm):
+        """执行排列5AI智能分析（后台线程）"""
+        tm.log("=== 排列5AI智能分析 ===\n")
+        self._execute_p5_ai_core(tm)
+        tm.log('\n=== 排列5AI智能分析完成 ===')
+
+    def _execute_qxc_ai_core(self, tm):
+        """七星彩AI智能分析核心逻辑"""
+        try:
+            from modules.ai_analyzer import AILotteryAnalyzer
+
+            analyzer = AILotteryAnalyzer()
+
+            tm.log('  正在获取历史数据...')
+            tm.progress(10, "获取数据...")
+
+            tm.log('  正在调用AI进行深度分析...')
+            tm.progress(30, "AI分析中...")
+
+            result = analyzer.analyze_qxc()
+
+            if result.get('status') == 'success':
+                tm.log(f'  分析完成，数据量: {result["data_summary"]["data_count"]} 条')
+                tm.log(f'  最新期号: {result["data_summary"]["latest_issue"]}')
+                tm.progress(70, "生成报告...")
+
+                tm.log('\n  【AI分析报告】')
+                tm.log(result['report'])
+
+                tm.log('\n  正在保存报告到数据库...')
+                tm.progress(90, "保存数据库...")
+
+                save_result = analyzer.save_report_to_database(result)
+                if save_result:
+                    tm.log('  AI分析报告已成功存入数据库')
+                else:
+                    tm.log('  数据库保存失败')
+
+                tm.progress(100, "完成")
+            else:
+                tm.log(f'  AI分析失败: {result.get("message", "未知错误")}')
+
+        except Exception as e:
+            import traceback
+            tm.log(f'  AI分析异常: {str(e)}')
+            tm.log(f'  错误详情:\n{traceback.format_exc()}')
+
+    def _execute_p5_ai_core(self, tm):
+        """排列5AI智能分析核心逻辑"""
+        try:
+            from modules.ai_analyzer import AILotteryAnalyzer
+
+            analyzer = AILotteryAnalyzer()
+
+            tm.log('  正在获取历史数据...')
+            tm.progress(10, "获取数据...")
+
+            tm.log('  正在调用AI进行深度分析...')
+            tm.progress(30, "AI分析中...")
+
+            result = analyzer.analyze_p5()
+
+            if result.get('status') == 'success':
+                tm.log(f'  分析完成，数据量: {result["data_summary"]["data_count"]} 条')
+                tm.log(f'  最新期号: {result["data_summary"]["latest_issue"]}')
+                tm.progress(70, "生成报告...")
+
+                tm.log('\n  【AI分析报告】')
+                tm.log(result['report'])
+
+                tm.log('\n  正在保存报告到数据库...')
+                tm.progress(90, "保存数据库...")
+
+                save_result = analyzer.save_report_to_database(result)
+                if save_result:
+                    tm.log('  AI分析报告已成功存入数据库')
+                else:
+                    tm.log('  数据库保存失败')
+
+                tm.progress(100, "完成")
+            else:
+                tm.log(f'  AI分析失败: {result.get("message", "未知错误")}')
+
+        except Exception as e:
+            import traceback
+            tm.log(f'  AI分析异常: {str(e)}')
+            tm.log(f'  错误详情:\n{traceback.format_exc()}')
+
+    def _execute_p5_prediction(self, tm):
+        """执行排列5走势预测（后台线程）"""
+        tm.log("=== 排列5走势预测与号码预测 ===\n")
+
+        try:
+            database = P5Database()
+            predictor = P5Predictor()
+            tracker = P5PredictionTracker()
+            generator = P5ReportGenerator()
+
+            tm.progress(10, "获取历史数据...")
+            tm.log("【步骤 1/3】获取历史数据")
+
+            if database.connect():
+                history_data = database.get_history_data()
+                database.disconnect()
+                tm.log(f'  获取到 {len(history_data)} 期历史数据')
+            else:
+                tm.log('  数据库连接失败')
+                return
+
+            tm.progress(40, "执行预测算法...")
+            tm.log("\n【步骤 2/3】执行多算法融合预测")
+
+            prediction_result = predictor.predict(history_data)
+            target_issue = prediction_result.get('target_issue', '下一期')
+            tm.log(f'  预测目标期号: {target_issue}')
+            tm.log(f'  算法配置: {prediction_result.get("algorithm_summary", "默认配置")}')
+
+            # 打印各位置Top3
+            fused = prediction_result.get('fused_probabilities', [])
+            position_names = ['万位', '千位', '百位', '十位', '个位']
+            tm.log('  各位置概率Top3:')
+            for pos in range(5):
+                if pos < len(fused):
+                    top3 = sorted(fused[pos].items(), key=lambda x: x[1], reverse=True)[:3]
+                    nums_str = ', '.join([f'{n}({p:.3f})' for n, p in top3])
+                    tm.log(f'    {position_names[pos]}: {nums_str}')
+
+            # 打印推荐组合
+            top_combos = prediction_result.get('top_combinations', [])
+            tm.log('\n  【推荐号码组合】')
+            for combo in top_combos[:3]:
+                tm.log(f"    第{combo.get('rank', 0)}名: {combo.get('combination', '')} "
+                        f"联合概率={combo.get('joint_probability', 0):.6f}")
+
+            tm.progress(70, "生成预测报告...")
+            tm.log("\n【步骤 3/3】生成预测报告并保存")
+
+            pred_report = generator.generate_prediction_report(prediction_result)
+            tm.log('  预测报告已生成')
+
+            # 保存预测结果到数据库
+            tracker.save_prediction(prediction_result)
+            tm.log('  预测结果已存入数据库')
+
+            # 保存预测报告图表到数据库
+            if database.connect():
+                database.create_tables()
+                sql = '''
+                INSERT INTO p5_next_issue_forecast
+                (base_issue, next_issue, probability_chart, combination_chart, trend_chart, forecast_data)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                forecast_time = CURRENT_TIMESTAMP,
+                probability_chart = VALUES(probability_chart),
+                combination_chart = VALUES(combination_chart),
+                trend_chart = VALUES(trend_chart),
+                forecast_data = VALUES(forecast_data)
+                '''
+                database.cursor.execute(sql, (
+                    prediction_result.get('base_issue', ''),
+                    target_issue,
+                    pred_report.get('probability_chart'),
+                    pred_report.get('combination_chart'),
+                    pred_report.get('trend_chart'),
+                    json.dumps(prediction_result, ensure_ascii=False)
+                ))
+                database.connection.commit()
+                database.disconnect()
+                tm.log('  预测图表及数据已存入数据库')
+
+            # 在UI中显示报告摘要
+            tm.log('\n【预测报告摘要】')
+            summary_lines = pred_report['report_content'].split('\n')
+            for line in summary_lines[:30]:
+                if line.strip():
+                    tm.log(line)
+            if len(summary_lines) > 30:
+                tm.log(f'  ... (共{len(summary_lines)}行，完整报告已保存到数据库)')
+
+            tm.progress(100, "预测完成")
+            tm.log('\n=== 排列5走势预测完成 ===')
+
+        except Exception as e:
+            import traceback
+            tm.log(f'  预测异常: {str(e)}')
+            tm.log(f'  错误详情:\n{traceback.format_exc()}')
+
+    def _execute_p5_accuracy(self, tm):
+        """执行排列5准确率跟踪（后台线程）"""
+        tm.log("=== 排列5预测准确率跟踪 ===\n")
+
+        try:
+            tracker = P5PredictionTracker()
+
+            tm.progress(20, "自动评估最新期...")
+            tm.log("【步骤 1/2】自动评估最新期预测准确率")
+
+            eval_result = tracker.auto_evaluate_latest()
+            if eval_result:
+                tm.log(f'  期号 {eval_result["target_issue"]} 评估完成')
+                tm.log(f'  综合得分: {eval_result["overall_score"]}/100')
+                tm.log(f'  Top-1命中: {eval_result["top1_hit_count"]}/5 位')
+                tm.log(f'  Top-3命中: {eval_result["top3_hit_count"]}/5 位')
+                tm.log(f'  校准得分: {eval_result["calibration_score"]}/100')
+            else:
+                tm.log('  无新数据需要评估（可能已评估过或无预测记录）')
+
+            tm.progress(60, "生成准确率统计...")
+            tm.log("\n【步骤 2/2】生成历史准确率统计报告")
+
+            report_text = tracker.generate_accuracy_report(100)
+            tm.log(report_text)
+
+            tm.progress(100, "完成")
+            tm.log('\n=== 排列5准确率跟踪完成 ===')
+
+        except Exception as e:
+            import traceback
+            tm.log(f'  准确率跟踪异常: {str(e)}')
+            tm.log(f'  错误详情:\n{traceback.format_exc()}')
 
     def _check_database(self, tm):
         """检测并修复数据库表（后台线程）"""
@@ -940,6 +1262,12 @@ class LotteryGUI:
                 head4_count = 0
                 head4_top10_count = 0
 
+            try:
+                database.cursor.execute('SELECT COUNT(*) as count FROM qxc_ai_report')
+                ai_report_count = database.cursor.fetchone()['count']
+            except Exception:
+                ai_report_count = 0
+
             database.disconnect()
 
             qxc_stats = {
@@ -948,7 +1276,8 @@ class LotteryGUI:
                 'detailed': detailed_count,
                 'final': final_count,
                 'head4': head4_count,
-                'head4_top10': head4_top10_count
+                'head4_top10': head4_top10_count,
+                'ai_report': ai_report_count
             }
         else:
             tm.log('  【七星彩】数据库连接失败')
@@ -986,6 +1315,30 @@ class LotteryGUI:
                 head4_count = 0
                 head4_top10_count = 0
 
+            try:
+                database_p5.cursor.execute('SELECT COUNT(*) as count FROM p5_ai_report')
+                ai_report_count = database_p5.cursor.fetchone()['count']
+            except Exception:
+                ai_report_count = 0
+
+            try:
+                database_p5.cursor.execute('SELECT COUNT(*) as count FROM p5_prediction_result')
+                pred_result_count = database_p5.cursor.fetchone()['count']
+            except Exception:
+                pred_result_count = 0
+
+            try:
+                database_p5.cursor.execute('SELECT COUNT(*) as count FROM p5_prediction_accuracy')
+                pred_accuracy_count = database_p5.cursor.fetchone()['count']
+            except Exception:
+                pred_accuracy_count = 0
+
+            try:
+                database_p5.cursor.execute('SELECT COUNT(*) as count FROM p5_next_issue_forecast')
+                forecast_count = database_p5.cursor.fetchone()['count']
+            except Exception:
+                forecast_count = 0
+
             database_p5.disconnect()
 
             p5_stats = {
@@ -994,7 +1347,11 @@ class LotteryGUI:
                 'detailed': detailed_count,
                 'final': final_count,
                 'head4': head4_count,
-                'head4_top10': head4_top10_count
+                'head4_top10': head4_top10_count,
+                'ai_report': ai_report_count,
+                'prediction_result': pred_result_count,
+                'prediction_accuracy': pred_accuracy_count,
+                'forecast': forecast_count
             }
         else:
             tm.log('  【排列5】数据库连接失败')
@@ -1006,6 +1363,7 @@ class LotteryGUI:
         tm.log(f'    最终最优报告: {qxc_stats.get("final", 0)} 份')
         tm.log(f'    头4分析报告: {qxc_stats.get("head4", 0)} 份')
         tm.log(f'    头4最优组合: {qxc_stats.get("head4_top10", 0)} 组')
+        tm.log(f'    AI智能分析报告: {qxc_stats.get("ai_report", 0)} 份')
 
         tm.log("")
         tm.log('  【排列5数据统计】')
@@ -1015,10 +1373,14 @@ class LotteryGUI:
         tm.log(f'    最优分析报告: {p5_stats.get("final", 0)} 份')
         tm.log(f'    头4分析报告: {p5_stats.get("head4", 0)} 份')
         tm.log(f'    头4最优组合: {p5_stats.get("head4_top10", 0)} 组')
+        tm.log(f'    AI智能分析报告: {p5_stats.get("ai_report", 0)} 份')
+        tm.log(f'    预测结果记录: {p5_stats.get("prediction_result", 0)} 条')
+        tm.log(f'    准确率评估记录: {p5_stats.get("prediction_accuracy", 0)} 条')
+        tm.log(f'    走势预测记录: {p5_stats.get("forecast", 0)} 条')
 
         stats_text = (
             f"七星彩: {qxc_stats.get('history', 0)}条数据 | {qxc_stats.get('detailed', 0)}份报告\n"
-            f"排列5: {p5_stats.get('history', 0)}条数据 | {p5_stats.get('detailed', 0)}份报告"
+            f"排列5: {p5_stats.get('history', 0)}条数据 | {p5_stats.get('prediction_result', 0)}条预测 | {p5_stats.get('prediction_accuracy', 0)}条评估"
         )
         tm.stats(stats_text)
 

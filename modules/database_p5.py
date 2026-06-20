@@ -216,6 +216,18 @@ class P5Database:
             # 创建头4最优10组数字组合表
             self._create_head4_top10_table()
 
+            # 创建AI分析报告表
+            self._create_ai_report_table()
+
+            # 创建预测结果表
+            self._create_prediction_result_table()
+
+            # 创建预测准确率跟踪表
+            self._create_prediction_accuracy_table()
+
+            # 创建下期走势预测表
+            self._create_next_issue_forecast_table()
+
             self.connection.commit()
             logger.info('排列5数据表创建成功')
             return True
@@ -289,6 +301,124 @@ class P5Database:
             logger.error(f'创建排列5头4最优10组数字组合表失败: {e}')
             return False
 
+    def _create_ai_report_table(self):
+        """创建排列5AI分析报告表"""
+        try:
+            sql_ai_report = '''
+            CREATE TABLE IF NOT EXISTS p5_ai_report (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
+                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '报告唯一标识',
+                data_count INT NULL DEFAULT NULL COMMENT '分析数据条数',
+                latest_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '最新期号',
+                trend_analysis LONGTEXT NULL DEFAULT NULL COMMENT '趋势分析结果',
+                probability_stats LONGTEXT NULL DEFAULT NULL COMMENT '概率统计数据',
+                recommended_numbers TEXT NULL DEFAULT NULL COMMENT '推荐号码列表',
+                recommended_combinations TEXT NULL DEFAULT NULL COMMENT '推荐组合列表',
+                confidence_scores TEXT NULL DEFAULT NULL COMMENT '置信度分数列表',
+                recommendation_reasons TEXT NULL DEFAULT NULL COMMENT '推荐理由',
+                key_conclusions TEXT NULL DEFAULT NULL COMMENT '关键结论',
+                risk_warning TEXT NULL DEFAULT NULL COMMENT '风险提示',
+                report_content LONGTEXT NULL DEFAULT NULL COMMENT '完整报告内容',
+                report_format TEXT NULL DEFAULT NULL COMMENT '报告格式(JSON/HTML/TEXT)',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX report_uuid (report_uuid ASC) USING BTREE,
+                INDEX idx_report_date (report_date ASC) USING BTREE,
+                INDEX idx_latest_issue (latest_issue ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5AI分析报告表';
+            '''
+            self.cursor.execute(sql_ai_report)
+            logger.info('排列5AI分析报告表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建排列5AI分析报告表失败: {e}')
+            return False
+
+    def _create_prediction_result_table(self):
+        """创建排列5预测结果表"""
+        try:
+            sql = '''
+            CREATE TABLE IF NOT EXISTS p5_prediction_result (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                predict_uuid VARCHAR(36) NOT NULL COMMENT '预测唯一标识',
+                target_issue VARCHAR(20) NOT NULL COMMENT '预测目标期号',
+                base_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '基准期号',
+                predict_time TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '预测时间',
+                algorithm_config LONGTEXT NULL DEFAULT NULL COMMENT '算法配置JSON',
+                position_predictions LONGTEXT NULL DEFAULT NULL COMMENT '各位置概率分布JSON',
+                top_combinations LONGTEXT NULL DEFAULT NULL COMMENT '推荐组合JSON',
+                trend_forecast LONGTEXT NULL DEFAULT NULL COMMENT '走势预测JSON',
+                summary_text LONGTEXT NULL DEFAULT NULL COMMENT '预测摘要文本',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_predict_uuid (predict_uuid ASC) USING BTREE,
+                INDEX idx_target_issue (target_issue ASC) USING BTREE,
+                INDEX idx_base_issue (base_issue ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5预测结果表';
+            '''
+            self.cursor.execute(sql)
+            logger.info('排列5预测结果表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建排列5预测结果表失败: {e}')
+            return False
+
+    def _create_prediction_accuracy_table(self):
+        """创建排列5预测准确率跟踪表"""
+        try:
+            sql = '''
+            CREATE TABLE IF NOT EXISTS p5_prediction_accuracy (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                target_issue VARCHAR(20) NOT NULL COMMENT '目标期号',
+                predict_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '关联预测UUID',
+                actual_numbers TEXT NULL DEFAULT NULL COMMENT '实际开奖号码JSON',
+                position_accuracy LONGTEXT NULL DEFAULT NULL COMMENT '各位置准确率详情JSON',
+                combination_hits LONGTEXT NULL DEFAULT NULL COMMENT '组合匹配详情JSON',
+                overall_score DECIMAL(5,2) NULL DEFAULT NULL COMMENT '综合得分(0-100)',
+                top1_hit_count INT NULL DEFAULT 0 COMMENT 'Top-1命中位数',
+                top3_hit_count INT NULL DEFAULT 0 COMMENT 'Top-3命中位数',
+                calibration_score DECIMAL(5,2) NULL DEFAULT NULL COMMENT '概率校准得分(0-100)',
+                avg_brier_score DECIMAL(10,6) NULL DEFAULT NULL COMMENT '平均Brier分数',
+                evaluated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '评估时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_target_issue (target_issue ASC) USING BTREE,
+                INDEX idx_predict_uuid (predict_uuid ASC) USING BTREE,
+                INDEX idx_evaluated_at (evaluated_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5预测准确率跟踪表';
+            '''
+            self.cursor.execute(sql)
+            logger.info('排列5预测准确率跟踪表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建排列5预测准确率跟踪表失败: {e}')
+            return False
+
+    def _create_next_issue_forecast_table(self):
+        """创建排列5下期走势预测表"""
+        try:
+            sql = '''
+            CREATE TABLE IF NOT EXISTS p5_next_issue_forecast (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                base_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '基准期号',
+                next_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '预测下期期号',
+                forecast_time TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '预测时间',
+                probability_chart LONGBLOB NULL DEFAULT NULL COMMENT '概率分布图',
+                combination_chart LONGBLOB NULL DEFAULT NULL COMMENT '组合排名图',
+                trend_chart LONGBLOB NULL DEFAULT NULL COMMENT '走势预测图',
+                forecast_data LONGTEXT NULL DEFAULT NULL COMMENT '预测数据JSON',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_next_issue (next_issue ASC) USING BTREE,
+                INDEX idx_base_issue (base_issue ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5下期走势预测表';
+            '''
+            self.cursor.execute(sql)
+            logger.info('排列5下期走势预测表创建成功')
+            return True
+        except Exception as e:
+            logger.error(f'创建排列5下期走势预测表失败: {e}')
+            return False
+
     def insert_head4_report(self, report_content, total_samples,
                             head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
                             head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
@@ -359,6 +489,57 @@ class P5Database:
             logger.error(f'插入排列5头4分析报告失败: {e}')
             return False
 
+    def insert_ai_report(self, report_content, data_count, latest_issue,
+                         trend_analysis=None, probability_stats=None,
+                         recommended_numbers=None, recommended_combinations=None,
+                         confidence_scores=None, recommendation_reasons=None,
+                         key_conclusions=None, risk_warning=None, report_format='TEXT'):
+        """
+        插入排列5AI分析报告
+
+        Args:
+            report_content: 完整报告内容
+            data_count: 分析数据条数
+            latest_issue: 最新期号
+            trend_analysis: 趋势分析结果
+            probability_stats: 概率统计数据
+            recommended_numbers: 推荐号码列表
+            recommended_combinations: 推荐组合列表
+            confidence_scores: 置信度分数列表
+            recommendation_reasons: 推荐理由
+            key_conclusions: 关键结论
+            risk_warning: 风险提示
+            report_format: 报告格式(JSON/HTML/TEXT)
+        """
+        try:
+            import uuid
+            report_uuid = str(uuid.uuid4())
+            report_date = datetime.now().strftime('%Y-%m-%d')
+
+            sql = '''
+            INSERT INTO p5_ai_report (
+                report_date, report_uuid, data_count, latest_issue,
+                trend_analysis, probability_stats, recommended_numbers,
+                recommended_combinations, confidence_scores, recommendation_reasons,
+                key_conclusions, risk_warning, report_content, report_format
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            '''
+
+            self.cursor.execute(sql, (
+                report_date, report_uuid, data_count, latest_issue,
+                trend_analysis, probability_stats, recommended_numbers,
+                recommended_combinations, confidence_scores, recommendation_reasons,
+                key_conclusions, risk_warning, report_content, report_format
+            ))
+            self.connection.commit()
+            logger.info('成功插入排列5AI分析报告')
+            return True
+        except Exception as e:
+            logger.error(f'插入排列5AI分析报告失败: {e}')
+            return False
+
     def insert_head4_top10(self, report_uuid, report_date, combinations):
         """
         批量插入排列5头4最优10组数字组合数据
@@ -426,7 +607,9 @@ class P5Database:
             required_tables = [
                 'p5_history_data', 'p5_trend_data',
                 'p5_detailed_report', 'p5_final_report',
-                'p5_head4_report', 'p5_head4_top10'
+                'p5_head4_report', 'p5_head4_top10',
+                'p5_prediction_result', 'p5_prediction_accuracy',
+                'p5_next_issue_forecast'
             ]
 
             # 获取当前数据库名称
@@ -465,7 +648,7 @@ class P5Database:
 
     def insert_history_data(self, data):
         """
-        批量插入历史开奖数据
+        批量插入历史开奖数据（仅插入不存在的数据，不更新已存在的数据）
         
         Args:
             data: 历史数据列表
@@ -476,6 +659,7 @@ class P5Database:
         if not self.connection:
             self.connect()
         
+        total_count = 0
         inserted_count = 0
         try:
             sql = '''
@@ -484,18 +668,7 @@ class P5Database:
              hezhi, hezhi_feature, odd_even_ratio, odd_even_pattern, span)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
-            draw_date = VALUES(draw_date),
-            num_wan = VALUES(num_wan),
-            num_qian = VALUES(num_qian),
-            num_bai = VALUES(num_bai),
-            num_shi = VALUES(num_shi),
-            num_ge = VALUES(num_ge),
-            hezhi = VALUES(hezhi),
-            hezhi_feature = VALUES(hezhi_feature),
-            odd_even_ratio = VALUES(odd_even_ratio),
-            odd_even_pattern = VALUES(odd_even_pattern),
-            span = VALUES(span),
-            updated_at = CURRENT_TIMESTAMP
+                id = id
             '''
             
             for item in data:
@@ -515,12 +688,14 @@ class P5Database:
                         item.get('odd_even_pattern'),
                         item.get('span')
                     ))
-                    inserted_count += 1
+                    total_count += 1
+                    if self.cursor.rowcount > 0:
+                        inserted_count += 1
                 except Exception as e:
                     logger.error(f'插入数据失败 {item.get("issue")}: {e}')
             
             self.connection.commit()
-            logger.info(f'成功插入/更新 {inserted_count} 条历史数据')
+            logger.info(f'处理 {total_count} 条数据，新增 {inserted_count} 条，跳过 {total_count - inserted_count} 条已存在数据')
             return inserted_count
         except Exception as e:
             logger.error(f'批量插入历史数据失败: {e}')
@@ -529,7 +704,7 @@ class P5Database:
     
     def insert_trend_data(self, data):
         """
-        批量插入走势图数据
+        批量插入走势图数据（仅插入不存在的数据，不更新已存在的数据）
         
         Args:
             data: 走势图数据列表
@@ -540,6 +715,7 @@ class P5Database:
         if not self.connection:
             self.connect()
         
+        total_count = 0
         inserted_count = 0
         try:
             sql = '''
@@ -548,17 +724,7 @@ class P5Database:
              hezhi, odd_even_ratio, big_small_ratio, prime_composite_ratio, trend_values)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
-            num_wan = VALUES(num_wan),
-            num_qian = VALUES(num_qian),
-            num_bai = VALUES(num_bai),
-            num_shi = VALUES(num_shi),
-            num_ge = VALUES(num_ge),
-            hezhi = VALUES(hezhi),
-            odd_even_ratio = VALUES(odd_even_ratio),
-            big_small_ratio = VALUES(big_small_ratio),
-            prime_composite_ratio = VALUES(prime_composite_ratio),
-            trend_values = VALUES(trend_values),
-            updated_at = CURRENT_TIMESTAMP
+                id = id
             '''
             
             for item in data:
@@ -580,12 +746,14 @@ class P5Database:
                         item.get('prime_composite_ratio'),
                         trend_values_json
                     ))
-                    inserted_count += 1
+                    total_count += 1
+                    if self.cursor.rowcount > 0:
+                        inserted_count += 1
                 except Exception as e:
                     logger.error(f'插入走势数据失败 {item.get("issue")}: {e}')
             
             self.connection.commit()
-            logger.info(f'成功插入/更新 {inserted_count} 条走势数据')
+            logger.info(f'处理 {total_count} 条走势图数据，新增 {inserted_count} 条，跳过 {total_count - inserted_count} 条已存在数据')
             return inserted_count
         except Exception as e:
             logger.error(f'批量插入走势数据失败: {e}')
@@ -609,7 +777,7 @@ class P5Database:
         try:
             sql = f'''
             SELECT * FROM p5_history_data 
-            ORDER BY issue {order}
+            ORDER BY CAST(issue AS UNSIGNED) {order}
             '''
             if limit:
                 sql += f' LIMIT {limit}'
@@ -660,7 +828,7 @@ class P5Database:
         try:
             sql = f'''
             SELECT * FROM p5_trend_data 
-            ORDER BY issue {order}
+            ORDER BY CAST(issue AS UNSIGNED) {order}
             '''
             if limit:
                 sql += f' LIMIT {limit}'
