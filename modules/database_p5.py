@@ -1,15 +1,18 @@
 """
-排列5数据库操作模块
+排列5数据库操作模块（完整版）
 
-负责排列5数据的数据库连接、表结构管理、数据插入/查询等操作
-包含历史数据表、走势图表、详细报告表、最优报告表
+负责排列5数据的数据库连接、表结构管理、数据存储与查询
+包含：历史数据表、走势数据表、AI分析报告表、预测验证记录表
 """
 
 import pymysql
 import logging
 import json
 import os
+import uuid
 from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple
+from contextlib import contextmanager
 
 os.makedirs('logs', exist_ok=True)
 
@@ -24,14 +27,33 @@ if not logger.handlers:
 
 class P5Database:
     """
-    排列5数据库操作类
+    排列5数据库操作类（完整版）
     
-    负责数据库连接、表结构管理、数据插入/查询等操作
+    负责数据库连接、表结构管理、数据操作
     """
     
     def __init__(self):
         self.connection = None
         self.cursor = None
+        self._in_transaction = False
+    
+    @contextmanager
+    def transaction(self):
+        """事务上下文管理器"""
+        if not self.connection:
+            self.connect()
+        
+        self._in_transaction = True
+        try:
+            yield self
+            self.connection.commit()
+            logger.debug('事务提交成功')
+        except Exception as e:
+            self.connection.rollback()
+            logger.error(f'事务回滚: {e}')
+            raise
+        finally:
+            self._in_transaction = False
     
     def connect(self):
         """连接MySQL数据库"""
@@ -93,1039 +115,731 @@ class P5Database:
         logger.info('MySQL数据库连接已关闭')
     
     def create_tables(self):
-        """创建排列5专用数据表"""
+        """创建排列5数据表（完整版）"""
         try:
-            # 确保数据库已连接
             if not self.connection:
                 self.connect()
             
-            # 1. 历史开奖数据表
+            # 历史开奖数据表
             sql_history = '''
             CREATE TABLE IF NOT EXISTS p5_history_data (
                 id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一标识）',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
                 draw_date VARCHAR(20) NULL DEFAULT NULL COMMENT '开奖日期',
-                num_wan INT NULL DEFAULT NULL COMMENT '万位号码',
-                num_qian INT NULL DEFAULT NULL COMMENT '千位号码',
-                num_bai INT NULL DEFAULT NULL COMMENT '百位号码',
-                num_shi INT NULL DEFAULT NULL COMMENT '十位号码',
-                num_ge INT NULL DEFAULT NULL COMMENT '个位号码',
+                wan TINYINT NOT NULL COMMENT '万位号码(0-9)',
+                qian TINYINT NOT NULL COMMENT '千位号码(0-9)',
+                bai TINYINT NOT NULL COMMENT '百位号码(0-9)',
+                shi TINYINT NOT NULL COMMENT '十位号码(0-9)',
+                ge TINYINT NOT NULL COMMENT '个位号码(0-9)',
                 hezhi INT NULL DEFAULT NULL COMMENT '和值',
-                hezhi_feature VARCHAR(10) NULL DEFAULT NULL COMMENT '和值特征',
-                odd_even_ratio VARCHAR(10) NULL DEFAULT NULL COMMENT '奇偶比例',
-                odd_even_pattern VARCHAR(50) NULL DEFAULT NULL COMMENT '奇偶形态',
                 span INT NULL DEFAULT NULL COMMENT '跨度',
+                odd_even_ratio VARCHAR(10) NULL DEFAULT NULL COMMENT '奇偶比',
+                odd_even_pattern VARCHAR(10) NULL DEFAULT NULL COMMENT '奇偶模式',
+                big_small_ratio VARCHAR(10) NULL DEFAULT NULL COMMENT '大小比',
+                is_valid TINYINT(1) NOT NULL DEFAULT 1 COMMENT '数据有效性(1=有效,0=无效)',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
                 created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                 updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                 PRIMARY KEY (id) USING BTREE,
                 UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
                 INDEX idx_draw_date (draw_date ASC) USING BTREE,
-                INDEX idx_hezhi (hezhi ASC) USING BTREE,
-                INDEX idx_span (span ASC) USING BTREE
+                INDEX idx_created_at (created_at ASC) USING BTREE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5历史开奖数据表';
             '''
             self.cursor.execute(sql_history)
             
-            # 2. 走势图数据表
+            # 走势图数据表
             sql_trend = '''
             CREATE TABLE IF NOT EXISTS p5_trend_data (
                 id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                issue VARCHAR(20) NOT NULL COMMENT '期号（关联开奖数据）',
-                num_wan INT NULL DEFAULT NULL COMMENT '万位号码',
-                num_qian INT NULL DEFAULT NULL COMMENT '千位号码',
-                num_bai INT NULL DEFAULT NULL COMMENT '百位号码',
-                num_shi INT NULL DEFAULT NULL COMMENT '十位号码',
-                num_ge INT NULL DEFAULT NULL COMMENT '个位号码',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                wan TINYINT NOT NULL COMMENT '万位号码',
+                qian TINYINT NOT NULL COMMENT '千位号码',
+                bai TINYINT NOT NULL COMMENT '百位号码',
+                shi TINYINT NOT NULL COMMENT '十位号码',
+                ge TINYINT NOT NULL COMMENT '个位号码',
                 hezhi VARCHAR(10) NULL DEFAULT NULL COMMENT '和值',
                 odd_even_ratio VARCHAR(10) NULL DEFAULT NULL COMMENT '奇偶比',
                 big_small_ratio VARCHAR(10) NULL DEFAULT NULL COMMENT '大小比',
                 prime_composite_ratio VARCHAR(10) NULL DEFAULT NULL COMMENT '质合比',
-                trend_values TEXT NULL DEFAULT NULL COMMENT '走势图详细数据JSON',
+                wan_omission INT NULL DEFAULT 0 COMMENT '万位遗漏值',
+                qian_omission INT NULL DEFAULT 0 COMMENT '千位遗漏值',
+                bai_omission INT NULL DEFAULT 0 COMMENT '百位遗漏值',
+                shi_omission INT NULL DEFAULT 0 COMMENT '十位遗漏值',
+                ge_omission INT NULL DEFAULT 0 COMMENT '个位遗漏值',
+                trend_json LONGTEXT NULL DEFAULT NULL COMMENT '走势图JSON数据',
                 created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                 PRIMARY KEY (id) USING BTREE,
-                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
-                INDEX idx_draw_date (issue ASC) USING BTREE
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5走势图数据表';
             '''
             self.cursor.execute(sql_trend)
             
-            # 3. 详细分析报告表
-            sql_detailed_report = '''
-            CREATE TABLE IF NOT EXISTS p5_detailed_report (
-                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
-                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '报告唯一标识',
-                raw_data_snapshot LONGTEXT NULL DEFAULT NULL COMMENT '原始数据快照',
-                calculation_steps LONGTEXT NULL DEFAULT NULL COMMENT '计算步骤记录',
-                analysis_params TEXT NULL DEFAULT NULL COMMENT '分析参数配置',
-                frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '频率分析结果',
-                probability_analysis LONGTEXT NULL DEFAULT NULL COMMENT '概率分析结果',
-                interval_analysis LONGTEXT NULL DEFAULT NULL COMMENT '间隔分析结果',
-                hezhi_analysis LONGTEXT NULL DEFAULT NULL COMMENT '和值分析结果',
-                odd_even_analysis LONGTEXT NULL DEFAULT NULL COMMENT '奇偶分析结果',
-                span_analysis LONGTEXT NULL DEFAULT NULL COMMENT '跨度分析结果',
-                big_small_analysis LONGTEXT NULL DEFAULT NULL COMMENT '大小分析结果',
-                trend_analysis LONGTEXT NULL DEFAULT NULL COMMENT '走势分析结果',
-                total_samples INT NULL DEFAULT NULL COMMENT '分析样本数',
-                confidence_level DECIMAL(5,2) NULL DEFAULT NULL COMMENT '置信水平',
-                report_content LONGTEXT NULL DEFAULT NULL COMMENT '报告内容',
-                frequency_chart LONGBLOB NULL DEFAULT NULL COMMENT '频率分布图',
-                probability_chart LONGBLOB NULL DEFAULT NULL COMMENT '概率分布图',
-                trend_chart LONGBLOB NULL DEFAULT NULL COMMENT '趋势分析图',
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-                PRIMARY KEY (id) USING BTREE,
-                UNIQUE INDEX uk_report_uuid (report_uuid ASC) USING BTREE,
-                INDEX idx_report_date (report_date ASC) USING BTREE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5详细分析报告表';
-            '''
-            self.cursor.execute(sql_detailed_report)
-            
-            # 4. 最终最优报告表
-            sql_final_report = '''
-            CREATE TABLE IF NOT EXISTS p5_final_report (
-                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                detailed_report_id INT NULL DEFAULT NULL COMMENT '关联详细报告ID',
-                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
-                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '报告唯一标识',
-                recommended_numbers VARCHAR(50) NULL DEFAULT NULL COMMENT '推荐号码组合',
-                confidence_score DECIMAL(5,2) NULL DEFAULT NULL COMMENT '置信分数',
-                analysis_summary TEXT NULL DEFAULT NULL COMMENT '分析摘要',
-                key_conclusions TEXT NULL DEFAULT NULL COMMENT '关键结论',
-                core_metrics TEXT NULL DEFAULT NULL COMMENT '核心指标',
-                decision_recommendations TEXT NULL DEFAULT NULL COMMENT '决策建议',
-                report_content TEXT NULL DEFAULT NULL COMMENT '报告内容',
-                frequency_chart LONGBLOB NULL DEFAULT NULL COMMENT '频率分布图',
-                probability_chart LONGBLOB NULL DEFAULT NULL COMMENT '概率分布图',
-                status ENUM('draft', 'validated', 'published') NULL DEFAULT 'draft' COMMENT '报告状态',
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                PRIMARY KEY (id) USING BTREE,
-                UNIQUE INDEX uk_report_uuid (report_uuid ASC) USING BTREE,
-                INDEX idx_final_report_date (report_date ASC) USING BTREE,
-                INDEX idx_detailed_report_id (detailed_report_id ASC) USING BTREE,
-                CONSTRAINT fk_p5_detailed_report FOREIGN KEY (detailed_report_id) 
-                    REFERENCES p5_detailed_report(id) ON DELETE CASCADE ON UPDATE RESTRICT
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5最终最优报告表';
-            '''
-            self.cursor.execute(sql_final_report)
-
-            # 创建头4分析报告表
-            self._create_head4_report_table()
-
-            # 创建头4最优10组数字组合表
-            self._create_head4_top10_table()
-
-            # 创建AI分析报告表
-            self._create_ai_report_table()
-
-            # 创建预测结果表
-            self._create_prediction_result_table()
-
-            # 创建预测准确率跟踪表
-            self._create_prediction_accuracy_table()
-
-            # 创建下期走势预测表
-            self._create_next_issue_forecast_table()
-
-            self.connection.commit()
-            logger.info('排列5数据表创建成功')
-            return True
-        except Exception as e:
-            logger.error(f'创建数据表失败: {e}')
-            return False
-
-    def _create_head4_report_table(self):
-        """创建排列5头4分析报告表"""
-        try:
-            sql_head4_report = '''
-            CREATE TABLE IF NOT EXISTS p5_head4_report (
-                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
-                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '报告唯一标识',
-                head_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '头(万位)频率分析结果',
-                middle_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '中间(千位+百位)频率分析结果',
-                tail_frequency_analysis LONGTEXT NULL DEFAULT NULL COMMENT '尾(十位)频率分析结果',
-                head_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '头遗漏值分析结果',
-                middle_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '中间遗漏值分析结果',
-                tail_omission_analysis LONGTEXT NULL DEFAULT NULL COMMENT '尾遗漏值分析结果',
-                head_tail_combination LONGTEXT NULL DEFAULT NULL COMMENT '头尾组合分析结果',
-                middle_features LONGTEXT NULL DEFAULT NULL COMMENT '中间位特征分析结果',
-                total_samples INT NULL DEFAULT NULL COMMENT '分析样本数',
-                confidence_level DECIMAL(5,2) NULL DEFAULT NULL COMMENT '置信水平',
-                report_content LONGTEXT NULL DEFAULT NULL COMMENT '报告内容',
-                frequency_chart LONGBLOB NULL DEFAULT NULL COMMENT '频率分布图',
-                probability_chart LONGBLOB NULL DEFAULT NULL COMMENT '概率分布图',
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-                PRIMARY KEY (id) USING BTREE,
-                UNIQUE INDEX report_uuid (report_uuid ASC) USING BTREE,
-                INDEX idx_report_date (report_date ASC) USING BTREE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5头4分析报告表';
-            '''
-            self.cursor.execute(sql_head4_report)
-            logger.info('排列5头4分析报告表创建成功')
-            return True
-        except Exception as e:
-            logger.error(f'创建排列5头4分析报告表失败: {e}')
-            return False
-
-    def _create_head4_top10_table(self):
-        """创建排列5头4最优10组数字组合表"""
-        try:
-            sql_head4_top10 = '''
-            CREATE TABLE IF NOT EXISTS p5_head4_top10 (
-                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '关联报告UUID',
-                report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
-                rank_no INT NOT NULL COMMENT '排名(1-10)',
-                combination VARCHAR(20) NOT NULL COMMENT '组合(如:3-45-7)',
-                head_num INT NULL DEFAULT NULL COMMENT '头位数字(万位)',
-                middle_num INT NULL DEFAULT NULL COMMENT '中间组合数字(千位+百位)',
-                tail_num INT NULL DEFAULT NULL COMMENT '尾位数字(十位)',
-                score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '综合得分',
-                head_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '头位得分',
-                middle_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '中间组合得分',
-                tail_score DECIMAL(10,4) NULL DEFAULT NULL COMMENT '尾位得分',
-                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-                PRIMARY KEY (id) USING BTREE,
-                INDEX idx_report_uuid (report_uuid ASC) USING BTREE,
-                INDEX idx_report_date (report_date ASC) USING BTREE,
-                INDEX idx_rank_no (rank_no ASC) USING BTREE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5头4最优10组数字组合表';
-            '''
-            self.cursor.execute(sql_head4_top10)
-            logger.info('排列5头4最优10组数字组合表创建成功')
-            return True
-        except Exception as e:
-            logger.error(f'创建排列5头4最优10组数字组合表失败: {e}')
-            return False
-
-    def _create_ai_report_table(self):
-        """创建排列5AI分析报告表"""
-        try:
+            # AI分析报告表
             sql_ai_report = '''
             CREATE TABLE IF NOT EXISTS p5_ai_report (
                 id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
                 report_date VARCHAR(20) NULL DEFAULT NULL COMMENT '报告日期',
                 report_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '报告唯一标识',
                 data_count INT NULL DEFAULT NULL COMMENT '分析数据条数',
-                latest_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '最新期号',
-                trend_analysis LONGTEXT NULL DEFAULT NULL COMMENT '趋势分析结果',
-                probability_stats LONGTEXT NULL DEFAULT NULL COMMENT '概率统计数据',
-                recommended_numbers TEXT NULL DEFAULT NULL COMMENT '推荐号码列表',
-                recommended_combinations TEXT NULL DEFAULT NULL COMMENT '推荐组合列表',
-                confidence_scores TEXT NULL DEFAULT NULL COMMENT '置信度分数列表',
+                latest_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '分析时的最新期号',
+                next_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '预测目标期号',
+                trend_analysis LONGTEXT NULL DEFAULT NULL COMMENT '趋势分析结果(JSON)',
+                probability_stats LONGTEXT NULL DEFAULT NULL COMMENT '概率统计数据(JSON)',
+                recommended_numbers TEXT NULL DEFAULT NULL COMMENT '推荐号码列表(JSON)',
+                recommended_combinations TEXT NULL DEFAULT NULL COMMENT '推荐组合列表(JSON)',
+                confidence_scores TEXT NULL DEFAULT NULL COMMENT '置信度分数列表(JSON)',
                 recommendation_reasons TEXT NULL DEFAULT NULL COMMENT '推荐理由',
                 key_conclusions TEXT NULL DEFAULT NULL COMMENT '关键结论',
                 risk_warning TEXT NULL DEFAULT NULL COMMENT '风险提示',
                 report_content LONGTEXT NULL DEFAULT NULL COMMENT '完整报告内容',
-                report_format TEXT NULL DEFAULT NULL COMMENT '报告格式(JSON/HTML/TEXT)',
+                report_format VARCHAR(20) NULL DEFAULT 'TEXT' COMMENT '报告格式(JSON/HTML/TEXT)',
                 created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                 updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                 PRIMARY KEY (id) USING BTREE,
-                UNIQUE INDEX report_uuid (report_uuid ASC) USING BTREE,
+                UNIQUE INDEX uk_report_uuid (report_uuid ASC) USING BTREE,
                 INDEX idx_report_date (report_date ASC) USING BTREE,
-                INDEX idx_latest_issue (latest_issue ASC) USING BTREE
+                INDEX idx_latest_issue (latest_issue ASC) USING BTREE,
+                INDEX idx_next_issue (next_issue ASC) USING BTREE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5AI分析报告表';
             '''
             self.cursor.execute(sql_ai_report)
-            logger.info('排列5AI分析报告表创建成功')
-            return True
-        except Exception as e:
-            logger.error(f'创建排列5AI分析报告表失败: {e}')
-            return False
-
-    def _create_prediction_result_table(self):
-        """创建排列5预测结果表"""
-        try:
-            sql = '''
-            CREATE TABLE IF NOT EXISTS p5_prediction_result (
+            
+            # 预测验证记录表
+            sql_prediction = '''
+            CREATE TABLE IF NOT EXISTS p5_prediction_record (
                 id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                predict_uuid VARCHAR(36) NOT NULL COMMENT '预测唯一标识',
+                report_uuid VARCHAR(36) NOT NULL COMMENT '关联的报告UUID',
                 target_issue VARCHAR(20) NOT NULL COMMENT '预测目标期号',
-                base_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '基准期号',
-                predict_time TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '预测时间',
-                algorithm_config LONGTEXT NULL DEFAULT NULL COMMENT '算法配置JSON',
-                position_predictions LONGTEXT NULL DEFAULT NULL COMMENT '各位置概率分布JSON',
-                top_combinations LONGTEXT NULL DEFAULT NULL COMMENT '推荐组合JSON',
-                trend_forecast LONGTEXT NULL DEFAULT NULL COMMENT '走势预测JSON',
-                summary_text LONGTEXT NULL DEFAULT NULL COMMENT '预测摘要文本',
+                predicted_numbers TEXT NULL DEFAULT NULL COMMENT '预测号码(JSON格式，各位置推荐)',
+                predicted_combinations TEXT NULL DEFAULT NULL COMMENT '预测组合列表(JSON)',
+                confidence_scores TEXT NULL DEFAULT NULL COMMENT '各位置置信度(JSON)',
+                actual_numbers TEXT NULL DEFAULT NULL COMMENT '实际开奖号码(JSON)',
+                actual_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '实际开奖期号',
+                is_matched TINYINT(1) NULL DEFAULT NULL COMMENT '是否完全猜中(1=是,0=否)',
+                match_count INT NULL DEFAULT 0 COMMENT '命中位数(0-5)',
+                match_details TEXT NULL DEFAULT NULL COMMENT '各位置命中详情(JSON)',
+                wan_match TINYINT(1) NULL DEFAULT 0 COMMENT '万位是否命中',
+                qian_match TINYINT(1) NULL DEFAULT 0 COMMENT '千位是否命中',
+                bai_match TINYINT(1) NULL DEFAULT 0 COMMENT '百位是否命中',
+                shi_match TINYINT(1) NULL DEFAULT 0 COMMENT '十位是否命中',
+                ge_match TINYINT(1) NULL DEFAULT 0 COMMENT '个位是否命中',
+                deviation_analysis TEXT NULL DEFAULT NULL COMMENT '偏差分析',
+                accuracy_rate DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '准确率(命中位数/5*100)',
+                verification_status VARCHAR(20) NULL DEFAULT 'pending' COMMENT '验证状态(pending/verified/failed)',
+                verified_at TIMESTAMP NULL DEFAULT NULL COMMENT '验证时间',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                 PRIMARY KEY (id) USING BTREE,
-                UNIQUE INDEX uk_predict_uuid (predict_uuid ASC) USING BTREE,
+                UNIQUE INDEX uk_report_issue (report_uuid ASC, target_issue ASC) USING BTREE,
                 INDEX idx_target_issue (target_issue ASC) USING BTREE,
-                INDEX idx_base_issue (base_issue ASC) USING BTREE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5预测结果表';
+                INDEX idx_verification_status (verification_status ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5预测验证记录表';
             '''
-            self.cursor.execute(sql)
-            logger.info('排列5预测结果表创建成功')
-            return True
-        except Exception as e:
-            logger.error(f'创建排列5预测结果表失败: {e}')
-            return False
-
-    def _create_prediction_accuracy_table(self):
-        """创建排列5预测准确率跟踪表"""
-        try:
-            sql = '''
-            CREATE TABLE IF NOT EXISTS p5_prediction_accuracy (
+            self.cursor.execute(sql_prediction)
+            
+            # 预测性能统计表
+            sql_performance = '''
+            CREATE TABLE IF NOT EXISTS p5_performance_stats (
                 id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                target_issue VARCHAR(20) NOT NULL COMMENT '目标期号',
-                predict_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '关联预测UUID',
-                actual_numbers TEXT NULL DEFAULT NULL COMMENT '实际开奖号码JSON',
-                position_accuracy LONGTEXT NULL DEFAULT NULL COMMENT '各位置准确率详情JSON',
-                combination_hits LONGTEXT NULL DEFAULT NULL COMMENT '组合匹配详情JSON',
-                overall_score DECIMAL(5,2) NULL DEFAULT NULL COMMENT '综合得分(0-100)',
-                top1_hit_count INT NULL DEFAULT 0 COMMENT 'Top-1命中位数',
-                top3_hit_count INT NULL DEFAULT 0 COMMENT 'Top-3命中位数',
-                calibration_score DECIMAL(5,2) NULL DEFAULT NULL COMMENT '概率校准得分(0-100)',
-                avg_brier_score DECIMAL(10,6) NULL DEFAULT NULL COMMENT '平均Brier分数',
-                evaluated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '评估时间',
+                stat_date VARCHAR(20) NULL DEFAULT NULL COMMENT '统计日期',
+                total_predictions INT NULL DEFAULT 0 COMMENT '总预测次数',
+                total_matched INT NULL DEFAULT 0 COMMENT '完全猜中次数',
+                total_partial_match INT NULL DEFAULT 0 COMMENT '部分命中次数',
+                avg_match_count DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '平均命中位数',
+                wan_accuracy DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '万位命中率',
+                qian_accuracy DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '千位命中率',
+                bai_accuracy DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '百位命中率',
+                shi_accuracy DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '十位命中率',
+                ge_accuracy DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '个位命中率',
+                overall_accuracy DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '综合命中率',
+                best_streak INT NULL DEFAULT 0 COMMENT '最长连中次数',
+                current_streak INT NULL DEFAULT 0 COMMENT '当前连中次数',
+                performance_json LONGTEXT NULL DEFAULT NULL COMMENT '详细性能数据(JSON)',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
                 PRIMARY KEY (id) USING BTREE,
-                UNIQUE INDEX uk_target_issue (target_issue ASC) USING BTREE,
-                INDEX idx_predict_uuid (predict_uuid ASC) USING BTREE,
-                INDEX idx_evaluated_at (evaluated_at ASC) USING BTREE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5预测准确率跟踪表';
+                UNIQUE INDEX uk_stat_date (stat_date ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5预测性能统计表';
             '''
-            self.cursor.execute(sql)
-            logger.info('排列5预测准确率跟踪表创建成功')
-            return True
-        except Exception as e:
-            logger.error(f'创建排列5预测准确率跟踪表失败: {e}')
-            return False
-
-    def _create_next_issue_forecast_table(self):
-        """创建排列5下期走势预测表"""
-        try:
-            sql = '''
-            CREATE TABLE IF NOT EXISTS p5_next_issue_forecast (
-                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                base_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '基准期号',
-                next_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '预测下期期号',
-                forecast_time TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '预测时间',
-                probability_chart LONGBLOB NULL DEFAULT NULL COMMENT '概率分布图',
-                combination_chart LONGBLOB NULL DEFAULT NULL COMMENT '组合排名图',
-                trend_chart LONGBLOB NULL DEFAULT NULL COMMENT '走势预测图',
-                forecast_data LONGTEXT NULL DEFAULT NULL COMMENT '预测数据JSON',
-                PRIMARY KEY (id) USING BTREE,
-                UNIQUE INDEX uk_next_issue (next_issue ASC) USING BTREE,
-                INDEX idx_base_issue (base_issue ASC) USING BTREE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5下期走势预测表';
-            '''
-            self.cursor.execute(sql)
-            logger.info('排列5下期走势预测表创建成功')
-            return True
-        except Exception as e:
-            logger.error(f'创建排列5下期走势预测表失败: {e}')
-            return False
-
-    def insert_head4_report(self, report_content, total_samples,
-                            head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
-                            head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
-                            head_tail_combination, middle_features,
-                            confidence_level=None, frequency_chart=None, probability_chart=None):
-        """
-        插入排列5头4分析报告
-
-        Args:
-            report_content: 报告内容
-            total_samples: 分析样本数
-            head_frequency_analysis: 头(万位)频率分析结果
-            middle_frequency_analysis: 中间(千位+百位)频率分析结果
-            tail_frequency_analysis: 尾(十位)频率分析结果
-            head_omission_analysis: 头遗漏值分析结果
-            middle_omission_analysis: 中间遗漏值分析结果
-            tail_omission_analysis: 尾遗漏值分析结果
-            head_tail_combination: 头尾组合分析结果
-            middle_features: 中间位特征分析结果
-            confidence_level: 置信水平
-            frequency_chart: 频率分布图
-            probability_chart: 概率分布图
-
-        Returns:
-            True表示成功，False表示失败
-        """
-        try:
-            import uuid
-            report_date = datetime.now().strftime('%Y-%m-%d')
-            report_uuid = str(uuid.uuid4())
-
-            sql = '''
-            INSERT INTO p5_head4_report
-            (report_date, report_uuid, head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
-             head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
-             head_tail_combination, middle_features, total_samples, confidence_level, report_content,
-             frequency_chart, probability_chart)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                head_frequency_analysis = VALUES(head_frequency_analysis),
-                middle_frequency_analysis = VALUES(middle_frequency_analysis),
-                tail_frequency_analysis = VALUES(tail_frequency_analysis),
-                head_omission_analysis = VALUES(head_omission_analysis),
-                middle_omission_analysis = VALUES(middle_omission_analysis),
-                tail_omission_analysis = VALUES(tail_omission_analysis),
-                head_tail_combination = VALUES(head_tail_combination),
-                middle_features = VALUES(middle_features),
-                total_samples = VALUES(total_samples),
-                confidence_level = VALUES(confidence_level),
-                report_content = VALUES(report_content),
-                frequency_chart = VALUES(frequency_chart),
-                probability_chart = VALUES(probability_chart),
-                updated_at = CURRENT_TIMESTAMP
-            '''
-
-            self.cursor.execute(sql, (
-                report_date, report_uuid,
-                head_frequency_analysis, middle_frequency_analysis, tail_frequency_analysis,
-                head_omission_analysis, middle_omission_analysis, tail_omission_analysis,
-                head_tail_combination, middle_features,
-                total_samples, confidence_level, report_content,
-                frequency_chart, probability_chart
-            ))
+            self.cursor.execute(sql_performance)
+            
             self.connection.commit()
-            logger.info('成功插入排列5头4分析报告')
+            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、性能统计）')
             return True
         except Exception as e:
-            logger.error(f'插入排列5头4分析报告失败: {e}')
+            logger.error(f'创建数据表失败: {e}')
             return False
-
-    def insert_ai_report(self, report_content, data_count, latest_issue,
-                         trend_analysis=None, probability_stats=None,
-                         recommended_numbers=None, recommended_combinations=None,
-                         confidence_scores=None, recommendation_reasons=None,
-                         key_conclusions=None, risk_warning=None, report_format='TEXT'):
+    
+    # ============================================================
+    # 历史数据操作
+    # ============================================================
+    
+    def insert_history_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        插入排列5AI分析报告
-
-        Args:
-            report_content: 完整报告内容
-            data_count: 分析数据条数
-            latest_issue: 最新期号
-            trend_analysis: 趋势分析结果
-            probability_stats: 概率统计数据
-            recommended_numbers: 推荐号码列表
-            recommended_combinations: 推荐组合列表
-            confidence_scores: 置信度分数列表
-            recommendation_reasons: 推荐理由
-            key_conclusions: 关键结论
-            risk_warning: 风险提示
-            report_format: 报告格式(JSON/HTML/TEXT)
-        """
-        try:
-            import uuid
-            report_uuid = str(uuid.uuid4())
-            report_date = datetime.now().strftime('%Y-%m-%d')
-
-            sql = '''
-            INSERT INTO p5_ai_report (
-                report_date, report_uuid, data_count, latest_issue,
-                trend_analysis, probability_stats, recommended_numbers,
-                recommended_combinations, confidence_scores, recommendation_reasons,
-                key_conclusions, risk_warning, report_content, report_format
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
-            '''
-
-            self.cursor.execute(sql, (
-                report_date, report_uuid, data_count, latest_issue,
-                trend_analysis, probability_stats, recommended_numbers,
-                recommended_combinations, confidence_scores, recommendation_reasons,
-                key_conclusions, risk_warning, report_content, report_format
-            ))
-            self.connection.commit()
-            logger.info('成功插入排列5AI分析报告')
-            return True
-        except Exception as e:
-            logger.error(f'插入排列5AI分析报告失败: {e}')
-            return False
-
-    def insert_head4_top10(self, report_uuid, report_date, combinations):
-        """
-        批量插入排列5头4最优10组数字组合数据
-
-        Args:
-            report_uuid: 关联的报告UUID
-            report_date: 报告日期
-            combinations: 组合列表，每项包含:
-                - rank: 排名(1-10)
-                - combination: 组合字符串(如:3-45-7)
-                - head: 头位数字(万位)
-                - middle: 中间组合数字(千位+百位)
-                - tail: 尾位数字(十位)
-                - score: 综合得分
-                - head_score: 头位得分
-                - middle_score: 中间组合得分
-                - tail_score: 尾位得分
-
-        Returns:
-            成功插入的记录数
-        """
-        try:
-            sql = '''
-            INSERT INTO p5_head4_top10
-            (report_uuid, report_date, rank_no, combination,
-             head_num, middle_num, tail_num,
-             score, head_score, middle_score, tail_score)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            '''
-
-            count = 0
-            for item in combinations:
-                try:
-                    self.cursor.execute(sql, (
-                        report_uuid,
-                        report_date,
-                        item['rank'],
-                        item['combination'],
-                        item['head'],
-                        item['middle'],
-                        item['tail'],
-                        item['score'],
-                        item['head_score'],
-                        item['middle_score'],
-                        item['tail_score']
-                    ))
-                    count += 1
-                except Exception as e:
-                    logger.error(f'插入排列5头4最优组合失败(排名{item.get("rank")}): {e}')
-
-            self.connection.commit()
-            logger.info(f'成功插入 {count} 条排列5头4最优组合数据')
-            return count
-        except Exception as e:
-            logger.error(f'批量插入排列5头4最优组合数据失败: {e}')
-            return 0
-
-    def check_and_repair_tables(self):
-        """检查排列5数据库表状态，自动修复缺失的表"""
-        try:
-            if not self.connection:
-                if not self.connect():
-                    return {'status': 'error', 'message': '数据库连接失败'}
-
-            required_tables = [
-                'p5_history_data', 'p5_trend_data',
-                'p5_detailed_report', 'p5_final_report',
-                'p5_head4_report', 'p5_head4_top10',
-                'p5_prediction_result', 'p5_prediction_accuracy',
-                'p5_next_issue_forecast'
-            ]
-
-            # 获取当前数据库名称
-            self.cursor.execute("SELECT DATABASE()")
-            db_name_result = self.cursor.fetchone()
-            db_name = db_name_result['DATABASE()'] if db_name_result else None
-
-            # 获取现有表
-            self.cursor.execute("SHOW TABLES")
-            rows = self.cursor.fetchall()
-            if db_name:
-                existing_tables = [row[f'Tables_in_{db_name}'] for row in rows]
-            else:
-                existing_tables = [list(row.values())[0] for row in rows]
-
-            missing_tables = [t for t in required_tables if t not in existing_tables]
-
-            if missing_tables:
-                logger.info(f'检测到缺失的表: {missing_tables}，开始自动修复')
-                self.create_tables()
-                return {
-                    'status': 'repaired',
-                    'message': f'已自动修复 {len(missing_tables)} 个缺失的表',
-                    'missing': missing_tables,
-                    'existing': existing_tables
-                }
-            else:
-                return {
-                    'status': 'ok',
-                    'message': '所有表结构正常',
-                    'existing': existing_tables
-                }
-        except Exception as e:
-            logger.error(f'检查修复表失败: {e}')
-            return {'status': 'error', 'message': str(e)}
-
-    def insert_history_data(self, data):
-        """
-        批量插入历史开奖数据（仅插入不存在的数据，不更新已存在的数据）
+        批量插入历史开奖数据（智能去重）
         
         Args:
             data: 历史数据列表
         
         Returns:
-            成功插入的记录数
+            (成功条数, 跳过条数)
         """
-        if not self.connection:
-            self.connect()
+        if not data:
+            return 0, 0
         
-        total_count = 0
-        inserted_count = 0
+        success_count = 0
+        skip_count = 0
+        
         try:
+            # 获取已有期号
+            self.cursor.execute('SELECT issue FROM p5_history_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            
             sql = '''
             INSERT INTO p5_history_data 
-            (issue, draw_date, num_wan, num_qian, num_bai, num_shi, num_ge, 
-             hezhi, hezhi_feature, odd_even_ratio, odd_even_pattern, span)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                id = id
-            '''
-            
-            for item in data:
-                try:
-                    numbers = item['numbers']
-                    self.cursor.execute(sql, (
-                        item['issue'],
-                        item['date'],
-                        numbers[0] if len(numbers) > 0 else None,
-                        numbers[1] if len(numbers) > 1 else None,
-                        numbers[2] if len(numbers) > 2 else None,
-                        numbers[3] if len(numbers) > 3 else None,
-                        numbers[4] if len(numbers) > 4 else None,
-                        item.get('hezhi'),
-                        item.get('hezhi_feature'),
-                        item.get('odd_even_ratio'),
-                        item.get('odd_even_pattern'),
-                        item.get('span')
-                    ))
-                    total_count += 1
-                    if self.cursor.rowcount > 0:
-                        inserted_count += 1
-                except Exception as e:
-                    logger.error(f'插入数据失败 {item.get("issue")}: {e}')
-            
-            self.connection.commit()
-            logger.info(f'处理 {total_count} 条数据，新增 {inserted_count} 条，跳过 {total_count - inserted_count} 条已存在数据')
-            return inserted_count
-        except Exception as e:
-            logger.error(f'批量插入历史数据失败: {e}')
-            self.connection.rollback()
-            return 0
-    
-    def insert_trend_data(self, data):
-        """
-        批量插入走势图数据（仅插入不存在的数据，不更新已存在的数据）
-        
-        Args:
-            data: 走势图数据列表
-        
-        Returns:
-            成功插入的记录数
-        """
-        if not self.connection:
-            self.connect()
-        
-        total_count = 0
-        inserted_count = 0
-        try:
-            sql = '''
-            INSERT INTO p5_trend_data 
-            (issue, num_wan, num_qian, num_bai, num_shi, num_ge, 
-             hezhi, odd_even_ratio, big_small_ratio, prime_composite_ratio, trend_values)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                id = id
-            '''
-            
-            for item in data:
-                try:
-                    numbers = item.get('numbers', [])
-                    trend = item.get('trend', {})
-                    trend_values_json = json.dumps(trend, ensure_ascii=False) if trend else None
-                    
-                    self.cursor.execute(sql, (
-                        item['issue'],
-                        numbers[0] if len(numbers) > 0 else None,
-                        numbers[1] if len(numbers) > 1 else None,
-                        numbers[2] if len(numbers) > 2 else None,
-                        numbers[3] if len(numbers) > 3 else None,
-                        numbers[4] if len(numbers) > 4 else None,
-                        item.get('hezhi'),
-                        item.get('odd_even_ratio'),
-                        item.get('big_small_ratio'),
-                        item.get('prime_composite_ratio'),
-                        trend_values_json
-                    ))
-                    total_count += 1
-                    if self.cursor.rowcount > 0:
-                        inserted_count += 1
-                except Exception as e:
-                    logger.error(f'插入走势数据失败 {item.get("issue")}: {e}')
-            
-            self.connection.commit()
-            logger.info(f'处理 {total_count} 条走势图数据，新增 {inserted_count} 条，跳过 {total_count - inserted_count} 条已存在数据')
-            return inserted_count
-        except Exception as e:
-            logger.error(f'批量插入走势数据失败: {e}')
-            self.connection.rollback()
-            return 0
-    
-    def get_history_data(self, limit=None, order='DESC'):
-        """
-        查询历史开奖数据
-        
-        Args:
-            limit: 限制返回数量
-            order: 排序方式（ASC/DESC）
-        
-        Returns:
-            历史数据列表
-        """
-        if not self.connection:
-            self.connect()
-        
-        try:
-            sql = f'''
-            SELECT * FROM p5_history_data 
-            ORDER BY CAST(issue AS UNSIGNED) {order}
-            '''
-            if limit:
-                sql += f' LIMIT {limit}'
-            
-            self.cursor.execute(sql)
-            results = self.cursor.fetchall()
-            
-            # 转换为统一格式
-            data = []
-            for row in results:
-                numbers = [
-                    row['num_wan'],
-                    row['num_qian'],
-                    row['num_bai'],
-                    row['num_shi'],
-                    row['num_ge']
-                ]
-                data.append({
-                    'issue': row['issue'],
-                    'date': row['draw_date'],
-                    'numbers': numbers,
-                    'hezhi': row['hezhi'],
-                    'hezhi_feature': row['hezhi_feature'],
-                    'odd_even_ratio': row['odd_even_ratio'],
-                    'odd_even_pattern': row['odd_even_pattern'],
-                    'span': row['span']
-                })
-            
-            return data
-        except Exception as e:
-            logger.error(f'查询历史数据失败: {e}')
-            return []
-    
-    def get_trend_data(self, limit=None, order='DESC'):
-        """
-        查询走势图数据
-        
-        Args:
-            limit: 限制返回数量
-            order: 排序方式（ASC/DESC）
-        
-        Returns:
-            走势数据列表
-        """
-        if not self.connection:
-            self.connect()
-        
-        try:
-            sql = f'''
-            SELECT * FROM p5_trend_data 
-            ORDER BY CAST(issue AS UNSIGNED) {order}
-            '''
-            if limit:
-                sql += f' LIMIT {limit}'
-            
-            self.cursor.execute(sql)
-            results = self.cursor.fetchall()
-            
-            # 转换为统一格式
-            data = []
-            for row in results:
-                numbers = [
-                    row['num_wan'],
-                    row['num_qian'],
-                    row['num_bai'],
-                    row['num_shi'],
-                    row['num_ge']
-                ]
-                trend = json.loads(row['trend_values']) if row['trend_values'] else {}
-                data.append({
-                    'issue': row['issue'],
-                    'numbers': numbers,
-                    'trend': trend,
-                    'hezhi': row['hezhi'],
-                    'odd_even_ratio': row['odd_even_ratio'],
-                    'big_small_ratio': row['big_small_ratio'],
-                    'prime_composite_ratio': row['prime_composite_ratio']
-                })
-            
-            return data
-        except Exception as e:
-            logger.error(f'查询走势数据失败: {e}')
-            return []
-    
-    def get_latest_issue(self):
-        """获取最新的期号"""
-        if not self.connection:
-            self.connect()
-        
-        try:
-            sql = 'SELECT MAX(issue) as latest_issue FROM p5_history_data'
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
-            return result['latest_issue'] if result else None
-        except Exception as e:
-            logger.error(f'获取最新期号失败: {e}')
-            return None
-    
-    def get_data_count(self):
-        """获取数据总数"""
-        if not self.connection:
-            self.connect()
-        
-        try:
-            sql = 'SELECT COUNT(*) as count FROM p5_history_data'
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
-            return result['count'] if result else 0
-        except Exception as e:
-            logger.error(f'获取数据总数失败: {e}')
-            return 0
-    
-    def save_detailed_report(self, report_data):
-        """
-        保存详细分析报告
-        
-        Args:
-            report_data: 报告数据字典
-        
-        Returns:
-            报告ID
-        """
-        if not self.connection:
-            self.connect()
-        
-        try:
-            import uuid
-            report_uuid = str(uuid.uuid4())
-            
-            sql = '''
-            INSERT INTO p5_detailed_report 
-            (report_date, report_uuid, frequency_analysis, probability_analysis, 
-             interval_analysis, hezhi_analysis, odd_even_analysis, span_analysis,
-             big_small_analysis, trend_analysis, total_samples, report_content,
-             frequency_chart, probability_chart, trend_chart)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            '''
-            
-            self.cursor.execute(sql, (
-                datetime.now().strftime('%Y-%m-%d'),
-                report_uuid,
-                report_data.get('frequency_analysis'),
-                report_data.get('probability_analysis'),
-                report_data.get('interval_analysis'),
-                report_data.get('hezhi_analysis'),
-                report_data.get('odd_even_analysis'),
-                report_data.get('span_analysis'),
-                report_data.get('big_small_analysis'),
-                report_data.get('trend_analysis'),
-                report_data.get('total_samples'),
-                report_data.get('report_content'),
-                report_data.get('frequency_chart'),
-                report_data.get('probability_chart'),
-                report_data.get('trend_chart')
-            ))
-            
-            self.connection.commit()
-            report_id = self.cursor.lastrowid
-            logger.info(f'详细报告保存成功，ID: {report_id}, UUID: {report_uuid}')
-            return report_id
-        except Exception as e:
-            logger.error(f'保存详细报告失败: {e}')
-            self.connection.rollback()
-            return None
-    
-    def save_final_report(self, report_data, detailed_report_id=None):
-        """
-        保存最终最优报告
-        
-        Args:
-            report_data: 报告数据字典
-            detailed_report_id: 关联的详细报告ID
-        
-        Returns:
-            报告ID
-        """
-        if not self.connection:
-            self.connect()
-        
-        try:
-            import uuid
-            report_uuid = str(uuid.uuid4())
-            
-            sql = '''
-            INSERT INTO p5_final_report 
-            (detailed_report_id, report_date, report_uuid, recommended_numbers,
-             confidence_score, analysis_summary, key_conclusions, core_metrics,
-             decision_recommendations, report_content, frequency_chart, probability_chart, status)
+            (issue, draw_date, wan, qian, bai, shi, ge, hezhi, span, 
+             odd_even_ratio, odd_even_pattern, big_small_ratio, source)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             '''
             
-            self.cursor.execute(sql, (
-                detailed_report_id,
-                datetime.now().strftime('%Y-%m-%d'),
-                report_uuid,
-                report_data.get('recommended_numbers'),
-                report_data.get('confidence_score'),
-                report_data.get('analysis_summary'),
-                report_data.get('key_conclusions'),
-                report_data.get('core_metrics'),
-                report_data.get('decision_recommendations'),
-                report_data.get('report_content'),
-                report_data.get('frequency_chart'),
-                report_data.get('probability_chart'),
-                'published'
-            ))
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue or issue in existing_issues:
+                    skip_count += 1
+                    continue
+                
+                numbers = item.get('numbers', [])
+                if len(numbers) != 5:
+                    skip_count += 1
+                    continue
+                
+                # 数据校验
+                try:
+                    wan, qian, bai, shi, ge = [int(n) for n in numbers]
+                    if not all(0 <= n <= 9 for n in [wan, qian, bai, shi, ge]):
+                        skip_count += 1
+                        continue
+                except (ValueError, TypeError):
+                    skip_count += 1
+                    continue
+                
+                hezhi = sum([wan, qian, bai, shi, ge])
+                span = max([wan, qian, bai, shi, ge]) - min([wan, qian, bai, shi, ge])
+                
+                odd_count = sum(1 for n in [wan, qian, bai, shi, ge] if n % 2 == 1)
+                odd_even_ratio = f"{odd_count}:{5-odd_count}"
+                odd_even_pattern = ''.join(['奇' if n % 2 == 1 else '偶' for n in [wan, qian, bai, shi, ge]])
+                
+                big_count = sum(1 for n in [wan, qian, bai, shi, ge] if n >= 5)
+                big_small_ratio = f"{big_count}:{5-big_count}"
+                
+                self.cursor.execute(sql, (
+                    issue, item.get('date', ''), wan, qian, bai, shi, ge,
+                    hezhi, span, odd_even_ratio, odd_even_pattern, big_small_ratio,
+                    item.get('source', 'spider')
+                ))
+                success_count += 1
             
             self.connection.commit()
-            report_id = self.cursor.lastrowid
-            logger.info(f'最终报告保存成功，ID: {report_id}, UUID: {report_uuid}')
-            return report_id
+            logger.info(f'历史数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
         except Exception as e:
-            logger.error(f'保存最终报告失败: {e}')
-            self.connection.rollback()
+            logger.error(f'插入历史数据失败: {e}')
+            return 0, len(data)
+    
+    def get_latest_history_issue(self) -> Optional[str]:
+        """获取数据库中最新的历史开奖期号"""
+        try:
+            sql = 'SELECT issue FROM p5_history_data ORDER BY issue DESC LIMIT 1'
+            self.cursor.execute(sql)
+            result = self.cursor.fetchone()
+            return result['issue'] if result else None
+        except Exception as e:
+            logger.error(f'获取最新历史期号失败: {e}')
             return None
     
-    def get_reports(self, report_type='all', limit=10):
+    def get_history_data(self, limit: int = 500, order_by: str = 'issue DESC') -> List[Dict[str, Any]]:
         """
-        查询报告列表
+        获取历史开奖数据
         
         Args:
-            report_type: 报告类型（all/detailed/final）
-            limit: 限制返回数量
-        
-        Returns:
-            报告列表
+            limit: 返回数量限制
+            order_by: 排序方式
         """
-        if not self.connection:
-            self.connect()
-        
-        reports = []
-        
         try:
-            if report_type in ['all', 'final']:
-                sql = f'''
-                SELECT * FROM p5_final_report 
-                ORDER BY created_at DESC 
-                LIMIT {limit}
-                '''
-                self.cursor.execute(sql)
-                final_reports = self.cursor.fetchall()
-                for r in final_reports:
-                    r['report_type'] = 'final'
-                    reports.append(r)
-            
-            if report_type in ['all', 'detailed']:
-                sql = f'''
-                SELECT * FROM p5_detailed_report 
-                ORDER BY created_at DESC 
-                LIMIT {limit}
-                '''
-                self.cursor.execute(sql)
-                detailed_reports = self.cursor.fetchall()
-                for r in detailed_reports:
-                    r['report_type'] = 'detailed'
-                    reports.append(r)
-            
-            # 按创建时间排序
-            reports.sort(key=lambda x: x['created_at'], reverse=True)
-            return reports[:limit]
+            sql = f'SELECT * FROM p5_history_data WHERE is_valid = 1 ORDER BY {order_by} LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
         except Exception as e:
-            logger.error(f'查询报告失败: {e}')
+            logger.error(f'获取历史数据失败: {e}')
             return []
     
-    def get_statistics(self):
+    def get_history_count(self) -> int:
+        """获取历史数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_history_data WHERE is_valid = 1')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取历史数据总数失败: {e}')
+            return 0
+    
+    def get_history_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取历史数据"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_history_data WHERE issue = %s', (issue,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'根据期号获取历史数据失败: {e}')
+            return None
+    
+    # ============================================================
+    # 走势数据操作
+    # ============================================================
+    
+    def insert_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        获取数据统计信息
+        批量插入走势数据（智能去重）
+        
+        Args:
+            data: 走势数据列表
         
         Returns:
-            统计信息字典
+            (成功条数, 跳过条数)
         """
-        if not self.connection:
-            self.connect()
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
         
         try:
-            stats = {}
+            self.cursor.execute('SELECT issue FROM p5_trend_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
             
-            # 历史数据统计
-            sql = 'SELECT COUNT(*) as count FROM p5_history_data'
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
-            stats['history_count'] = result['count'] if result else 0
+            sql = '''
+            INSERT INTO p5_trend_data 
+            (issue, wan, qian, bai, shi, ge, hezhi, odd_even_ratio, 
+             big_small_ratio, prime_composite_ratio, trend_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            '''
             
-            # 走势数据统计
-            sql = 'SELECT COUNT(*) as count FROM p5_trend_data'
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
-            stats['trend_count'] = result['count'] if result else 0
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue or issue in existing_issues:
+                    skip_count += 1
+                    continue
+                
+                trend = item.get('trend', {})
+                numbers = item.get('numbers', [])
+                
+                wan = int(trend.get('wan', numbers[0] if numbers else 0))
+                qian = int(trend.get('qian', numbers[1] if len(numbers) > 1 else 0))
+                bai = int(trend.get('bai', numbers[2] if len(numbers) > 2 else 0))
+                shi = int(trend.get('shi', numbers[3] if len(numbers) > 3 else 0))
+                ge = int(trend.get('ge', numbers[4] if len(numbers) > 4 else 0))
+                
+                self.cursor.execute(sql, (
+                    issue, wan, qian, bai, shi, ge,
+                    item.get('hezhi', ''),
+                    item.get('odd_even_ratio', ''),
+                    item.get('big_small_ratio', ''),
+                    item.get('prime_composite_ratio', ''),
+                    json.dumps(item, ensure_ascii=False)
+                ))
+                success_count += 1
             
-            # 报告统计
-            sql = 'SELECT COUNT(*) as count FROM p5_detailed_report'
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
-            stats['detailed_report_count'] = result['count'] if result else 0
-            
-            sql = 'SELECT COUNT(*) as count FROM p5_final_report'
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
-            stats['final_report_count'] = result['count'] if result else 0
-            
-            # 最新期号
-            stats['latest_issue'] = self.get_latest_issue()
-            
-            # 和值范围统计
-            sql = 'SELECT MIN(hezhi) as min_hezhi, MAX(hezhi) as max_hezhi, AVG(hezhi) as avg_hezhi FROM p5_history_data'
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
-            if result:
-                stats['min_hezhi'] = result['min_hezhi']
-                stats['max_hezhi'] = result['max_hezhi']
-                stats['avg_hezhi'] = round(result['avg_hezhi'], 2) if result['avg_hezhi'] else 0
-            
-            # 跨度范围统计
-            sql = 'SELECT MIN(span) as min_span, MAX(span) as max_span, AVG(span) as avg_span FROM p5_history_data'
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
-            if result:
-                stats['min_span'] = result['min_span']
-                stats['max_span'] = result['max_span']
-                stats['avg_span'] = round(result['avg_span'], 2) if result['avg_span'] else 0
-            
-            return stats
+            self.connection.commit()
+            logger.info(f'走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
         except Exception as e:
-            logger.error(f'获取统计信息失败: {e}')
+            logger.error(f'插入走势数据失败: {e}')
+            return 0, len(data)
+    
+    def get_trend_data(self, limit: int = 120) -> List[Dict[str, Any]]:
+        """获取走势数据"""
+        try:
+            sql = 'SELECT * FROM p5_trend_data ORDER BY issue DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取走势数据失败: {e}')
+            return []
+    
+    # ============================================================
+    # AI分析报告操作
+    # ============================================================
+    
+    def insert_ai_report(self, report_content, data_count, latest_issue, next_issue=None,
+                         trend_analysis=None, probability_stats=None,
+                         recommended_numbers=None, recommended_combinations=None,
+                         confidence_scores=None, recommendation_reasons=None,
+                         key_conclusions=None, risk_warning=None, report_format='TEXT'):
+        """插入排列5AI分析报告"""
+        try:
+            report_uuid = str(uuid.uuid4())
+            report_date = datetime.now().strftime('%Y-%m-%d')
+
+            sql = '''
+            INSERT INTO p5_ai_report (
+                report_date, report_uuid, data_count, latest_issue, next_issue,
+                trend_analysis, probability_stats, recommended_numbers,
+                recommended_combinations, confidence_scores, recommendation_reasons,
+                key_conclusions, risk_warning, report_content, report_format
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            '''
+
+            self.cursor.execute(sql, (
+                report_date, report_uuid, data_count, latest_issue, next_issue,
+                trend_analysis, probability_stats, recommended_numbers,
+                recommended_combinations, confidence_scores, recommendation_reasons,
+                key_conclusions, risk_warning, report_content, report_format
+            ))
+            self.connection.commit()
+            logger.info(f'成功插入排列5AI分析报告, UUID: {report_uuid}')
+            return report_uuid
+        except Exception as e:
+            logger.error(f'插入排列5AI分析报告失败: {e}')
+            return None
+    
+    def get_latest_ai_report(self):
+        """获取最新的AI分析报告"""
+        try:
+            sql = 'SELECT * FROM p5_ai_report ORDER BY created_at DESC LIMIT 1'
+            self.cursor.execute(sql)
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'获取最新AI分析报告失败: {e}')
+            return None
+    
+    def get_all_ai_reports(self, limit=10):
+        """获取AI分析报告列表"""
+        try:
+            sql = 'SELECT * FROM p5_ai_report ORDER BY created_at DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取AI分析报告列表失败: {e}')
+            return []
+    
+    def get_report_count(self) -> int:
+        """获取AI分析报告总数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_ai_report')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取报告数量失败: {e}')
+            return 0
+    
+    # ============================================================
+    # 预测验证记录操作
+    # ============================================================
+    
+    def insert_prediction_record(self, report_uuid: str, target_issue: str,
+                                  predicted_numbers: str, predicted_combinations: str,
+                                  confidence_scores: str) -> bool:
+        """插入预测记录"""
+        try:
+            sql = '''
+            INSERT INTO p5_prediction_record 
+            (report_uuid, target_issue, predicted_numbers, predicted_combinations, confidence_scores)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+            predicted_numbers = VALUES(predicted_numbers),
+            predicted_combinations = VALUES(predicted_combinations),
+            confidence_scores = VALUES(confidence_scores)
+            '''
+            self.cursor.execute(sql, (report_uuid, target_issue, predicted_numbers, 
+                                       predicted_combinations, confidence_scores))
+            self.connection.commit()
+            logger.info(f'预测记录插入成功: {target_issue}')
+            return True
+        except Exception as e:
+            logger.error(f'插入预测记录失败: {e}')
+            return False
+    
+    def update_prediction_verification(self, report_uuid: str, target_issue: str,
+                                        actual_numbers: List[int], actual_issue: str) -> Dict[str, Any]:
+        """
+        更新预测验证结果
+        
+        Args:
+            report_uuid: 报告UUID
+            target_issue: 目标期号
+            actual_numbers: 实际开奖号码 [wan, qian, bai, shi, ge]
+            actual_issue: 实际开奖期号
+        
+        Returns:
+            验证结果字典
+        """
+        try:
+            # 获取预测记录
+            self.cursor.execute(
+                'SELECT * FROM p5_prediction_record WHERE report_uuid = %s AND target_issue = %s',
+                (report_uuid, target_issue)
+            )
+            record = self.cursor.fetchone()
+            
+            if not record:
+                logger.warning(f'未找到预测记录: {report_uuid}/{target_issue}')
+                return {'status': 'error', 'message': '预测记录不存在'}
+            
+            # 解析预测号码
+            predicted = json.loads(record['predicted_numbers'])
+            
+            # 比对结果
+            wan_match = int(actual_numbers[0]) in predicted.get('wan', [])
+            qian_match = int(actual_numbers[1]) in predicted.get('qian', [])
+            bai_match = int(actual_numbers[2]) in predicted.get('bai', [])
+            shi_match = int(actual_numbers[3]) in predicted.get('shi', [])
+            ge_match = int(actual_numbers[4]) in predicted.get('ge', [])
+            
+            match_count = sum([wan_match, qian_match, bai_match, shi_match, ge_match])
+            is_matched = 1 if match_count == 5 else 0
+            accuracy_rate = round(match_count / 5 * 100, 2)
+            
+            match_details = {
+                'wan': {'predicted': predicted.get('wan', []), 'actual': actual_numbers[0], 'matched': wan_match},
+                'qian': {'predicted': predicted.get('qian', []), 'actual': actual_numbers[1], 'matched': qian_match},
+                'bai': {'predicted': predicted.get('bai', []), 'actual': actual_numbers[2], 'matched': bai_match},
+                'shi': {'predicted': predicted.get('shi', []), 'actual': actual_numbers[3], 'matched': shi_match},
+                'ge': {'predicted': predicted.get('ge', []), 'actual': actual_numbers[4], 'matched': ge_match}
+            }
+            
+            deviation = []
+            positions = ['wan', 'qian', 'bai', 'shi', 'ge']
+            for i, pos in enumerate(positions):
+                if not match_details[pos]['matched']:
+                    pred_nums = predicted.get(pos, [])
+                    deviation.append(f"{pos}: 预测{pred_nums} vs 实际{actual_numbers[i]}")
+            
+            sql = '''
+            UPDATE p5_prediction_record SET
+                actual_numbers = %s,
+                actual_issue = %s,
+                is_matched = %s,
+                match_count = %s,
+                match_details = %s,
+                wan_match = %s,
+                qian_match = %s,
+                bai_match = %s,
+                shi_match = %s,
+                ge_match = %s,
+                deviation_analysis = %s,
+                accuracy_rate = %s,
+                verification_status = 'verified',
+                verified_at = NOW()
+            WHERE report_uuid = %s AND target_issue = %s
+            '''
+            
+            self.cursor.execute(sql, (
+                json.dumps(actual_numbers),
+                actual_issue,
+                is_matched,
+                match_count,
+                json.dumps(match_details, ensure_ascii=False),
+                wan_match, qian_match, bai_match, shi_match, ge_match,
+                '; '.join(deviation) if deviation else '无偏差',
+                accuracy_rate,
+                report_uuid, target_issue
+            ))
+            self.connection.commit()
+            
+            logger.info(f'预测验证完成: {target_issue}, 命中{match_count}/5, 准确率{accuracy_rate}%')
+            
+            return {
+                'status': 'success',
+                'target_issue': target_issue,
+                'match_count': match_count,
+                'is_matched': is_matched,
+                'accuracy_rate': accuracy_rate,
+                'match_details': match_details
+            }
+        except Exception as e:
+            logger.error(f'更新预测验证失败: {e}')
+            return {'status': 'error', 'message': str(e)}
+    
+    def get_pending_predictions(self) -> List[Dict[str, Any]]:
+        """获取待验证的预测记录"""
+        try:
+            sql = '''
+            SELECT * FROM p5_prediction_record 
+            WHERE verification_status = 'pending'
+            ORDER BY target_issue DESC
+            '''
+            self.cursor.execute(sql)
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取待验证预测失败: {e}')
+            return []
+    
+    def get_verification_stats(self) -> Dict[str, Any]:
+        """获取验证统计信息"""
+        try:
+            sql = '''
+            SELECT 
+                COUNT(*) as total,
+                SUM(is_matched) as total_matched,
+                AVG(match_count) as avg_match,
+                AVG(accuracy_rate) as avg_accuracy,
+                SUM(wan_match) as wan_hits,
+                SUM(qian_match) as qian_hits,
+                SUM(bai_match) as bai_hits,
+                SUM(shi_match) as shi_hits,
+                SUM(ge_match) as ge_hits
+            FROM p5_prediction_record 
+            WHERE verification_status = 'verified'
+            '''
+            self.cursor.execute(sql)
+            result = self.cursor.fetchone()
+            
+            total = result.get('total', 0) or 0
+            if total == 0:
+                return {'total': 0, 'message': '暂无验证数据'}
+            
+            return {
+                'total': total,
+                'total_matched': result.get('total_matched', 0) or 0,
+                'avg_match': round(result.get('avg_match', 0) or 0, 2),
+                'avg_accuracy': round(result.get('avg_accuracy', 0) or 0, 2),
+                'wan_accuracy': round((result.get('wan_hits', 0) or 0) / total * 100, 2),
+                'qian_accuracy': round((result.get('qian_hits', 0) or 0) / total * 100, 2),
+                'bai_accuracy': round((result.get('bai_hits', 0) or 0) / total * 100, 2),
+                'shi_accuracy': round((result.get('shi_hits', 0) or 0) / total * 100, 2),
+                'ge_accuracy': round((result.get('ge_hits', 0) or 0) / total * 100, 2),
+                'overall_accuracy': round((result.get('avg_accuracy', 0) or 0), 2)
+            }
+        except Exception as e:
+            logger.error(f'获取验证统计失败: {e}')
             return {}
+    
+    # ============================================================
+    # 性能统计操作
+    # ============================================================
+    
+    def update_performance_stats(self) -> bool:
+        """更新性能统计"""
+        try:
+            stats = self.get_verification_stats()
+            if stats.get('total', 0) == 0:
+                return False
+            
+            stat_date = datetime.now().strftime('%Y-%m-%d')
+            
+            sql = '''
+            INSERT INTO p5_performance_stats 
+            (stat_date, total_predictions, total_matched, avg_match_count,
+             wan_accuracy, qian_accuracy, bai_accuracy, shi_accuracy, ge_accuracy,
+             overall_accuracy, performance_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+            total_predictions = VALUES(total_predictions),
+            total_matched = VALUES(total_matched),
+            avg_match_count = VALUES(avg_match_count),
+            wan_accuracy = VALUES(wan_accuracy),
+            qian_accuracy = VALUES(qian_accuracy),
+            bai_accuracy = VALUES(bai_accuracy),
+            shi_accuracy = VALUES(shi_accuracy),
+            ge_accuracy = VALUES(ge_accuracy),
+            overall_accuracy = VALUES(overall_accuracy),
+            performance_json = VALUES(performance_json),
+            updated_at = NOW()
+            '''
+            
+            self.cursor.execute(sql, (
+                stat_date,
+                stats['total'],
+                stats['total_matched'],
+                stats['avg_match'],
+                stats['wan_accuracy'],
+                stats['qian_accuracy'],
+                stats['bai_accuracy'],
+                stats['shi_accuracy'],
+                stats['ge_accuracy'],
+                stats['overall_accuracy'],
+                json.dumps(stats, ensure_ascii=False)
+            ))
+            self.connection.commit()
+            logger.info('性能统计更新成功')
+            return True
+        except Exception as e:
+            logger.error(f'更新性能统计失败: {e}')
+            return False
+    
+    def get_performance_history(self, limit: int = 30) -> List[Dict[str, Any]]:
+        """获取性能历史记录"""
+        try:
+            sql = 'SELECT * FROM p5_performance_stats ORDER BY stat_date DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取性能历史失败: {e}')
+            return []
 
 
 def test_database():
     """测试数据库功能"""
     db = P5Database()
     
-    # 连接数据库
     print('=== 测试数据库连接 ===')
     if db.connect():
         print('数据库连接成功')
         
-        # 创建表
-        print('\n=== 创建数据表 ===')
+        print('\n=== 测试创建表 ===')
         if db.create_tables():
-            print('数据表创建成功')
+            print('所有表创建成功')
         
-        # 获取统计信息
-        print('\n=== 数据统计 ===')
-        stats = db.get_statistics()
-        for key, value in stats.items():
-            print(f'{key}: {value}')
+        print('\n=== 测试历史数据操作 ===')
+        test_data = [
+            {'issue': '2024001', 'date': '2024-01-01', 'numbers': [1,2,3,4,5], 'source': 'test'},
+            {'issue': '2024002', 'date': '2024-01-02', 'numbers': [5,4,3,2,1], 'source': 'test'}
+        ]
+        success, skip = db.insert_history_data(test_data)
+        print(f'插入结果: 成功{success}条, 跳过{skip}条')
         
-        # 断开连接
+        count = db.get_history_count()
+        print(f'历史数据总数: {count}')
+        
+        latest_issue = db.get_latest_history_issue()
+        print(f'最新期号: {latest_issue}')
+        
+        print('\n=== 测试AI报告操作 ===')
+        report_uuid = db.insert_ai_report(
+            report_content='测试报告内容',
+            data_count=100,
+            latest_issue='2024001',
+            next_issue='2024002',
+            recommended_numbers='[["1","2"],["3","4"],["5","6"],["7","8"],["9","0"]]',
+            recommended_combinations='["12345"]',
+            confidence_scores='[0.8,0.7,0.6,0.5,0.4]'
+        )
+        print(f'报告UUID: {report_uuid}')
+        
+        print('\n=== 测试预测验证 ===')
+        if report_uuid:
+            db.insert_prediction_record(
+                report_uuid=report_uuid,
+                target_issue='2024002',
+                predicted_numbers='{"wan":["1","2"],"qian":["3","4"],"bai":["5","6"],"shi":["7","8"],"ge":["9","0"]}',
+                predicted_combinations='["12345","67890"]',
+                confidence_scores='[0.8,0.7,0.6,0.5,0.4]'
+            )
+            
+            result = db.update_prediction_verification(
+                report_uuid=report_uuid,
+                target_issue='2024002',
+                actual_numbers=[1, 3, 5, 7, 9],
+                actual_issue='2024002'
+            )
+            print(f'验证结果: {result}')
+        
+        stats = db.get_verification_stats()
+        print(f'验证统计: {stats}')
+        
         db.disconnect()
     else:
         print('数据库连接失败')

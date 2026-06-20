@@ -1,8 +1,8 @@
 """
-排列5数据爬虫模块
+排列5数据爬虫模块（完整版）
 
-负责从指定网站爬取排列5历史开奖数据和走势图数据
-支持自动重试、请求间隔控制、异常处理等功能
+负责从多个数据源爬取排列5历史开奖数据和走势图数据
+支持多源备份、自动重试、请求间隔控制、增量爬取、数据校验等功能
 """
 
 import requests
@@ -11,7 +11,9 @@ import logging
 import random
 import time
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Tuple
 
 os.makedirs('logs', exist_ok=True)
 
@@ -26,45 +28,83 @@ if not logger.handlers:
 
 class P5Spider:
     """
-    排列5数据爬虫类
+    排列5数据爬虫类（完整版）
     
-    负责从指定网站爬取历史开奖数据和走势图数据
-    支持自动重试、请求间隔控制等功能
+    负责从多个数据源爬取历史开奖数据和走势图数据
+    支持多源备份、自动重试、请求间隔控制、增量爬取等功能
     """
     
     def __init__(self):
         """初始化爬虫配置"""
-        self.base_url = 'https://www.55128.cn/kjh/tcp5-history-120.htm'
-        self.trend_url = 'https://www.55128.cn/zs/3_32.htm'
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Firefox/121.0',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ]
+        
+        self.history_sources = [
+            {
+                'name': '55128_120',
+                'url': 'https://www.55128.cn/kjh/tcp5-history-120.htm',
+                'parser': 'parse_55128_history'
+            },
+            {
+                'name': '55128_main',
+                'url': 'https://www.55128.cn/kjh/tcp5.htm',
+                'parser': 'parse_55128_history'
+            }
+        ]
+        
+        self.trend_sources = [
+            {
+                'name': '55128_trend',
+                'url': 'https://www.55128.cn/zs/3_32.htm',
+                'parser': 'parse_55128_trend'
+            }
+        ]
+        
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Referer': 'https://www.55128.cn/',
             'Connection': 'keep-alive',
             'Cache-Control': 'max-age=0'
         }
+        
         self.session = requests.Session()
-        self.session.headers.update(self.headers)
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
+        self.session.mount('http://', requests.adapters.HTTPAdapter(max_retries=3))
     
-    def _get_page(self, url, max_retries=3):
+    def _get_random_headers(self):
+        """获取随机请求头"""
+        headers = self.headers.copy()
+        headers['User-Agent'] = random.choice(self.user_agents)
+        headers['Referer'] = random.choice([
+            'https://www.55128.cn/',
+            'https://www.cpzhixun.com/',
+            'https://www.sporttery.cn/'
+        ])
+        return headers
+    
+    def _get_page(self, url, max_retries=3, delay_range=(2, 5)):
         """
         获取网页内容
         
         Args:
             url: 目标网页URL
             max_retries: 最大重试次数
+            delay_range: 请求间隔范围（秒）
         
         Returns:
             网页HTML内容，失败返回None
         """
         for attempt in range(max_retries):
             try:
-                # 随机延迟，避免请求过于频繁
-                delay = random.uniform(2, 5)
+                delay = random.uniform(*delay_range)
                 time.sleep(delay)
                 
+                self.session.headers.update(self._get_random_headers())
                 response = self.session.get(url, timeout=30)
                 response.encoding = 'utf-8'
                 
@@ -77,33 +117,65 @@ class P5Spider:
             except requests.exceptions.RequestException as e:
                 logger.error(f'请求异常: {e}, 尝试: {attempt + 1}/{max_retries}')
                 if attempt < max_retries - 1:
-                    # 指数退避重试
                     backoff_delay = random.uniform(3, 6) * (attempt + 1)
                     time.sleep(backoff_delay)
         
         logger.error(f'多次请求失败，已达到最大重试次数: {url}')
         return None
     
-    def _parse_history_page(self, html):
+    def validate_data_item(self, item: Dict[str, Any]) -> Tuple[bool, str]:
         """
-        解析历史开奖数据页面
+        数据完整性校验
         
         Args:
-            html: 网页HTML内容
+            item: 数据项
         
         Returns:
-            解析后的开奖数据列表
+            (是否有效, 错误信息)
         """
+        # 期号校验
+        issue = str(item.get('issue', ''))
+        if not issue:
+            return False, '期号为空'
+        
+        # 期号格式校验（排列5期号通常为7位数字，如2024001）
+        if not issue.isdigit():
+            return False, f'期号格式错误: {issue}'
+        
+        # 号码校验
+        numbers = item.get('numbers', [])
+        if not isinstance(numbers, list) or len(numbers) != 5:
+            return False, f'号码数量异常: {len(numbers) if isinstance(numbers, list) else type(numbers)}'
+        
+        for i, n in enumerate(numbers):
+            try:
+                num = int(n)
+                if not (0 <= num <= 9):
+                    return False, f'第{i+1}位号码超出范围: {num}'
+            except (ValueError, TypeError):
+                return False, f'第{i+1}位号码格式错误: {n}'
+        
+        # 和值校验
+        hezhi = sum(int(n) for n in numbers)
+        if not (0 <= hezhi <= 45):
+            return False, f'和值异常: {hezhi}'
+        
+        # 跨度校验
+        span = max(int(n) for n in numbers) - min(int(n) for n in numbers)
+        if not (0 <= span <= 9):
+            return False, f'跨度异常: {span}'
+        
+        return True, '数据有效'
+    
+    def parse_55128_history(self, html):
+        """解析55128网站历史数据"""
         data = []
         try:
             soup = BeautifulSoup(html, 'html.parser')
             
-            # 尝试多种表格定位方式
             table = soup.find('table', class_='table table-bordered table-striped')
-            
             if not table:
                 table = soup.find('table', {'id': 'kjhTable'})
-            
             if not table:
                 table = soup.find('table')
             
@@ -112,11 +184,7 @@ class P5Spider:
                 return data
             
             tbody = table.find('tbody')
-            if not tbody:
-                # 如果没有tbody，直接从table获取行
-                rows = table.find_all('tr')
-            else:
-                rows = tbody.find_all('tr')
+            rows = tbody.find_all('tr') if tbody else table.find_all('tr')
             
             for row in rows:
                 try:
@@ -125,11 +193,9 @@ class P5Spider:
                         draw_date = cells[0].get_text(strip=True)
                         issue = cells[1].get_text(strip=True)
                         
-                        # 提取号码 - 支持多种HTML结构
                         numbers_cell = cells[2]
                         numbers = []
                         
-                        # 尝试通过span标签提取
                         number_spans = numbers_cell.find_all('span', class_=lambda x: x and ('ball' in x.lower() or 'number' in x.lower()))
                         if not number_spans:
                             number_spans = numbers_cell.find_all('span')
@@ -137,46 +203,44 @@ class P5Spider:
                         if number_spans:
                             numbers = [span.get_text(strip=True) for span in number_spans if span.get_text(strip=True).isdigit()]
                         else:
-                            # 如果没有span标签，直接提取文本
                             text_content = numbers_cell.get_text(strip=True)
-                            # 按空格分割号码
                             numbers = text_content.split()
                             numbers = [n for n in numbers if n.isdigit()]
                         
-                        # 确保提取到5个号码
                         if len(numbers) != 5:
-                            logger.warning(f'期号 {issue} 号码数量异常: {len(numbers)}, 内容: {numbers}')
                             continue
                         
-                        # 提取扩展字段
-                        hezhi_feature = cells[3].get_text(strip=True) if len(cells) > 3 else ''
-                        odd_even_ratio = cells[4].get_text(strip=True) if len(cells) > 4 else ''
-                        odd_even_pattern = cells[5].get_text(strip=True) if len(cells) > 5 else ''
-                        span = cells[6].get_text(strip=True) if len(cells) > 6 else ''
-                        
-                        # 计算和值
                         numbers_int = [int(n) for n in numbers]
                         hezhi = sum(numbers_int)
-                        
-                        # 计算跨度
                         span_calc = max(numbers_int) - min(numbers_int)
+                        
+                        odd_even_ratio = ''
+                        odd_even_pattern = ''
+                        if len(cells) > 4:
+                            odd_even_ratio = cells[4].get_text(strip=True)
+                        if len(cells) > 5:
+                            odd_even_pattern = cells[5].get_text(strip=True)
                         
                         item = {
                             'issue': issue,
                             'date': draw_date,
                             'numbers': numbers_int,
                             'hezhi': hezhi,
-                            'hezhi_feature': hezhi_feature,
+                            'span': span_calc,
                             'odd_even_ratio': odd_even_ratio,
                             'odd_even_pattern': odd_even_pattern,
-                            'span': span_calc,
-                            'span_original': span
+                            'source': '55128'
                         }
-                        data.append(item)
-                        logger.debug(f'解析数据: {issue} - {numbers_int}')
+                        
+                        # 数据校验
+                        valid, msg = self.validate_data_item(item)
+                        if valid:
+                            data.append(item)
+                        else:
+                            logger.warning(f'数据校验失败 [{issue}]: {msg}')
                         
                 except Exception as e:
-                    logger.error(f'解析行数据失败: {e}')
+                    logger.debug(f'解析行数据失败: {e}')
             
             logger.info(f'成功解析 {len(data)} 条历史数据')
             
@@ -185,204 +249,166 @@ class P5Spider:
         
         return data
     
-    def _parse_trend_page(self, html):
+    def parse_cpzhixun_history(self, html):
+        """解析cpzhixun网站历史数据"""
+        data = []
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            table = soup.find('table', class_='kjh-table')
+            if not table:
+                table = soup.find('table')
+            
+            if not table:
+                logger.warning('未找到数据表格')
+                return data
+            
+            tbody = table.find('tbody')
+            rows = tbody.find_all('tr') if tbody else table.find_all('tr')
+            
+            for row in rows:
+                try:
+                    cells = row.find_all('td')
+                    if len(cells) >= 4:
+                        issue = cells[0].get_text(strip=True)
+                        draw_date = cells[1].get_text(strip=True)
+                        
+                        numbers_cell = cells[2]
+                        numbers = []
+                        
+                        balls = numbers_cell.find_all(class_=lambda x: x and ('ball' in x.lower()))
+                        if balls:
+                            numbers = [b.get_text(strip=True) for b in balls if b.get_text(strip=True).isdigit()]
+                        else:
+                            text_content = numbers_cell.get_text(strip=True)
+                            numbers = re.findall(r'\d', text_content)
+                        
+                        if len(numbers) != 5:
+                            continue
+                        
+                        numbers_int = [int(n) for n in numbers]
+                        hezhi = sum(numbers_int)
+                        span_calc = max(numbers_int) - min(numbers_int)
+                        
+                        odd_count = sum(1 for n in numbers_int if n % 2 == 1)
+                        even_count = 5 - odd_count
+                        odd_even_ratio = f'{odd_count}:{even_count}'
+                        
+                        item = {
+                            'issue': issue,
+                            'date': draw_date,
+                            'numbers': numbers_int,
+                            'hezhi': hezhi,
+                            'span': span_calc,
+                            'odd_even_ratio': odd_even_ratio,
+                            'odd_even_pattern': '',
+                            'source': 'cpzhixun'
+                        }
+                        
+                        valid, msg = self.validate_data_item(item)
+                        if valid:
+                            data.append(item)
+                        else:
+                            logger.warning(f'数据校验失败 [{issue}]: {msg}')
+                        
+                except Exception as e:
+                    logger.debug(f'解析行数据失败: {e}')
+            
+            logger.info(f'成功解析 {len(data)} 条历史数据')
+            
+        except Exception as e:
+            logger.error(f'解析页面失败: {e}')
+        
+        return data
+    
+    def parse_55128_trend(self, html):
         """
-        解析走势图页面
+        解析55128网站走势图数据
         
-        Args:
-            html: 网页HTML内容
-        
-        Returns:
-            解析后的走势数据列表
+        走势图页面表格结构复杂，包含期号、号码、和值、奇偶比例、大小比例、质合比例等
+        表格列顺序：期号 | 万位 | 千位 | 百位 | 十位 | 个位 | 和值 | 奇偶比例 | 大小比例 | 质合比例 | 遗漏数据...
         """
         data = []
         try:
             soup = BeautifulSoup(html, 'html.parser')
             
-            # 查找包含走势数据的表格
+            # 查找所有表格
             tables = soup.find_all('table')
             
             for table in tables:
                 try:
                     tbody = table.find('tbody')
-                    if tbody:
-                        rows = tbody.find_all('tr')
-                    else:
-                        rows = table.find_all('tr')
+                    rows = tbody.find_all('tr') if tbody else table.find_all('tr')
                     
                     for row in rows:
                         try:
                             cells = row.find_all('td')
-                            if len(cells) >= 2:
-                                # 尝试提取期号和走势数据
-                                first_cell = cells[0].get_text(strip=True)
-                                # 期号通常为6-8位数字
-                                if first_cell.isdigit() and 6 <= len(first_cell) <= 8:
-                                    issue = first_cell
-                                    trend_values = []
-                                    
-                                    # 提取5个位置的号码
-                                    # 排列5: 万位、千位、百位、十位、个位
-                                    positions = ['万位', '千位', '百位', '十位', '个位']
-                                    position_data = {}
-                                    
-                                    # 解析每个位置的遗漏值
-                                    # 表格结构：期号 | 万位(0-9) | 千位(0-9) | 百位(0-9) | 十位(0-9) | 个位(0-9) | 和值 | 奇偶比 | 大小比 | 质合比
-                                    
-                                    # 提取万位号码（第2-11个单元格，对应0-9）
-                                    wan_position = self._extract_position_number(cells[1:12] if len(cells) > 11 else cells[1:min(12, len(cells))])
-                                    # 提取千位号码
-                                    qian_position = self._extract_position_number(cells[12:23] if len(cells) > 22 else cells[12:min(23, len(cells))]) if len(cells) > 12 else None
-                                    # 提取百位号码
-                                    bai_position = self._extract_position_number(cells[23:34] if len(cells) > 33 else cells[23:min(34, len(cells))]) if len(cells) > 23 else None
-                                    # 提取十位号码
-                                    shi_position = self._extract_position_number(cells[34:45] if len(cells) > 44 else cells[34:min(45, len(cells))]) if len(cells) > 34 else None
-                                    # 提取个位号码
-                                    ge_position = self._extract_position_number(cells[45:56] if len(cells) > 55 else cells[45:min(56, len(cells))]) if len(cells) > 45 else None
-                                    
-                                    # 提取和值、奇偶比、大小比、质合比
-                                    hezhi = cells[-4].get_text(strip=True) if len(cells) > 4 else ''
-                                    odd_even_ratio = cells[-3].get_text(strip=True) if len(cells) > 3 else ''
-                                    big_small_ratio = cells[-2].get_text(strip=True) if len(cells) > 2 else ''
-                                    prime_composite_ratio = cells[-1].get_text(strip=True) if len(cells) > 1 else ''
-                                    
-                                    # 构建号码列表
-                                    numbers = []
-                                    for pos_num in [wan_position, qian_position, bai_position, shi_position, ge_position]:
-                                        if pos_num is not None:
-                                            numbers.append(pos_num)
-                                    
+                            if len(cells) < 10:  # 至少需要期号+5位号码+和值+奇偶+大小+质合
+                                continue
+                            
+                            # 第一列是期号
+                            first_cell = cells[0].get_text(strip=True)
+                            
+                            # 跳过表头和特殊行
+                            if not first_cell.isdigit():
+                                continue
+                            
+                            # 期号应该是7位数字（如2026160）
+                            if len(first_cell) != 7:
+                                continue
+                            
+                            issue = first_cell
+                            
+                            # 解析号码（第2-6列是万、千、百、十、个位）
+                            # 但走势图页面中，号码列可能包含遗漏数据，需要找到实际开奖号码
+                            # 实际号码在带有特殊class的td中（如.ball-red或高亮显示）
+                            numbers = []
+                            
+                            # 尝试从带class的元素中获取号码
+                            for i in range(1, 6):
+                                cell = cells[i]
+                                # 查找高亮的号码（通常有特殊class）
+                                highlighted = cell.find(class_=lambda x: x and ('red' in x.lower() or 'ball' in x.lower() or 'current' in x.lower()))
+                                if highlighted:
+                                    num_text = highlighted.get_text(strip=True)
+                                    if num_text.isdigit() and len(num_text) == 1:
+                                        numbers.append(int(num_text))
+                            
+                            # 如果没有找到高亮号码，尝试从文本中提取
+                            if len(numbers) != 5:
+                                numbers = []
+                                for i in range(1, 6):
+                                    cell_text = cells[i].get_text(strip=True)
+                                    # 查找第一个数字
+                                    for char in cell_text:
+                                        if char.isdigit():
+                                            numbers.append(int(char))
+                                            break
                                     if len(numbers) == 5:
-                                        item = {
-                                            'issue': issue,
-                                            'numbers': numbers,
-                                            'trend': {
-                                                'wan': wan_position,
-                                                'qian': qian_position,
-                                                'bai': bai_position,
-                                                'shi': shi_position,
-                                                'ge': ge_position
-                                            },
-                                            'hezhi': hezhi,
-                                            'odd_even_ratio': odd_even_ratio,
-                                            'big_small_ratio': big_small_ratio,
-                                            'prime_composite_ratio': prime_composite_ratio
-                                        }
-                                        data.append(item)
+                                        break
                             
-                        except Exception as e:
-                            logger.debug(f'解析走势行数据失败: {e}')
-                            continue
+                            if len(numbers) != 5:
+                                continue
                             
-                except Exception as e:
-                    logger.debug(f'解析走势表格失败: {e}')
-                    continue
-            
-            # 去重处理
-            seen = set()
-            unique_data = []
-            for item in data:
-                if item['issue'] not in seen:
-                    seen.add(item['issue'])
-                    unique_data.append(item)
-            
-            data = unique_data
-            logger.info(f'成功解析 {len(data)} 条走势数据')
-            
-        except Exception as e:
-            logger.error(f'解析走势图页面失败: {e}')
-        
-        return data
-    
-    def _extract_position_number(self, cells):
-        """
-        从走势图单元格中提取该位置的号码
-        
-        Args:
-            cells: 该位置对应的10个单元格（0-9）
-        
-        Returns:
-            该位置的开奖号码
-        """
-        try:
-            for idx, cell in enumerate(cells):
-                text = cell.get_text(strip=True)
-                # 如果单元格内容是数字且不是遗漏值（遗漏值通常较大）
-                # 开奖号码通常会有特殊样式或为空/小数字
-                class_attr = cell.get('class', [])
-                
-                # 检查是否有选中样式
-                if any('selected' in str(c).lower() or 'active' in str(c).lower() for c in class_attr):
-                    return idx
-                
-                # 检查文本内容
-                if text and text.isdigit():
-                    val = int(text)
-                    # 如果是0-9之间的数字，可能是开奖号码
-                    if 0 <= val <= 9:
-                        return val
-                
-                # 检查是否有特殊标记（如背景色、粗体等）
-                style = cell.get('style', '')
-                if 'background' in style or 'font-weight' in style:
-                    return idx
-            
-            # 如果无法确定，返回None
-            return None
-            
-        except Exception as e:
-            logger.debug(f'提取位置号码失败: {e}')
-            return None
-    
-    def _parse_trend_page_simple(self, html):
-        """
-        简化版走势图解析 - 直接从页面文本提取
-        
-        Args:
-            html: 网页HTML内容
-        
-        Returns:
-            解析后的走势数据列表
-        """
-        data = []
-        try:
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # 查找所有表格行
-            tables = soup.find_all('table')
-            
-            for table in tables:
-                rows = table.find_all('tr')
-                
-                for row in rows:
-                    try:
-                        # 获取行内所有文本
-                        text = row.get_text(separator='|', strip=True)
-                        parts = text.split('|')
-                        
-                        # 查找期号（7位数字）
-                        issue = None
-                        for part in parts:
-                            part = part.strip()
-                            if part.isdigit() and len(part) == 7:
-                                issue = part
-                                break
-                        
-                        if not issue:
-                            continue
-                        
-                        # 提取号码 - 查找连续的5个数字
-                        numbers = []
-                        for part in parts:
-                            part = part.strip()
-                            if part.isdigit() and len(part) == 1:
-                                numbers.append(int(part))
-                                if len(numbers) == 5:
-                                    break
-                        
-                        if len(numbers) == 5:
-                            # 计算和值
-                            hezhi = sum(numbers)
+                            # 解析和值（第7列）
+                            hezhi_text = cells[6].get_text(strip=True) if len(cells) > 6 else ''
+                            hezhi = sum(numbers)  # 直接计算更准确
+                            
+                            # 解析奇偶比例（第8列，格式如"3:2"）
+                            odd_even_ratio = cells[7].get_text(strip=True) if len(cells) > 7 else ''
+                            
+                            # 解析大小比例（第9列，格式如"4:1"）
+                            big_small_ratio = cells[8].get_text(strip=True) if len(cells) > 8 else ''
+                            
+                            # 解析质合比例（第10列，格式如"2:3"）
+                            prime_composite_ratio = cells[9].get_text(strip=True) if len(cells) > 9 else ''
+                            
+                            # 计算遗漏值（从后续列中提取）
+                            omission_data = {}
+                            for i in range(10, min(len(cells), 60)):
+                                cell_text = cells[i].get_text(strip=True)
+                                if cell_text.isdigit():
+                                    omission_data[f'col_{i}'] = int(cell_text)
                             
                             item = {
                                 'issue': issue,
@@ -394,12 +420,26 @@ class P5Spider:
                                     'shi': numbers[3],
                                     'ge': numbers[4]
                                 },
-                                'hezhi': str(hezhi)
+                                'hezhi': str(hezhi),
+                                'odd_even_ratio': odd_even_ratio,
+                                'big_small_ratio': big_small_ratio,
+                                'prime_composite_ratio': prime_composite_ratio,
+                                'omission_data': omission_data
                             }
-                            data.append(item)
-                    
-                    except Exception as e:
-                        continue
+                            
+                            valid, msg = self.validate_data_item(item)
+                            if valid:
+                                data.append(item)
+                            else:
+                                logger.debug(f'走势数据校验失败 [{issue}]: {msg}')
+                        
+                        except Exception as e:
+                            logger.debug(f'解析走势行数据失败: {e}')
+                            continue
+                            
+                except Exception as e:
+                    logger.debug(f'解析走势表格失败: {e}')
+                    continue
             
             # 去重
             seen = set()
@@ -409,83 +449,195 @@ class P5Spider:
                     seen.add(item['issue'])
                     unique_data.append(item)
             
-            logger.info(f'简化解析成功获取 {len(unique_data)} 条走势数据')
+            logger.info(f'成功解析 {len(unique_data)} 条走势数据')
             return unique_data
             
         except Exception as e:
-            logger.error(f'简化解析走势图失败: {e}')
+            logger.error(f'解析走势图页面失败: {e}')
             return []
     
-    def crawl_history_data(self):
+    def parse_cpzhixun_trend(self, html):
+        """解析cpzhixun网站走势图数据"""
+        data = []
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            tables = soup.find_all('table')
+            
+            for table in tables:
+                rows = table.find_all('tr')
+                
+                for row in rows:
+                    try:
+                        text = row.get_text(separator='|', strip=True)
+                        parts = text.split('|')
+                        
+                        issue = None
+                        for part in parts:
+                            part = part.strip()
+                            if part.isdigit() and len(part) == 7:
+                                issue = part
+                                break
+                        
+                        if not issue:
+                            continue
+                        
+                        numbers = []
+                        for part in parts:
+                            part = part.strip()
+                            if part.isdigit() and len(part) == 1:
+                                numbers.append(int(part))
+                                if len(numbers) == 5:
+                                    break
+                        
+                        if len(numbers) == 5:
+                            hezhi = sum(numbers)
+                            odd_count = sum(1 for n in numbers if n % 2 == 1)
+                            big_count = sum(1 for n in numbers if n >= 5)
+                            primes = {1, 2, 3, 5, 7}
+                            prime_count = sum(1 for n in numbers if n in primes)
+                            
+                            item = {
+                                'issue': issue,
+                                'numbers': numbers,
+                                'trend': {
+                                    'wan': numbers[0],
+                                    'qian': numbers[1],
+                                    'bai': numbers[2],
+                                    'shi': numbers[3],
+                                    'ge': numbers[4]
+                                },
+                                'hezhi': str(hezhi),
+                                'odd_even_ratio': f'{odd_count}:{5-odd_count}',
+                                'big_small_ratio': f'{big_count}:{5-big_count}',
+                                'prime_composite_ratio': f'{prime_count}:{5-prime_count}'
+                            }
+                            
+                            valid, msg = self.validate_data_item(item)
+                            if valid:
+                                data.append(item)
+                    
+                    except Exception as e:
+                        continue
+            
+            seen = set()
+            unique_data = []
+            for item in data:
+                if item['issue'] not in seen:
+                    seen.add(item['issue'])
+                    unique_data.append(item)
+            
+            logger.info(f'成功解析 {len(unique_data)} 条走势数据')
+            return unique_data
+            
+        except Exception as e:
+            logger.error(f'解析走势图页面失败: {e}')
+            return []
+    
+    def crawl_history_data(self, max_records: int = 120) -> List[Dict[str, Any]]:
         """
-        爬取历史开奖数据
+        爬取历史开奖数据（多源备份）
+        
+        Args:
+            max_records: 最大获取记录数，默认120条
         
         Returns:
             历史开奖数据列表
         """
         logger.info('开始爬取排列5历史开奖数据')
-        logger.info(f'正在请求: {self.base_url}')
         
-        html = self._get_page(self.base_url)
-        if html:
-            data = self._parse_history_page(html)
-            logger.info(f'爬取完成，共获取 {len(data)} 条历史数据')
-            return data
-        else:
-            logger.warning('未获取到历史数据')
-            return []
+        all_data = []
+        seen_issues = set()
+        
+        for source in self.history_sources:
+            logger.info(f'尝试数据源: {source["name"]}')
+            html = self._get_page(source['url'])
+            
+            if html:
+                parser_method = getattr(self, source['parser'])
+                data = parser_method(html)
+                
+                for item in data:
+                    if item['issue'] not in seen_issues:
+                        seen_issues.add(item['issue'])
+                        all_data.append(item)
+                
+                if len(all_data) >= max_records:
+                    break
+            
+            time.sleep(random.uniform(1, 3))
+        
+        all_data.sort(key=lambda x: x['issue'], reverse=True)
+        
+        logger.info(f'爬取完成，共获取 {len(all_data)} 条历史数据')
+        return all_data[:max_records]
     
-    def crawl_trend_data(self, record=120):
+    def crawl_trend_data(self, record: int = 120) -> List[Dict[str, Any]]:
         """
         爬取走势图数据
         
+        策略：直接从历史数据生成走势图数据，因为走势图页面结构复杂且不稳定
+        
         Args:
-            record: 获取的记录数量
+            record: 获取的记录数量，默认120条
         
         Returns:
             走势数据列表
         """
-        url = f'{self.trend_url}?record={record}'
-        logger.info(f'开始爬取排列5走势图数据')
-        logger.info(f'正在请求: {url}')
+        logger.info(f'开始获取排列5走势图数据（从历史数据生成）')
         
-        html = self._get_page(url)
-        if html:
-            # 先尝试标准解析
-            data = self._parse_trend_page(html)
-            
-            # 如果标准解析失败，尝试简化解析
-            if not data:
-                logger.info('标准解析未获取到数据，尝试简化解析')
-                data = self._parse_trend_page_simple(html)
-            
-            logger.info(f'爬取完成，共获取 {len(data)} 条走势数据')
-            return data
-        else:
-            logger.warning('未获取到走势图数据')
+        # 直接从历史数据获取，然后生成走势图数据
+        history_data = self.crawl_history_data(max_records=record)
+        
+        if not history_data:
+            logger.warning('无法获取历史数据，走势图数据为空')
             return []
+        
+        trend_data = []
+        for item in history_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) != 5:
+                continue
+            
+            # 计算各种统计指标
+            hezhi = sum(numbers)
+            odd_count = sum(1 for n in numbers if n % 2 == 1)
+            even_count = 5 - odd_count
+            big_count = sum(1 for n in numbers if n >= 5)
+            small_count = 5 - big_count
+            
+            # 质数：1, 2, 3, 5, 7
+            primes = {1, 2, 3, 5, 7}
+            prime_count = sum(1 for n in numbers if n in primes)
+            composite_count = 5 - prime_count
+            
+            # 跨度
+            span = max(numbers) - min(numbers)
+            
+            trend_item = {
+                'issue': item.get('issue', ''),
+                'numbers': numbers,
+                'trend': {
+                    'wan': numbers[0],
+                    'qian': numbers[1],
+                    'bai': numbers[2],
+                    'shi': numbers[3],
+                    'ge': numbers[4]
+                },
+                'hezhi': str(hezhi),
+                'span': str(span),
+                'odd_even_ratio': f'{odd_count}:{even_count}',
+                'big_small_ratio': f'{big_count}:{small_count}',
+                'prime_composite_ratio': f'{prime_count}:{composite_count}',
+                'source': 'generated_from_history'
+            }
+            
+            trend_data.append(trend_item)
+        
+        logger.info(f'走势图数据生成完成，共 {len(trend_data)} 条')
+        return trend_data[:record]
     
-    def crawl_all_data(self, trend_record=120):
-        """
-        爬取所有数据（历史数据+走势图数据）
-        
-        Args:
-            trend_record: 走势图记录数量
-        
-        Returns:
-            包含历史数据和走势数据的字典
-        """
-        logger.info('开始爬取所有数据')
-        
-        history_data = self.crawl_history_data()
-        trend_data = self.crawl_trend_data(record=trend_record)
-        
-        return {
-            'history_data': history_data,
-            'trend_data': trend_data
-        }
-    
-    def crawl_incremental_data(self, last_issue=None):
+    def crawl_incremental_data(self, last_issue: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         增量爬取最新数据
         
@@ -500,9 +652,9 @@ class P5Spider:
         all_data = self.crawl_history_data()
         
         if not last_issue:
+            logger.info(f'无历史数据，全量爬取 {len(all_data)} 条')
             return all_data
         
-        # 筛选出比last_issue更新的数据
         new_data = []
         for item in all_data:
             if item['issue'] > last_issue:
@@ -510,31 +662,107 @@ class P5Spider:
         
         logger.info(f'增量爬取完成，新增 {len(new_data)} 条数据')
         return new_data
+    
+    def crawl_and_save_incremental(self) -> Tuple[int, int, int, int]:
+        """
+        增量爬取并保存到数据库
+        
+        Returns:
+            (新增历史数据条数, 跳过历史数据条数, 新增走势数据条数, 跳过走势数据条数)
+        """
+        from modules.database_p5 import P5Database
+        
+        db = P5Database()
+        if not db.connect():
+            logger.error('数据库连接失败，无法保存数据')
+            return 0, 0, 0, 0
+        
+        try:
+            # 创建表
+            db.create_tables()
+            
+            # 获取已有最新期号
+            latest_issue = db.get_latest_history_issue()
+            
+            # 增量爬取历史数据
+            new_history = self.crawl_incremental_data(latest_issue)
+            history_success, history_skip = db.insert_history_data(new_history)
+            
+            # 爬取并保存走势数据
+            trend_data = self.crawl_trend_data()
+            trend_success, trend_skip = db.insert_trend_data(trend_data)
+            
+            logger.info(f'数据保存完成: 历史数据新增{history_success}条, 走势数据新增{trend_success}条')
+            return history_success, history_skip, trend_success, trend_skip
+            
+        except Exception as e:
+            logger.error(f'爬取并保存数据失败: {e}')
+            return 0, 0, 0, 0
+        finally:
+            db.disconnect()
+    
+    def full_crawl_and_save(self, max_records: int = 120) -> Tuple[int, int, int, int]:
+        """
+        全量爬取并保存到数据库（首次运行或重建数据时使用）
+        
+        Args:
+            max_records: 最大获取记录数，默认120条
+        
+        Returns:
+            (新增历史数据条数, 跳过历史数据条数, 新增走势数据条数, 跳过走势数据条数)
+        """
+        from modules.database_p5 import P5Database
+        
+        db = P5Database()
+        if not db.connect():
+            logger.error('数据库连接失败，无法保存数据')
+            return 0, 0, 0, 0
+        
+        try:
+            db.create_tables()
+            
+            # 全量爬取历史数据
+            history_data = self.crawl_history_data(max_records)
+            history_success, history_skip = db.insert_history_data(history_data)
+            
+            # 爬取并保存走势数据
+            trend_data = self.crawl_trend_data(min(max_records, 120))
+            trend_success, trend_skip = db.insert_trend_data(trend_data)
+            
+            logger.info(f'全量爬取完成: 历史数据新增{history_success}条, 走势数据新增{trend_success}条')
+            return history_success, history_skip, trend_success, trend_skip
+            
+        except Exception as e:
+            logger.error(f'全量爬取失败: {e}')
+            return 0, 0, 0, 0
+        finally:
+            db.disconnect()
 
 
 def test_spider():
     """测试爬虫功能"""
     spider = P5Spider()
     
-    # 测试历史数据爬取
     print('=== 测试排列5历史数据爬取 ===')
-    history_data = spider.crawl_history_data()
+    history_data = spider.crawl_history_data(max_records=50)
     print(f'获取到 {len(history_data)} 条历史数据')
     if history_data:
         print('前5条数据:')
         for item in history_data[:5]:
             print(f'期号: {item["issue"]}, 日期: {item["date"]}, 号码: {item["numbers"]}')
-            print(f'  和值: {item["hezhi"]}, 奇偶比: {item["odd_even_ratio"]}, 跨度: {item["span"]}')
+            print(f'  和值: {item["hezhi"]}, 跨度: {item["span"]}')
     
-    # 测试走势图数据爬取
     print('\n=== 测试排列5走势图数据爬取 ===')
-    trend_data = spider.crawl_trend_data(record=120)
+    trend_data = spider.crawl_trend_data(record=30)
     print(f'获取到 {len(trend_data)} 条走势图数据')
     if trend_data:
         print(f'第一条走势图数据:')
         print(f'期号: {trend_data[0]["issue"]}')
         print(f'号码: {trend_data[0]["numbers"]}')
-        print(f'走势数据: {trend_data[0]["trend"]}')
+    
+    print('\n=== 测试增量爬取并保存 ===')
+    result = spider.crawl_and_save_incremental()
+    print(f'结果: 历史新增{result[0]}条, 跳过{result[1]}条, 走势新增{result[2]}条, 跳过{result[3]}条')
     
     return history_data, trend_data
 
