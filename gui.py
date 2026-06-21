@@ -571,52 +571,149 @@ class LotteryGUI:
 
     def _execute_p5_ai(self, task_mgr):
         """执行排列5 AI智能分析"""
-        task_mgr.log("正在初始化AI分析器...")
-        task_mgr.progress(10, "初始化分析器")
-
-        analyzer = AILotteryAnalyzer()
-
-        task_mgr.log("正在从数据库获取历史数据...")
-        task_mgr.progress(25, "获取数据")
-        data = analyzer.fetch_data(source='database')
-
-        task_mgr.log(f"获取到 {len(data)} 条历史数据")
-        task_mgr.progress(40, "数据获取完成")
-
-        if not data:
-            task_mgr.log("警告: 数据库无数据，尝试从爬虫获取...")
-            data = analyzer.fetch_data(source='spider')
-            task_mgr.log(f"爬虫获取到 {len(data)} 条数据")
-
-        task_mgr.log("正在执行多模型综合分析...")
-        task_mgr.progress(55, "多模型分析")
-        result = analyzer.analyze_p5(data)
-
-        if result.get('status') == 'success':
+        try:
+            task_mgr.log("正在初始化AI分析器...")
+            task_mgr.progress(10, "初始化分析器")
+            
+            analyzer = AILotteryAnalyzer()
+            
+            task_mgr.log("正在从数据库获取历史数据...")
+            task_mgr.progress(20, "获取数据")
+            
+            try:
+                data = analyzer.fetch_data(source='database')
+                task_mgr.log(f"✓ 数据库获取成功: {len(data)} 条历史数据")
+            except Exception as e:
+                task_mgr.log(f"✗ 数据库获取失败: {str(e)}")
+                task_mgr.log("正在尝试从爬虫获取数据...")
+                try:
+                    data = analyzer.fetch_data(source='spider')
+                    task_mgr.log(f"✓ 爬虫获取成功: {len(data)} 条数据")
+                except Exception as e2:
+                    task_mgr.log(f"✗ 爬虫获取失败: {str(e2)}")
+                    task_mgr.log("\n错误: 无法获取数据，请检查数据库连接或网络状态")
+                    task_mgr.progress(0, "数据获取失败")
+                    return
+            
+            task_mgr.progress(35, "数据获取完成")
+            
+            if not data:
+                task_mgr.log("\n错误: 没有获取到任何数据")
+                task_mgr.log("建议操作:")
+                task_mgr.log("  1. 检查数据库是否有数据")
+                task_mgr.log("  2. 执行「增量爬取数据」或「全量爬取数据」")
+                task_mgr.log("  3. 检查网络连接状态")
+                task_mgr.progress(0, "无数据")
+                return
+            
+            # 数据质量检查
+            task_mgr.log("\n正在验证数据质量...")
+            task_mgr.progress(45, "验证数据质量")
+            
+            quality_report = analyzer.validate_data_quality(data)
+            
+            if quality_report.get('status') == 'error':
+                task_mgr.log(f"\n✗ 数据质量不合格: {quality_report.get('message', '')}")
+                task_mgr.log(f"  数据总量: {quality_report.get('total_count', 0)}")
+                task_mgr.log(f"  有效数据: {quality_report.get('valid_count', 0)}")
+                task_mgr.log(f"  有效率: {quality_report.get('valid_rate', 0)}%")
+                
+                issues = quality_report.get('issues', [])
+                if issues:
+                    task_mgr.log("\n问题列表:")
+                    for issue in issues[:5]:
+                        task_mgr.log(f"  - {issue}")
+                
+                task_mgr.log("\n建议: 请先执行数据爬取以获取更多有效数据")
+                task_mgr.progress(0, "数据质量不合格")
+                return
+            
+            if quality_report.get('status') == 'warning':
+                task_mgr.log(f"\n⚠ 数据质量警告: {quality_report.get('message', '')}")
+                task_mgr.log(f"  有效率: {quality_report.get('valid_rate', 0)}%")
+                warnings = quality_report.get('warnings', [])
+                if warnings:
+                    for warning in warnings[:3]:
+                        task_mgr.log(f"  - {warning}")
+                task_mgr.log("\n继续执行分析...")
+            
+            task_mgr.log(f"✓ 数据质量验证通过: 有效率 {quality_report.get('valid_rate', 0)}%")
+            
+            # 执行AI分析
+            task_mgr.log("\n正在执行多模型综合分析...")
+            task_mgr.progress(55, "频率统计模型")
+            
+            result = analyzer.analyze_p5(data)
+            
+            if result.get('status') != 'success':
+                error_msg = result.get('message', '未知错误')
+                error_code = result.get('error_code', 'UNKNOWN')
+                task_mgr.log(f"\n✗ AI分析失败: {error_msg}")
+                task_mgr.log(f"  错误代码: {error_code}")
+                
+                if 'quality_report' in result:
+                    qr = result['quality_report']
+                    task_mgr.log(f"  数据质量: {qr.get('message', '')}")
+                
+                task_mgr.progress(0, "分析失败")
+                return
+            
+            task_mgr.progress(75, "分析完成")
+            
+            # 显示分析报告
             task_mgr.log("\n" + "=" * 70)
-            task_mgr.log("AI分析报告生成完成！")
+            task_mgr.log("✓ AI分析报告生成完成！")
             task_mgr.log("=" * 70)
             task_mgr.report(result)
-
-            task_mgr.log("正在保存报告到数据库...")
+            
+            # 保存报告到数据库
+            task_mgr.log("\n正在保存报告到数据库...")
             task_mgr.progress(85, "保存报告")
-            save_result = analyzer.save_report_to_database(result)
-            if save_result:
-                task_mgr.log(f"报告已成功保存到数据库，UUID: {save_result}")
-            else:
-                task_mgr.log("警告：报告保存失败")
-
+            
+            try:
+                save_result = analyzer.save_report_to_database(result)
+                if save_result:
+                    task_mgr.log(f"✓ 报告已成功保存到数据库")
+                    task_mgr.log(f"  报告UUID: {save_result}")
+                else:
+                    task_mgr.log("⚠ 报告保存失败，但分析结果已显示")
+            except Exception as e:
+                task_mgr.log(f"⚠ 报告保存异常: {str(e)}")
+                task_mgr.log("  分析结果已显示，可手动保存")
+            
+            # 更新统计面板
             data_summary = result.get('data_summary', {})
+            quality_info = result.get('quality_report', {})
+            
             stats_text = (
-                f"数据量: {data_summary.get('data_count')} | "
-                f"最新期号: {data_summary.get('latest_issue')} | "
+                f"数据量: {data_summary.get('data_count')} 条\n"
+                f"有效率: {data_summary.get('valid_rate')}%\n"
+                f"最新期号: {data_summary.get('latest_issue')}\n"
                 f"预测期号: {data_summary.get('next_issue')}"
             )
-            self.stats_content.config(text=stats_text, fg=COLORS['success'])
-        else:
-            task_mgr.log(f"分析失败: {result.get('message', '未知错误')}")
-
-        task_mgr.progress(100, "任务完成")
+            
+            # 根据数据质量设置颜色
+            if quality_info.get('status') == 'success':
+                fg_color = COLORS['success']
+            elif quality_info.get('status') == 'warning':
+                fg_color = COLORS['warning']
+            else:
+                fg_color = COLORS['accent_danger']
+            
+            self.stats_content.config(text=stats_text, fg=fg_color)
+            
+            task_mgr.progress(100, "任务完成")
+            task_mgr.log("\n✓ AI智能分析流程全部完成")
+            
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ AI分析过程发生异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
+            task_mgr.log("\n建议操作:")
+            task_mgr.log("  1. 检查数据库连接配置")
+            task_mgr.log("  2. 查看日志文件获取详细错误信息")
+            task_mgr.log("  3. 联系技术支持")
 
     def _view_latest_report(self, task_mgr):
         """查看最新AI分析报告"""
