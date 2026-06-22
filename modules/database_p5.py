@@ -264,8 +264,197 @@ class P5Database:
             '''
             self.cursor.execute(sql_performance)
             
+            # 万位走势数据表
+            sql_wan_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_wan_trend_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                wan_number TINYINT NOT NULL COMMENT '万位数字(0-9)',
+                draw_date VARCHAR(20) NULL DEFAULT NULL COMMENT '开奖日期',
+                is_odd TINYINT(1) NULL DEFAULT NULL COMMENT '是否奇数(1=是,0=否)',
+                is_big TINYINT(1) NULL DEFAULT NULL COMMENT '是否大数(>=5为大,1=是,0=否)',
+                is_prime TINYINT(1) NULL DEFAULT NULL COMMENT '是否质数(1=是,0=否)',
+                omission INT NULL DEFAULT 0 COMMENT '当前遗漏值',
+                hot_level VARCHAR(10) NULL DEFAULT NULL COMMENT '冷热等级(hot/warm/cold)',
+                consecutive_count INT NULL DEFAULT 0 COMMENT '连续出现次数',
+                trend_json LONGTEXT NULL DEFAULT NULL COMMENT '万位走势JSON数据',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_wan_number (wan_number ASC) USING BTREE,
+                INDEX idx_draw_date (draw_date ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5万位走势图数据表';
+            '''
+            self.cursor.execute(sql_wan_trend)
+            
+            # 千位走势数据表
+            sql_qian_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_qian_trend_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                qian_number TINYINT NOT NULL COMMENT '千位数字(0-9)',
+                draw_date VARCHAR(20) NULL DEFAULT NULL COMMENT '开奖日期',
+                is_odd TINYINT(1) NULL DEFAULT NULL COMMENT '是否奇数(1=是,0=否)',
+                is_big TINYINT(1) NULL DEFAULT NULL COMMENT '是否大数(>=5为大,1=是,0=否)',
+                is_prime TINYINT(1) NULL DEFAULT NULL COMMENT '是否质数(1=是,0=否)',
+                omission INT NULL DEFAULT 0 COMMENT '当前遗漏值',
+                hot_level VARCHAR(10) NULL DEFAULT NULL COMMENT '冷热等级(hot/warm/cold)',
+                consecutive_count INT NULL DEFAULT 0 COMMENT '连续出现次数',
+                trend_json LONGTEXT NULL DEFAULT NULL COMMENT '千位走势JSON数据',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_qian_number (qian_number ASC) USING BTREE,
+                INDEX idx_draw_date (draw_date ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5千位走势图数据表';
+            '''
+            self.cursor.execute(sql_qian_trend)
+            
+            # 百位走势数据表
+            sql_bai_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_bai_trend_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                bai_number TINYINT NOT NULL COMMENT '百位数字(0-9)',
+                draw_date VARCHAR(20) NULL DEFAULT NULL COMMENT '开奖日期',
+                is_odd TINYINT(1) NULL DEFAULT NULL COMMENT '是否奇数(1=是,0=否)',
+                is_big TINYINT(1) NULL DEFAULT NULL COMMENT '是否大数(>=5为大,1=是,0=否)',
+                is_prime TINYINT(1) NULL DEFAULT NULL COMMENT '是否质数(1=是,0=否)',
+                omission INT NULL DEFAULT 0 COMMENT '当前遗漏值',
+                hot_level VARCHAR(10) NULL DEFAULT NULL COMMENT '冷热等级(hot/warm/cold)',
+                consecutive_count INT NULL DEFAULT 0 COMMENT '连续出现次数',
+                trend_json LONGTEXT NULL DEFAULT NULL COMMENT '百位走势JSON数据',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_bai_number (bai_number ASC) USING BTREE,
+                INDEX idx_draw_date (draw_date ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5百位走势图数据表';
+            '''
+            self.cursor.execute(sql_bai_trend)
+            
+            # 十位走势数据表
+            sql_shi_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_shi_trend_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                shi_number TINYINT NOT NULL COMMENT '十位数字(0-9)',
+                draw_date VARCHAR(20) NULL DEFAULT NULL COMMENT '开奖日期',
+                is_odd TINYINT(1) NULL DEFAULT NULL COMMENT '是否奇数(1=是,0=否)',
+                is_big TINYINT(1) NULL DEFAULT NULL COMMENT '是否大数(>=5为大,1=是,0=否)',
+                is_prime TINYINT(1) NULL DEFAULT NULL COMMENT '是否质数(1=是,0=否)',
+                omission INT NULL DEFAULT 0 COMMENT '当前遗漏值',
+                hot_level VARCHAR(10) NULL DEFAULT NULL COMMENT '冷热等级(hot/warm/cold)',
+                consecutive_count INT NULL DEFAULT 0 COMMENT '连续出现次数',
+                trend_json LONGTEXT NULL DEFAULT NULL COMMENT '十位走势JSON数据',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_shi_number (shi_number ASC) USING BTREE,
+                INDEX idx_draw_date (draw_date ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5十位走势图数据表';
+            '''
+            self.cursor.execute(sql_shi_trend)
+            
+            # 和尾走势数据表
+            sql_sum_end_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_sum_end_trend_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                sum_end TINYINT NOT NULL COMMENT '和尾值(0-9)',
+                sum_value INT NULL DEFAULT NULL COMMENT '和值',
+                draw_date VARCHAR(20) NULL DEFAULT NULL COMMENT '开奖日期',
+                is_odd TINYINT(1) NULL DEFAULT NULL COMMENT '是否奇数(1=是,0=否)',
+                is_big TINYINT(1) NULL DEFAULT NULL COMMENT '是否大尾(>=5为大,1=是,0=否)',
+                omission INT NULL DEFAULT 0 COMMENT '当前遗漏值',
+                hot_level VARCHAR(10) NULL DEFAULT NULL COMMENT '冷热等级(hot/warm/cold)',
+                consecutive_count INT NULL DEFAULT 0 COMMENT '连续出现次数',
+                trend_json LONGTEXT NULL DEFAULT NULL COMMENT '和尾走势JSON数据',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_sum_end (sum_end ASC) USING BTREE,
+                INDEX idx_sum_value (sum_value ASC) USING BTREE,
+                INDEX idx_draw_date (draw_date ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5和尾走势图数据表';
+            '''
+            self.cursor.execute(sql_sum_end_trend)
+            
+            # 后三走势数据表
+            sql_back_three_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_back_three_trend_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                bai_number TINYINT NOT NULL COMMENT '百位数字(0-9)',
+                shi_number TINYINT NOT NULL COMMENT '十位数字(0-9)',
+                ge_number TINYINT NOT NULL COMMENT '个位数字(0-9)',
+                back_three_value VARCHAR(10) NULL DEFAULT NULL COMMENT '后三数值(XXX)',
+                sum_value INT NULL DEFAULT NULL COMMENT '后三和值',
+                sum_end TINYINT NULL DEFAULT NULL COMMENT '后三和尾',
+                draw_date VARCHAR(20) NULL DEFAULT NULL COMMENT '开奖日期',
+                is_odd TINYINT(1) NULL DEFAULT NULL COMMENT '是否奇数(1=是,0=否)',
+                is_big TINYINT(1) NULL DEFAULT NULL COMMENT '是否大数(>=5为大,1=是,0=否)',
+                omission INT NULL DEFAULT 0 COMMENT '当前遗漏值',
+                hot_level VARCHAR(10) NULL DEFAULT NULL COMMENT '冷热等级(hot/warm/cold)',
+                consecutive_count INT NULL DEFAULT 0 COMMENT '连续出现次数',
+                trend_json LONGTEXT NULL DEFAULT NULL COMMENT '后三走势JSON数据',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_bai_number (bai_number ASC) USING BTREE,
+                INDEX idx_shi_number (shi_number ASC) USING BTREE,
+                INDEX idx_ge_number (ge_number ASC) USING BTREE,
+                INDEX idx_sum_end (sum_end ASC) USING BTREE,
+                INDEX idx_draw_date (draw_date ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5后三走势图数据表';
+            '''
+            self.cursor.execute(sql_back_three_trend)
+            
+            sql_expert_recommendation = '''
+            CREATE TABLE IF NOT EXISTS p5_expert_recommendation (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                user_id INT NOT NULL COMMENT '专家用户ID',
+                nick_name VARCHAR(50) NULL DEFAULT NULL COMMENT '专家昵称',
+                head_url VARCHAR(255) NULL DEFAULT NULL COMMENT '专家头像URL',
+                issue_name VARCHAR(20) NOT NULL COMMENT '预测期号名称',
+                issue_no VARCHAR(20) NULL DEFAULT NULL COMMENT '期号编号',
+                issue_end_time VARCHAR(30) NULL DEFAULT NULL COMMENT '期号截止时间',
+                issue_open_time VARCHAR(30) NULL DEFAULT NULL COMMENT '开奖时间',
+                summary LONGTEXT NULL DEFAULT NULL COMMENT '推荐总结',
+                intro TEXT NULL DEFAULT NULL COMMENT '专家介绍',
+                create_time VARCHAR(30) NULL DEFAULT NULL COMMENT '推荐创建时间',
+                scheme_count INT NULL DEFAULT 0 COMMENT '方案数量',
+                schemes_json LONGTEXT NULL DEFAULT NULL COMMENT '方案列表(JSON)',
+                hit_ratio VARCHAR(20) NULL DEFAULT NULL COMMENT '专家命中率',
+                hit_count INT NULL DEFAULT 0 COMMENT '命中次数',
+                serial_hit_count INT NULL DEFAULT 0 COMMENT '连续命中次数',
+                detail_url VARCHAR(255) NULL DEFAULT NULL COMMENT '专家详情URL',
+                source VARCHAR(50) NULL DEFAULT 'china_lottery' COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',
+                updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_user_issue (user_id ASC, issue_name ASC) USING BTREE,
+                INDEX idx_user_id (user_id ASC) USING BTREE,
+                INDEX idx_issue_name (issue_name ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5专家推荐数据表';
+            '''
+            self.cursor.execute(sql_expert_recommendation)
+            
             self.connection.commit()
-            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、性能统计）')
+            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐）')
             return True
         except Exception as e:
             logger.error(f'创建数据表失败: {e}')
@@ -779,6 +968,978 @@ class P5Database:
         except Exception as e:
             logger.error(f'获取性能历史失败: {e}')
             return []
+    
+    # ============================================================
+    # 万位走势数据操作
+    # ============================================================
+    
+    def insert_wan_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入万位走势数据（智能去重）
+        
+        Args:
+            data: 万位走势数据列表
+        
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
+        
+        try:
+            self.cursor.execute('SELECT issue FROM p5_wan_trend_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            
+            sql = '''
+            INSERT INTO p5_wan_trend_data 
+            (issue, wan_number, draw_date, is_odd, is_big, is_prime, 
+             omission, hot_level, consecutive_count, trend_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                wan_number = VALUES(wan_number),
+                draw_date = VALUES(draw_date),
+                is_odd = VALUES(is_odd),
+                is_big = VALUES(is_big),
+                is_prime = VALUES(is_prime),
+                omission = VALUES(omission),
+                hot_level = VALUES(hot_level),
+                consecutive_count = VALUES(consecutive_count),
+                trend_json = VALUES(trend_json),
+                source = VALUES(source)
+            '''
+            
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                
+                wan_number = item.get('wan_number', 0)
+                if not (0 <= wan_number <= 9):
+                    skip_count += 1
+                    continue
+                
+                self.cursor.execute(sql, (
+                    issue,
+                    wan_number,
+                    item.get('draw_date', ''),
+                    item.get('is_odd', None),
+                    item.get('is_big', None),
+                    item.get('is_prime', None),
+                    item.get('omission', 0),
+                    item.get('hot_level', ''),
+                    item.get('consecutive_count', 0),
+                    json.dumps(item, ensure_ascii=False),
+                    item.get('source', 'china_lottery')
+                ))
+                success_count += 1
+            
+            self.connection.commit()
+            logger.info(f'万位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入万位走势数据失败: {e}')
+            return 0, len(data)
+    
+    def get_wan_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取万位走势数据"""
+        try:
+            sql = 'SELECT * FROM p5_wan_trend_data ORDER BY issue DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取万位走势数据失败: {e}')
+            return []
+    
+    def get_wan_trend_count(self) -> int:
+        """获取万位走势数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_wan_trend_data')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取万位走势数据总数失败: {e}')
+            return 0
+    
+    def get_wan_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取万位走势数据"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_wan_trend_data WHERE issue = %s', (issue,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'根据期号获取万位走势数据失败: {e}')
+            return None
+    
+    def get_wan_number_stats(self) -> Dict[str, Any]:
+        """获取万位数字统计信息"""
+        try:
+            sql = '''
+            SELECT 
+                wan_number,
+                COUNT(*) as count,
+                AVG(omission) as avg_omission,
+                MIN(omission) as min_omission,
+                MAX(omission) as max_omission
+            FROM p5_wan_trend_data
+            GROUP BY wan_number
+            ORDER BY count DESC
+            '''
+            self.cursor.execute(sql)
+            results = self.cursor.fetchall()
+            
+            stats = {}
+            for row in results:
+                stats[row['wan_number']] = {
+                    'count': row['count'],
+                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
+                    'min_omission': row['min_omission'],
+                    'max_omission': row['max_omission']
+                }
+            
+            return stats
+        except Exception as e:
+            logger.error(f'获取万位数字统计失败: {e}')
+            return {}
+    
+    # ============================================================
+    # 千位走势数据操作
+    # ============================================================
+    
+    def insert_qian_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入千位走势数据（智能去重）
+        
+        Args:
+            data: 千位走势数据列表
+        
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
+        
+        try:
+            self.cursor.execute('SELECT issue FROM p5_qian_trend_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            
+            sql = '''
+            INSERT INTO p5_qian_trend_data 
+            (issue, qian_number, draw_date, is_odd, is_big, is_prime, 
+             omission, hot_level, consecutive_count, trend_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                qian_number = VALUES(qian_number),
+                draw_date = VALUES(draw_date),
+                is_odd = VALUES(is_odd),
+                is_big = VALUES(is_big),
+                is_prime = VALUES(is_prime),
+                omission = VALUES(omission),
+                hot_level = VALUES(hot_level),
+                consecutive_count = VALUES(consecutive_count),
+                trend_json = VALUES(trend_json),
+                source = VALUES(source)
+            '''
+            
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                
+                qian_number = item.get('qian_number', 0)
+                if not (0 <= qian_number <= 9):
+                    skip_count += 1
+                    continue
+                
+                self.cursor.execute(sql, (
+                    issue,
+                    qian_number,
+                    item.get('draw_date', ''),
+                    item.get('is_odd', None),
+                    item.get('is_big', None),
+                    item.get('is_prime', None),
+                    item.get('omission', 0),
+                    item.get('hot_level', ''),
+                    item.get('consecutive_count', 0),
+                    json.dumps(item, ensure_ascii=False),
+                    item.get('source', 'china_lottery')
+                ))
+                success_count += 1
+            
+            self.connection.commit()
+            logger.info(f'千位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入千位走势数据失败: {e}')
+            return 0, len(data)
+    
+    def get_qian_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取千位走势数据"""
+        try:
+            sql = 'SELECT * FROM p5_qian_trend_data ORDER BY issue DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取千位走势数据失败: {e}')
+            return []
+    
+    def get_qian_trend_count(self) -> int:
+        """获取千位走势数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_qian_trend_data')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取千位走势数据总数失败: {e}')
+            return 0
+    
+    def get_qian_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取千位走势数据"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_qian_trend_data WHERE issue = %s', (issue,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'根据期号获取千位走势数据失败: {e}')
+            return None
+    
+    def get_qian_number_stats(self) -> Dict[str, Any]:
+        """获取千位数字统计信息"""
+        try:
+            sql = '''
+            SELECT 
+                qian_number,
+                COUNT(*) as count,
+                AVG(omission) as avg_omission,
+                MIN(omission) as min_omission,
+                MAX(omission) as max_omission
+            FROM p5_qian_trend_data
+            GROUP BY qian_number
+            ORDER BY count DESC
+            '''
+            self.cursor.execute(sql)
+            results = self.cursor.fetchall()
+            
+            stats = {}
+            for row in results:
+                stats[row['qian_number']] = {
+                    'count': row['count'],
+                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
+                    'min_omission': row['min_omission'],
+                    'max_omission': row['max_omission']
+                }
+            
+            return stats
+        except Exception as e:
+            logger.error(f'获取千位数字统计失败: {e}')
+            return {}
+    
+    # ============================================================
+    # 百位走势数据操作
+    # ============================================================
+    
+    def insert_bai_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入百位走势数据（智能去重）
+        
+        Args:
+            data: 百位走势数据列表
+        
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
+        
+        try:
+            self.cursor.execute('SELECT issue FROM p5_bai_trend_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            
+            sql = '''
+            INSERT INTO p5_bai_trend_data 
+            (issue, bai_number, draw_date, is_odd, is_big, is_prime, 
+             omission, hot_level, consecutive_count, trend_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                bai_number = VALUES(bai_number),
+                draw_date = VALUES(draw_date),
+                is_odd = VALUES(is_odd),
+                is_big = VALUES(is_big),
+                is_prime = VALUES(is_prime),
+                omission = VALUES(omission),
+                hot_level = VALUES(hot_level),
+                consecutive_count = VALUES(consecutive_count),
+                trend_json = VALUES(trend_json),
+                source = VALUES(source)
+            '''
+            
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                
+                bai_number = item.get('bai_number', 0)
+                if not (0 <= bai_number <= 9):
+                    skip_count += 1
+                    continue
+                
+                self.cursor.execute(sql, (
+                    issue,
+                    bai_number,
+                    item.get('draw_date', ''),
+                    item.get('is_odd', None),
+                    item.get('is_big', None),
+                    item.get('is_prime', None),
+                    item.get('omission', 0),
+                    item.get('hot_level', ''),
+                    item.get('consecutive_count', 0),
+                    json.dumps(item, ensure_ascii=False),
+                    item.get('source', 'china_lottery')
+                ))
+                success_count += 1
+            
+            self.connection.commit()
+            logger.info(f'百位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入百位走势数据失败: {e}')
+            return 0, len(data)
+    
+    def get_bai_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取百位走势数据"""
+        try:
+            sql = 'SELECT * FROM p5_bai_trend_data ORDER BY issue DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取百位走势数据失败: {e}')
+            return []
+    
+    def get_bai_trend_count(self) -> int:
+        """获取百位走势数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_bai_trend_data')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取百位走势数据总数失败: {e}')
+            return 0
+    
+    def get_bai_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取百位走势数据"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_bai_trend_data WHERE issue = %s', (issue,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'根据期号获取百位走势数据失败: {e}')
+            return None
+    
+    def get_bai_number_stats(self) -> Dict[str, Any]:
+        """获取百位数字统计信息"""
+        try:
+            sql = '''
+            SELECT 
+                bai_number,
+                COUNT(*) as count,
+                AVG(omission) as avg_omission,
+                MIN(omission) as min_omission,
+                MAX(omission) as max_omission
+            FROM p5_bai_trend_data
+            GROUP BY bai_number
+            ORDER BY count DESC
+            '''
+            self.cursor.execute(sql)
+            results = self.cursor.fetchall()
+            
+            stats = {}
+            for row in results:
+                stats[row['bai_number']] = {
+                    'count': row['count'],
+                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
+                    'min_omission': row['min_omission'],
+                    'max_omission': row['max_omission']
+                }
+            
+            return stats
+        except Exception as e:
+            logger.error(f'获取百位数字统计失败: {e}')
+            return {}
+    
+    # ============================================================
+    # 十位走势数据操作
+    # ============================================================
+    
+    def insert_shi_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入十位走势数据（智能去重）
+        
+        Args:
+            data: 十位走势数据列表
+        
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
+        
+        try:
+            self.cursor.execute('SELECT issue FROM p5_shi_trend_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            
+            sql = '''
+            INSERT INTO p5_shi_trend_data 
+            (issue, shi_number, draw_date, is_odd, is_big, is_prime, 
+             omission, hot_level, consecutive_count, trend_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                shi_number = VALUES(shi_number),
+                draw_date = VALUES(draw_date),
+                is_odd = VALUES(is_odd),
+                is_big = VALUES(is_big),
+                is_prime = VALUES(is_prime),
+                omission = VALUES(omission),
+                hot_level = VALUES(hot_level),
+                consecutive_count = VALUES(consecutive_count),
+                trend_json = VALUES(trend_json),
+                source = VALUES(source)
+            '''
+            
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                
+                shi_number = item.get('shi_number', 0)
+                if not (0 <= shi_number <= 9):
+                    skip_count += 1
+                    continue
+                
+                self.cursor.execute(sql, (
+                    issue,
+                    shi_number,
+                    item.get('draw_date', ''),
+                    item.get('is_odd', None),
+                    item.get('is_big', None),
+                    item.get('is_prime', None),
+                    item.get('omission', 0),
+                    item.get('hot_level', ''),
+                    item.get('consecutive_count', 0),
+                    json.dumps(item, ensure_ascii=False),
+                    item.get('source', 'china_lottery')
+                ))
+                success_count += 1
+            
+            self.connection.commit()
+            logger.info(f'十位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入十位走势数据失败: {e}')
+            return 0, len(data)
+    
+    def get_shi_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取十位走势数据"""
+        try:
+            sql = 'SELECT * FROM p5_shi_trend_data ORDER BY issue DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取十位走势数据失败: {e}')
+            return []
+    
+    def get_shi_trend_count(self) -> int:
+        """获取十位走势数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_shi_trend_data')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取十位走势数据总数失败: {e}')
+            return 0
+    
+    def get_shi_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取十位走势数据"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_shi_trend_data WHERE issue = %s', (issue,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'根据期号获取十位走势数据失败: {e}')
+            return None
+    
+    def get_shi_number_stats(self) -> Dict[str, Any]:
+        """获取十位数字统计信息"""
+        try:
+            sql = '''
+            SELECT 
+                shi_number,
+                COUNT(*) as count,
+                AVG(omission) as avg_omission,
+                MIN(omission) as min_omission,
+                MAX(omission) as max_omission
+            FROM p5_shi_trend_data
+            GROUP BY shi_number
+            ORDER BY count DESC
+            '''
+            self.cursor.execute(sql)
+            results = self.cursor.fetchall()
+            
+            stats = {}
+            for row in results:
+                stats[row['shi_number']] = {
+                    'count': row['count'],
+                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
+                    'min_omission': row['min_omission'],
+                    'max_omission': row['max_omission']
+                }
+            
+            return stats
+        except Exception as e:
+            logger.error(f'获取十位数字统计失败: {e}')
+            return {}
+    
+    # ============================================================
+    # 和尾走势数据操作
+    # ============================================================
+    
+    def insert_sum_end_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入和尾走势数据（智能去重）
+        
+        Args:
+            data: 和尾走势数据列表
+        
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
+        
+        try:
+            self.cursor.execute('SELECT issue FROM p5_sum_end_trend_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            
+            sql = '''
+            INSERT INTO p5_sum_end_trend_data 
+            (issue, sum_end, sum_value, draw_date, is_odd, is_big, 
+             omission, hot_level, consecutive_count, trend_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                sum_end = VALUES(sum_end),
+                sum_value = VALUES(sum_value),
+                draw_date = VALUES(draw_date),
+                is_odd = VALUES(is_odd),
+                is_big = VALUES(is_big),
+                omission = VALUES(omission),
+                hot_level = VALUES(hot_level),
+                consecutive_count = VALUES(consecutive_count),
+                trend_json = VALUES(trend_json),
+                source = VALUES(source)
+            '''
+            
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                
+                sum_end = item.get('sum_end', 0)
+                if not (0 <= sum_end <= 9):
+                    skip_count += 1
+                    continue
+                
+                self.cursor.execute(sql, (
+                    issue,
+                    sum_end,
+                    item.get('sum_value', None),
+                    item.get('draw_date', ''),
+                    item.get('is_odd', None),
+                    item.get('is_big', None),
+                    item.get('omission', 0),
+                    item.get('hot_level', ''),
+                    item.get('consecutive_count', 0),
+                    json.dumps(item, ensure_ascii=False),
+                    item.get('source', 'china_lottery')
+                ))
+                success_count += 1
+            
+            self.connection.commit()
+            logger.info(f'和尾走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入和尾走势数据失败: {e}')
+            return 0, len(data)
+    
+    def get_sum_end_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取和尾走势数据"""
+        try:
+            sql = 'SELECT * FROM p5_sum_end_trend_data ORDER BY issue DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取和尾走势数据失败: {e}')
+            return []
+    
+    def get_sum_end_trend_count(self) -> int:
+        """获取和尾走势数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_sum_end_trend_data')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取和尾走势数据总数失败: {e}')
+            return 0
+    
+    def get_sum_end_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取和尾走势数据"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_sum_end_trend_data WHERE issue = %s', (issue,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'根据期号获取和尾走势数据失败: {e}')
+            return None
+    
+    def get_sum_end_stats(self) -> Dict[str, Any]:
+        """获取和尾统计信息"""
+        try:
+            sql = '''
+            SELECT 
+                sum_end,
+                COUNT(*) as count,
+                AVG(omission) as avg_omission,
+                MIN(omission) as min_omission,
+                MAX(omission) as max_omission
+            FROM p5_sum_end_trend_data
+            GROUP BY sum_end
+            ORDER BY count DESC
+            '''
+            self.cursor.execute(sql)
+            results = self.cursor.fetchall()
+            
+            stats = {}
+            for row in results:
+                stats[row['sum_end']] = {
+                    'count': row['count'],
+                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
+                    'min_omission': row['min_omission'],
+                    'max_omission': row['max_omission']
+                }
+            
+            return stats
+        except Exception as e:
+            logger.error(f'获取和尾统计失败: {e}')
+            return {}
+    
+    # ============================================================
+    # 后三走势数据操作
+    # ============================================================
+    
+    def insert_back_three_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入后三走势数据（智能去重）
+        
+        Args:
+            data: 后三走势数据列表
+        
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
+        
+        try:
+            self.cursor.execute('SELECT issue FROM p5_back_three_trend_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            
+            sql = '''
+            INSERT INTO p5_back_three_trend_data 
+            (issue, bai_number, shi_number, ge_number, back_three_value, 
+             sum_value, sum_end, draw_date, is_odd, is_big, 
+             omission, hot_level, consecutive_count, trend_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                bai_number = VALUES(bai_number),
+                shi_number = VALUES(shi_number),
+                ge_number = VALUES(ge_number),
+                back_three_value = VALUES(back_three_value),
+                sum_value = VALUES(sum_value),
+                sum_end = VALUES(sum_end),
+                draw_date = VALUES(draw_date),
+                is_odd = VALUES(is_odd),
+                is_big = VALUES(is_big),
+                omission = VALUES(omission),
+                hot_level = VALUES(hot_level),
+                consecutive_count = VALUES(consecutive_count),
+                trend_json = VALUES(trend_json),
+                source = VALUES(source)
+            '''
+            
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                
+                bai_num = item.get('bai_number', 0)
+                shi_num = item.get('shi_number', 0)
+                ge_num = item.get('ge_number', 0)
+                
+                if not (0 <= bai_num <= 9 and 0 <= shi_num <= 9 and 0 <= ge_num <= 9):
+                    skip_count += 1
+                    continue
+                
+                self.cursor.execute(sql, (
+                    issue,
+                    bai_num,
+                    shi_num,
+                    ge_num,
+                    item.get('back_three_value', ''),
+                    item.get('sum_value', None),
+                    item.get('sum_end', None),
+                    item.get('draw_date', ''),
+                    item.get('is_odd', None),
+                    item.get('is_big', None),
+                    item.get('omission', 0),
+                    item.get('hot_level', ''),
+                    item.get('consecutive_count', 0),
+                    json.dumps(item, ensure_ascii=False),
+                    item.get('source', 'china_lottery')
+                ))
+                success_count += 1
+            
+            self.connection.commit()
+            logger.info(f'后三走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入后三走势数据失败: {e}')
+            return 0, len(data)
+    
+    def get_back_three_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取后三走势数据"""
+        try:
+            sql = 'SELECT * FROM p5_back_three_trend_data ORDER BY issue DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取后三走势数据失败: {e}')
+            return []
+    
+    def get_back_three_trend_count(self) -> int:
+        """获取后三走势数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_back_three_trend_data')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取后三走势数据总数失败: {e}')
+            return 0
+    
+    def get_back_three_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取后三走势数据"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_back_three_trend_data WHERE issue = %s', (issue,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'根据期号获取后三走势数据失败: {e}')
+            return None
+    
+    def get_back_three_sum_end_stats(self) -> Dict[str, Any]:
+        """获取后三和尾统计信息"""
+        try:
+            sql = '''
+            SELECT 
+                sum_end,
+                COUNT(*) as count,
+                AVG(omission) as avg_omission,
+                MIN(omission) as min_omission,
+                MAX(omission) as max_omission
+            FROM p5_back_three_trend_data
+            GROUP BY sum_end
+            ORDER BY count DESC
+            '''
+            self.cursor.execute(sql)
+            results = self.cursor.fetchall()
+            
+            stats = {}
+            for row in results:
+                stats[row['sum_end']] = {
+                    'count': row['count'],
+                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
+                    'min_omission': row['min_omission'],
+                    'max_omission': row['max_omission']
+                }
+            
+            return stats
+        except Exception as e:
+            logger.error(f'获取后三和尾统计失败: {e}')
+            return {}
+    
+    # ============================================================
+    # 专家推荐数据操作
+    # ============================================================
+    
+    def insert_expert_recommendation(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入专家推荐数据（智能去重）
+        
+        Args:
+            data: 专家推荐数据列表
+        
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
+        
+        try:
+            self.cursor.execute('SELECT user_id, issue_name FROM p5_expert_recommendation')
+            existing = {(row['user_id'], row['issue_name']) for row in self.cursor.fetchall()}
+            
+            sql = '''
+            INSERT INTO p5_expert_recommendation 
+            (user_id, nick_name, head_url, issue_name, issue_no, issue_end_time, 
+             issue_open_time, summary, intro, create_time, scheme_count, schemes_json,
+             hit_ratio, hit_count, serial_hit_count, detail_url, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                nick_name = VALUES(nick_name),
+                head_url = VALUES(head_url),
+                issue_no = VALUES(issue_no),
+                issue_end_time = VALUES(issue_end_time),
+                issue_open_time = VALUES(issue_open_time),
+                summary = VALUES(summary),
+                intro = VALUES(intro),
+                create_time = VALUES(create_time),
+                scheme_count = VALUES(scheme_count),
+                schemes_json = VALUES(schemes_json),
+                hit_ratio = VALUES(hit_ratio),
+                hit_count = VALUES(hit_count),
+                serial_hit_count = VALUES(serial_hit_count),
+                detail_url = VALUES(detail_url),
+                updated_at = NOW()
+            '''
+            
+            for item in data:
+                user_id = item.get('user_id', 0)
+                issue_name = item.get('issue_name', '')
+                
+                if not user_id or not issue_name:
+                    skip_count += 1
+                    continue
+                
+                if (user_id, issue_name) in existing:
+                    skip_count += 1
+                    continue
+                
+                schemes = item.get('schemes', [])
+                schemes_json = json.dumps(schemes, ensure_ascii=False)
+                scheme_count = len(schemes)
+                
+                expert_info = item.get('expert_info', {})
+                
+                self.cursor.execute(sql, (
+                    user_id,
+                    item.get('nick_name', ''),
+                    expert_info.get('head_url', '') or item.get('head_url', ''),
+                    issue_name,
+                    item.get('issue_no', ''),
+                    item.get('issue_end_time', ''),
+                    item.get('issue_open_time', ''),
+                    item.get('summary', ''),
+                    item.get('intro', ''),
+                    item.get('create_time', ''),
+                    scheme_count,
+                    schemes_json,
+                    expert_info.get('hit_ratio', '') or item.get('hit_ratio', ''),
+                    expert_info.get('hit_count', 0) or item.get('hit_count', 0),
+                    expert_info.get('serial_hit_count', 0) or item.get('serial_hit_count', 0),
+                    expert_info.get('detail_url', '') or item.get('detail_url', ''),
+                    item.get('source', 'china_lottery')
+                ))
+                success_count += 1
+            
+            self.connection.commit()
+            logger.info(f'专家推荐数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入专家推荐数据失败: {e}')
+            return 0, len(data)
+    
+    def _parse_schemes_json(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """解析记录中的schemes_json字段"""
+        for record in records:
+            schemes_json = record.get('schemes_json', '')
+            if schemes_json:
+                try:
+                    record['schemes'] = json.loads(schemes_json)
+                except:
+                    record['schemes'] = []
+            else:
+                record['schemes'] = []
+        return records
+    
+    def get_expert_recommendation_by_user(self, user_id: int) -> List[Dict[str, Any]]:
+        """根据专家ID获取推荐记录"""
+        try:
+            sql = 'SELECT * FROM p5_expert_recommendation WHERE user_id = %s ORDER BY issue_name DESC'
+            self.cursor.execute(sql, (user_id,))
+            records = self.cursor.fetchall()
+            return self._parse_schemes_json(records)
+        except Exception as e:
+            logger.error(f'获取专家推荐记录失败: {e}')
+            return []
+    
+    def get_expert_recommendation_by_issue(self, issue_name: str) -> List[Dict[str, Any]]:
+        """根据期号获取专家推荐记录"""
+        try:
+            sql = 'SELECT * FROM p5_expert_recommendation WHERE issue_name = %s ORDER BY user_id'
+            self.cursor.execute(sql, (issue_name,))
+            records = self.cursor.fetchall()
+            return self._parse_schemes_json(records)
+        except Exception as e:
+            logger.error(f'根据期号获取专家推荐记录失败: {e}')
+            return []
+    
+    def get_latest_expert_recommendations(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """获取最新专家推荐记录"""
+        try:
+            sql = 'SELECT * FROM p5_expert_recommendation ORDER BY created_at DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            records = self.cursor.fetchall()
+            return self._parse_schemes_json(records)
+        except Exception as e:
+            logger.error(f'获取最新专家推荐记录失败: {e}')
+            return []
+    
+    def get_expert_recommendation_count(self) -> int:
+        """获取专家推荐数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_expert_recommendation')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取专家推荐数据总数失败: {e}')
+            return 0
 
 
 def test_database():
