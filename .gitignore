@@ -6,3 +6,5 @@ api/ai_api.py
 ai_report_generator.py
 modules/ai_analyzer.py
 /.uploads/
+/api/
+api
