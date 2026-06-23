@@ -28,7 +28,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from modules.ai_analyzer import AILotteryAnalyzer
+from modules.ai_analyzer import AIAnalyzer
 from modules.database_p5 import P5Database
 from modules.spider_p5 import P5Spider
 from modules.prediction_validator import P5PredictionValidator
@@ -575,7 +575,7 @@ class LotteryGUI:
             task_mgr.log("正在初始化AI分析器...")
             task_mgr.progress(10, "初始化分析器")
             
-            analyzer = AILotteryAnalyzer()
+            analyzer = AIAnalyzer()
             
             task_mgr.log("正在从数据库获取历史数据...")
             task_mgr.progress(20, "获取数据")

@@ -35,12 +35,12 @@ class P5DataUpdater:
             from modules.spider_p5 import P5Spider
             from modules.database_p5 import P5Database
             from modules.analyzer_p5 import P5Analyzer
-            from modules.ai_analyzer import AILotteryAnalyzer
+            from modules.ai_analyzer import AIAnalyzer
             
             spider = P5Spider()
             db = P5Database()
             analyzer = P5Analyzer()
-            ai_analyzer = AILotteryAnalyzer()
+            ai_analyzer = AIAnalyzer()
             
             logger.info('1. 获取数据库中最新期号...')
             if db.connect():

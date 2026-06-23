@@ -8,3 +8,4 @@ modules/ai_analyzer.py
 /.uploads/
 /api/
 api
+config.py
