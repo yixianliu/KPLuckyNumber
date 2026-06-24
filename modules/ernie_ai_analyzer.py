@@ -213,13 +213,14 @@ class ERNIEAIAnalyzer:
             qian_trend_data = db.get_qian_trend_data(limit=limit)
             bai_trend_data = db.get_bai_trend_data(limit=limit)
             shi_trend_data = db.get_shi_trend_data(limit=limit)
+            ge_trend_data = db.get_ge_trend_data(limit=limit)
 
             db.disconnect()
 
             latest_issue = history_data[0]['issue'] if history_data else ''
 
             logger.info(f'数据库数据加载完成: 历史数据{len(history_data)}条, 走势数据{len(trend_data)}条')
-            logger.info(f'各位置走势数据: 万位{len(wan_trend_data)}条, 千位{len(qian_trend_data)}条, 百位{len(bai_trend_data)}条, 十位{len(shi_trend_data)}条')
+            logger.info(f'各位置走势数据: 万位{len(wan_trend_data)}条, 千位{len(qian_trend_data)}条, 百位{len(bai_trend_data)}条, 十位{len(shi_trend_data)}条, 个位{len(ge_trend_data)}条')
 
             return {
                 'history_data': history_data,
@@ -228,6 +229,7 @@ class ERNIEAIAnalyzer:
                 'qian_trend_data': qian_trend_data,
                 'bai_trend_data': bai_trend_data,
                 'shi_trend_data': shi_trend_data,
+                'ge_trend_data': ge_trend_data,
                 'latest_issue': latest_issue,
                 'data_count': len(history_data),
                 'error': None

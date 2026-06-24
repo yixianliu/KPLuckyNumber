@@ -1,44 +1,56 @@
-"""检查Redis存储数据"""
-from modules.redis_client import RedisClient
+import redis
 import json
 
-r = RedisClient()
-keys = r.client.keys('kpluckynumber:pl5:*')
-print('Redis键列表:', keys)
+r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+keys = r.keys('kpluckynumber:pl5:article:*')
+
+print(f'Redis中共有 {len(keys)} 篇文章')
+print()
 
 for key in keys:
-    key_str = key if isinstance(key, str) else key.decode()
+    if key.endswith(':list'):
+        continue
     
-    # 检查键类型
-    key_type = r.client.type(key)
-    print(f'\n{key_str} (类型: {key_type}):')
+    data = json.loads(r.get(key))
+    print(f'=' * 70)
+    print(f'文章ID: {key}')
+    print(f'  期号: {data.get("issue")}')
+    print(f'  标题: {data.get("article_data", {}).get("title", "未知")[:60]}')
+    print(f'  内容长度: 原始={data.get("content_length", {}).get("raw", 0)}, 清洗后={data.get("content_length", {}).get("clean", 0)}')
     
-    if key_type == 'string':
-        data = r.client.get(key)
-        if data:
-            data_str = data if isinstance(data, str) else data.decode()
-            try:
-                parsed = json.loads(data_str)
-                print(f'  数据类型: {type(parsed).__name__}')
-                if isinstance(parsed, dict):
-                    print(f'  字段: {list(parsed.keys())[:10]}')
-                    if 'issue' in parsed:
-                        print(f'  期号: {parsed["issue"]}')
-                    if 'article_data' in parsed:
-                        art = parsed['article_data']
-                        print(f'  文章标题: {art.get("title", "未知")[:50]}...')
-                    if 'ai_analysis' in parsed:
-                        ai = parsed['ai_analysis']
-                        print(f'  AI分析期号: {ai.get("issue_number", "未知")}')
-            except:
-                print(f'  原始数据: {data_str[:200]}...')
-    elif key_type == 'zset':
-        # 有序集合，显示成员数量
-        members = r.client.zrange(key, 0, -1)
-        print(f'  成员数量: {len(members)}')
-        print(f'  成员列表: {members[:10]}')
-    elif key_type == 'set':
-        # 集合
-        members = r.client.smembers(key)
-        print(f'  成员数量: {len(members)}')
-        print(f'  成员列表: {list(members)[:10]}')
+    # 纯文本预览
+    plain = data.get('content_plain', '')
+    if plain:
+        print(f'  纯文本预览: {plain[:150]}...' if len(plain) > 150 else f'  纯文本预览: {plain}')
+    
+    # 内容理解
+    if 'content_understanding' in data:
+        cu = data['content_understanding']
+        print(f'  【AI内容理解】')
+        print(f'    - 文章类型: {cu.get("article_type")}')
+        print(f'    - 专家: {cu.get("expert_name")}')
+        pred_und = cu.get('prediction_understanding', {})
+        print(f'    - 有预测: {pred_und.get("has_prediction")}')
+        print(f'    - 预测类型: {pred_und.get("prediction_type")}')
+        qa = cu.get('quality_assessment', {})
+        print(f'    - 信息密度: {qa.get("information_density")}')
+        print(f'    - 预测完整性: {qa.get("prediction_completeness")}')
+        print(f'    - 整体评分: {qa.get("overall_score")}/100')
+    else:
+        print(f'  内容理解: 无')
+    
+    # 预测数据
+    if 'prediction_data' in data and data['prediction_data']:
+        pd = data['prediction_data']
+        print(f'  【预测数据】')
+        print(f'    - 质量评分: {data.get("quality_score")}')
+        print(f'    - 验证状态: {data.get("validation_status")}')
+        pred = pd.get('prediction', {})
+        for pos in ['wan', 'qian', 'bai', 'shi', 'ge']:
+            if pos in pred and pred[pos].get('numbers'):
+                nums = pred[pos]['numbers']
+                print(f'    - {pos}: {nums}')
+    else:
+        print(f'  预测数据: 无')
+    
+    print()

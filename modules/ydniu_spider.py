@@ -93,7 +93,7 @@ class YDNiuSpider:
 
     def parse_zx_list_links(self, html: str) -> List[Dict[str, Any]]:
         """
-        解析主页面中class为"zx_list_subbox_left"的DOM元素下的所有超链接
+        解析主页面中的所有超链接，支持多板块解析
 
         Args:
             html: 网页HTML内容
@@ -106,39 +106,128 @@ class YDNiuSpider:
         try:
             soup = BeautifulSoup(html, 'html.parser')
             
-            # 查找所有class为"zx_list_subbox_left"的元素
+            # 策略1：查找所有class为"zx_list_subbox_left"的元素
             list_boxes = soup.find_all('div', class_='zx_list_subbox_left')
-            
-            logger.info(f'找到 {len(list_boxes)} 个zx_list_subbox_left元素')
+            logger.info(f'策略1 - 找到 {len(list_boxes)} 个zx_list_subbox_left元素')
             
             for box in list_boxes:
-                # 查找该元素下的所有超链接
                 a_tags = box.find_all('a', href=True)
-                
                 for a_tag in a_tags:
-                    url = a_tag.get('href', '')
-                    title = a_tag.get_text(strip=True)
-                    
-                    # 补全完整URL
-                    if url and not url.startswith('http'):
-                        if url.startswith('/'):
-                            url = self.base_url + url
-                        else:
-                            url = self.base_url + '/' + url
-                    
-                    if url:
-                        links.append({
-                            'url': url,
-                            'title': title,
-                            'crawl_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        })
+                    links = self._add_link(links, a_tag)
             
-            logger.info(f'解析到 {len(links)} 个超链接')
+            # 策略2：查找所有包含"pl5"或"排列5"相关的链接
+            all_a_tags = soup.find_all('a', href=True)
+            logger.info(f'策略2 - 找到 {len(all_a_tags)} 个超链接')
+            
+            for a_tag in all_a_tags:
+                href = a_tag.get('href', '')
+                text = a_tag.get_text(strip=True)
+                
+                if ('pl5' in href.lower() or '排列5' in text or 
+                    '/info/pl5/' in href or '/article/pl5/' in href):
+                    links = self._add_link(links, a_tag)
+            
+            # 策略3：查找class包含"list"或"article"的容器下的链接
+            article_containers = soup.find_all('div', class_=re.compile(r'list|article|content'))
+            logger.info(f'策略3 - 找到 {len(article_containers)} 个list/article容器')
+            
+            for container in article_containers:
+                a_tags = container.find_all('a', href=True)
+                for a_tag in a_tags:
+                    href = a_tag.get('href', '')
+                    if '/info/' in href or '/article/' in href:
+                        links = self._add_link(links, a_tag)
+            
+            # 去重
+            seen_urls = set()
+            unique_links = []
+            for link in links:
+                if link['url'] not in seen_urls:
+                    seen_urls.add(link['url'])
+                    unique_links.append(link)
+            
+            links = unique_links
+            logger.info(f'去重后解析到 {len(links)} 个超链接')
             
         except Exception as e:
             logger.error(f'解析超链接失败: {e}')
         
         return links
+
+    def _add_link(self, links: List[Dict[str, Any]], a_tag) -> List[Dict[str, Any]]:
+        """
+        添加链接到列表，处理URL补全
+
+        Args:
+            links: 当前链接列表
+            a_tag: 超链接标签
+
+        Returns:
+            更新后的链接列表
+        """
+        url = a_tag.get('href', '')
+        title = a_tag.get_text(strip=True)
+        
+        if not url or not title:
+            return links
+        
+        if not url.startswith('http'):
+            if url.startswith('/'):
+                url = self.base_url + url
+            else:
+                url = self.base_url + '/' + url
+        
+        links.append({
+            'url': url,
+            'title': title,
+            'crawl_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+        
+        return links
+
+    def crawl_with_pagination(self, max_pages: int = 5) -> List[Dict[str, Any]]:
+        """
+        分页爬取文章列表
+
+        Args:
+            max_pages: 最大页数
+
+        Returns:
+            所有页面的链接列表
+        """
+        all_links = []
+        
+        for page in range(1, max_pages + 1):
+            if page == 1:
+                url = self.pl5_zjtj_url
+            else:
+                url = f'{self.pl5_zjtj_url}index_{page}.html'
+            
+            logger.info(f'爬取第 {page} 页: {url}')
+            
+            html = self._make_request(url)
+            if not html:
+                logger.warning(f'第 {page} 页爬取失败，停止分页')
+                break
+            
+            page_links = self.parse_zx_list_links(html)
+            all_links.extend(page_links)
+            logger.info(f'第 {page} 页解析到 {len(page_links)} 个链接')
+            
+            if len(page_links) < 5:
+                logger.info(f'第 {page} 页链接少于5个，可能已到最后一页')
+                break
+        
+        # 去重
+        seen_urls = set()
+        unique_links = []
+        for link in all_links:
+            if link['url'] not in seen_urls:
+                seen_urls.add(link['url'])
+                unique_links.append(link)
+        
+        logger.info(f'分页爬取完成，共获取 {len(unique_links)} 个唯一链接')
+        return unique_links
 
     def filter_links_by_issue(self, links: List[Dict[str, Any]], target_issue: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -276,18 +365,21 @@ class YDNiuSpider:
         
         return article_data
 
-    def crawl_all_articles(self, target_issue: Optional[str] = None) -> Dict[str, Any]:
+    def crawl_all_articles(self, target_issue: Optional[str] = None, 
+                          max_articles: int = 30) -> Dict[str, Any]:
         """
-        爬取所有符合条件的文章
+        爬取所有符合条件的文章，支持分页和数量限制
 
         Args:
             target_issue: 目标期号，如果为None则爬取所有文章
+            max_articles: 最大爬取文章数量
 
         Returns:
             爬取结果
         """
         logger.info('=' * 80)
         logger.info('开始爬取所有文章')
+        logger.info(f'目标期号: {target_issue}, 最大文章数: {max_articles}')
         logger.info('=' * 80)
         
         result = {
@@ -300,29 +392,29 @@ class YDNiuSpider:
             'articles': []
         }
         
-        # 1. 爬取主页面
-        logger.info('步骤1：爬取主页面...')
-        main_html = self._make_request(self.pl5_zjtj_url)
-        if not main_html:
-            logger.error('无法获取主页面内容')
-            return result
-        
-        # 2. 解析超链接
-        logger.info('步骤2：解析超链接...')
-        all_links = self.parse_zx_list_links(main_html)
+        # 1. 分页爬取链接
+        logger.info('步骤1：分页爬取文章链接...')
+        all_links = self.crawl_with_pagination(max_pages=5)
         result['total_links'] = len(all_links)
         
-        # 3. 根据期号过滤
-        logger.info('步骤3：根据期号过滤超链接...')
+        if not all_links:
+            logger.warning('未获取到任何链接')
+            return result
+        
+        # 2. 根据期号过滤
+        logger.info('步骤2：根据期号过滤超链接...')
         filtered_links = self.filter_links_by_issue(all_links, target_issue)
         result['filtered_links'] = len(filtered_links)
         
         if not filtered_links:
-            logger.warning('没有找到符合条件的超链接')
-            return result
+            logger.warning('没有找到符合条件的超链接，使用全部链接')
+            filtered_links = all_links
+        
+        # 3. 限制数量
+        filtered_links = filtered_links[:max_articles]
+        logger.info(f'步骤3：准备爬取 {len(filtered_links)} 篇文章...')
         
         # 4. 爬取文章内容
-        logger.info(f'步骤4：开始爬取 {len(filtered_links)} 篇文章...')
         for i, link in enumerate(filtered_links, 1):
             logger.info(f'爬取进度: {i}/{len(filtered_links)} - {link["url"]}')
             
@@ -331,8 +423,13 @@ class YDNiuSpider:
             if article_data and article_data.get('content'):
                 article_data['link_title'] = link['title']
                 article_data['link_url'] = link['url']
+                article_data['article_index'] = i
                 result['articles'].append(article_data)
                 result['successful_articles'] += 1
+                
+                if result['successful_articles'] >= max_articles:
+                    logger.info(f'已达到最大文章数 {max_articles}，停止爬取')
+                    break
             else:
                 logger.warning(f'文章内容为空或解析失败: {link["url"]}')
         

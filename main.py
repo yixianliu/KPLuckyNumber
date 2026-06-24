@@ -653,6 +653,149 @@ def run_save_articles_to_redis(target_issue=None, max_articles=100, extract_pred
         return False
 
 
+def run_process_article(url: str, title: str = '') -> bool:
+    """
+    处理单篇文章：爬取→AI分析→预处理→Redis存储
+    
+    Args:
+        url: 文章URL
+        title: 文章标题
+        
+    Returns:
+        是否成功
+    """
+    logger.info('=' * 80)
+    logger.info('开始处理单篇文章')
+    logger.info('=' * 80)
+
+    try:
+        from modules.article_processor import ArticleProcessor
+
+        logger.info(f'文章URL: {url}')
+        if title:
+            logger.info(f'文章标题: {title}')
+
+        processor = ArticleProcessor()
+        result = processor.process_article(url, title)
+
+        if result['success']:
+            logger.info('=' * 80)
+            logger.info('文章处理完成')
+            logger.info('=' * 80)
+            
+            logger.info('【处理步骤】')
+            logger.info('-' * 50)
+            for step in result['steps']:
+                status_icon = '✓' if step['status'] == '成功' else '✗'
+                logger.info(f'  {status_icon} {step["step"]}: {step["status"]}')
+                if 'content_length' in step:
+                    logger.info(f'      内容长度: {step["content_length"]}')
+                if 'report_length' in step:
+                    logger.info(f'      报告长度: {step["report_length"]}')
+                if 'processed_length' in step:
+                    logger.info(f'      处理后长度: {step["processed_length"]}')
+                if 'key' in step:
+                    logger.info(f'      Redis键: {step["key"]}')
+            
+            logger.info('')
+            logger.info('【报告预览】')
+            logger.info('-' * 50)
+            if result['report']:
+                preview = result['report'][:300] + '...' if len(result['report']) > 300 else result['report']
+                logger.info(f'{preview}')
+            
+            logger.info('')
+            logger.info(f'Redis键名: {result["redis_key"]}')
+            logger.info(f'过期时间: 7天')
+            logger.info('=' * 80)
+
+            return True
+        else:
+            logger.error(f'文章处理失败：{result["error"]}')
+            if result['steps']:
+                logger.info('【失败步骤】')
+                for step in result['steps']:
+                    if step['status'] == '失败':
+                        logger.info(f'  {step["step"]}: {step.get("error", "未知错误")}')
+            return False
+
+    except Exception as e:
+        logger.error(f'文章处理执行失败：{e}', exc_info=True)
+        return False
+
+
+def run_process_multiple_articles(max_count: int = 10) -> bool:
+    """
+    批量处理文章：爬取→AI分析→预处理→Redis存储
+    
+    Args:
+        max_count: 最大处理文章数
+        
+    Returns:
+        是否成功
+    """
+    logger.info('=' * 80)
+    logger.info(f'开始批量处理 {max_count} 篇文章')
+    logger.info('=' * 80)
+
+    try:
+        from modules.article_processor import ArticleProcessor
+
+        processor = ArticleProcessor()
+
+        # 获取文章URL列表（从爬虫获取）
+        logger.info('获取文章列表...')
+        if processor.spider:
+            crawl_result = processor.spider.crawl_all_articles()
+            articles = crawl_result.get('articles', [])[:max_count]
+            urls = [article.get('url', article.get('link_url', '')) for article in articles if article.get('url') or article.get('link_url')]
+            
+            if not urls:
+                logger.error('未获取到文章列表')
+                return False
+            
+            logger.info(f'获取到 {len(urls)} 篇文章')
+        else:
+            logger.error('爬虫模块不可用')
+            return False
+
+        # 批量处理
+        summary = processor.process_multiple_articles(urls)
+
+        logger.info('=' * 80)
+        logger.info('批量处理完成')
+        logger.info('=' * 80)
+        logger.info(f'总文章数：{summary["total"]}')
+        logger.info(f'成功：{summary["success"]}')
+        logger.info(f'失败：{summary["failed"]}')
+
+        if summary['reports']:
+            logger.info('')
+            logger.info('【成功处理的报告】')
+            logger.info('-' * 50)
+            for i, report in enumerate(summary['reports'], 1):
+                logger.info(f'{i}. {report["url"][:60]}...')
+                logger.info(f'   Redis键: {report["redis_key"]}')
+                logger.info(f'   期号: {report["issue"]}')
+                logger.info(f'   报告长度: {report["report_length"]}')
+
+        if summary['errors']:
+            logger.info('')
+            logger.info('【处理失败的文章】')
+            logger.info('-' * 50)
+            for i, error in enumerate(summary['errors'], 1):
+                logger.info(f'{i}. {error["url"][:60]}...')
+                logger.info(f'   错误: {error["error"]}')
+
+        logger.info('=' * 80)
+
+        return summary['success'] > 0
+
+    except Exception as e:
+        logger.error(f'批量处理执行失败：{e}', exc_info=True)
+        return False
+
+
 def main():
     """
     主函数
@@ -708,6 +851,18 @@ def main():
     save_articles_parser.add_argument('--no-extract', action='store_true',
                                        help='不提取预测数据，仅保存原始文章')
 
+    # 文章处理命令（爬取→AI→预处理→Redis存储）
+    process_article_parser = subparsers.add_parser('process-article', help='处理单篇文章：爬取→AI分析→预处理→Redis存储')
+    process_article_parser.add_argument('--url', type=str, required=True,
+                                        help='文章URL')
+    process_article_parser.add_argument('--title', type=str, default='',
+                                        help='文章标题（可选）')
+
+    # 批量文章处理命令
+    process_articles_parser = subparsers.add_parser('process-articles', help='批量处理文章：爬取→AI分析→预处理→Redis存储')
+    process_articles_parser.add_argument('--max', type=int, default=10,
+                                         help='最大处理文章数（默认10）')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -733,6 +888,10 @@ def main():
     elif args.command == 'save-articles':
         extract_predictions = not args.no_extract
         success = run_save_articles_to_redis(target_issue=args.issue, max_articles=args.max, extract_predictions=extract_predictions)
+    elif args.command == 'process-article':
+        success = run_process_article(url=args.url, title=args.title)
+    elif args.command == 'process-articles':
+        success = run_process_multiple_articles(max_count=args.max)
     else:
         logger.error(f'未知命令：{args.command}')
         success = False

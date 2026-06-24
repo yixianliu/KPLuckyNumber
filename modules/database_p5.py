@@ -364,6 +364,31 @@ class P5Database:
             '''
             self.cursor.execute(sql_shi_trend)
             
+            # 个位走势数据表
+            sql_ge_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_ge_trend_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                ge_number TINYINT NOT NULL COMMENT '个位数字(0-9)',
+                draw_date VARCHAR(20) NULL DEFAULT NULL COMMENT '开奖日期',
+                is_odd TINYINT(1) NULL DEFAULT NULL COMMENT '是否奇数(1=是,0=否)',
+                is_big TINYINT(1) NULL DEFAULT NULL COMMENT '是否大数(>=5为大,1=是,0=否)',
+                is_prime TINYINT(1) NULL DEFAULT NULL COMMENT '是否质数(1=是,0=否)',
+                omission INT NULL DEFAULT 0 COMMENT '当前遗漏值',
+                hot_level VARCHAR(10) NULL DEFAULT NULL COMMENT '冷热等级(hot/warm/cold)',
+                consecutive_count INT NULL DEFAULT 0 COMMENT '连续出现次数',
+                trend_json LONGTEXT NULL DEFAULT NULL COMMENT '个位走势JSON数据',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_ge_number (ge_number ASC) USING BTREE,
+                INDEX idx_draw_date (draw_date ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5个位走势图数据表';
+            '''
+            self.cursor.execute(sql_ge_trend)
+            
             # 和尾走势数据表
             sql_sum_end_trend = '''
             CREATE TABLE IF NOT EXISTS p5_sum_end_trend_data (
@@ -1507,6 +1532,141 @@ class P5Database:
             return stats
         except Exception as e:
             logger.error(f'获取十位数字统计失败: {e}')
+            return {}
+    
+    # ============================================================
+    # 个位走势数据操作
+    # ============================================================
+    
+    def insert_ge_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入个位走势数据（智能去重）
+        
+        Args:
+            data: 个位走势数据列表
+        
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        
+        success_count = 0
+        skip_count = 0
+        
+        try:
+            self.cursor.execute('SELECT issue FROM p5_ge_trend_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            
+            sql = '''
+            INSERT INTO p5_ge_trend_data 
+            (issue, ge_number, draw_date, is_odd, is_big, is_prime, 
+             omission, hot_level, consecutive_count, trend_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                ge_number = VALUES(ge_number),
+                draw_date = VALUES(draw_date),
+                is_odd = VALUES(is_odd),
+                is_big = VALUES(is_big),
+                is_prime = VALUES(is_prime),
+                omission = VALUES(omission),
+                hot_level = VALUES(hot_level),
+                consecutive_count = VALUES(consecutive_count),
+                trend_json = VALUES(trend_json),
+                source = VALUES(source)
+            '''
+            
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                
+                ge_num = item.get('ge_number', 0)
+                if not (0 <= ge_num <= 9):
+                    skip_count += 1
+                    continue
+                
+                self.cursor.execute(sql, (
+                    issue,
+                    ge_num,
+                    item.get('draw_date', ''),
+                    item.get('is_odd', None),
+                    item.get('is_big', None),
+                    item.get('is_prime', None),
+                    item.get('omission', 0),
+                    item.get('hot_level', ''),
+                    item.get('consecutive_count', 0),
+                    json.dumps(item, ensure_ascii=False),
+                    item.get('source', 'china_lottery')
+                ))
+                success_count += 1
+            
+            self.connection.commit()
+            logger.info(f'个位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入个位走势数据失败: {e}')
+            return 0, len(data)
+    
+    def get_ge_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取个位走势数据"""
+        try:
+            sql = 'SELECT * FROM p5_ge_trend_data ORDER BY issue DESC LIMIT %s'
+            self.cursor.execute(sql, (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取个位走势数据失败: {e}')
+            return []
+    
+    def get_ge_trend_count(self) -> int:
+        """获取个位走势数据总条数"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) as count FROM p5_ge_trend_data')
+            result = self.cursor.fetchone()
+            return result.get('count', 0) if result else 0
+        except Exception as e:
+            logger.error(f'获取个位走势数据总数失败: {e}')
+            return 0
+    
+    def get_ge_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取个位走势数据"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_ge_trend_data WHERE issue = %s', (issue,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.error(f'根据期号获取个位走势数据失败: {e}')
+            return None
+    
+    def get_ge_number_stats(self) -> Dict[str, Any]:
+        """获取个位数字统计信息"""
+        try:
+            sql = '''
+            SELECT 
+                ge_number,
+                COUNT(*) as count,
+                AVG(omission) as avg_omission,
+                MIN(omission) as min_omission,
+                MAX(omission) as max_omission
+            FROM p5_ge_trend_data
+            GROUP BY ge_number
+            ORDER BY count DESC
+            '''
+            self.cursor.execute(sql)
+            results = self.cursor.fetchall()
+            
+            stats = {}
+            for row in results:
+                stats[row['ge_number']] = {
+                    'count': row['count'],
+                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
+                    'min_omission': row['min_omission'],
+                    'max_omission': row['max_omission']
+                }
+            
+            return stats
+        except Exception as e:
+            logger.error(f'获取个位数字统计失败: {e}')
             return {}
     
     # ============================================================

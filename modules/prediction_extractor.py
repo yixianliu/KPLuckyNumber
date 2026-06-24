@@ -5,10 +5,11 @@
 过滤冗余内容，建立质量检查机制。
 
 核心功能：
-1. AI预测数据提取 - 使用专用Prompt精准识别预测数据
-2. 数据清洗过滤 - 去除背景介绍、广告、无关评论等冗余内容
-3. 格式统一化 - 确保输出数据格式统一、内容准确
-4. 质量检查机制 - 验证提取结果的完整性和准确性
+1. HTML清洗 - 去除所有HTML标签和样式，保留纯文本
+2. 内容理解 - AI模型生成对文章内容的理解和结构化分析
+3. 预测提取 - 从清洗后的内容中精准识别预测数据
+4. 质量检查 - 验证提取结果的完整性和准确性
+5. Redis存储 - 完整保存文章内容、理解结果和预测数据
 """
 
 import logging
@@ -36,7 +37,12 @@ class PredictionExtractor:
     """
     排列5预测数据提取器
     
-    从文章内容中精准提取预测数据，过滤冗余内容，建立质量检查机制
+    完整流程：
+    1. HTML清洗 - 去除标签、样式、脚本，保留纯文本
+    2. 内容理解 - AI模型生成对文章内容的深度理解
+    3. 预测提取 - 从理解后的内容中提取预测号码
+    4. 质量检查 - 验证数据完整性
+    5. Redis存储 - 完整保存所有数据
     """
     
     def __init__(self):
@@ -192,6 +198,230 @@ class PredictionExtractor:
 请开始提取，仅输出JSON格式数据：""")
         
         return ''.join(prompt_parts)
+    
+    def _build_content_understanding_prompt(self, clean_text: str, article_title: str) -> str:
+        """
+        构建内容理解Prompt - AI模型生成对文章的深度理解
+        
+        Args:
+            clean_text: 清洗后的纯文本
+            article_title: 文章标题
+            
+        Returns:
+            Prompt文本
+        """
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        prompt_parts = []
+        
+        prompt_parts.append("""你是一位专业的排列5彩票预测文章分析师。请仔细阅读以下文章内容，生成对文章内容的深度理解和结构化分析。
+
+【文章标题】""")
+        prompt_parts.append(article_title)
+        
+        prompt_parts.append("""
+【文章内容（已去除HTML格式，纯文本）】""")
+        prompt_parts.append(clean_text)
+        
+        prompt_parts.append(f"""
+【分析任务】
+请对文章进行深度理解和结构化分析，包括：
+
+1. **文章类型判断**
+   - 是预测分析类文章还是其他类型
+   - 作者/专家身份
+   - 发布时间和相关性
+
+2. **核心内容理解**
+   - 文章主要讨论什么
+   - 预测的依据是什么
+   - 提到了哪些关键指标或方法
+
+3. **预测号码识别**
+   - 明确识别出所有预测号码
+   - 区分定位预测和综合推荐
+   - 标注号码来源（原文直接给出 vs 分析推断）
+
+4. **关键信息提取**
+   - 遗漏值、出现频率等统计数据
+   - 趋势分析描述
+   - 专家选号思路
+
+5. **内容质量评估**
+   - 文章信息量（高/中/低）
+   - 预测数据完整性
+   - 可信度评估
+
+【输出格式要求】
+请严格按照以下JSON格式输出：
+
+```json
+{{
+    "article_title": "文章标题",
+    "analyze_time": """)
+        prompt_parts.append(current_time)
+        prompt_parts.append("""",
+    "article_type": "文章类型（预测分析/数据统计/综合资讯/其他）",
+    "expert_name": "专家名称（如有）",
+    
+    "content_summary": {{
+        "main_topic": "文章主要讨论内容",
+        "prediction_basis": "预测依据",
+        "key_methods": ["关键方法1", "关键方法2"],
+        "key_indicators": ["关键指标1", "关键指标2"]
+    }},
+    
+    "prediction_understanding": {{
+        "has_prediction": true/false,
+        "prediction_type": "预测类型（定位/单选/复式/综合/无）",
+        "prediction_positions": {{
+            "万位": "万位预测描述",
+            "千位": "千位预测描述",
+            "百位": "百位预测描述",
+            "十位": "十位预测描述",
+            "个位": "个位预测描述"
+        }},
+        "single_recommendation": "单选推荐描述",
+        "combined_recommendation": "复式/组合推荐描述"
+    }},
+    
+    "key_information": [
+        "关键信息1",
+        "关键信息2",
+        "关键信息3"
+    ],
+    
+    "quality_assessment": {{
+        "information_density": "高/中/低",
+        "prediction_completeness": "完整/部分/无",
+        "credibility": "高/中/低",
+        "overall_score": 0-100的评分
+    }},
+    
+    "raw_text_length": 原始纯文本长度,
+    "paragraphs_count": 段落数量
+}}
+```
+
+【重要规则】
+1. 内容理解要基于原文，不要添加原文没有的信息
+2. prediction_understanding中的描述要引用原文的具体表述
+3. 如果没有预测内容，has_prediction设为false
+4. quality_assessment要客观评估文章质量
+5. raw_text_length和paragraphs_count填写实际数值
+
+请开始分析，仅输出JSON格式数据：""")
+        
+        return ''.join(prompt_parts)
+    
+    def clean_html_to_plain_text(self, html_content: str) -> str:
+        """
+        清洗HTML内容为纯文本
+        
+        Args:
+            html_content: 原始HTML内容
+            
+        Returns:
+            清洗后的纯文本
+        """
+        try:
+            from modules.html_cleaner import HTMLTextCleaner
+            cleaner = HTMLTextCleaner()
+            return cleaner.clean_html(html_content)
+        except ImportError:
+            # 回退方案：使用简单正则清洗
+            logger.warning('HTMLCleaner导入失败，使用简单清洗方案')
+            return self._simple_html_clean(html_content)
+    
+    def _simple_html_clean(self, html_content: str) -> str:
+        """
+        简单HTML清洗（回退方案）
+        
+        Args:
+            html_content: 原始HTML
+            
+        Returns:
+            清洗后的文本
+        """
+        import html as html_module
+        
+        if not html_content:
+            return ""
+        
+        # 移除script和style
+        text = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
+        # 移除所有HTML标签
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # 转换HTML实体
+        text = html_module.unescape(text)
+        
+        # 规范化空白
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        
+        return text
+    
+    def generate_content_understanding(self, article_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        AI模型生成内容理解
+        
+        Args:
+            article_data: 包含HTML内容的文章数据
+            
+        Returns:
+            内容理解结果
+        """
+        logger.info('开始生成内容理解...')
+        
+        # 获取原始HTML内容
+        raw_content = article_data.get('content', '')
+        title = article_data.get('title', article_data.get('article_data', {}).get('title', ''))
+        
+        if not raw_content:
+            logger.warning('文章内容为空，无法生成理解')
+            return None
+        
+        # 步骤1：清洗HTML为纯文本
+        logger.info('步骤1：清洗HTML为纯文本...')
+        clean_text = self.clean_html_to_plain_text(raw_content)
+        
+        if not clean_text or len(clean_text) < 50:
+            logger.warning(f'清洗后文本过短({len(clean_text)}字符)，可能解析失败')
+            return None
+        
+        logger.info(f'HTML清洗完成：原始{len(raw_content)}字符 → 纯文本{len(clean_text)}字符')
+        
+        # 步骤2：构建内容理解Prompt
+        logger.info('步骤2：构建内容理解Prompt...')
+        prompt = self._build_content_understanding_prompt(clean_text, title)
+        
+        # 步骤3：调用AI模型
+        logger.info('步骤3：调用AI模型生成内容理解...')
+        ai_response = self.call_ai_model(prompt)
+        
+        if not ai_response:
+            logger.error('AI模型调用失败')
+            return None
+        
+        # 步骤4：解析响应
+        logger.info('步骤4：解析AI响应...')
+        understanding = self.parse_ai_response(ai_response)
+        
+        if not understanding:
+            logger.error('AI响应解析失败')
+            return None
+        
+        # 添加纯文本信息
+        understanding['clean_text_length'] = len(clean_text)
+        understanding['clean_text_preview'] = clean_text[:500] + '...' if len(clean_text) > 500 else clean_text
+        understanding['paragraphs'] = [p for p in clean_text.split('\n') if p.strip()]
+        
+        logger.info(f'内容理解生成成功：类型={understanding.get("article_type")}, 质量评分={understanding.get("quality_assessment", {}).get("overall_score")}')
+        
+        return understanding
     
     def call_ai_model(self, prompt: str) -> Optional[str]:
         """

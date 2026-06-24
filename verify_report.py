@@ -1,45 +1,28 @@
-from modules.database_p5 import P5Database
+import redis
 import json
 
-db = P5Database()
-db.connect()
+r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+key = 'kpluckynumber:article:report:b819f598d6432a04'
+data = json.loads(r.get(key))
 
-report = db.get_latest_ai_report()
-if report:
-    print('=' * 80)
-    print('AI分析报告数据库验证')
-    print('=' * 80)
-    print(f'报告UUID: {report["report_uuid"]}')
-    print(f'报告日期: {report["report_date"]}')
-    print(f'数据条数: {report["data_count"]}')
-    print(f'最新期号: {report["latest_issue"]}')
-    print(f'预测期号: {report["next_issue"]}')
-    print(f'报告格式: {report["report_format"]}')
-    print(f'报告内容长度: {len(report["report_content"])}')
-    print(f'风险提示: {report["risk_warning"]}')
-    
-    if report.get('recommended_numbers'):
-        nums = json.loads(report['recommended_numbers'])
-        print('\n推荐号码:')
-        for pos, numbers in nums.items():
-            pos_name = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位'}.get(pos, pos)
-            print(f'  {pos_name}: {numbers}')
-    
-    if report.get('confidence_scores'):
-        scores = json.loads(report['confidence_scores'])
-        print('\n置信度分数:')
-        for pos, confs in scores.items():
-            pos_name = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位'}.get(pos, pos)
-            print(f'  {pos_name}: {confs}')
-    
-    if report.get('probability_stats'):
-        stats = json.loads(report['probability_stats'])
-        print(f'\n模型版本: {stats.get("model_version", "未知")}')
-    
-    print('\n' + '=' * 80)
-    print('数据库存储验证通过！')
-    print('=' * 80)
-else:
-    print('未找到报告')
-
-db.disconnect()
+print('=' * 70)
+print('Redis数据验证')
+print('=' * 70)
+print('键名:', key)
+print('URL:', data['url'])
+print('报告长度:', data['report_length'])
+print('处理时间:', data['process_time'])
+print('过期天数:', data['expire_days'])
+print('期号:', data['metadata']['issue'])
+print('AI模型:', data['metadata']['ai_model'])
+print()
+print('报告内容中是否包含换行符:', '\n' in data['report'])
+print('报告内容中是否包含回车符:', '\r' in data['report'])
+print()
+print('报告前500字符预览:')
+print('-' * 70)
+print(data['report'][:500])
+print()
+print('=' * 70)
+print('验证完成')
+print('=' * 70)
