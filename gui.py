@@ -32,6 +32,9 @@ from modules.ai_analyzer import AIAnalyzer
 from modules.database_p5 import P5Database
 from modules.spider_p5 import P5Spider
 from modules.prediction_validator import P5PredictionValidator
+from modules.optimized_p5_predictor import OptimizedP5Predictor, OptimizedP5PredictorConfig
+from modules.backtest_engine import P5BacktestEngine
+from modules.feature_engineering import P5FeatureEngineering
 
 COLORS = {
     'bg_primary': '#0f172a',
@@ -152,8 +155,8 @@ class LotteryGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("排列5 AI智能分析系统")
-        self.root.geometry("1200x800")
-        self.root.minsize(1000, 700)
+        self.root.geometry("1100x750")
+        self.root.minsize(950, 650)
         self.root.configure(bg=COLORS['bg_primary'])
 
         self.task_mgr = TaskManager(self)
@@ -185,37 +188,37 @@ class LotteryGUI:
         self._build_status_bar(main_container)
 
     def _build_header(self, parent):
-        header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=60)
+        header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=50)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
 
         left = tk.Frame(header, bg=COLORS['bg_secondary'])
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=15)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=12)
 
-        icon = tk.Canvas(left, width=36, height=36, bg=COLORS['bg_secondary'],
+        icon = tk.Canvas(left, width=32, height=32, bg=COLORS['bg_secondary'],
                          highlightthickness=0)
-        icon.pack(side=tk.LEFT, pady=12)
-        icon.create_rectangle(2, 2, 34, 16, fill=COLORS['accent_p5'], outline='', width=0)
-        icon.create_rectangle(2, 20, 34, 34, fill=COLORS['accent_ai'], outline='', width=0)
+        icon.pack(side=tk.LEFT, pady=9)
+        icon.create_rectangle(2, 2, 30, 14, fill=COLORS['accent_p5'], outline='', width=0)
+        icon.create_rectangle(2, 18, 30, 30, fill=COLORS['accent_ai'], outline='', width=0)
 
         title_box = tk.Frame(left, bg=COLORS['bg_secondary'])
-        title_box.pack(side=tk.LEFT, padx=(10, 0), pady=8)
+        title_box.pack(side=tk.LEFT, padx=(8, 0), pady=6)
 
         tk.Label(title_box, text="排列5 AI智能分析系统",
-                 font=('微软雅黑', 14, 'bold'),
+                 font=('微软雅黑', 13, 'bold'),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_primary']).pack(anchor=tk.W)
 
         tk.Label(title_box, text="多模型综合预测分析平台",
-                 font=('微软雅黑', 9),
+                 font=('微软雅黑', 8),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_muted']).pack(anchor=tk.W)
 
         self.time_label = tk.Label(header, text="",
-                                   font=('Consolas', 10),
+                                   font=('Consolas', 9),
                                    bg=COLORS['bg_secondary'],
                                    fg=COLORS['text_secondary'])
-        self.time_label.pack(side=tk.RIGHT, padx=15, pady=18)
+        self.time_label.pack(side=tk.RIGHT, padx=12, pady=15)
         self._update_time()
 
     def _update_time(self):
@@ -224,10 +227,10 @@ class LotteryGUI:
 
     def _build_content(self, parent):
         content = tk.Frame(parent, bg=COLORS['bg_primary'])
-        content.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+        content.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
-        left = tk.Frame(content, bg=COLORS['bg_primary'], width=280)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        left = tk.Frame(content, bg=COLORS['bg_primary'], width=260)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
         left.pack_propagate(False)
 
         self._build_control_panel(left)
@@ -240,27 +243,27 @@ class LotteryGUI:
     def _build_control_panel(self, parent):
         # 数据爬取卡片
         crawl_card = self._create_card(parent, "数据爬取", '#f59e0b')
-        crawl_card.pack(fill=tk.X, pady=(0, 10))
+        crawl_card.pack(fill=tk.X, pady=(0, 8))
 
         self._add_big_button(crawl_card, "增量爬取数据", '#f59e0b',
                              lambda: self._on_button_click("增量爬取数据", self._execute_crawl_incremental))
         self._add_action_button(crawl_card, "全量爬取数据", '#d97706',
                                 lambda: self._on_button_click("全量爬取数据", self._execute_crawl_full))
 
-        # AI分析卡片
-        p5_card = self._create_card(parent, "排列5 AI分析", COLORS['accent_p5'])
-        p5_card.pack(fill=tk.X, pady=(0, 10))
+        # AI分析卡片（优化版）
+        p5_card = self._create_card(parent, "AI智能分析", COLORS['accent_p5'])
+        p5_card.pack(fill=tk.X, pady=(0, 8))
 
         self._add_big_button(p5_card, "执行AI智能分析", COLORS['accent_p5'],
-                             lambda: self._on_button_click("AI智能分析", self._execute_p5_ai))
-        self._add_action_button(p5_card, "查看最新报告", '#8b5cf6',
-                                lambda: self._on_button_click("查看最新报告", self._view_latest_report))
-        self._add_action_button(p5_card, "查看报告列表", '#3b82f6',
-                                lambda: self._on_button_click("查看报告列表", self._view_report_list))
+                             lambda: self._on_button_click("AI智能分析", self._execute_optimized_p5_ai))
+        self._add_action_button(p5_card, "执行历史回测", '#22c55e',
+                                lambda: self._on_button_click("历史回测", self._execute_backtest))
+        self._add_action_button(p5_card, "执行特征分析", '#f59e0b',
+                                lambda: self._on_button_click("特征分析", self._execute_feature_analysis))
 
         # 预测验证卡片
         verify_card = self._create_card(parent, "预测验证", '#ec4899')
-        verify_card.pack(fill=tk.X, pady=(0, 10))
+        verify_card.pack(fill=tk.X, pady=(0, 8))
 
         self._add_action_button(verify_card, "验证待验证预测", '#ec4899',
                                 lambda: self._on_button_click("验证预测", self._execute_verify_predictions))
@@ -269,7 +272,7 @@ class LotteryGUI:
 
         # 系统操作卡片
         common_card = self._create_card(parent, "系统操作", COLORS['accent_ai'])
-        common_card.pack(fill=tk.X, pady=(0, 10))
+        common_card.pack(fill=tk.X, pady=(0, 8))
 
         self._add_action_button(common_card, "数据库检测", COLORS['accent_ai'],
                                 lambda: self._on_button_click("数据库检测", self._check_database))
@@ -281,27 +284,27 @@ class LotteryGUI:
         progress_card = tk.Frame(parent, bg=COLORS['bg_secondary'],
                                  highlightbackground=COLORS['border'],
                                  highlightthickness=1)
-        progress_card.pack(fill=tk.X, pady=(0, 10))
+        progress_card.pack(fill=tk.X, pady=(0, 8))
 
         tk.Label(progress_card, text="任务进度",
-                 font=('微软雅黑', 10, 'bold'),
+                 font=('微软雅黑', 9, 'bold'),
                  bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+                 fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=10, pady=(8, 4))
 
         self.progress = ttk.Progressbar(progress_card, mode='determinate', maximum=100)
-        self.progress.pack(fill=tk.X, padx=12, pady=(0, 5))
+        self.progress.pack(fill=tk.X, padx=10, pady=(0, 4))
 
         self.progress_label = tk.Label(progress_card, text="0%",
-                                       font=('Consolas', 12, 'bold'),
+                                       font=('Consolas', 11, 'bold'),
                                        bg=COLORS['bg_secondary'],
                                        fg=COLORS['accent_p5'])
-        self.progress_label.pack(anchor=tk.CENTER, pady=(0, 5))
+        self.progress_label.pack(anchor=tk.CENTER, pady=(0, 4))
 
         self.task_status_label = tk.Label(progress_card, text="就绪",
-                                          font=('微软雅黑', 9),
+                                          font=('微软雅黑', 8),
                                           bg=COLORS['bg_secondary'],
                                           fg=COLORS['text_muted'])
-        self.task_status_label.pack(anchor=tk.W, padx=12, pady=(0, 10))
+        self.task_status_label.pack(anchor=tk.W, padx=10, pady=(0, 8))
 
         stats_card = tk.Frame(parent, bg=COLORS['bg_secondary'],
                               highlightbackground=COLORS['border'],
@@ -309,37 +312,37 @@ class LotteryGUI:
         stats_card.pack(fill=tk.X)
 
         tk.Label(stats_card, text="快捷统计",
-                 font=('微软雅黑', 10, 'bold'),
+                 font=('微软雅黑', 9, 'bold'),
                  bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=12, pady=(10, 5))
+                 fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=10, pady=(8, 4))
 
         self.stats_content = tk.Label(stats_card,
                                       text="点击「执行AI智能分析」开始",
-                                      font=('微软雅黑', 9),
+                                      font=('微软雅黑', 8),
                                       bg=COLORS['bg_secondary'],
                                       fg=COLORS['text_muted'],
                                       justify=tk.LEFT)
-        self.stats_content.pack(anchor=tk.W, padx=12, pady=(0, 10))
+        self.stats_content.pack(anchor=tk.W, padx=10, pady=(0, 8))
 
     def _create_card(self, parent, title, accent_color):
         card = tk.Frame(parent, bg=COLORS['bg_secondary'],
                         highlightbackground=COLORS['border'],
                         highlightthickness=1)
 
-        top_bar = tk.Frame(card, bg=accent_color, height=3)
+        top_bar = tk.Frame(card, bg=accent_color, height=2)
         top_bar.pack(fill=tk.X)
         top_bar.pack_propagate(False)
 
         title_frame = tk.Frame(card, bg=COLORS['bg_secondary'])
-        title_frame.pack(fill=tk.X, padx=12, pady=(10, 8))
+        title_frame.pack(fill=tk.X, padx=10, pady=(8, 6))
 
-        dot = tk.Canvas(title_frame, width=10, height=10,
+        dot = tk.Canvas(title_frame, width=8, height=8,
                         bg=COLORS['bg_secondary'], highlightthickness=0)
-        dot.pack(side=tk.LEFT, padx=(0, 8))
-        dot.create_oval(1, 1, 9, 9, fill=accent_color, outline='')
+        dot.pack(side=tk.LEFT, padx=(0, 6))
+        dot.create_oval(1, 1, 7, 7, fill=accent_color, outline='')
 
         tk.Label(title_frame, text=title,
-                 font=('微软雅黑', 12, 'bold'),
+                 font=('微软雅黑', 11, 'bold'),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_primary']).pack(side=tk.LEFT)
 
@@ -347,10 +350,10 @@ class LotteryGUI:
 
     def _add_big_button(self, parent, text, color, command):
         btn_frame = tk.Frame(parent, bg=COLORS['bg_secondary'])
-        btn_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
 
         btn = tk.Button(btn_frame, text=text,
-                        font=('微软雅黑', 12, 'bold'),
+                        font=('微软雅黑', 11, 'bold'),
                         bg=color,
                         fg=COLORS['text_primary'],
                         activebackground=color,
@@ -358,7 +361,7 @@ class LotteryGUI:
                         relief='flat',
                         cursor='hand2',
                         command=command,
-                        padx=15, pady=12)
+                        padx=12, pady=10)
         btn.pack(fill=tk.X)
 
         light_color = self._lighten_color(color, 1.15)
@@ -370,10 +373,10 @@ class LotteryGUI:
 
     def _add_action_button(self, parent, text, color, command):
         btn_frame = tk.Frame(parent, bg=COLORS['bg_secondary'])
-        btn_frame.pack(fill=tk.X, padx=12, pady=3)
+        btn_frame.pack(fill=tk.X, padx=10, pady=2)
 
         btn = tk.Button(btn_frame, text=text,
-                        font=('微软雅黑', 10),
+                        font=('微软雅黑', 9),
                         bg=COLORS['bg_card'],
                         fg=COLORS['text_primary'],
                         activebackground=color,
@@ -381,7 +384,7 @@ class LotteryGUI:
                         relief='flat',
                         cursor='hand2',
                         command=command,
-                        padx=15, pady=6)
+                        padx=12, pady=5)
         btn.pack(fill=tk.X)
 
         btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=c))
@@ -399,21 +402,21 @@ class LotteryGUI:
         return f'#{r:02x}{g:02x}{b:02x}'
 
     def _build_output_panel(self, parent):
-        header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=35)
+        header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=30)
         header.pack(fill=tk.X, pady=(0, 2))
         header.pack_propagate(False)
 
         tk.Label(header, text="AI分析报告",
-                 font=('微软雅黑', 10, 'bold'),
+                 font=('微软雅黑', 9, 'bold'),
                  bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_secondary']).pack(side=tk.LEFT, padx=12, pady=6)
+                 fg=COLORS['text_secondary']).pack(side=tk.LEFT, padx=10, pady=5)
 
         self.log_level_label = tk.Label(header, text="INFO",
-                                        font=('Consolas', 8),
+                                        font=('Consolas', 7),
                                         bg=COLORS['success'],
                                         fg=COLORS['text_primary'],
-                                        padx=6, pady=1)
-        self.log_level_label.pack(side=tk.RIGHT, padx=12, pady=6)
+                                        padx=5, pady=1)
+        self.log_level_label.pack(side=tk.RIGHT, padx=10, pady=5)
 
         text_container = tk.Frame(parent, bg=COLORS['bg_input'])
         text_container.pack(fill=tk.BOTH, expand=True)
@@ -422,17 +425,17 @@ class LotteryGUI:
                                  troughcolor=COLORS['bg_secondary'],
                                  activebackground=COLORS['border'],
                                  relief='flat',
-                                 width=12)
+                                 width=10)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.output_text = tk.Text(text_container,
                                    wrap=tk.WORD,
-                                   font=('Consolas', 10),
+                                   font=('Consolas', 9),
                                    bg=COLORS['bg_input'],
                                    fg=COLORS['text_primary'],
                                    insertbackground=COLORS['accent_p5'],
                                    relief='flat',
-                                   padx=10, pady=10,
+                                   padx=8, pady=8,
                                    state=tk.NORMAL,
                                    yscrollcommand=scrollbar.set)
         self.output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -444,23 +447,31 @@ class LotteryGUI:
     def _show_welcome(self):
         welcome = f"""
 {'='*70}
-  欢迎使用 排列5 AI智能分析系统
+  欢迎使用 排列5 AI智能分析系统 v2.0
 {'='*70}
 
   系统功能:
     [增量爬取数据] 仅获取数据库中缺失的新数据
     [全量爬取数据] 重新爬取全部历史数据和走势数据
-    [AI智能分析] 多模型综合分析 + 预测 + 保存报告
-    [查看最新报告] 从数据库读取最新的AI分析报告
-    [查看报告列表] 查看历史AI分析报告列表
+    
+    [AI智能分析] ✨ 优化后模型分析（推荐）
+    [历史回测] ✨ 批量历史回测，验证模型性能
+    [特征分析] ✨ 提取和分析历史数据特征
+    
     [验证待验证预测] 自动比对预测与实际开奖结果
     [性能评估报告] 生成AI预测命中率统计报告
 
-  分析模型:
-    - 频率统计模型：基于历史数据统计号码出现频率
-    - 遗漏分析模型：分析号码遗漏值，预测冷号回补
-    - 趋势分析模型：分析近期走势方向
-    - 机器学习模型：基于条件概率的智能预测
+  优化模型 (v2.0):
+    - 修复期号排序Bug（数值排序而非字符串排序）
+    - 修复质数定义Bug（1不是质数）
+    - 修复遗漏值计算Bug（正确处理从未出现的号码）
+    - 新增特征工程（012路、连号、重隔号、区间分布、滑动窗口）
+    - 新增概率归一化（确保概率总和为1）
+    - 新增边界保护（限制极端输出）
+    - 新增多模型融合（统计模型+特征工程交叉校验）
+
+  ⚠️ 重要提示：本系统仅基于历史数据统计分析，无法预测开奖结果，
+     不构成任何投资建议。彩票开奖具有随机性，请理性购彩。
 
   当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
@@ -569,203 +580,7 @@ class LotteryGUI:
     # 业务任务
     # ============================================================
 
-    def _execute_p5_ai(self, task_mgr):
-        """执行排列5 AI智能分析"""
-        try:
-            task_mgr.log("正在初始化AI分析器...")
-            task_mgr.progress(10, "初始化分析器")
-            
-            analyzer = AIAnalyzer()
-            
-            task_mgr.log("正在从数据库获取历史数据...")
-            task_mgr.progress(20, "获取数据")
-            
-            try:
-                data = analyzer.fetch_data(source='database')
-                task_mgr.log(f"✓ 数据库获取成功: {len(data)} 条历史数据")
-            except Exception as e:
-                task_mgr.log(f"✗ 数据库获取失败: {str(e)}")
-                task_mgr.log("正在尝试从爬虫获取数据...")
-                try:
-                    data = analyzer.fetch_data(source='spider')
-                    task_mgr.log(f"✓ 爬虫获取成功: {len(data)} 条数据")
-                except Exception as e2:
-                    task_mgr.log(f"✗ 爬虫获取失败: {str(e2)}")
-                    task_mgr.log("\n错误: 无法获取数据，请检查数据库连接或网络状态")
-                    task_mgr.progress(0, "数据获取失败")
-                    return
-            
-            task_mgr.progress(35, "数据获取完成")
-            
-            if not data:
-                task_mgr.log("\n错误: 没有获取到任何数据")
-                task_mgr.log("建议操作:")
-                task_mgr.log("  1. 检查数据库是否有数据")
-                task_mgr.log("  2. 执行「增量爬取数据」或「全量爬取数据」")
-                task_mgr.log("  3. 检查网络连接状态")
-                task_mgr.progress(0, "无数据")
-                return
-            
-            # 数据质量检查
-            task_mgr.log("\n正在验证数据质量...")
-            task_mgr.progress(45, "验证数据质量")
-            
-            quality_report = analyzer.validate_data_quality(data)
-            
-            if quality_report.get('status') == 'error':
-                task_mgr.log(f"\n✗ 数据质量不合格: {quality_report.get('message', '')}")
-                task_mgr.log(f"  数据总量: {quality_report.get('total_count', 0)}")
-                task_mgr.log(f"  有效数据: {quality_report.get('valid_count', 0)}")
-                task_mgr.log(f"  有效率: {quality_report.get('valid_rate', 0)}%")
-                
-                issues = quality_report.get('issues', [])
-                if issues:
-                    task_mgr.log("\n问题列表:")
-                    for issue in issues[:5]:
-                        task_mgr.log(f"  - {issue}")
-                
-                task_mgr.log("\n建议: 请先执行数据爬取以获取更多有效数据")
-                task_mgr.progress(0, "数据质量不合格")
-                return
-            
-            if quality_report.get('status') == 'warning':
-                task_mgr.log(f"\n⚠ 数据质量警告: {quality_report.get('message', '')}")
-                task_mgr.log(f"  有效率: {quality_report.get('valid_rate', 0)}%")
-                warnings = quality_report.get('warnings', [])
-                if warnings:
-                    for warning in warnings[:3]:
-                        task_mgr.log(f"  - {warning}")
-                task_mgr.log("\n继续执行分析...")
-            
-            task_mgr.log(f"✓ 数据质量验证通过: 有效率 {quality_report.get('valid_rate', 0)}%")
-            
-            # 执行AI分析
-            task_mgr.log("\n正在执行多模型综合分析...")
-            task_mgr.progress(55, "频率统计模型")
-            
-            result = analyzer.analyze_p5(data)
-            
-            if result.get('status') != 'success':
-                error_msg = result.get('message', '未知错误')
-                error_code = result.get('error_code', 'UNKNOWN')
-                task_mgr.log(f"\n✗ AI分析失败: {error_msg}")
-                task_mgr.log(f"  错误代码: {error_code}")
-                
-                if 'quality_report' in result:
-                    qr = result['quality_report']
-                    task_mgr.log(f"  数据质量: {qr.get('message', '')}")
-                
-                task_mgr.progress(0, "分析失败")
-                return
-            
-            task_mgr.progress(75, "分析完成")
-            
-            # 显示分析报告
-            task_mgr.log("\n" + "=" * 70)
-            task_mgr.log("✓ AI分析报告生成完成！")
-            task_mgr.log("=" * 70)
-            task_mgr.report(result)
-            
-            # 保存报告到数据库
-            task_mgr.log("\n正在保存报告到数据库...")
-            task_mgr.progress(85, "保存报告")
-            
-            try:
-                save_result = analyzer.save_report_to_database(result)
-                if save_result:
-                    task_mgr.log(f"✓ 报告已成功保存到数据库")
-                    task_mgr.log(f"  报告UUID: {save_result}")
-                else:
-                    task_mgr.log("⚠ 报告保存失败，但分析结果已显示")
-            except Exception as e:
-                task_mgr.log(f"⚠ 报告保存异常: {str(e)}")
-                task_mgr.log("  分析结果已显示，可手动保存")
-            
-            # 更新统计面板
-            data_summary = result.get('data_summary', {})
-            quality_info = result.get('quality_report', {})
-            
-            stats_text = (
-                f"数据量: {data_summary.get('data_count')} 条\n"
-                f"有效率: {data_summary.get('valid_rate')}%\n"
-                f"最新期号: {data_summary.get('latest_issue')}\n"
-                f"预测期号: {data_summary.get('next_issue')}"
-            )
-            
-            # 根据数据质量设置颜色
-            if quality_info.get('status') == 'success':
-                fg_color = COLORS['success']
-            elif quality_info.get('status') == 'warning':
-                fg_color = COLORS['warning']
-            else:
-                fg_color = COLORS['accent_danger']
-            
-            self.stats_content.config(text=stats_text, fg=fg_color)
-            
-            task_mgr.progress(100, "任务完成")
-            task_mgr.log("\n✓ AI智能分析流程全部完成")
-            
-        except Exception as e:
-            error_detail = traceback.format_exc()
-            task_mgr.log(f"\n✗ AI分析过程发生异常: {str(e)}")
-            task_mgr.log(f"\n错误详情:\n{error_detail}")
-            task_mgr.progress(0, "异常终止")
-            task_mgr.log("\n建议操作:")
-            task_mgr.log("  1. 检查数据库连接配置")
-            task_mgr.log("  2. 查看日志文件获取详细错误信息")
-            task_mgr.log("  3. 联系技术支持")
 
-    def _view_latest_report(self, task_mgr):
-        """查看最新AI分析报告"""
-        task_mgr.log("正在查询最新AI分析报告...")
-        task_mgr.progress(30, "查询数据库")
-
-        db = P5Database()
-        if db.connect():
-            report = db.get_latest_ai_report()
-            db.disconnect()
-
-            if report:
-                task_mgr.log("\n" + "=" * 70)
-                task_mgr.log("最新AI分析报告")
-                task_mgr.log("=" * 70)
-                task_mgr.log(f"报告日期: {report.get('report_date', '')}")
-                task_mgr.log(f"数据量: {report.get('data_count', 0)}")
-                task_mgr.log(f"最新期号: {report.get('latest_issue', '')}")
-                task_mgr.log("\n报告内容:")
-                task_mgr.log(report.get('report_content', '无报告内容'))
-                task_mgr.log("\n" + "=" * 70)
-
-                stats_text = f"数据量: {report.get('data_count')} | 最新期号: {report.get('latest_issue')}"
-                self.stats_content.config(text=stats_text, fg=COLORS['success'])
-            else:
-                task_mgr.log("未找到AI分析报告，请先执行AI智能分析")
-                self.stats_content.config(text="暂无报告数据", fg=COLORS['text_muted'])
-        else:
-            task_mgr.log("数据库连接失败")
-
-    def _view_report_list(self, task_mgr):
-        """查看AI分析报告列表"""
-        task_mgr.log("正在查询AI分析报告列表...")
-
-        db = P5Database()
-        if db.connect():
-            reports = db.get_all_ai_reports(limit=10)
-            count = db.get_report_count()
-            db.disconnect()
-
-            if reports:
-                task_mgr.log(f"\n共找到 {count} 份AI分析报告")
-                task_mgr.log("=" * 70)
-                for i, report in enumerate(reports, 1):
-                    task_mgr.log(f"{i}. 报告日期: {report.get('report_date', '')}")
-                    task_mgr.log(f"   数据量: {report.get('data_count', 0)} | 最新期号: {report.get('latest_issue', '')}")
-                    task_mgr.log(f"   创建时间: {report.get('created_at', '')}")
-                    task_mgr.log("")
-            else:
-                task_mgr.log("未找到AI分析报告")
-        else:
-            task_mgr.log("数据库连接失败")
 
     def _check_database(self, task_mgr):
         """数据库检测"""
@@ -972,6 +787,336 @@ class LotteryGUI:
         db.disconnect()
         self.stats_content.config(text=stats_text, fg=COLORS['text_secondary'])
         task_mgr.log("快捷统计更新完成")
+
+    # ============================================================
+    # 优化后AI分析任务（v2.0）
+    # ============================================================
+
+    def _execute_optimized_p5_ai(self, task_mgr):
+        """执行优化后AI分析（v2.0）"""
+        try:
+            task_mgr.log("正在初始化优化后AI预测器...")
+            task_mgr.progress(10, "初始化预测器")
+
+            predictor = OptimizedP5Predictor()
+
+            task_mgr.log("正在从数据库获取历史数据...")
+            task_mgr.progress(20, "获取数据")
+
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+
+            history_data = db.get_history_data(limit=200, order_by='issue DESC')
+            db.disconnect()
+
+            if not history_data:
+                task_mgr.log("✗ 数据库中没有历史数据")
+                task_mgr.log("建议操作: 先执行「增量爬取数据」或「全量爬取数据」")
+                task_mgr.progress(0, "无数据")
+                return
+
+            task_mgr.log(f"✓ 数据库获取成功: {len(history_data)} 条历史数据")
+            current_issue = history_data[0].get('issue', '')
+            task_mgr.log(f"当前最新期号: {current_issue}")
+
+            task_mgr.progress(35, "数据获取完成")
+
+            # 执行优化后AI分析
+            task_mgr.log("\n正在执行优化后多模型综合分析...")
+            task_mgr.progress(50, "多算法预测")
+
+            result = predictor.predict(history_data, current_issue)
+
+            if 'error' in result:
+                task_mgr.log(f"\n✗ 预测失败: {result['error']}")
+                task_mgr.progress(0, "预测失败")
+                return
+
+            task_mgr.progress(75, "分析完成")
+
+            # 显示分析报告（简化版）
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.log("✓ AI智能分析报告")
+            task_mgr.log("=" * 70)
+
+            # 显示AI分析状态
+            ai_enabled = result.get('ai_analysis_enabled', False)
+            task_mgr.log(f"\n【分析状态】{'AI大模型已启用' if ai_enabled else '统计模型分析'}")
+            if not ai_enabled:
+                task_mgr.log("  提示：未配置API密钥，当前仅使用统计模型分析")
+
+            # 输出万千百十位预测号码
+            task_mgr.log("\n【万千百十位预测号码】")
+            pos_names = ['万位', '千位', '百位', '十位', '个位']
+            for pos in range(5):
+                pos_name = pos_names[pos]
+                pos_probs = result['fused_probabilities'][pos]
+                sorted_nums = sorted(pos_probs.items(), key=lambda x: x[1], reverse=True)
+                top_3 = sorted_nums[:3]
+
+                task_mgr.log(f"\n{pos_name}:")
+                for rank, (num, prob) in enumerate(top_3, 1):
+                    task_mgr.log(f"  {rank}. 号码{num} (概率: {prob:.2%})")
+
+            # 输出推荐组合
+            task_mgr.log("\n【推荐组合（Top-5）】")
+            for combo in result['top_combinations'][:5]:
+                task_mgr.log(f"{combo['rank']}. {combo['combination']} (置信度: {combo['confidence']:.2f}%)")
+
+            # 输出风险提示
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.log(result['risk_warning'])
+            task_mgr.log("=" * 70)
+
+            # 更新统计面板
+            stats_text = (
+                f"数据量: {result.get('data_samples')} 条\n"
+                f"最新期号: {current_issue}\n"
+                f"预测期号: {result.get('target_issue')}\n"
+                f"算法数量: {len(result.get('algorithm_weights', {}))}"
+            )
+            self.stats_content.config(text=stats_text, fg=COLORS['success'])
+
+            # 保存预测结果
+            os.makedirs('predictions', exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'predictions/optimized_prediction_{timestamp}.json'
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+
+            task_mgr.log(f"\n✓ 预测结果已保存到: {filename}")
+
+            task_mgr.progress(100, "任务完成")
+            task_mgr.log("\n✓ 优化后AI分析流程全部完成")
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 优化后AI分析过程发生异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
+
+    def _execute_backtest(self, task_mgr):
+        """执行历史回测"""
+        try:
+            task_mgr.log("正在执行历史回测...")
+            task_mgr.progress(10, "初始化回测引擎")
+
+            # 初始化预测器
+            predictor = OptimizedP5Predictor()
+
+            # 初始化数据库
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+
+            # 获取历史数据
+            task_mgr.log("正在加载历史数据...")
+            task_mgr.progress(20, "加载数据")
+
+            history_data = db.get_history_data(limit=None, order_by='issue ASC')
+            db.disconnect()
+
+            if len(history_data) < 100:
+                task_mgr.log(f"✗ 历史数据不足: 需要至少100期，实际{len(history_data)}期")
+                task_mgr.progress(0, "数据不足")
+                return
+
+            task_mgr.log(f"✓ 历史数据加载完成: 共{len(history_data)}期")
+
+            # 初始化回测引擎
+            task_mgr.log("正在初始化回测引擎...")
+            task_mgr.progress(30, "初始化引擎")
+
+            backtest_engine = P5BacktestEngine(predictor, db)
+
+            # 配置回测参数
+            start_index = 50
+            test_count = min(50, len(history_data) - start_index)
+
+            task_mgr.log(f"回测配置: 起始位置={start_index}, 测试期数={test_count}")
+
+            # 执行回测
+            task_mgr.log("\n正在执行回测...")
+            task_mgr.progress(40, "执行回测")
+
+            backtest_result = backtest_engine.run_backtest(start_index, test_count)
+
+            if backtest_result.get('status') != 'success':
+                task_mgr.log(f"\n✗ 回测失败: {backtest_result.get('message', '未知错误')}")
+                task_mgr.progress(0, "回测失败")
+                return
+
+            task_mgr.progress(80, "回测完成")
+
+            # 输出回测结果
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.log("✓ 历史回测完成！")
+            task_mgr.log("=" * 70)
+
+            stats = backtest_result.get('overall_stats', {})
+
+            task_mgr.log("\n【回测统计指标】")
+            task_mgr.log(f"测试期数: {backtest_result.get('total_tested', 0)}")
+            task_mgr.log(f"平均综合得分: {stats.get('avg_overall_score', 0):.2f}/100")
+            task_mgr.log(f"平均Top-1命中: {stats.get('avg_top1_hits', 0):.2f}/5 位")
+            task_mgr.log(f"平均Top-3命中: {stats.get('avg_top3_hits', 0):.2f}/5 位")
+            task_mgr.log(f"Top-1命中率: {stats.get('avg_top1_hit_rate', 0):.2f}%")
+            task_mgr.log(f"Top-3命中率: {stats.get('avg_top3_hit_rate', 0):.2f}%")
+            task_mgr.log(f"概率校准得分: {stats.get('avg_calibration_score', 0):.2f}/100")
+            task_mgr.log(f"完全猜中次数: {stats.get('full_match_count', 0)} 次")
+            task_mgr.log(f"完全猜中率: {stats.get('full_match_rate', 0):.2f}%")
+
+            # 输出详细结果（前10期）
+            task_mgr.log("\n【前10期回测详情】")
+            results = backtest_result.get('results', [])
+            for i, result in enumerate(results[:10], 1):
+                issue = result.get('issue', '')
+                top1_hits = result.get('top1_hits', 0)
+                top3_hits = result.get('top3_hits', 0)
+                overall_score = result.get('overall_score', 0)
+                task_mgr.log(f"{i}. 期号{issue}: Top1命中{top1_hits}/5, Top3命中{top3_hits}/5, 综合得分{overall_score:.1f}")
+
+            # 生成回测报告
+            task_mgr.log("\n正在生成回测报告...")
+            report_path = backtest_engine.generate_backtest_report(backtest_result)
+            task_mgr.log(f"✓ 回测报告已保存到: {report_path}")
+
+            # 更新统计面板
+            stats_text = (
+                f"回测期数: {backtest_result.get('total_tested', 0)}\n"
+                f"Top-1命中率: {stats.get('avg_top1_hit_rate', 0):.2f}%\n"
+                f"Top-3命中率: {stats.get('avg_top3_hit_rate', 0):.2f}%\n"
+                f"综合得分: {stats.get('avg_overall_score', 0):.2f}"
+            )
+            self.stats_content.config(text=stats_text, fg=COLORS['accent_ai'])
+
+            task_mgr.progress(100, "任务完成")
+            task_mgr.log("\n✓ 历史回测流程全部完成")
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 历史回测过程发生异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
+
+    def _execute_feature_analysis(self, task_mgr):
+        """执行特征分析"""
+        try:
+            task_mgr.log("正在执行特征分析...")
+            task_mgr.progress(10, "初始化特征工程")
+
+            # 初始化特征工程
+            fe = P5FeatureEngineering()
+
+            # 初始化数据库
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+
+            # 获取历史数据
+            task_mgr.log("正在加载历史数据...")
+            task_mgr.progress(20, "加载数据")
+
+            history_data = db.get_history_data(limit=None, order_by='issue ASC')
+            db.disconnect()
+
+            if not history_data:
+                task_mgr.log("✗ 数据库中没有历史数据")
+                task_mgr.progress(0, "无数据")
+                return
+
+            task_mgr.log(f"✓ 历史数据加载完成: 共{len(history_data)}期")
+
+            # 提取所有特征
+            task_mgr.log("\n正在提取特征...")
+            task_mgr.progress(40, "提取频率特征")
+
+            features = fe.extract_all_features(history_data)
+
+            task_mgr.progress(70, "特征提取完成")
+
+            # 输出特征分析结果
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.log("✓ 特征分析完成！")
+            task_mgr.log("=" * 70)
+
+            pos_names = ['万位', '千位', '百位', '十位', '个位']
+
+            # 频率特征
+            task_mgr.log("\n【频率特征】")
+            freq_features = features.get('frequency', {})
+            for pos_name in pos_names:
+                pos_freq = freq_features.get(pos_name, {})
+                hot_numbers = pos_freq.get('hot_numbers', [])
+                cold_numbers = pos_freq.get('cold_numbers', [])
+                warm_numbers = pos_freq.get('warm_numbers', [])
+                task_mgr.log(f"{pos_name}: 热号={hot_numbers}, 温号={warm_numbers}, 冷号={cold_numbers}")
+
+            # 012路特征
+            task_mgr.log("\n【012路特征】")
+            road_features = features.get('road_012', {})
+            for pos_name in pos_names:
+                pos_road = road_features.get(pos_name, {})
+                road_ratios = pos_road.get('road_ratios', {})
+                task_mgr.log(f"{pos_name}: 0路={road_ratios.get(0, 0):.2%}, 1路={road_ratios.get(1, 0):.2%}, 2路={road_ratios.get(2, 0):.2%}")
+
+            # 连号特征
+            task_mgr.log("\n【连号特征】")
+            consecutive_features = features.get('consecutive', {})
+            task_mgr.log(f"平均连号数: {consecutive_features.get('avg_consecutive_count', 0):.2f}")
+            task_mgr.log(f"最大连号数: {consecutive_features.get('max_consecutive_count', 0)}")
+            task_mgr.log(f"连号出现率: {consecutive_features.get('consecutive_rate', 0):.2%}")
+
+            # 重隔号特征
+            task_mgr.log("\n【重隔号特征】")
+            repeat_features = features.get('repeat', {})
+            task_mgr.log(f"重号率: {repeat_features.get('repeat_rate', 0):.2%}")
+            task_mgr.log(f"隔号率: {repeat_features.get('skip_rate', 0):.2%}")
+            task_mgr.log(f"无重复率: {repeat_features.get('no_repeat_rate', 0):.2%}")
+
+            # 和值与跨度特征
+            task_mgr.log("\n【和值与跨度特征】")
+            sum_span_features = features.get('sum_span', {})
+            task_mgr.log(f"和值范围: {sum_span_features.get('sum_range', [])}")
+            task_mgr.log(f"平均和值: {sum_span_features.get('avg_sum', 0):.2f}")
+            task_mgr.log(f"跨度范围: {sum_span_features.get('span_range', [])}")
+            task_mgr.log(f"平均跨度: {sum_span_features.get('avg_span', 0):.2f}")
+
+            # 保存特征分析结果
+            os.makedirs('reports/features', exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'reports/features/feature_analysis_{timestamp}.json'
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(features, f, indent=2, ensure_ascii=False, default=str)
+
+            task_mgr.log(f"\n✓ 特征分析结果已保存到: {filename}")
+
+            # 更新统计面板
+            stats_text = (
+                f"数据量: {len(history_data)} 条\n"
+                f"连号率: {consecutive_features.get('consecutive_rate', 0):.1%}\n"
+                f"重号率: {repeat_features.get('repeat_rate', 0):.1%}\n"
+                f"平均和值: {sum_span_features.get('avg_sum', 0):.1f}"
+            )
+            self.stats_content.config(text=stats_text, fg=COLORS['warning'])
+
+            task_mgr.progress(100, "任务完成")
+            task_mgr.log("\n✓ 特征分析流程全部完成")
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 特征分析过程发生异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
 
 
 def main():

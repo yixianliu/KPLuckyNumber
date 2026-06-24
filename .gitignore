@@ -9,3 +9,5 @@ modules/ai_analyzer.py
 /api/
 api
 config.py
+/predictions/
+__pycache__
