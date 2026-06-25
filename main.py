@@ -600,7 +600,8 @@ def run_save_articles_to_redis(target_issue=None, max_articles=100, extract_pred
         logger.info(f'配置参数：目标期号={target_issue or "全部"}, 最大文章数={max_articles}, 预测提取={extract_predictions}')
 
         analyzer = ArticleAnalyzer()
-        result = analyzer.save_all_articles_to_redis(
+        # call the bulk-save variant (renamed to avoid method name collision)
+        result = analyzer.save_all_articles_bulk_to_redis(
             target_issue=target_issue, 
             max_articles=max_articles,
             extract_predictions=extract_predictions

@@ -632,21 +632,78 @@ class ArticleAnalyzer:
             }
         ]
 
-        ai_response = self.ai_client._call_ai_model(messages=messages, max_tokens=8000, temperature=0.7)
-        if not ai_response:
-            logger.error('AI模型调用失败')
-            return None
+        try:
+            ai_response = self.ai_client._call_ai_model(messages=messages, max_tokens=8000, temperature=0.7)
+            if not ai_response:
+                logger.error('AI模型调用失败')
+                raise RuntimeError('AI模型调用失败')
 
-        # 解析AI响应
-        ai_result = self.ai_client._parse_ai_response(ai_response)
-        if not ai_result:
-            logger.error('AI响应解析失败')
-            return None
+            # 解析AI响应
+            ai_result = self.ai_client._parse_ai_response(ai_response)
+            if not ai_result:
+                logger.error('AI响应解析失败')
+                raise RuntimeError('AI响应解析失败')
 
-        logger.info('第二次AI分析完成')
-        logger.info(f'预测期号: {ai_result.get("next_issue", "未知")}')
+            logger.info('第二次AI分析完成')
+            logger.info(f'预测期号: {ai_result.get("next_issue", "未知")}')
 
-        return ai_result
+            return ai_result
+
+        except Exception as e:
+            # 发生错误时，记录日志并返回一个基于第一次AI分析与历史数据的回退报告，
+            # 以便后续流程（保存到DB、展示报告）能够继续执行。
+            logger.error(f'第二次AI分析异常，使用回退方案继续: {e}', exc_info=True)
+
+            # 尝试从redis_data中提取第一次AI分析结果
+            first_ai = redis_data.get('ai_analysis', {}) if isinstance(redis_data, dict) else {}
+
+            # 构建回退预测：优先使用第一次AI分析中的 forecast_numbers 字段
+            forecast = first_ai.get('forecast_numbers', {}) if isinstance(first_ai, dict) else {}
+
+            prediction = {}
+            for pos_key in ['wan', 'qian', 'bai', 'shi', 'ge']:
+                nums = forecast.get(pos_key, []) if isinstance(forecast, dict) else []
+                if not isinstance(nums, list):
+                    nums = [nums] if nums is not None else []
+                prediction[pos_key] = {
+                    'numbers': nums,
+                    'confidence': [0.0] * len(nums),
+                    'reason': '二次AI分析失败，回退使用文章初步分析结果作为推荐（置信度占位0.0）'
+                }
+
+            # 组合回退结果
+            latest_issue = ''
+            try:
+                latest_issue = db_history.get('latest_issue', '') if isinstance(db_history, dict) else ''
+            except Exception:
+                latest_issue = ''
+
+            next_issue = ''
+            try:
+                if latest_issue and str(latest_issue).isdigit():
+                    next_issue = str(int(latest_issue) + 1)
+                else:
+                    # 尝试从 first_ai 中取 issue_number
+                    fi = first_ai.get('issue_number') if isinstance(first_ai, dict) else None
+                    if fi and str(fi).isdigit():
+                        next_issue = str(int(fi) + 1)
+            except Exception:
+                next_issue = ''
+
+            fallback = {
+                'data_source': '回退：文章初步分析+历史数据',
+                'analysis_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'model_version': getattr(self.ai_client, 'model_name', 'unknown'),
+                'current_issue': latest_issue,
+                'next_issue': next_issue,
+                'prediction': prediction,
+                'trend_analysis': {},
+                'reasoning_process': ['二次AI分析失败，回退使用初步文章分析结果'],
+                'recommended_combinations': [],
+                'risk_warning': '二次AI分析失败，结果基于回退逻辑，请谨慎使用'
+            }
+
+            return fallback
 
     def save_to_database(self, final_report: Dict[str, Any], db_history: Dict[str, Any]) -> Optional[str]:
         """
@@ -892,9 +949,9 @@ class ArticleAnalyzer:
 
         return result
 
-    def save_all_articles_to_redis(self, target_issue: Optional[str] = None, 
-                                    max_articles: int = 100,
-                                    extract_predictions: bool = True) -> Dict[str, Any]:
+    def save_all_articles_bulk_to_redis(self, target_issue: Optional[str] = None, 
+                                        max_articles: int = 100,
+                                        extract_predictions: bool = True) -> Dict[str, Any]:
         """
         批量保存所有爬取的文章到Redis（按文章ID存储），并可选提取预测数据
 

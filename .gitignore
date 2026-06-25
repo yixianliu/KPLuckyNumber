@@ -11,3 +11,4 @@ api
 config.py
 /predictions/
 __pycache__
+/tests/
