@@ -81,6 +81,7 @@ class RedisClient:
 
     def get_key_prefix(self) -> str:
         """获取键名前缀"""
+        # 项目约定的 Redis 键前缀（AGENTS.md 中有说明），请勿随意修改以保证其他模块的兼容性
         return 'kpluckynumber:pl5:'
 
     def get_raw_data_key(self, issue: Optional[str] = None) -> str:

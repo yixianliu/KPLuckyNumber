@@ -1,12 +1,32 @@
 """
-文章内容AI分析模块
+文章内容AI分析模块（完整版双阶段AI分析）
 
-实现完整的文章分析流程：
-1. 爬取文章内容
-2. 第一次AI分析：结构化整理
-3. 存储到Redis
-4. 第二次AI分析：整合数据并预测
-5. 存储最终报告到数据库
+实现完整的6步文章分析工作流：
+1. 爬取文章内容（YDNiuSpider，支持分页和期号过滤）
+2. 第一次AI分析：结构化整理（生成JSON结构化的文章分析）
+3. 存储到Redis（文章原始数据+AI分析结果，7天过期）
+4. 从Redis加载数据（按期号索引）
+5. 第二次AI分析：整合多源数据并生成综合预测报告
+6. 存储最终报告到数据库（MySQL，含UUID追踪）
+
+调用路径：
+    main.py → run_article_analysis() / run_save_articles_to_redis()
+           → ArticleAnalyzer.analyze_article_workflow() / save_all_articles_bulk_to_redis()
+
+与 article_processor.py 的区别：
+    - ArticleAnalyzer: 完整6步流程，含双阶段AI分析+数据库存储
+    - ArticleProcessor: 简化4步流程，仅单次AI分析+Redis存储
+    - 两者共享: 爬虫(YDNiuSpider)、Redis、AI客户端
+
+懒加载模式：
+    所有外部组件（爬虫/Redis/AI/数据库）采用懒加载模式，
+    仅在首次使用时通过 _init_*() 方法初始化，
+    避免导入时因环境依赖缺失而失败。
+
+已知冗余（待后续重构）:
+    - _extract_issue_from_article() 与 article_processor.py::_extract_issue_from_content() 功能重复
+    - save_to_redis() / save_all_articles_to_redis() 与 article_processor.py::save_report_to_redis() 逻辑类似
+    - 第二次AI分析回退逻辑（second_ai_analysis中）较为复杂，可考虑提取为独立方法
 """
 
 import logging
@@ -17,6 +37,10 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 os.makedirs('logs', exist_ok=True)
+
+# 说明：文章分析链路涉及爬虫、AI、Redis与数据库等外部依赖。
+# 为提高模块可导入性，本项目采用延迟/懒加载（在函数内部导入依赖模块）的模式，
+# 在修改本文件时请保持该风格以避免导入时出现环境依赖错误。
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -29,19 +53,50 @@ if not logger.handlers:
 
 class ArticleAnalyzer:
     """
-    文章内容分析器
+    文章内容AI分析器（完整版双阶段分析）
 
-    整合爬虫、AI分析、Redis存储、数据库存储的完整流程
+    整合爬虫、AI分析、Redis缓存、数据库存储的完整分析工作流。
+
+    核心工作流 (analyze_article_workflow):
+    步骤1: 爬取文章 (crawl_all_articles → YDNiuSpider)
+    步骤2: 第一次AI分析 (first_ai_analysis → ERNIEAIAnalyzer)
+    步骤3: Redis存储 (save_all_articles_to_redis)
+    步骤4: 从Redis加载 (load_from_redis)
+    步骤5: 获取历史数据 (_fetch_data_from_database → ERNIEAIAnalyzer)
+    步骤6: 第二次AI分析 (second_ai_analysis → 整合多源数据+回退方案)
+    步骤7: 数据库存储 (save_to_database → P5Database)
+
+    批量保存工作流 (save_all_articles_bulk_to_redis):
+    步骤1: 爬取文章
+    步骤2: 初始化Redis
+    步骤3: (可选)初始化PredictionExtractor
+    步骤4: 批量处理（HTML清洗+AI分析+Redis存储）
+
+    组件初始化（全部懒加载）:
+    - _init_spider(): YDNiuSpider 爬虫
+    - _init_redis(): RedisClient 缓存
+    - _init_ai_client(): ERNIEAIAnalyzer AI客户端
+    - _init_db_client(): P5Database MySQL数据库
+
+    调用方:
+    - main.py: run_article_analysis(), run_save_articles_to_redis()
+    - gui.py: _execute_optimized_p5_ai()
     """
 
     def __init__(self):
+        """初始化分析器（所有组件采用懒加载，首次使用时才初始化）"""
         self.spider = None
         self.redis_client = None
         self.ai_client = None
         self.db_client = None
 
     def _init_spider(self):
-        """初始化爬虫模块"""
+        """
+        懒加载初始化爬虫模块 (YDNiuSpider)
+
+        仅在首次调用爬取相关方法时初始化，
+        避免导入时因网络/依赖问题导致整个模块加载失败。
+        """
         try:
             from modules.ydniu_spider import YDNiuSpider
             self.spider = YDNiuSpider()
@@ -50,7 +105,11 @@ class ArticleAnalyzer:
             logger.error('无法导入爬虫模块')
 
     def _init_redis(self):
-        """初始化Redis客户端"""
+        """
+        懒加载初始化Redis客户端 (RedisClient)
+
+        初始化后立即检查连接状态，连接失败记录warning但不阻塞后续流程。
+        """
         try:
             from modules.redis_client import RedisClient
             self.redis_client = RedisClient()
@@ -62,7 +121,12 @@ class ArticleAnalyzer:
             logger.error('无法导入Redis模块')
 
     def _init_ai_client(self):
-        """初始化AI客户端"""
+        """
+        懒加载初始化AI客户端 (ERNIEAIAnalyzer)
+
+        ERNIEAIAnalyzer封装了百度Qianfan API的调用和响应解析，
+        本模块通过其 _call_ai_model() 和 _parse_ai_response() 进行AI交互。
+        """
         try:
             from modules.ernie_ai_analyzer import ERNIEAIAnalyzer
             self.ai_client = ERNIEAIAnalyzer()
@@ -71,7 +135,12 @@ class ArticleAnalyzer:
             logger.error('无法导入AI客户端模块')
 
     def _init_db_client(self):
-        """初始化数据库客户端"""
+        """
+        懒加载初始化数据库客户端 (P5Database)
+
+        初始化后立即尝试连接MySQL，
+        连接失败记录warning但不阻塞后续流程（允许Redis缓存降级）。
+        """
         try:
             from modules.database_p5 import P5Database
             self.db_client = P5Database()
@@ -84,13 +153,26 @@ class ArticleAnalyzer:
 
     def _build_first_analysis_prompt(self, article_data: Dict[str, Any]) -> str:
         """
-        构建第一次AI分析的提示词（结构化整理）
+        构建第一次AI分析提示词：要求输出结构化JSON
+
+        输出JSON包含字段:
+        - data_source: 固定"亿点牛文章分析"
+        - article_info: {title, author, publish_time, url}
+        - analysis_time: 分析时间
+        - issue_number: 提取的期号
+        - forecast_numbers: {wan, qian, bai, shi, ge} 各位置号码列表
+        - recommended_combinations: 推荐组合
+        - key_points: 关键分析点
+        - trend_analysis: 趋势分析总结文本
+        - confidence_level: 置信度（高/中/低）
+        - risk_warning: 风险提示
+        - summary: 文章内容总结
 
         Args:
-            article_data: 文章数据
+            article_data: 文章数据字典（含title/author/publish_time/url/content等字段）
 
         Returns:
-            提示词
+            完整的提示词文本
         """
         prompt_parts = []
 
@@ -124,18 +206,14 @@ class ArticleAnalyzer:
     "analysis_time": "YYYY-MM-DD HH:MM:SS",
     "issue_number": "提取的期号（如2026165）",
     "forecast_numbers": {
-        "wan": [万位推荐号码列表],
-        "qian": [千位推荐号码列表],
-        "bai": [百位推荐号码列表],
-        "shi": [十位推荐号码列表],
-        "ge": [个位推荐号码列表]
+        "wan": [],
+        "qian": [],
+        "bai": [],
+        "shi": [],
+        "ge": []
     },
-    "recommended_combinations": ["推荐组合1", "推荐组合2"],
-    "key_points": [
-        "关键点1",
-        "关键点2",
-        "关键点3"
-    ],
+    "recommended_combinations": [],
+    "key_points": [],
     "trend_analysis": "趋势分析总结",
     "confidence_level": "置信度（高/中/低）",
     "risk_warning": "风险提示",
@@ -151,20 +229,28 @@ class ArticleAnalyzer:
 
         return "\n".join(prompt_parts)
 
-    def _build_second_analysis_prompt(self, 
+    def _build_second_analysis_prompt(self,
                                       redis_data: Dict[str, Any],
                                       first_ai_result: Dict[str, Any],
                                       db_history: Dict[str, Any]) -> str:
         """
-        构建第二次AI分析的提示词（整合数据并预测）
+        构建第二次AI分析提示词：整合5大数据源进行深度预测
+
+        数据源:
+        一、文章内容分析数据（Redis）：文章AI分析结果、推荐号码、关键点、趋势分析
+        二、历史开奖数据（MySQL）：最近30期记录，含和值/跨度/奇偶比/大小比
+        三、基础走势图数据（MySQL）：最近20期走势（含日期、和值、奇偶、大小）
+        四、各位置走势统计（MySQL）：万/千/百/十/个位独立走势，含热号/冷号/最大遗漏
+
+        输出要求: 严格JSON格式，要求分析5个维度（文章内容+历史+走势+奇偶大小+和值跨度）
 
         Args:
-            redis_data: Redis中的文章分析数据
-            first_ai_result: 第一次AI分析结果
-            db_history: 数据库历史数据
+            redis_data: Redis中保存的文章分析数据（含articles和ai_analysis）
+            first_ai_result: 第一次AI的结构化分析结果
+            db_history: 数据库历史数据（含history_data和trend_data和各位置走势）
 
         Returns:
-            提示词
+            完整的提示词文本（通常2000+字符）
         """
         prompt_parts = []
 
@@ -196,23 +282,23 @@ class ArticleAnalyzer:
             prompt_parts.append(f"数据来源：{ai_analysis.get('data_source', '未知')}")
             prompt_parts.append(f"分析时间：{ai_analysis.get('analysis_time', '未知')}")
             prompt_parts.append(f"期号：{ai_analysis.get('issue_number', '未知')}")
-            
+
             if ai_analysis.get('forecast_numbers'):
                 nums = ai_analysis['forecast_numbers']
                 prompt_parts.append("\n【文章推荐号码】")
-                for pos_name, pos_key in zip(['万位', '千位', '百位', '十位', '个位'], 
+                for pos_name, pos_key in zip(['万位', '千位', '百位', '十位', '个位'],
                                              ['wan', 'qian', 'bai', 'shi', 'ge']):
                     if nums.get(pos_key):
                         prompt_parts.append(f"  {pos_name}：{nums[pos_key]}")
-            
+
             if ai_analysis.get('key_points'):
                 prompt_parts.append("\n【关键点】")
                 for point in ai_analysis['key_points']:
                     prompt_parts.append(f"  - {point}")
-            
+
             if ai_analysis.get('trend_analysis'):
                 prompt_parts.append(f"\n【趋势分析】\n{ai_analysis['trend_analysis']}")
-            
+
             if ai_analysis.get('summary'):
                 prompt_parts.append(f"\n【文章总结】\n{ai_analysis['summary']}")
 
@@ -223,7 +309,7 @@ class ArticleAnalyzer:
         if db_history:
             prompt_parts.append(f"数据条数：{db_history.get('data_count', 0)}")
             prompt_parts.append(f"最新期号：{db_history.get('latest_issue', '未知')}")
-            
+
             if db_history.get('history_data'):
                 recent = db_history['history_data'][:20]
                 prompt_parts.append("\n最近20期开奖记录：")
@@ -276,23 +362,23 @@ class ArticleAnalyzer:
             if db_history and db_history.get(pos_key):
                 pos_data = db_history[pos_key][:15]
                 prompt_parts.append(f"\n【{pos_name}走势数据（最近15期）】")
-                
+
                 recent_values = []
                 hot_nums = {}
                 cold_nums = {}
                 max_omission = 0
-                
+
                 for item in pos_data:
                     num = item.get(num_key, 0)
                     recent_values.append(num)
                     hot_nums[num] = hot_nums.get(num, 0) + 1
                     omission = item.get('omission', 0)
                     max_omission = max(max_omission, omission)
-                
+
                 sorted_nums = sorted(hot_nums.items(), key=lambda x: x[1], reverse=True)
                 hot = [n for n, _ in sorted_nums[:3]]
                 cold = [n for n, _ in sorted_nums[-3:]]
-                
+
                 prompt_parts.append(f"  近期走势: {recent_values}")
                 prompt_parts.append(f"  热号(高频): {hot}")
                 prompt_parts.append(f"  冷号(低频): {cold}")
@@ -312,82 +398,104 @@ class ArticleAnalyzer:
 4. 考虑和值与跨度的合理范围
 5. 结合文章中的专家观点和推荐
 
-输出格式要求（必须严格按照JSON格式输出，不要包含任何额外文字）：
+【输出格式要求】
+请严格按照以下JSON格式输出，不要包含任何额外文字（不要有markdown标记）：
+
 {
-    "data_source": "综合分析（文章内容+历史数据+走势数据）",
+    "data_source": "亿点牛文章+历史数据综合AI分析",
     "analysis_time": "YYYY-MM-DD HH:MM:SS",
-    "model_version": "deepseek-v3.1-250821",
-    "data_period": "最近30期",
-    "current_issue": "当前期号",
-    "next_issue": "预测期号",
-    
+    "model_version": "模型版本号",
+    "data_period": "分析数据周期描述",
+    "current_issue": "当前最新期号",
+    "next_issue": "预测目标期号",
     "prediction": {
-        "wan": {"numbers": [数字列表], "confidence": [置信度列表], "reason": "详细分析理由，包含走势数据支持"},
-        "qian": {"numbers": [数字列表], "confidence": [置信度列表], "reason": "详细分析理由，包含走势数据支持"},
-        "bai": {"numbers": [数字列表], "confidence": [置信度列表], "reason": "详细分析理由，包含走势数据支持"},
-        "shi": {"numbers": [数字列表], "confidence": [置信度列表], "reason": "详细分析理由，包含走势数据支持"},
-        "ge": {"numbers": [数字列表], "confidence": [置信度列表], "reason": "详细分析理由，包含走势数据支持"}
+        "wan": {
+            "numbers": [1, 3, 5],
+            "confidence": [0.85, 0.72, 0.65],
+            "reason": "推荐理由"
+        },
+        "qian": {
+            "numbers": [2, 4, 6],
+            "confidence": [0.80, 0.75, 0.68],
+            "reason": "推荐理由"
+        },
+        "bai": {
+            "numbers": [3, 5, 7],
+            "confidence": [0.82, 0.76, 0.70],
+            "reason": "推荐理由"
+        },
+        "shi": {
+            "numbers": [4, 6, 8],
+            "confidence": [0.78, 0.74, 0.70],
+            "reason": "推荐理由"
+        },
+        "ge": {
+            "numbers": [5, 7, 9],
+            "confidence": [0.88, 0.78, 0.72],
+            "reason": "推荐理由"
+        }
     },
-    
     "trend_analysis": {
-        "summary": "总体趋势总结，包含对近期走势的整体判断",
-        "wan": "万位趋势分析，包含热冷号分析、遗漏值分析、奇偶大小分析",
-        "qian": "千位趋势分析，包含热冷号分析、遗漏值分析、奇偶大小分析",
-        "bai": "百位趋势分析，包含热冷号分析、遗漏值分析、奇偶大小分析",
-        "shi": "十位趋势分析，包含热冷号分析、遗漏值分析、奇偶大小分析",
-        "ge": "个位趋势分析，包含热冷号分析、遗漏值分析、奇偶大小分析"
+        "summary": "整体趋势分析总结",
+        "wan": "万位趋势分析...",
+        "qian": "千位趋势分析...",
+        "bai": "百位趋势分析...",
+        "shi": "十位趋势分析...",
+        "ge": "个位趋势分析..."
     },
-    
+    "reasoning_process": [
+        "第一步推理过程...",
+        "第二步推理过程...",
+        "第三步推理过程..."
+    ],
+    "recommended_combinations": [
+        {"combination": "13524", "confidence": 0.75, "reason": "组合推荐理由"},
+        {"combination": "35746", "confidence": 0.70, "reason": "组合推荐理由"},
+        {"combination": "57968", "confidence": 0.65, "reason": "组合推荐理由"}
+    ],
     "statistical_features": {
-        "hezhi_range": "[和值预测范围]",
-        "span_range": "[跨度预测范围]",
-        "odd_even_ratio": "[预测奇偶比]",
-        "big_small_ratio": "[预测大小比]",
-        "hot_numbers": "[热号列表]",
-        "cold_numbers": "[冷号列表]",
+        "hezhi_range": "和值范围",
+        "span_range": "跨度范围",
+        "odd_even_ratio": "奇偶比偏好",
+        "big_small_ratio": "大小比偏好",
+        "hot_numbers": "热号描述",
+        "cold_numbers": "冷号描述",
         "key_patterns": ["模式1", "模式2", "模式3"]
     },
-    
-    "reasoning_process": "详细的推理过程，包括：1) 各位置号码选择的依据；2) 走势数据的支持；3) 文章观点的参考；4) 统计特征的综合判断",
-    
-    "recommended_combinations": [
-        {"combination": "推荐组合1", "confidence": 置信度, "reason": "推荐理由"},
-        {"combination": "推荐组合2", "confidence": 置信度, "reason": "推荐理由"},
-        {"combination": "推荐组合3", "confidence": 置信度, "reason": "推荐理由"},
-        {"combination": "推荐组合4", "confidence": 置信度, "reason": "推荐理由"},
-        {"combination": "推荐组合5", "confidence": 置信度, "reason": "推荐理由"}
+    "key_conclusions": [
+        "关键结论1...",
+        "关键结论2...",
+        "关键结论3..."
     ],
-    
-    "data_source_summary": {
-        "article_source": "亿点牛网站",
-        "article_issue": "文章期号",
-        "history_data_count": 30,
-        "analysis_confidence": "综合置信度评估"
-    },
-    
-    "risk_warning": "本分析基于历史数据统计和文章内容分析，彩票开奖具有随机性，不保证中奖，请理性购彩。"
+    "risk_warning": "风险提示文本"
 }
 
-请确保：
-1. 推荐号码每个位置最多3个
-2. 置信度为0-1之间的小数
-3. 分析过程要综合考虑文章内容、历史数据和走势数据
-4. 推理过程要清晰、有条理，包含数据支持
-5. 预测期号根据当前期号自动计算
-6. 输出必须是纯JSON格式，不要包含Markdown标记或其他文字
+注意事项：
+1. prediction字段中每个位置必须包含numbers数组、confidence数组和reason字符串
+2. recommended_combinations必须是对象数组，每个对象含combination(5位号码字符串)、confidence(0-1浮点数)、reason
+3. reasoning_process必须是字符串数组，每条是完整推理过程
+4. trend_analysis必须包含summary和各位置分析
+5. key_conclusions必须是字符串数组
+6. 严格按照以上字段名输出，不要省略任何字段
 """)
 
         return "\n".join(prompt_parts)
 
     def first_ai_analysis(self, article_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        第一次AI分析：结构化整理文章内容
+        第一次AI分析：结构化整理文章内容为JSON
+
+        流程:
+        1. 构建分析提示词（_build_first_analysis_prompt）
+        2. 调用AI模型（ERNIEAIAnalyzer._call_ai_model, max_tokens=4000, temperature=0.5）
+        3. 解析AI响应JSON（ERNIEAIAnalyzer._parse_ai_response）
 
         Args:
-            article_data: 文章数据
+            article_data: 文章数据（含title/content等字段）
 
         Returns:
-            AI分析结果
+            AI分析结果JSON字典（含issue_number/forecast_numbers/confidence_level等），
+            失败返回None
         """
         logger.info('=' * 80)
         logger.info('开始第一次AI分析：结构化整理')
@@ -434,15 +542,20 @@ class ArticleAnalyzer:
 
     def save_to_redis(self, issue: str, article_data: Dict[str, Any], ai_result: Dict[str, Any]) -> bool:
         """
-        保存数据到Redis（单篇文章）
+        保存单篇文章数据到Redis（原始数据+AI分析结果）
+
+        存储键:
+        - 原始数据: RedisClient.save_raw_data(issue, article_data)
+        - AI分析: kpluckynumber:pl5:ai:{issue} (7天过期，JSON格式)
+          {issue, article_data, ai_analysis, save_time}
 
         Args:
-            issue: 期号
-            article_data: 文章数据
-            ai_result: AI分析结果
+            issue: 期号（作为键名的一部分）
+            article_data: 文章原始数据
+            ai_result: 第一次AI的结构化分析结果
 
         Returns:
-            是否成功
+            是否保存成功
         """
         logger.info('保存数据到Redis...')
 
@@ -482,15 +595,23 @@ class ArticleAnalyzer:
 
     def save_all_articles_to_redis(self, issue: str, articles: List[Dict[str, Any]], ai_result: Dict[str, Any]) -> Dict[str, Any]:
         """
-        保存所有文章数据到Redis
+        批量保存所有爬取的文章到Redis
+
+        流程:
+        1. 遍历articles列表，为每篇生成article_id
+        2. 逐篇调用redis_client.save_article_data()（7天过期）
+        3. 最后保存AI分析结果到 kpluckynumber:pl5:ai:{issue}
+
+        注意: 与 save_all_articles_bulk_to_redis() 不同，
+             本方法先做第一次AI分析再保存，后者在保存过程中做AI分析。
 
         Args:
             issue: 期号
             articles: 文章数据列表
-            ai_result: AI分析结果
+            ai_result: 第一次AI的结构化分析结果
 
         Returns:
-            保存结果字典
+            {success, saved_count, failed_count, total_count} 或 {success: False, error}
         """
         logger.info(f'保存所有文章数据到Redis（共{len(articles)}篇）...')
 
@@ -523,14 +644,14 @@ class ArticleAnalyzer:
 
                     if success:
                         saved_count += 1
-                        logger.info(f'文章{idx+1}保存成功: {article.get("title", "未知")[:50]}')
+                        logger.info(f'文章{idx + 1}保存成功: {article.get("title", "未知")[:50]}')
                     else:
                         failed_count += 1
-                        logger.warning(f'文章{idx+1}保存失败: {article.get("title", "未知")[:50]}')
+                        logger.warning(f'文章{idx + 1}保存失败: {article.get("title", "未知")[:50]}')
 
                 except Exception as e:
                     failed_count += 1
-                    logger.error(f'文章{idx+1}保存异常: {e}')
+                    logger.error(f'文章{idx + 1}保存异常: {e}')
 
             # 保存AI分析结果（使用统一键名）
             redis_data = {
@@ -559,13 +680,15 @@ class ArticleAnalyzer:
 
     def load_from_redis(self, issue: str) -> Optional[Dict[str, Any]]:
         """
-        从Redis加载数据
+        从Redis按期号加载AI分析数据
+
+        键名: kpluckynumber:pl5:ai:{issue}（通过redis_client.get_ai_analysis_key生成）
 
         Args:
             issue: 期号
 
         Returns:
-            Redis数据
+            包含 articles/ai_analysis/save_time 的数据字典，未找到返回None
         """
         logger.info(f'从Redis加载数据: {issue}')
 
@@ -594,14 +717,27 @@ class ArticleAnalyzer:
 
     def second_ai_analysis(self, redis_data: Dict[str, Any], db_history: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        第二次AI分析：整合数据并预测
+        第二次AI分析：整合多源数据进行综合预测
+
+        流程:
+        1. 提取第一次AI分析结果（redis_data['ai_analysis']）
+        2. 构建二次分析提示词（_build_second_analysis_prompt）
+        3. 调用AI模型（max_tokens=8000, temperature=0.7）
+        4. 解析AI响应JSON
+
+        回退方案（当第二次AI调用失败时）:
+        - 从第一次AI分析中提取 forecast_numbers 作为预测号码
+        - 置信度设为0.0（表示回退结果）
+        - 尝试推算next_issue（latest_issue + 1）
+        - 确保后续流程（保存DB、展示报告）可继续执行
 
         Args:
-            redis_data: Redis中的数据
-            db_history: 数据库历史数据
+            redis_data: Redis中加载的数据（含articles和ai_analysis）
+            db_history: 数据库历史数据（含history_data/trend_data/各位置走势）
 
         Returns:
-            AI分析结果
+            预测结果JSON（含prediction/trend_analysis/reasoning_process/
+            recommended_combinations/risk_warning），失败时返回回退结果
         """
         logger.info('=' * 80)
         logger.info('开始第二次AI分析：整合数据并预测')
@@ -707,14 +843,25 @@ class ArticleAnalyzer:
 
     def save_to_database(self, final_report: Dict[str, Any], db_history: Dict[str, Any]) -> Optional[str]:
         """
-        保存最终报告到数据库
+        保存最终AI分析报告到MySQL数据库
+
+        存储字段映射:
+        - report_content: 推理过程文本（从reasoning_process提取，支持list和str）
+        - next_issue: 预测目标期号
+        - trend_analysis: 趋势分析JSON
+        - recommended_combinations: 推荐组合JSON
+        - key_conclusions: 关键结论（优先取key_conclusions，回退key_features）
+        - risk_warning: 风险提示
+
+        通过 P5Database.insert_ai_report() 写入，
+        自动生成UUID作为追踪标识。
 
         Args:
-            final_report: 最终报告
-            db_history: 数据库历史数据
+            final_report: 第二次AI分析的完整结果
+            db_history: 数据库历史数据（用于data_count/latest_issue统计）
 
         Returns:
-            报告UUID
+            报告UUID字符串，失败返回None
         """
         logger.info('保存最终报告到数据库...')
 
@@ -729,45 +876,94 @@ class ArticleAnalyzer:
             import uuid
             report_uuid = str(uuid.uuid4())
 
-            # 构建数据库记录
-            db_record = {
-                'report_uuid': report_uuid,
-                'report_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'data_source': final_report.get('data_source', ''),
-                'model_version': final_report.get('model_version', ''),
-                'data_period': final_report.get('data_period', ''),
-                'current_issue': final_report.get('current_issue', ''),
-                'next_issue': final_report.get('next_issue', ''),
-                'trend_analysis': json.dumps(final_report.get('trend_analysis', {}), ensure_ascii=False),
-                'probability_stats': json.dumps(final_report.get('prediction', {}), ensure_ascii=False),
-                'recommended_numbers': json.dumps(final_report.get('prediction', {}), ensure_ascii=False),
-                'recommended_combinations': json.dumps(final_report.get('recommended_combinations', []), ensure_ascii=False),
-                'confidence_scores': json.dumps(final_report.get('prediction', {}), ensure_ascii=False),
-                'key_conclusions': json.dumps(final_report.get('key_features', []), ensure_ascii=False),
-                'report_content': final_report.get('reasoning_process', ''),
-                'data_count': db_history.get('data_count', 0),
-                'latest_issue': db_history.get('latest_issue', '')
-            }
+            # ---- 提取并规范化各字段 ----
 
-            # 保存到数据库（使用insert_ai_report方法，传入独立参数）
+            # next_issue: 优先从 final_report 取，回退从 db_history 推算
+            next_issue = final_report.get('next_issue', '')
+            if not next_issue:
+                latest_issue = db_history.get('latest_issue', '')
+                if latest_issue and str(latest_issue).isdigit():
+                    next_issue = str(int(latest_issue) + 1)
+
+            # report_content: reasoning_process 可能是list或str，统一转为可读文本
+            reasoning = final_report.get('reasoning_process', '')
+            if isinstance(reasoning, list):
+                report_content = '\n'.join([f'{i + 1}. {r}' for i, r in enumerate(reasoning)])
+            elif reasoning:
+                report_content = str(reasoning)
+            else:
+                # 回退：从prediction各位置reason拼接
+                prediction = final_report.get('prediction', {})
+                reasons = []
+                for pos in ['wan', 'qian', 'bai', 'shi', 'ge']:
+                    pos_data = prediction.get(pos, {})
+                    if isinstance(pos_data, dict) and pos_data.get('reason'):
+                        pos_names = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+                        reasons.append(f"{pos_names.get(pos, pos)}: {pos_data['reason']}")
+                report_content = '；'.join(reasons) if reasons else '暂无推理过程'
+
+            # trend_analysis: 可能是dict或str
+            trend = final_report.get('trend_analysis', {})
+            if isinstance(trend, dict):
+                trend_analysis = json.dumps(trend, ensure_ascii=False)
+            elif isinstance(trend, str) and trend:
+                trend_analysis = trend
+            else:
+                trend_analysis = json.dumps({}, ensure_ascii=False)
+
+            # key_conclusions: 优先key_conclusions，回退key_features
+            conclusions = final_report.get('key_conclusions', None)
+            if conclusions is None:
+                conclusions = final_report.get('key_features', [])
+            if isinstance(conclusions, list):
+                key_conclusions = json.dumps(conclusions, ensure_ascii=False)
+            elif conclusions:
+                key_conclusions = str(conclusions)
+            else:
+                key_conclusions = json.dumps([], ensure_ascii=False)
+
+            # recommended_combinations: list of dicts或list of strings
+            combos = final_report.get('recommended_combinations', [])
+            if combos:
+                # 标准化格式
+                formatted_combos = []
+                for c in combos:
+                    if isinstance(c, dict):
+                        combo_str = c.get('combination', c.get('numbers', ''))
+                        if isinstance(combo_str, list):
+                            combo_str = ''.join(str(n) for n in combo_str)
+                        formatted_combos.append({'combination': str(combo_str), 'confidence': c.get('confidence', 0), 'reason': c.get('reason', '')})
+                    elif isinstance(c, (list, str)):
+                        formatted_combos.append({'combination': ''.join(str(n) for n in c) if isinstance(c, list) else str(c)})
+                recommended_combinations = json.dumps(formatted_combos, ensure_ascii=False)
+            else:
+                recommended_combinations = json.dumps([], ensure_ascii=False)
+
+            # prediction数据（probability_stats, recommended_numbers, confidence_scores）
+            prediction = final_report.get('prediction', {})
+            probability_stats = json.dumps(prediction, ensure_ascii=False)
+            recommended_numbers = json.dumps(prediction, ensure_ascii=False)
+            confidence_scores = json.dumps(prediction, ensure_ascii=False)
+
+            # 保存到数据库
             success = self.db_client.insert_ai_report(
-                report_content=db_record['report_content'],
-                data_count=db_record['data_count'],
-                latest_issue=db_record['latest_issue'],
-                next_issue=db_record.get('next_issue'),
-                trend_analysis=db_record.get('trend_analysis'),
-                probability_stats=db_record.get('probability_stats'),
-                recommended_numbers=db_record.get('recommended_numbers'),
-                recommended_combinations=db_record.get('recommended_combinations'),
-                confidence_scores=db_record.get('confidence_scores'),
-                recommendation_reasons=db_record.get('key_conclusions'),
-                key_conclusions=db_record.get('key_conclusions'),
+                report_content=report_content,
+                data_count=db_history.get('data_count', 0),
+                latest_issue=db_history.get('latest_issue', ''),
+                next_issue=next_issue,
+                trend_analysis=trend_analysis,
+                probability_stats=probability_stats,
+                recommended_numbers=recommended_numbers,
+                recommended_combinations=recommended_combinations,
+                confidence_scores=confidence_scores,
+                recommendation_reasons=key_conclusions,
+                key_conclusions=key_conclusions,
                 risk_warning=final_report.get('risk_warning', '理性购彩，量力而行'),
-                report_format='TEXT'
+                report_format='JSON'
             )
 
             if success:
-                logger.info(f'最终报告已保存到数据库，UUID: {report_uuid}')
+                logger.info(f'最终报告已保存到数据库，UUID: {report_uuid}, next_issue={next_issue}')
                 return report_uuid
             else:
                 logger.error('保存到数据库失败')
@@ -779,14 +975,30 @@ class ArticleAnalyzer:
 
     def analyze_article_workflow(self, target_issue: Optional[str] = None, data_limit: int = 30) -> Dict[str, Any]:
         """
-        完整的文章分析工作流
+        完整的6步文章分析工作流（主入口方法）
+
+        步骤:
+        步骤1: 爬取文章 (YDNiuSpider.crawl_all_articles, max_articles=30)
+        步骤2: 第一次AI分析 (first_ai_analysis → 结构化整理文章内容)
+        步骤3: Redis存储 (save_all_articles_to_redis → 7天过期)
+        步骤4: Redis加载 (load_from_redis → 按期号索引)
+        步骤5: 获取历史数据 (ERNIEAIAnalyzer._fetch_data_from_database)
+        步骤6: 第二次AI分析 (second_ai_analysis → 整合多源数据预测)
+        步骤7: 数据库存储 (save_to_database → MySQL, 含UUID)
+
+        调用方:
+        - main.py: run_article_analysis()
+        - gui.py: _execute_optimized_p5_ai()
+        - CLI: python main.py article --issue 2026165 --limit 30
 
         Args:
-            target_issue: 目标期号
-            data_limit: 历史数据期数限制
+            target_issue: 目标期号（如"2026165"），None则从文章提取
+            data_limit: 历史数据获取期数（默认30）
 
         Returns:
-            分析结果
+            {success, step1_crawl, step2_first_ai, step3_redis_save,
+             step4_redis_load, step5_second_ai, step6_db_save,
+             error, report_uuid, final_report}
         """
         logger.info('=' * 80)
         logger.info('开始完整文章分析工作流')
@@ -795,7 +1007,7 @@ class ArticleAnalyzer:
         result = {
             'success': False,
             'step1_crawl': False,
-            'step2_first_ai': False,
+            'step2.first_ai': False,
             'step3_redis_save': False,
             'step4_redis_load': False,
             'step5_second_ai': False,
@@ -825,47 +1037,16 @@ class ArticleAnalyzer:
 
             article_data = articles[0]
             result['step1_crawl'] = True
-            logger.info(f'使用第一篇文章: {article_data.get("title", "未知")}')
+            logger.info(f'使用第一篇文章: {article_data.get("title", "未知")})')
 
-            # 增强期号提取逻辑
-            # 优先使用target_issue，否则从文章标题或URL中提取
-            if target_issue:
-                # 验证target_issue是否有效（6-8位数字）
-                if not re.match(r'^\d{6,8}$', str(target_issue)):
-                    logger.warning(f'target_issue格式可能不正确: {target_issue}，将尝试从文章内容提取')
-                    target_issue = None
-                else:
-                    issue = str(target_issue)
-                    logger.info(f'使用指定的期号: {issue}')
-            else:
-                issue = None
+            # 提取期号（委托 _extract_issue_from_article，复用了标题/URL/link_title 的多源提取逻辑）
+            issue = self._extract_issue_from_article(article_data, target_issue)
 
-            # 如果没有指定期号或格式不正确，从文章数据中提取
-            if not issue:
-                # 尝试从标题提取（格式：2026165期[xxx]...）
-                title = article_data.get('title', '')
-                title_match = re.search(r'(\d{6,8})期', title)
-                if title_match:
-                    issue = title_match.group(1)
-                    logger.info(f'从标题提取到期号: {issue}')
-                else:
-                    # 尝试从URL提取
-                    url = article_data.get('url', '')
-                    url_match = re.search(r'(\d{6,8})', url)
-                    if url_match:
-                        issue = url_match.group(1)
-                        logger.info(f'从URL提取到期号: {issue}')
-                    else:
-                        # 尝试从link_title提取
-                        link_title = article_data.get('link_title', '')
-                        link_match = re.search(r'(\d{6,8})期', link_title)
-                        if link_match:
-                            issue = link_match.group(1)
-                            logger.info(f'从link_title提取到期号: {issue}')
-
-            if not issue:
+            if not issue or not re.match(r'^\d{6,8}$', str(issue)):
                 result['error'] = '无法确定期号'
                 return result
+
+            logger.info(f'提取到期号: {issue}')
 
             # 步骤2：第一次AI分析
             logger.info('步骤2：第一次AI分析（结构化整理）...')
@@ -949,19 +1130,35 @@ class ArticleAnalyzer:
 
         return result
 
-    def save_all_articles_bulk_to_redis(self, target_issue: Optional[str] = None, 
+    def save_all_articles_bulk_to_redis(self, target_issue: Optional[str] = None,
                                         max_articles: int = 100,
                                         extract_predictions: bool = True) -> Dict[str, Any]:
         """
-        批量保存所有爬取的文章到Redis（按文章ID存储），并可选提取预测数据
+        批量爬取文章并保存到Redis（含可选预测数据提取）
+
+        流程:
+        步骤1: 爬取文章 (YDNiuSpider.crawl_all_articles → 按target_issue过滤)
+        步骤2: 初始化Redis客户端
+        步骤3: (可选)初始化PredictionExtractor（仅当extract_predictions=True且AI可用）
+        步骤4: 批量处理每篇文章:
+            4.1: 提取期号（_extract_issue_from_article）
+            4.2: 生成article_id（RedisClient.generate_article_id）
+            4.3: HTML清洗为纯文本（HTMLTextCleaner）
+            4.4: 第一次AI分析（first_ai_analysis）
+            4.5: 将AI结果和元数据保存到Redis（按article_id，7天过期）
+
+        调用方:
+        - main.py: run_save_articles_to_redis()
+        - CLI: python main.py save-articles --max 100
 
         Args:
-            target_issue: 目标期号
-            max_articles: 最大处理文章数
-            extract_predictions: 是否提取预测数据
+            target_issue: 目标期号，None则爬取全部文章
+            max_articles: 最大处理文章数（默认100）
+            extract_predictions: 是否提取预测数据（默认True，通过PredictionExtractor）
 
         Returns:
-            处理结果
+            {success, total_articles, saved_articles, failed_articles,
+             extracted_predictions, high_quality_predictions, articles, predictions, error}
         """
         logger.info('=' * 80)
         logger.info('开始批量保存文章到Redis')
@@ -1024,117 +1221,78 @@ class ArticleAnalyzer:
                 try:
                     # 提取期号
                     issue = self._extract_issue_from_article(article_data, target_issue)
-                    
+
                     # 生成文章唯一ID
                     url = article_data.get('url', article_data.get('link_url', f'article_{i}'))
                     article_id = self.redis_client.generate_article_id(url, i)
-                    
-                    # 构建存储数据
-                    redis_data = {
-                        'issue': issue,
-                        'article_data': article_data,
-                        'article_index': i,
-                        'crawl_time': article_data.get('crawl_time', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-                    }
-                    
-                    # 步骤4.1：HTML清洗（只保留纯文本）
-                    logger.info(f'  步骤4.1：清洗HTML为纯文本...')
+
+                    # 构建用于AI分析的最小化文章数据（先清洗HTML）
+                    logger.info(f'  步骤4.1：清洗HTML为纯文本并进行AI分析...')
                     try:
                         from modules.html_cleaner import HTMLTextCleaner
                         html_cleaner = HTMLTextCleaner()
                         raw_content = article_data.get('content', '')
                         clean_text = html_cleaner.clean_html(raw_content)
-                        
-                        # 保存清洗后的纯文本
-                        redis_data['content_plain'] = clean_text
-                        redis_data['content_length'] = {
-                            'raw': len(raw_content) if raw_content else 0,
-                            'clean': len(clean_text)
-                        }
-                        logger.info(f'  HTML清洗完成: {redis_data["content_length"]["raw"]} → {redis_data["content_length"]["clean"]}字符')
                     except Exception as e:
-                        logger.warning(f'  HTML清洗失败: {e}，使用原始内容')
-                        redis_data['content_plain'] = article_data.get('content', '')
-                        redis_data['content_length'] = {'raw': 0, 'clean': len(redis_data['content_plain'])}
-                    
-                    # 步骤4.2：AI内容理解（生成对文章内容的深度理解）
-                    content_understanding = None
-                    if extract_predictions and prediction_extractor:
-                        logger.info(f'  步骤4.2：AI生成内容理解...')
-                        try:
-                            content_understanding = prediction_extractor.generate_content_understanding({
-                                'article_id': article_id,
-                                'title': article_data.get('title', ''),
-                                'content': article_data.get('content', '')
-                            })
-                            
-                            if content_understanding:
-                                redis_data['content_understanding'] = content_understanding
-                                logger.info(f'  内容理解完成: 类型={content_understanding.get("article_type")}, 评分={content_understanding.get("quality_assessment", {}).get("overall_score")}')
-                            else:
-                                logger.warning(f'  内容理解失败')
-                        except Exception as e:
-                            logger.warning(f'  内容理解异常: {e}')
-                    
-                    # 步骤4.3：提取预测数据
-                    prediction_result = None
-                    if extract_predictions and prediction_extractor:
-                        logger.info(f'  步骤4.3：提取预测数据...')
-                        prediction_result = prediction_extractor.extract_prediction_from_article({
-                            'article_id': article_id,
-                            'title': article_data.get('title', ''),
-                            'content': article_data.get('content', '')
-                        })
-                        
-                        if prediction_result['success']:
-                            redis_data['prediction_data'] = prediction_result['prediction_data']
-                            redis_data['quality_score'] = prediction_result['quality_score']
-                            redis_data['validation_status'] = prediction_result['prediction_data'].get('validation_status')
-                            
-                            result['extracted_predictions'] += 1
-                            if prediction_result['quality_score'] >= 0.7:
-                                result['high_quality_predictions'] += 1
-                            
-                            result['predictions'].append({
-                                'article_id': article_id,
-                                'issue': prediction_result['issue'],
-                                'quality_score': prediction_result['quality_score'],
-                                'validation_status': prediction_result['prediction_data'].get('validation_status'),
-                                'prediction_summary': prediction_extractor._summarize_prediction(prediction_result['prediction_data'])
-                            })
-                            
-                            logger.info(f'  预测提取成功: 期号={prediction_result["issue"]}, 质量={prediction_result["quality_score"]}')
-                        else:
-                            redis_data['prediction_data'] = None
-                            redis_data['prediction_errors'] = prediction_result['validation_errors']
-                            logger.warning(f'  预测提取失败: {prediction_result["validation_errors"]}')
-                    
-                    # 步骤4.4：保存到Redis
-                    save_success = self.redis_client.save_article_data(article_id, redis_data)
-                    
+                        logger.warning(f'  HTML清洗失败，使用原始内容: {e}')
+                        clean_text = article_data.get('content', '')
+
+                    # 构造传给AI的文章数据，只包含必要字段
+                    article_for_ai = {
+                        'title': article_data.get('title', ''),
+                        'author': article_data.get('author', ''),
+                        'publish_time': article_data.get('publish_time', ''),
+                        'url': article_data.get('url', ''),
+                        'content': clean_text,
+                        'crawl_time': article_data.get('crawl_time', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                    }
+
+                    # 调用一次AI分析（使用第一次结构化分析接口）
+                    try:
+                        ai_analysis = self.first_ai_analysis(article_for_ai)
+                    except Exception as e:
+                        logger.error(f'  AI分析失败: {e}', exc_info=True)
+                        ai_analysis = None
+
+                    # 仅将AI分析结果和必要元数据保存到Redis（不保存原始HTML或全文）
+                    redis_store = {
+                        'issue': issue,
+                        'article_id': article_id,
+                        'title': article_data.get('title', '')[:200],
+                        'url': article_data.get('url', ''),
+                        'ai_analysis': ai_analysis,
+                        'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+
+                    save_success = self.redis_client.save_article_data(article_id, redis_store, expire_days=7)
+
                     if save_success:
                         result['saved_articles'] += 1
                         result['articles'].append({
                             'article_id': article_id,
                             'issue': issue,
                             'title': article_data.get('title', '未知')[:50],
-                            'content_length': redis_data['content_length']['clean'],
-                            'has_understanding': content_understanding is not None,
-                            'has_prediction': prediction_result['success'] if prediction_result else False,
-                            'quality_score': prediction_result['quality_score'] if prediction_result else 0
+                            'has_ai_analysis': ai_analysis is not None
                         })
-                        logger.info(f'文章 {i}/{len(articles)} 处理完成: {article_id} (期号: {issue}, 纯文本: {redis_data["content_length"]["clean"]}字符)')
+                        logger.info(f'文章 {i}/{len(articles)} AI分析并保存完成: {article_id} (期号: {issue})')
                     else:
                         result['failed_articles'] += 1
                         logger.warning(f'文章 {i}/{len(articles)} 保存失败')
-                        
+
                 except Exception as e:
                     result['failed_articles'] += 1
                     logger.error(f'处理文章 {i} 时出错: {e}')
                     continue
 
             result['success'] = result['saved_articles'] > 0
-            
+
+            # 步骤5：将所有文章AI分析汇总保存到统一键（供二次AI分析按期号加载）
+            if result['saved_articles'] > 0:
+                try:
+                    self._save_aggregated_ai_to_redis(target_issue, articles, result)
+                except Exception as e:
+                    logger.warning(f'汇总AI分析保存到统一键失败（不影响主流程）: {e}')
+
             logger.info('=' * 80)
             logger.info('批量处理文章完成')
             logger.info(f'总文章数: {result["total_articles"]}')
@@ -1151,59 +1309,148 @@ class ArticleAnalyzer:
 
         return result
 
-    def _extract_issue_from_article(self, article_data: Dict[str, Any], 
-                                     target_issue: Optional[str] = None) -> str:
+    def _save_aggregated_ai_to_redis(self, target_issue: Optional[str],
+                                     articles: List[Dict[str, Any]],
+                                     batch_result: Dict[str, Any]) -> None:
         """
-        从文章数据中提取期号
+        将批量文章处理的AI分析结果汇总保存到统一键 kpluckynumber:pl5:ai:{issue}
+
+        从各篇文章的Redis存储中加载AI分析结果，汇总后保存到统一键，
+        确保后续二次AI分析（second_ai_analysis/load_from_redis）能按期号加载。
 
         Args:
-            article_data: 文章数据
             target_issue: 目标期号
+            articles: 原始文章数据列表
+            batch_result: 批量处理结果（含saved_articles列表）
+        """
+        if not target_issue:
+            # 尝试从文章中提取期号
+            for article_data in articles[:3]:
+                issue = self._extract_issue_from_article(article_data, None)
+                if issue and re.match(r'^\d{6,8}$', str(issue)):
+                    target_issue = issue
+                    break
+            if not target_issue:
+                target_issue = datetime.now().strftime('%Y%m%d')
+
+        self._init_redis()
+        if not self.redis_client or not self.redis_client.is_connected():
+            logger.warning('Redis未连接，跳过汇总AI分析保存')
+            return
+
+        # 收集所有已保存文章的AI分析结果
+        collected_analyses = []
+        saved_article_ids = []
+        for saved_info in batch_result.get('articles', []):
+            article_id = saved_info.get('article_id', '')
+            if article_id:
+                saved_article_ids.append(article_id)
+                # 从Redis加载已保存的文章AI分析
+                try:
+                    article_data = self.redis_client.get_article_data(article_id)
+                    if article_data and article_data.get('ai_analysis'):
+                        collected_analyses.append({
+                            'article_id': article_id,
+                            'title': article_data.get('title', ''),
+                            'url': article_data.get('url', ''),
+                            'issue': article_data.get('issue', ''),
+                            'ai_analysis': article_data['ai_analysis']
+                        })
+                except Exception as e:
+                    logger.debug(f'加载文章{article_id}的AI分析失败: {e}')
+
+        # 构建汇总的Redis数据
+        aggregated = {
+            'issue': target_issue,
+            'articles_count': len(articles),
+            'saved_count': batch_result.get('saved_articles', 0),
+            'collected_analyses_count': len(collected_analyses),
+            'articles': articles,  # 原始文章列表（用于二次AI分析）
+            'ai_analysis': collected_analyses[0].get('ai_analysis') if collected_analyses else {},
+            'all_ai_analyses': collected_analyses,  # 所有文章的AI分析
+            'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+        # 保存到统一键
+        key = self.redis_client.get_ai_analysis_key(target_issue)
+        self.redis_client.client.setex(key, 86400 * 7, json.dumps(aggregated, ensure_ascii=False))
+        logger.info(f'汇总AI分析已保存到统一键: {key} (含{len(collected_analyses)}篇AI分析)')
+
+    def _extract_issue_from_article(self, article_data: Dict[str, Any],
+                                    target_issue: Optional[str] = None) -> str:
+        """
+        从文章数据中提取期号（多源策略，按优先级）
+
+        优先级:
+        1. target_issue参数 - 若提供且符合r'^\\d{6,8}$'格式，直接使用
+        2. 文章标题 - 匹配 r'(\\d{6,8})期' 模式
+        3. link_title字段 - 同上模式
+        4. 文章URL - 匹配 r'(\\d{6,8})' 模式
+        5. 默认值 - 当前日期 YYYYMMDD
+
+        注意: 与 article_processor.py::_extract_issue_from_content() 功能重复，
+             本版本多了link_title和URL的提取支持。
+
+        Args:
+            article_data: 文章数据（含title/url/link_title等字段）
+            target_issue: 指定的目标期号（可选，最高优先级）
 
         Returns:
-            提取的期号
+            提取的期号字符串
         """
         # 优先使用target_issue
         if target_issue and re.match(r'^\d{6,8}$', str(target_issue)):
             return str(target_issue)
-        
+
         # 从标题提取
         title = article_data.get('title', '')
         title_match = re.search(r'(\d{6,8})期', title)
         if title_match:
             return title_match.group(1)
-        
+
         # 从link_title提取
         link_title = article_data.get('link_title', '')
         link_match = re.search(r'(\d{6,8})期', link_title)
         if link_match:
             return link_match.group(1)
-        
+
         # 从URL提取
         url = article_data.get('url', article_data.get('link_url', ''))
         url_match = re.search(r'(\d{6,8})', url)
         if url_match:
             return url_match.group(1)
-        
+
         # 使用当前日期作为默认值
         return datetime.now().strftime('%Y%m%d')
 
 
+# ============================================================
+# 便捷函数：供外部模块直接调用的简化入口
+# ============================================================
+
 def run_article_analysis(target_issue: Optional[str] = None, data_limit: int = 30) -> Dict[str, Any]:
     """
-    便捷函数：执行文章分析工作流
+    便捷函数：执行完整文章分析工作流
+
+    使用示例:
+        result = run_article_analysis(target_issue='2026165', data_limit=30)
+        if result['success']:
+            print(f"报告UUID: {result['report_uuid']}")
 
     Args:
         target_issue: 目标期号
         data_limit: 历史数据期数限制
 
     Returns:
-        分析结果
+        ArticleAnalyzer.analyze_article_workflow() 的完整返回结果
     """
     analyzer = ArticleAnalyzer()
     return analyzer.analyze_article_workflow(target_issue=target_issue, data_limit=data_limit)
 
 
+# ============================================================
+# 独立测试入口：可运行 python -m modules.article_analyzer
+# ============================================================
 if __name__ == '__main__':
     print('=' * 80)
     print('文章内容AI分析模块测试')

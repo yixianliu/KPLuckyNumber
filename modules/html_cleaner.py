@@ -12,6 +12,9 @@ HTML文本清洗模块
 5. 保留段落结构和换行
 """
 
+# 说明：本模块负责将HTML转换为纯文本以便传入AI模型。对外暴露的主要方法为 HTMLTextCleaner.clean_html。
+# 修改清洗规则时请兼顾不同网站的HTML结构，避免误删有用信息（如表格中的号码）。
+
 import re
 import html
 from bs4 import BeautifulSoup

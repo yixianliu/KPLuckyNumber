@@ -20,13 +20,14 @@ import logging
 import os
 import json
 import uuid
-import time
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 import requests
 
 os.makedirs('logs', exist_ok=True)
+
+# 日志目录保证：遵循项目约定，将日志写入 logs/ 供集中查看。
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -35,6 +36,9 @@ if not logger.handlers:
     file_handler = logging.FileHandler('logs/ernie_ai_analyzer.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+# 说明：本模块负责调用ERNIE并生成结构化报告。AI配置优先从项目根的 config.py 加载，
+# 若未配置则尝试从 api/ai_ERNIE_X1.1.py 中提取密钥，属于容错兼容逻辑。
 
 
 class ERNIEAIAnalyzer:
@@ -53,9 +57,9 @@ class ERNIEAIAnalyzer:
     def _init_ai_config(self):
         """初始化AI模型配置（从ai_ERNIE_X1.1.py读取）"""
         try:
-            # 尝试从config.py加载配置
-            from config import QIANYAN_API_CONFIG
-            self.api_config = QIANYAN_API_CONFIG
+            # 尝试从config.py加载配置（使用模块导入以避免在except路径中出现未定义名警告）
+            import config as cfg
+            self.api_config = getattr(cfg, 'QIANYAN_API_CONFIG', {}) or {}
             self.api_url = self.api_config.get('api_url', "https://qianfan.baidubce.com/v2/chat/completions")
             self.api_key = self.api_config.get('api_key', '')
             self.model_name = self.api_config.get('model_name', 'deepseek-v3.1-250821')
@@ -69,11 +73,17 @@ class ERNIEAIAnalyzer:
                 logger.info(f'从config.py加载API配置: {self.model_name}')
             else:
                 logger.warning('config.py中未配置API密钥')
-        except ImportError:
+        except Exception:
+            # 如果无法导入config模块，使用空配置继续后续的回退逻辑
             self.api_config = {}
-            logger.info('config.py不存在，从api/ai_ERNIE_X1.1.py读取配置')
+            self.api_url = "https://qianfan.baidubce.com/v2/chat/completions"
+            self.api_key = ''
+            self.model_name = 'deepseek-v3.1-250821'
+            self.ai_available = False
+            logger.info('未能从config.py加载配置，准备尝试api/目录下的回退配置')
 
-        # 如果没有从config加载，使用ai_ERNIE_X1.1.py的配置
+        # 如果没有从config加载，使用 api/ 目录下的 ai_ERNIE_X1.1.py 的配置作为回退方案
+        # 该逻辑确保在未统一配置config.py的情况下也能进行AI调试（非生产安全方式）
         if not getattr(self, 'api_key', ''):
             try:
                 # 读取ai_ERNIE_X1.1.py文件获取API密钥
@@ -133,6 +143,7 @@ class ERNIEAIAnalyzer:
         logger.info(f'=== 开始调用ERNIE AI模型(X1.1): {self.model_name} ===')
 
         # 构建请求payload，参考function call接口规范
+        # 注意：payload 尽量保持简洁，response 可能包含非严格 JSON 的文本，因此解析需增加容错。
         payload = {
             "model": self.model_name,
             "messages": messages,
@@ -181,6 +192,8 @@ class ERNIEAIAnalyzer:
                 return {}
 
             json_str = response_text[start_idx:end_idx]
+            # 按照仓库约定：从第一个 '{' 到最后一个 '}' 提取第一个 JSON 对象并解析
+            # 该策略同样在 optimized_p5_predictor.py 中采用，确保两个模块解析逻辑一致
             return json.loads(json_str)
 
         except json.JSONDecodeError as e:
@@ -1147,7 +1160,9 @@ class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
 
         # 9. 保存到数据库
         logger.info('步骤9：保存报告到数据库...')
-        report_uuid = self._save_report_to_database(report, db_data)
+        # _save_report_to_database 接受单个 report 参数（与父类实现一致），
+        # 传入多余参数会导致调用错误，故仅传入 report。
+        report_uuid = self._save_report_to_database(report)
 
         # 10. 保存到文件
         logger.info('步骤10：保存报告到文件...')

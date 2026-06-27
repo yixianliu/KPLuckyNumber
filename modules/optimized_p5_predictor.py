@@ -17,19 +17,21 @@
 
 import logging
 import os
-import json
 import math
 import uuid
-import time
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 import numpy as np
 import requests
 
 os.makedirs('logs', exist_ok=True)
 os.makedirs('reports', exist_ok=True)
+
+# 注：本模块会把日志写入项目根目录下的 logs/*.log
+#      并把部分AI/分析报告写入 reports/ 目录，遵循项目约定，
+#      因此在导入时确保目录存在以避免 FileHandler 抛错。
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -38,6 +40,8 @@ if not logger.handlers:
     file_handler = logging.FileHandler('logs/optimized_p5_predictor.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+# logger 已配置：模块内使用 logger.info/warning/error 记录运行信息，便于排查。
 
 
 class OptimizedP5PredictorConfig:
@@ -204,6 +208,7 @@ class OptimizedP5Predictor:
     def _get_feature_engineering(self):
         """获取特征工程实例（懒加载）"""
         if self._feature_engineering is None and self.config.get_global_param('enable_feature_engineering'):
+            # 延迟导入特征工程模块以避免在导入阶段出现依赖错误（延迟/懒加载模式）
             from modules.feature_engineering import P5FeatureEngineering
             self._feature_engineering = P5FeatureEngineering()
         return self._feature_engineering
@@ -231,6 +236,8 @@ class OptimizedP5Predictor:
             self.api_key = ''
             self.ai_available = False
             logger.warning('无法加载config.py，AI模型分析将被跳过')
+
+        # 说明：AI部分为可选功能，若未配置 api_key 则会被优雅跳过，遵循 AGENTS.md 中的设计约定。
 
     def _build_ai_prompt(self, history_data: List[Dict], current_issue: str, 
                         stats_summary: str) -> str:
@@ -323,6 +330,10 @@ class OptimizedP5Predictor:
             "response_format": {"type": "json_object"}
         })
 
+        # 备注：payload 中使用 messages(system/user) 的结构与项目中其他调用 Qianfan/ERNIE 模型的实现保持一致，
+        #       便于统一管理和解析。response_format 期望返回JSON对象，但服务端常常返回带杂讯的文本，
+        #       因此后续需使用 _parse_ai_response 做容错解析。
+
         try:
             response = requests.request("POST", self.api_url, headers=self.headers, data=payload)
             response.raise_for_status()
@@ -358,6 +369,8 @@ class OptimizedP5Predictor:
                 return {}
 
             json_str = response_text[start_idx:end_idx]
+            # 按照项目约定：从第一个 '{' 到最后一个 '}' 提取第一个 JSON 对象并解析，
+            # 这是因为模型回复常带有解释性文字或多余符号，不宜直接假设纯JSON返回。
             return json.loads(json_str)
 
         except json.JSONDecodeError as e:
@@ -381,6 +394,7 @@ class OptimizedP5Predictor:
                 sorted_nums = sorted(freq_probs[pos].items(), key=lambda x: x[1], reverse=True)
                 top3 = sorted_nums[:3]
                 bottom3 = sorted_nums[-3:]
+                # 将Top3与Bottom3列为摘要，便于AI把握冷热号分布作为分析依据
                 lines.append(f'{pos_name}: 热号={[n for n, _ in top3]}, 冷号={[n for n, _ in bottom3]}')
         
         # 遗漏分析
@@ -431,6 +445,9 @@ class OptimizedP5Predictor:
 
         # 执行各算法预测
         algorithm_probs = self._run_algorithms(sorted_data)
+
+        # 说明：algorithm_probs 的结构为 {算法名: [pos0_probs, pos1_probs, ..., pos4_probs]}
+        # 每个 pos_probs 为 {号码: 概率} 的字典，后续将被融合为最终的 fused_probs。
 
         # 融合各算法概率
         fused_probs = self._fuse_probabilities(algorithm_probs)
@@ -523,9 +540,22 @@ class OptimizedP5Predictor:
                 if isinstance(rec, dict):
                     num = rec.get('number')
                     conf = rec.get('confidence', 0.5)
-                    if num is not None:
-                        ai_probs[int(num)] = conf
+                    # 对AI返回的号码和置信度进行严格校验并尝试转换为数值
+                    try:
+                        num_int = int(num)
+                    except (TypeError, ValueError):
+                        logger.warning(f'AI推荐号码格式异常，跳过: {num}')
+                        continue
+                    try:
+                        conf = float(conf)
+                    except (TypeError, ValueError):
+                        conf = 0.5
+
+                    if 0 <= num_int <= 9:
+                        ai_probs[num_int] = conf
                         total_confidence += conf
+                    else:
+                        logger.warning(f'AI推荐号码超出范围0-9，跳过: {num_int}')
 
             # 归一化AI概率
             if total_confidence > 0:
@@ -604,6 +634,7 @@ class OptimizedP5Predictor:
         Returns:
             算法名称 -> 各位置概率分布列表的字典
         """
+        # results 保存每个算法的分位概率分布
         results = {}
         weights = self.config.get_algorithm_weights()
 
@@ -626,6 +657,11 @@ class OptimizedP5Predictor:
                     results['feature_engineering'] = self._algo_feature_engineering(sorted_data, fe)
                 except Exception as e:
                     logger.error(f'特征工程算法执行失败: {e}')
+
+        # 返回格式示例：{
+        #   'frequency_weighted': [ {0:0.12,1:0.09,...}, ... ],
+        #   'omission_regression': [ ... ],
+        # }
 
         return results
 
@@ -952,6 +988,7 @@ class OptimizedP5Predictor:
                 w = weights.get(algo_name, 0)
                 if pos < len(pos_probs):
                     for num, prob in pos_probs[pos].items():
+                        # 加权累加：将每个算法的概率按照配置权重叠加
                         pos_fused[num] += w * prob
 
             # 归一化

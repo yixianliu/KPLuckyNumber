@@ -30,6 +30,9 @@ plt.rcParams['axes.unicode_minus'] = False
 os.makedirs('logs', exist_ok=True)
 os.makedirs('reports/backtest', exist_ok=True)
 
+# 说明：回测结果与报告写入 projects/reports/backtest 下；日志写入 logs/。
+# 本模块可能生成大量文件，请确保磁盘空间充足并使用配置好的日志路径进行集中管理。
+
 logger = logging.getLogger(__name__)
 
 
@@ -729,9 +732,9 @@ class P5BacktestEngine:
 
 if __name__ == '__main__':
     # 测试回测引擎
-    from modules.p5_predictor import P5Predictor
+    from modules.optimized_p5_predictor import OptimizedP5Predictor
 
-    predictor = P5Predictor()
+    predictor = OptimizedP5Predictor()
     backtest_engine = P5BacktestEngine(predictor)
 
     # 执行回测

@@ -16,6 +16,11 @@ from contextlib import contextmanager
 
 os.makedirs('logs', exist_ok=True)
 
+# 说明：本模块负责数据库的全部操作。按照 AGENTS.md 的约定：
+# - 在 connect() 中会尝试自动创建缺失的数据库（兼容新环境）
+# - 在 create_tables() 中创建/兼容表结构时应保持向后兼容，不删除已有列
+# 修改 schema 时请务必保留兼容性以保护历史数据。
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
@@ -31,6 +36,8 @@ class P5Database:
     
     负责数据库连接、表结构管理、数据操作
     """
+    # 该类封装了常用的数据库操作：连接/断开、事务、建表、插入/查询、报告入库、预测验证等。
+    # 注意：为避免导入时失败，项目中有时使用延迟导入（在函数内部导入config或其他模块），本类保持该风格。
     
     def __init__(self):
         self.connection = None

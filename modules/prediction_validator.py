@@ -2,10 +2,19 @@
 排列5预测验证系统模块
 
 功能：
-1. 跟踪每一期AI预测结果
+1. 跟踪每一期AI预测结果（从数据库读取待验证预测记录）
 2. 在实际开奖结果公布后，自动比对预测与实际结果
-3. 计算命中率、偏差分析、准确率指标
-4. 建立完整的AI预测性能评估档案
+3. 计算命中率、偏差分析、准确率指标（按位置统计）
+4. 建立完整的AI预测性能评估档案（含历史趋势）
+
+调用路径：
+    gui.py → P5PredictionValidator → P5Database（读写预测验证数据）
+
+数据库依赖表：
+    - ai_predictions: 预测记录源（含待验证状态）
+    - prediction_verification: 验证结果表
+    - performance_stats: 性能统计汇总表
+    - p5_history: 历史开奖数据（用于获取实际号码）
 """
 
 import json
@@ -28,15 +37,29 @@ if not logger.handlers:
 class P5PredictionValidator:
     """
     排列5预测验证器
-    
-    负责预测结果的验证、统计分析和性能评估
+
+    职责：
+    - 验证待验证预测记录（比对预测号码与实际开奖号码）
+    - 按位置（万/千/百/十/个）统计命中率
+    - 生成性能评估报告（含整体统计、各位置命中率、趋势图表数据）
+    - 提供完整验证流程入口
+
+    验证精度计算：
+    - 总命中位数: 统计所有预测中各位置命中的总数
+    - 平均命中位数: 总命中位数 / 总预测次数
+    - 平均准确率: (总命中位数 / (总预测次数 × 5)) × 100%
+    - 各位置命中率: 该位置命中次数 / 总预测次数 × 100%
     """
-    
+
     def __init__(self):
+        """初始化验证器，数据库连接采用延迟加载模式"""
         self.db = None
-    
+
     def _load_database(self):
-        """延迟加载数据库"""
+        """
+        延迟加载数据库模块
+        遵循项目延迟导入模式，避免导入时因MySQL不可用而失败
+        """
         if self.db is None:
             from modules.database_p5 import P5Database
             self.db = P5Database()
@@ -44,15 +67,21 @@ class P5PredictionValidator:
     def verify_prediction(self, report_uuid: str, target_issue: str,
                            actual_numbers: List[int]) -> Dict[str, Any]:
         """
-        验证指定预测记录
-        
+        验证单条预测记录
+
+        流程:
+        1. 先尝试从数据库历史数据中获取该期的实际开奖号码
+        2. 若数据库中有，则覆盖传入的actual_numbers
+        3. 调用数据库层update_prediction_verification()执行比对
+        4. 更新全局性能统计表
+
         Args:
-            report_uuid: 报告UUID
-            target_issue: 目标期号
-            actual_numbers: 实际开奖号码 [wan, qian, bai, shi, ge]
-        
+            report_uuid: 报告唯一标识符
+            target_issue: 目标期号（如"2026165"）
+            actual_numbers: 实际开奖号码 [wan, qian, bai, shi, ge]，每个0-9
+
         Returns:
-            验证结果字典
+            验证结果字典，包含status/message/各位置命中情况
         """
         self._load_database()
         
@@ -85,10 +114,17 @@ class P5PredictionValidator:
     
     def verify_all_pending(self) -> List[Dict[str, Any]]:
         """
-        验证所有待验证的预测记录
-        
+        批量验证所有待验证的预测记录
+
+        流程:
+        1. 从数据库获取所有status='pending'的预测记录
+        2. 逐条查询对应期号的实际开奖数据
+        3. 若已开奖（有历史数据），执行验证并更新状态
+        4. 若未开奖，跳过该条记录
+        5. 全部完成后更新全局性能统计
+
         Returns:
-            验证结果列表
+            验证结果列表，每项包含各位置命中详情
         """
         self._load_database()
         
@@ -132,8 +168,26 @@ class P5PredictionValidator:
     
     def get_performance_stats(self) -> Dict[str, Any]:
         """
-        获取预测性能统计
-        
+        获取预测性能统计数据
+
+        返回数据结构:
+        {
+            'status': 'success',
+            'current_stats': {
+                'total': 总预测次数,
+                'total_matched': 完全猜中次数（5位全中）,
+                'avg_match': 平均命中位数（0-5）,
+                'avg_accuracy': 平均准确率（%),
+                'wan_accuracy': 万位命中率（%),
+                'qian_accuracy': 千位命中率（%),
+                'bai_accuracy': 百位命中率（%),
+                'shi_accuracy': 十位命中率（%),
+                'ge_accuracy': 个位命中率（%),
+                'overall_accuracy': 整体命中率（%)
+            },
+            'history': [最近30天的每日统计记录]
+        }
+
         Returns:
             性能统计字典
         """
@@ -159,10 +213,13 @@ class P5PredictionValidator:
     
     def get_pending_predictions(self) -> List[Dict[str, Any]]:
         """
-        获取待验证的预测列表
-        
+        获取所有待验证的预测记录列表
+
+        从数据库查询status='pending'的AI预测记录，
+        这些记录已生成预测但尚未与实际开奖结果比对。
+
         Returns:
-            待验证预测列表
+            待验证预测列表，每项包含report_uuid/target_issue/预测号码等
         """
         self._load_database()
         
@@ -179,10 +236,23 @@ class P5PredictionValidator:
     
     def generate_performance_report(self) -> str:
         """
-        生成性能评估报告
-        
+        生成人类可读的性能评估报告文本
+
+        报告包含5个部分:
+        一、整体统计 - 总预测次数/完全猜中/平均命中位数/平均准确率
+        二、各位置命中率 - 万位~个位各位置独立命中率
+        三、综合评估 - 整体命中率和质量评级（优秀/良好/一般/待提升）
+        四、命中率分级 - 根据overall_accuracy对应4个等级
+        五、性能趋势 - 最近7天的命中率变化趋势
+
+        评级标准:
+        - overall_accuracy >= 60%: 优秀
+        - overall_accuracy >= 40%: 良好
+        - overall_accuracy >= 20%: 一般
+        - overall_accuracy <  20%: 待提升
+
         Returns:
-            报告文本
+            格式化的报告文本
         """
         stats_result = self.get_performance_stats()
         
@@ -262,14 +332,21 @@ class P5PredictionValidator:
     
     def run_full_validation(self) -> Dict[str, Any]:
         """
-        执行完整验证流程
-        
-        1. 验证所有待验证的预测
-        2. 更新性能统计
-        3. 生成性能报告
-        
+        执行完整验证流程（GUI调用的统一入口）
+
+        步骤:
+        1. verify_all_pending() - 验证所有待验证预测
+        2. get_performance_stats() - 获取最新统计数据
+        3. generate_performance_report() - 生成可读报告
+
         Returns:
-            验证结果汇总
+            {
+                'status': 'success',
+                'verified_count': 本次验证的记录数,
+                'verified_results': [逐条验证详情],
+                'stats': {当前性能统计数据},
+                'report': '格式化的报告文本'
+            }
         """
         logger.info('开始执行完整验证流程')
         
@@ -293,19 +370,23 @@ class P5PredictionValidator:
         }
 
 
+# ============================================================
+# 独立测试入口：可运行 python -m modules.prediction_validator
+# ============================================================
+
 def test_validator():
-    """测试预测验证器"""
+    """测试预测验证器的完整功能链路"""
     validator = P5PredictionValidator()
-    
+
     print('=== 测试获取待验证预测 ===')
     pending = validator.get_pending_predictions()
     print(f'待验证预测数量: {len(pending)}')
-    
+
     print('\n=== 测试执行验证 ===')
     result = validator.run_full_validation()
     print(f'验证状态: {result["status"]}')
     print(f'验证数量: {result["verified_count"]}')
-    
+
     print('\n=== 性能统计 ===')
     stats = result.get('stats', {})
     if stats.get('total', 0) > 0:
@@ -314,10 +395,10 @@ def test_validator():
         print(f'平均准确率: {stats["avg_accuracy"]}%')
     else:
         print('暂无验证数据')
-    
+
     print('\n=== 性能报告 ===')
     print(result.get('report', ''))
-    
+
     return result
 
 

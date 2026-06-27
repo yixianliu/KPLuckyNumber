@@ -1,15 +1,28 @@
 """
-排列五AI预测系统主程序
+排列五AI预测系统主程序（CLI入口）
 
-整合所有模块，提供完整的预测、回测、数据更新功能。
+整合所有模块，提供完整的命令行操作接口。
 
 功能模块：
-1. 数据采集与更新
-2. 数据清洗与验证
-3. 特征工程提取
-4. AI预测推理
-5. 历史回测验证
-6. 可视化报告生成
+1. 数据采集与更新 (update)        - 从多源爬取排列5开奖数据并入库
+2. AI预测推理 (predict)           - 基于历史数据的统计模型+AI融合预测
+3. 历史回测验证 (backtest)        - 滚动回测验证模型命中率
+4. 特征工程分析 (analyze)         - 提取频率/遗漏/012路/连号等统计特征
+5. ERNIE AI深度分析 (ernie)       - 调用百度ERNIE模型进行深度分析
+6. 综合分析 (comprehensive)       - 整合Redis+专家数据+AI分析的二次深度分析
+7. 文章分析工作流 (article)       - 爬取文章→AI分析→Redis→DB的完整流水线
+8. 批量文章保存 (save-articles)   - 批量爬取文章并保存到Redis
+9. 单篇/批量文章处理 (process-article/process-articles) - 爬取→AI→预处理→Redis存储
+
+用法示例：
+    python main.py update                    # 更新并入库最新开奖
+    python main.py predict --model optimized # 运行优化模型预测
+    python main.py backtest --mode compare   # 后测对比
+    python main.py analyze                   # 分析历史特征并输出报告
+    python main.py ernie --limit 30          # ERNIE深度分析
+    python main.py comprehensive --limit 30  # 综合二次深度分析
+    python main.py process-article --url "..." --title "..."  # 处理单篇文章
+    python main.py process-articles --max 10 # 批量处理文章
 """
 
 import sys
@@ -35,7 +48,16 @@ logger = logging.getLogger(__name__)
 
 def update_data():
     """
-    更新历史数据
+    更新历史数据：爬取最新开奖数据并写入MySQL数据库
+
+    流程:
+    1. 初始化P5Spider爬虫，调用fetch_latest_data()获取最新数据
+    2. 连接MySQL数据库
+    3. 调用batch_insert()批量写入
+    4. 返回成功/失败
+
+    Returns:
+        bool: 是否更新成功
     """
     logger.info('=' * 80)
     logger.info('开始更新历史数据')
@@ -79,10 +101,27 @@ def update_data():
 
 def predict_next_issue(use_optimized=True):
     """
-    预测下一期
+    预测下一期排列5开奖号码
+
+    流程:
+    1. 连接数据库，获取最近200期历史数据
+    2. 初始化OptimizedP5Predictor（统计模型+AI融合）
+    3. 调用predict()方法执行预测
+    4. 输出各位置推荐号码（Top-3）和推荐组合（Top-5）
+    5. 保存预测结果JSON到 predictions/ 目录
+
+    预测器返回结构（必须包含的字段）:
+    - fused_probabilities: 融合后的各位置概率分布
+    - top_combinations: 推荐号码组合
+    - predict_time: 预测时间戳
+    - predict_uuid: 预测唯一标识
+    - risk_warning: 风险提示
 
     Args:
-        use_optimized: 是否使用优化后的模型
+        use_optimized: 始终使用优化后的模型（旧版P5Predictor已删除）
+
+    Returns:
+        bool: 是否预测成功
     """
     logger.info('=' * 80)
     logger.info(f'开始预测下一期（{"优化后" if use_optimized else "原始"}模型）')
@@ -90,10 +129,8 @@ def predict_next_issue(use_optimized=True):
 
     try:
         # 导入模块
-        if use_optimized:
-            from modules.optimized_p5_predictor import OptimizedP5Predictor as Predictor
-        else:
-            from modules.p5_predictor import P5Predictor as Predictor
+        # 始终使用优化后的预测器（旧版 p5_predictor.py 已删除，功能已整合到优化版）
+        from modules.optimized_p5_predictor import OptimizedP5Predictor as Predictor
 
         from modules.database_p5 import P5Database
 
@@ -183,12 +220,26 @@ def predict_next_issue(use_optimized=True):
 
 def run_backtest(mode='compare', start=50, count=50):
     """
-    运行历史回测
+    运行历史回测：在历史数据上滚动验证预测模型命中率
+
+    回测原理:
+    1. 加载全部历史数据（至少100期）
+    2. 从第start期开始，每期用前N期数据作为训练集预测该期
+    3. 统计Top-1命中数（第一名推荐命中）、Top-3命中数（前三名中至少一个命中）
+    4. 计算综合得分、命中率、完全猜中次数
+
+    模式说明:
+    - compare: 对比"优化前"和"优化后"两个预测器实例的性能差异
+    - old: 仅测试"优化前"实例
+    - new: 仅测试"优化后"实例
 
     Args:
         mode: 回测模式（compare/old/new）
-        start: 回测起始位置
-        count: 回测期数
+        start: 回测起始位置（留出前N期作为训练数据，默认50）
+        count: 回测期数（默认50）
+
+    Returns:
+        bool: 是否回测成功
     """
     logger.info('=' * 80)
     logger.info(f'开始历史回测（模式：{mode}）')
@@ -196,7 +247,6 @@ def run_backtest(mode='compare', start=50, count=50):
 
     try:
         # 导入模块
-        from modules.p5_predictor import P5Predictor
         from modules.optimized_p5_predictor import OptimizedP5Predictor
         from modules.backtest_engine import P5BacktestEngine
         from modules.database_p5 import P5Database
@@ -221,7 +271,9 @@ def run_backtest(mode='compare', start=50, count=50):
 
         # 初始化预测器
         logger.info('初始化预测器...')
-        old_predictor = P5Predictor()
+        # 回测对比模式下，使用两个独立实例模拟"优化前"和"优化后"对比
+        # 两者均为优化后的预测器，但可通过配置区分行为
+        old_predictor = OptimizedP5Predictor()
         new_predictor = OptimizedP5Predictor()
 
         # 初始化回测引擎
@@ -307,10 +359,20 @@ def run_backtest(mode='compare', start=50, count=50):
 
 def run_ernie_ai_analysis(data_limit=30):
     """
-    执行ERNIE AI分析
+    执行ERNIE AI深度分析：调用百度ERNIE模型对历史数据进行AI分析
+
+    流程:
+    1. 初始化ERNIEAIAnalyzer（封装Qianfan API调用）
+    2. 从数据库获取最近data_limit期历史数据
+    3. 构造分析prompt，调用ERNIE模型
+    4. 解析AI返回的JSON结果
+    5. 保存报告到数据库和reports/目录
 
     Args:
-        data_limit: 获取历史数据的期数限制
+        data_limit: 获取历史数据的期数限制（默认30期）
+
+    Returns:
+        bool: 是否分析成功
     """
     logger.info('=' * 80)
     logger.info('开始执行ERNIE AI分析')
@@ -357,15 +419,24 @@ def run_ernie_ai_analysis(data_limit=30):
 
 def run_comprehensive_analysis(data_limit=30):
     """
-    执行综合分析（二次深度分析）
+    执行综合分析（二次深度分析）：整合多源数据进行深度AI分析
 
-    整合多源数据进行深度分析：
-    - Redis中的原始数据
-    - 网络大神分析结果
-    - AI模型初步分析数据
+    数据源:
+    - Redis中的原始文章数据（从ydniu.com爬取的专家推荐）
+    - 网络专家数据（文章中的预测信息）
+    - AI初步分析数据（第一次AI分析的中间结果）
+    - 数据库历史开奖数据
+
+    流程:
+    1. 初始化ComprehensiveAnalyzer
+    2. 调用analyze_with_multi_sources()整合多源数据
+    3. 输出多源数据汇总和预测结果
 
     Args:
-        data_limit: 获取历史数据的期数限制
+        data_limit: 获取历史数据的期数限制（默认30期）
+
+    Returns:
+        bool: 是否分析成功
     """
     logger.info('=' * 80)
     logger.info('开始执行综合分析（二次深度分析）')
@@ -421,7 +492,19 @@ def run_comprehensive_analysis(data_limit=30):
 
 def analyze_features():
     """
-    分析历史数据特征
+    分析历史数据特征：提取全部统计特征并输出报告
+
+    提取的特征类型:
+    - 频率特征: 各位置号码出现频次（热号/温号/冷号分类）
+    - 012路特征: 各位置号码模3分布比例
+    - 连号特征: 连续号码出现统计
+    - 重隔号特征: 与上期重复/间隔号码统计
+    - 和值与跨度特征: 五位数和值/跨度分布
+
+    输出: 特征分析结果JSON文件（保存到 reports/features/）
+
+    Returns:
+        bool: 是否分析成功
     """
     logger.info('=' * 80)
     logger.info('开始分析历史数据特征')
@@ -515,11 +598,22 @@ def analyze_features():
 
 def run_article_analysis(target_issue=None, data_limit=30):
     """
-    执行文章内容分析工作流
+    执行文章内容分析工作流：完整的6步分析流水线
+
+    步骤:
+    步骤1: 爬取文章 - 从ydniu.com获取专家推荐文章
+    步骤2: 第一次AI分析 - 结构化整理文章内容
+    步骤3: 保存Redis - 将分析结果缓存到Redis（7天过期）
+    步骤4: 加载Redis - 从Redis读取缓存数据
+    步骤5: 第二次AI分析 - 整合文章分析+历史数据，综合预测
+    步骤6: 保存数据库 - 将最终报告写入MySQL
 
     Args:
-        target_issue: 目标期号
-        data_limit: 获取历史数据的期数限制
+        target_issue: 目标期号（如"2026165"），None则爬取最新文章
+        data_limit: 获取历史数据的期数限制（默认30期）
+
+    Returns:
+        bool: 是否分析成功
     """
     logger.info('=' * 80)
     logger.info('开始执行文章内容分析工作流')
@@ -583,10 +677,19 @@ def run_save_articles_to_redis(target_issue=None, max_articles=100, extract_pred
     """
     执行批量保存文章到Redis，并可选提取预测数据
 
+    流程:
+    1. 爬取最多max_articles篇文章
+    2. 可选提取每篇文章中的预测数据（号码推荐等）
+    3. 按质量分数（≥0.7为高质量）分类
+    4. 将所有文章和预测数据保存到Redis
+
     Args:
-        target_issue: 目标期号
-        max_articles: 最大处理文章数
-        extract_predictions: 是否提取预测数据
+        target_issue: 目标期号（如"2026165"），None则爬取全部文章
+        max_articles: 最大处理文章数（默认100）
+        extract_predictions: 是否提取预测数据（默认True）
+
+    Returns:
+        bool: 是否保存成功
     """
     logger.info('=' * 80)
     logger.info('开始执行批量保存文章到Redis')
@@ -657,13 +760,19 @@ def run_save_articles_to_redis(target_issue=None, max_articles=100, extract_pred
 def run_process_article(url: str, title: str = '') -> bool:
     """
     处理单篇文章：爬取→AI分析→预处理→Redis存储
-    
+
+    完整流程:
+    1. 爬取文章内容（从给定URL）
+    2. AI分析（调用Qianfan API进行内容结构化）
+    3. 预处理（HTML清洗、格式规范化）
+    4. Redis存储（key格式: kpluckynumber:pl5:article:{issue}，7天过期）
+
     Args:
         url: 文章URL
-        title: 文章标题
-        
+        title: 文章标题（可选，不提供则从页面提取）
+
     Returns:
-        是否成功
+        bool: 是否处理成功
     """
     logger.info('=' * 80)
     logger.info('开始处理单篇文章')
@@ -728,12 +837,17 @@ def run_process_article(url: str, title: str = '') -> bool:
 def run_process_multiple_articles(max_count: int = 10) -> bool:
     """
     批量处理文章：爬取→AI分析→预处理→Redis存储
-    
+
+    流程:
+    1. 通过爬虫获取文章URL列表（最多max_count篇）
+    2. 逐篇执行爬取→AI分析→预处理→Redis存储
+    3. 汇总统计成功/失败数量
+
     Args:
-        max_count: 最大处理文章数
-        
+        max_count: 最大处理文章数（默认10）
+
     Returns:
-        是否成功
+        bool: 至少有一篇处理成功则返回True
     """
     logger.info('=' * 80)
     logger.info(f'开始批量处理 {max_count} 篇文章')
@@ -799,7 +913,19 @@ def run_process_multiple_articles(max_count: int = 10) -> bool:
 
 def main():
     """
-    主函数
+    主函数：解析命令行参数并分发到对应的功能函数
+
+    支持的命令:
+    - update: 更新历史数据
+    - predict: 预测下一期（--model optimized/old）
+    - backtest: 历史回测（--mode compare/old/new, --start, --count）
+    - analyze: 分析历史数据特征
+    - ernie: ERNIE AI深度分析（--limit）
+    - comprehensive: 综合分析/二次深度分析（--limit）
+    - article: 文章内容分析工作流（--issue, --limit）
+    - save-articles: 批量爬取文章并保存到Redis（--issue, --max, --no-extract）
+    - process-article: 处理单篇文章（--url, --title）
+    - process-articles: 批量处理文章（--max）
     """
     parser = argparse.ArgumentParser(description='排列五AI预测系统')
     subparsers = parser.add_subparsers(dest='command', help='可用命令')

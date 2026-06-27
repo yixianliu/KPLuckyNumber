@@ -1,9 +1,22 @@
-"""排列5 AI智能分析系统 - GUI界面
+"""
+排列5 AI智能分析系统 - GUI界面
 
-核心功能：
-1. 排列5数据爬取与AI分析
-2. AI分析报告展示
-3. 预测结果可视化
+基于tkinter的桌面应用程序，提供以下核心功能：
+1. 数据爬取（增量/全量） - 从多个数据源获取排列5开奖数据并存储到MySQL
+2. AI智能分析 - 集成文章爬取、双阶段AI分析（文章初步分析+综合预测）
+3. 历史回测 - 批量历史数据验证，评估模型Top-1/Top-3命中率
+4. 特征分析 - 提取频率、遗漏、012路、连号等统计特征
+5. 预测验证 - 自动比对预测与实际开奖结果，生成性能报告
+
+工作流程：
+  数据爬取 → AI智能分析（文章→初步AI→Redis→综合AI→数据库） → 预测验证
+                                                                    ↓
+                               历史回测 ← 特征分析 ← 性能评估报告
+
+架构说明：
+  - TaskManager: 异步任务管理器，通过ThreadPoolExecutor在后台线程执行耗时操作
+  - LotteryGUI: 主界面类，负责UI构建、事件绑定和业务逻辑协调
+  - 所有业务方法通过_task_wrapper在后台线程执行，通过消息队列更新UI
 """
 
 import sys
@@ -26,46 +39,81 @@ except ImportError:
     input("\n  按回车键退出...")
     sys.exit(1)
 
+# 确保项目根目录在sys.path中，以便模块导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from modules.ai_analyzer import AIAnalyzer
+# 核心模块导入
+# P5Database: 数据库连接、建表、增删改查操作
 from modules.database_p5 import P5Database
+# P5Spider: 多源数据爬虫（历史开奖数据+走势数据）
 from modules.spider_p5 import P5Spider
+# P5PredictionValidator: 预测结果验证与性能统计
 from modules.prediction_validator import P5PredictionValidator
+# OptimizedP5Predictor: 优化后的预测引擎（修复了原始版的排序/质数等Bug）
 from modules.optimized_p5_predictor import OptimizedP5Predictor, OptimizedP5PredictorConfig
+# P5BacktestEngine: 历史回测引擎，支持对比分析和可视化
 from modules.backtest_engine import P5BacktestEngine
+# P5FeatureEngineering: 特征工程模块（频率、遗漏、012路、连号等）
 from modules.feature_engineering import P5FeatureEngineering
+# ArticleAnalyzer: 文章分析器（爬取→初步AI→Redis→综合AI→数据库）
 from modules.article_analyzer import ArticleAnalyzer
 
+# 全局颜色主题配置（暗色主题，基于 Tailwind CSS 色板）
 COLORS = {
-    'bg_primary': '#0f172a',
-    'bg_secondary': '#1e293b',
-    'bg_card': '#334155',
-    'bg_input': '#1e1e2e',
-    'accent_p5': '#10b981',
-    'accent_ai': '#8b5cf6',
-    'accent_danger': '#ef4444',
-    'text_primary': '#f1f5f9',
-    'text_secondary': '#94a3b8',
-    'text_muted': '#64748b',
-    'border': '#475569',
-    'success': '#22c55e',
-    'warning': '#f59e0b',
+    'bg_primary': '#0f172a',  # 主背景色（深蓝灰）
+    'bg_secondary': '#1e293b',  # 次背景色（稍浅蓝灰）
+    'bg_card': '#334155',  # 卡片背景色
+    'bg_input': '#1e1e2e',  # 输入/输出区域背景色
+    'accent_p5': '#10b981',  # 排列5主题色（翠绿）
+    'accent_ai': '#8b5cf6',  # AI分析主题色（紫色）
+    'accent_danger': '#ef4444',  # 危险/错误色（红色）
+    'text_primary': '#f1f5f9',  # 主文字色（浅白）
+    'text_secondary': '#94a3b8',  # 次要文字色（灰蓝）
+    'text_muted': '#64748b',  # 弱化文字色（中灰）
+    'border': '#475569',  # 边框色
+    'success': '#22c55e',  # 成功状态色（绿色）
+    'warning': '#f59e0b',  # 警告状态色（琥珀色）
 }
 
 
 class TaskManager:
+    """
+    异步任务管理器
+
+    通过 ThreadPoolExecutor（单工作线程）在后台执行耗时任务，
+    使用 queue.Queue 作为消息通道将日志、进度、状态更新传递回主线程UI。
+    这样既保证了UI响应性，又避免了线程安全问题。
+
+    消息类型：
+    - 'log': 日志文本 → _append_log()
+    - 'progress': 进度更新 → _update_progress_ui()
+    - 'status': 状态栏更新 → _update_status_ui()
+    - 'finished': 任务完成 → _on_task_finished()
+    - 'error': 任务失败 → _on_task_error()
+    - 'report': 报告数据 → _display_report()
+    """
+
     def __init__(self, gui_instance):
+        """
+        初始化任务管理器
+
+        Args:
+            gui_instance: LotteryGUI实例，用于回调UI更新方法
+        """
         self.gui = gui_instance
-        self._task_queue = queue.Queue()
-        self._running = False
-        self._current_future = None
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._lock = threading.Lock()
-        self._cancelled = False
-        self._poll_ui_updates()
+        self._task_queue = queue.Queue()  # 线程安全的消息队列
+        self._running = False  # 任务运行状态标志
+        self._current_future = None  # 当前任务的Future对象
+        self._executor = ThreadPoolExecutor(max_workers=1)  # 单线程池，保证任务串行
+        self._lock = threading.Lock()  # 保护_running状态的锁
+        self._cancelled = False  # 取消标志
+        self._poll_ui_updates()  # 启动消息轮询循环
 
     def _poll_ui_updates(self):
+        """
+        定时轮询消息队列（每50ms），将后台线程的消息传递到主线程UI。
+        通过 tkinter 的 after() 方法实现递归调度，不阻塞主线程。
+        """
         try:
             while True:
                 msg = self._task_queue.get_nowait()
@@ -89,28 +137,45 @@ class TaskManager:
         self.gui.root.after(50, self._poll_ui_updates)
 
     def log(self, text):
+        """向输出区域追加日志文本（线程安全）"""
         self._task_queue.put({'type': 'log', 'text': text})
 
     def progress(self, value, text=""):
+        """更新进度条和进度文本（线程安全）"""
         self._task_queue.put({'type': 'progress', 'value': value, 'text': text})
 
     def status(self, text, color=COLORS['text_muted']):
+        """更新状态栏文本（线程安全）"""
         self._task_queue.put({'type': 'status', 'text': text, 'color': color})
 
     def report(self, data):
+        """投递报告数据到UI显示（线程安全）"""
         self._task_queue.put({'type': 'report', 'data': data})
 
     def finished(self):
+        """通知UI任务已完成（线程安全）"""
         self._task_queue.put({'type': 'finished'})
 
     def error(self, err_text):
+        """通知UI任务执行出错（线程安全）"""
         self._task_queue.put({'type': 'error', 'error': err_text})
 
     def is_running(self):
+        """检查当前是否有任务正在执行（线程安全）"""
         with self._lock:
             return self._running
 
     def submit(self, task_func, task_name="任务"):
+        """
+        提交后台任务
+
+        Args:
+            task_func: 接收TaskManager实例作为参数的可调用对象
+            task_name: 任务显示名称
+
+        Returns:
+            bool: 是否成功提交（如果已有任务运行则返回False）
+        """
         with self._lock:
             if self._running:
                 return False
@@ -122,6 +187,11 @@ class TaskManager:
         return True
 
     def _task_wrapper(self, task_func):
+        """
+        任务包装器，在线程池中执行。
+
+        捕获所有异常并记录详细堆栈，确保即使任务崩溃也能正确清理状态。
+        """
         try:
             task_func(self)
         except Exception as e:
@@ -134,40 +204,68 @@ class TaskManager:
                 self.finished()
 
     def _on_task_finished(self):
+        """任务完成时的清理工作"""
         with self._lock:
             self._running = False
         self.gui._on_task_finished()
 
     def _on_task_error(self, error_msg):
+        """任务出错时的清理工作"""
         with self._lock:
             self._running = False
         self.gui._on_task_error(error_msg)
 
     def cancel(self):
+        """取消当前任务（设置取消标志，但不会强制中断线程）"""
         self._cancelled = True
         with self._lock:
             self._running = False
 
     def shutdown(self):
+        """关闭线程池（不等待正在执行的任务）"""
         self._executor.shutdown(wait=False)
 
 
 class LotteryGUI:
+    """
+    排列5 AI智能分析系统主界面
+
+    负责构建和管理整个GUI，包括：
+    - 控制面板（数据爬取、AI分析、预测验证、系统操作四个功能卡片）
+    - 输出面板（AI分析报告/日志显示区域）
+    - 状态栏（任务状态、进度条、快捷统计）
+
+    通过 TaskManager 将所有耗时业务逻辑放到后台线程执行，
+    确保UI保持响应。
+    """
+
     def __init__(self, root):
+        """
+        初始化主界面
+
+        Args:
+            root: tkinter.Tk 根窗口实例
+        """
         self.root = root
         self.root.title("排列5 AI智能分析系统")
-        self.root.geometry("1100x750")
-        self.root.minsize(950, 650)
+        # 适配常见屏幕尺寸，默认使用较大窗口确保内容完全可见
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        win_width = min(1280, screen_width - 40)
+        win_height = min(860, screen_height - 80)
+        self.root.geometry(f"{win_width}x{win_height}+{max(0, (screen_width - win_width) // 2)}+{max(0, (screen_height - win_height) // 2)}")
+        self.root.minsize(1024, 720)
         self.root.configure(bg=COLORS['bg_primary'])
 
-        self.task_mgr = TaskManager(self)
-        self._buttons = []
-        self._current_task_name = ""
+        self.task_mgr = TaskManager(self)  # 异步任务管理器
+        self._buttons = []  # 所有按钮列表（用于批量启用/禁用）
+        self._current_task_name = ""  # 当前正在执行的任务名称
 
         self._setup_window_style()
         self._build_ui()
 
     def _setup_window_style(self):
+        """配置ttk样式主题（暗色主题，clam引擎）"""
         style = ttk.Style()
         style.theme_use('clam')
         style.configure('.', font=('微软雅黑', 10),
@@ -181,6 +279,7 @@ class LotteryGUI:
                         borderwidth=0)
 
     def _build_ui(self):
+        """构建完整的UI布局：顶部标题栏 + 中部（左侧控制面板 + 右侧输出区） + 底部状态栏"""
         main_container = tk.Frame(self.root, bg=COLORS['bg_primary'])
         main_container.pack(fill=tk.BOTH, expand=True)
 
@@ -189,6 +288,7 @@ class LotteryGUI:
         self._build_status_bar(main_container)
 
     def _build_header(self, parent):
+        """构建顶部标题栏（Logo + 系统名称 + 实时时钟）"""
         header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=50)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
@@ -223,25 +323,73 @@ class LotteryGUI:
         self._update_time()
 
     def _update_time(self):
+        """每秒更新顶部时钟显示"""
         self.time_label.config(text=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         self.root.after(1000, self._update_time)
 
     def _build_content(self, parent):
+        """构建中部内容区：左侧控制面板（可滚动，280px）+ 右侧输出面板（自适应）"""
         content = tk.Frame(parent, bg=COLORS['bg_primary'])
         content.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
-        left = tk.Frame(content, bg=COLORS['bg_primary'], width=260)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
-        left.pack_propagate(False)
+        # 左侧控制面板（可滚动，固定宽度280px）
+        left_container = tk.Frame(content, bg=COLORS['bg_primary'], width=280)
+        left_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        left_container.pack_propagate(False)
 
-        self._build_control_panel(left)
+        # 创建Canvas+Scrollbar实现左侧面板滚动
+        left_canvas = tk.Canvas(left_container, bg=COLORS['bg_primary'],
+                                highlightthickness=0, width=280)
+        left_scrollbar = tk.Scrollbar(left_container, orient='vertical',
+                                      command=left_canvas.yview, width=8,
+                                      bg=COLORS['bg_card'],
+                                      troughcolor=COLORS['bg_secondary'])
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
 
+        left_inner = tk.Frame(left_canvas, bg=COLORS['bg_primary'])
+        left_canvas.create_window((0, 0), window=left_inner, anchor='nw', width=270)
+
+        # 让内部Frame自适应Canvas宽度
+        def _on_left_configure(event):
+            left_canvas.itemconfig('all', width=event.width - 4)
+
+        left_canvas.bind('<Configure>', _on_left_configure)
+
+        # 更新Canvas滚动区域
+        def _on_inner_configure(event):
+            left_canvas.configure(scrollregion=left_canvas.bbox('all'))
+
+        left_inner.bind('<Configure>', _on_inner_configure)
+
+        # 鼠标滚轮滚动支持
+        def _on_mousewheel(event):
+            left_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+
+        left_canvas.bind('<Enter>', lambda e: left_canvas.bind_all('<MouseWheel>', _on_mousewheel))
+        left_canvas.bind('<Leave>', lambda e: left_canvas.unbind_all('<MouseWheel>'))
+
+        left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        left_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._build_control_panel(left_inner)
+
+        # 右侧输出面板（自适应宽度）
         right = tk.Frame(content, bg=COLORS['bg_primary'])
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self._build_output_panel(right)
 
     def _build_control_panel(self, parent):
+        """
+        构建左侧控制面板，包含四个功能卡片：
+
+        1. 数据爬取卡片 - 增量爬取 / 全量爬取
+        2. AI智能分析卡片 - 执行AI分析 / 历史回测 / 特征分析
+        3. 预测验证卡片 - 验证预测 / 性能报告
+        4. 系统操作卡片 - 数据库检测 / 更新统计 / 清空输出
+
+        以及进度条和快捷统计面板
+        """
         # 数据爬取卡片
         crawl_card = self._create_card(parent, "数据爬取", '#f59e0b')
         crawl_card.pack(fill=tk.X, pady=(0, 8))
@@ -326,14 +474,27 @@ class LotteryGUI:
         self.stats_content.pack(anchor=tk.W, padx=10, pady=(0, 8))
 
     def _create_card(self, parent, title, accent_color):
+        """
+        创建一个带标题和顶部彩色装饰条的功能卡片
+
+        Args:
+            parent: 父容器
+            title: 卡片标题
+            accent_color: 装饰条和圆点颜色
+
+        Returns:
+            tk.Frame: 卡片框架
+        """
         card = tk.Frame(parent, bg=COLORS['bg_secondary'],
                         highlightbackground=COLORS['border'],
                         highlightthickness=1)
 
+        # 顶部彩色装饰条（2px高度）
         top_bar = tk.Frame(card, bg=accent_color, height=2)
         top_bar.pack(fill=tk.X)
         top_bar.pack_propagate(False)
 
+        # 标题行（彩色圆点 + 标题文字）
         title_frame = tk.Frame(card, bg=COLORS['bg_secondary'])
         title_frame.pack(fill=tk.X, padx=10, pady=(8, 6))
 
@@ -350,6 +511,18 @@ class LotteryGUI:
         return card
 
     def _add_big_button(self, parent, text, color, command):
+        """
+        添加主要操作按钮（大号、彩色背景、占满整行）
+
+        Args:
+            parent: 父容器
+            text: 按钮文字
+            color: 按钮背景色
+            command: 点击回调函数
+
+        Returns:
+            tk.Button: 按钮实例
+        """
         btn_frame = tk.Frame(parent, bg=COLORS['bg_secondary'])
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
 
@@ -373,6 +546,18 @@ class LotteryGUI:
         return btn
 
     def _add_action_button(self, parent, text, color, command):
+        """
+        添加次要操作按钮（小号、深色背景、hover时变色）
+
+        Args:
+            parent: 父容器
+            text: 按钮文字
+            color: hover时的背景色
+            command: 点击回调函数
+
+        Returns:
+            tk.Button: 按钮实例
+        """
         btn_frame = tk.Frame(parent, bg=COLORS['bg_secondary'])
         btn_frame.pack(fill=tk.X, padx=10, pady=2)
 
@@ -388,6 +573,7 @@ class LotteryGUI:
                         padx=12, pady=5)
         btn.pack(fill=tk.X)
 
+        # hover效果：鼠标进入时变亮，离开时恢复
         btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=c))
         btn.bind('<Leave>', lambda e, b=btn: b.config(bg=COLORS['bg_card']))
 
@@ -396,6 +582,16 @@ class LotteryGUI:
 
     @staticmethod
     def _lighten_color(hex_color, factor):
+        """
+        将十六进制颜色按比例变亮
+
+        Args:
+            hex_color: 十六进制颜色字符串（如 '#10b981'）
+            factor: 亮度因子（>1变亮，<1变暗）
+
+        Returns:
+            变亮后的十六进制颜色字符串
+        """
         hex_color = hex_color.lstrip('#')
         r = min(255, int(int(hex_color[0:2], 16) * factor))
         g = min(255, int(int(hex_color[2:4], 16) * factor))
@@ -403,6 +599,7 @@ class LotteryGUI:
         return f'#{r:02x}{g:02x}{b:02x}'
 
     def _build_output_panel(self, parent):
+        """构建右侧输出面板（报告标题 + 可滚动的文本输出区）"""
         header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=30)
         header.pack(fill=tk.X, pady=(0, 2))
         header.pack_propagate(False)
@@ -446,42 +643,47 @@ class LotteryGUI:
         self._show_welcome()
 
     def _show_welcome(self):
+        """显示欢迎信息和工作流程说明"""
         welcome = f"""
-{'='*70}
+{'=' * 70}
   欢迎使用 排列5 AI智能分析系统 v2.0
-{'='*70}
+{'=' * 70}
 
-  系统功能:
+  【数据爬取】
     [增量爬取数据] 仅获取数据库中缺失的新数据
     [全量爬取数据] 重新爬取全部历史数据和走势数据
-    
-    [AI智能分析] ✨ 优化后模型分析（推荐）
-    [历史回测] ✨ 批量历史回测，验证模型性能
-    [特征分析] ✨ 提取和分析历史数据特征
-    
+
+  【AI智能分析】（核心工作流）
+    [执行AI智能分析] 完整分析流水线：
+       阶段1: 文章爬取（从ydniu.com获取专家推荐）
+       阶段2: 第一次AI分析（结构化整理文章内容）
+       阶段3: Redis存储（所有文章缓存，7天过期）
+       阶段4: 第二次AI分析（整合文章+历史数据，综合预测）
+       阶段5: 数据库存储（保存最终分析报告）
+    [执行历史回测] 批量历史回测，验证模型Top-1/Top-3命中率
+    [执行特征分析] 提取频率、遗漏、012路、连号、重隔号等统计特征
+
+  【预测验证】
     [验证待验证预测] 自动比对预测与实际开奖结果
     [性能评估报告] 生成AI预测命中率统计报告
 
-  优化模型 (v2.0):
-    - 修复期号排序Bug（数值排序而非字符串排序）
-    - 修复质数定义Bug（1不是质数）
-    - 修复遗漏值计算Bug（正确处理从未出现的号码）
-    - 新增特征工程（012路、连号、重隔号、区间分布、滑动窗口）
-    - 新增概率归一化（确保概率总和为1）
-    - 新增边界保护（限制极端输出）
-    - 新增多模型融合（统计模型+特征工程交叉校验）
+  【系统操作】
+    [数据库检测] 检测数据库连接、表结构、数据量
+    [更新快捷统计] 刷新右侧统计面板的最新数据
+    [清空输出] 清除当前输出区域内容
 
   ⚠️ 重要提示：本系统仅基于历史数据统计分析，无法预测开奖结果，
      不构成任何投资建议。彩票开奖具有随机性，请理性购彩。
 
   当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-{'='*70}
+{'=' * 70}
 """
         self.output_text.insert(tk.END, welcome)
         self.output_text.see(tk.END)
 
     def _build_status_bar(self, parent):
+        """构建底部状态栏（状态指示灯 + 状态文字 + 技术栈信息）"""
         status_bar = tk.Frame(parent, bg=COLORS['bg_secondary'], height=28)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
         status_bar.pack_propagate(False)
@@ -507,6 +709,7 @@ class LotteryGUI:
                  fg=COLORS['text_muted']).pack(side=tk.LEFT, padx=5, pady=4)
 
     def _on_button_click(self, task_name, task_func):
+        """按钮点击统一入口：检查任务状态后提交到后台线程"""
         if self.task_mgr.is_running():
             messagebox.showwarning("提示", "当前有任务正在执行，请等待完成")
             return
@@ -516,6 +719,7 @@ class LotteryGUI:
             messagebox.showwarning("提示", "任务提交失败，请重试")
 
     def _on_task_started(self, task_name):
+        """任务启动时：禁用按钮、重置进度条、更新状态指示器"""
         self._current_task_name = task_name
         self._set_buttons_state(tk.DISABLED)
         self.progress['value'] = 0
@@ -525,11 +729,12 @@ class LotteryGUI:
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['warning'])
 
         now = datetime.now().strftime('%H:%M:%S')
-        self._append_log(f"\n{'='*70}\n")
+        self._append_log(f"\n{'=' * 70}\n")
         self._append_log(f"  [{now}] 开始执行: {task_name}\n")
-        self._append_log(f"{'='*70}\n\n")
+        self._append_log(f"{'=' * 70}\n\n")
 
     def _on_task_finished(self):
+        """任务完成时：恢复按钮、进度条置100%、状态指示器变绿"""
         self._set_buttons_state(tk.NORMAL)
         self.progress['value'] = 100
         self.progress_label.config(text="100%")
@@ -538,11 +743,12 @@ class LotteryGUI:
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['success'])
 
         now = datetime.now().strftime('%H:%M:%S')
-        self._append_log(f"\n{'='*70}\n")
+        self._append_log(f"\n{'=' * 70}\n")
         self._append_log(f"  [{now}] 任务完成: {self._current_task_name}\n")
-        self._append_log(f"{'='*70}\n")
+        self._append_log(f"{'=' * 70}\n")
 
     def _on_task_error(self, error_msg):
+        """任务出错时：恢复按钮、进度条归零、状态指示器变红、弹窗提示"""
         self._set_buttons_state(tk.NORMAL)
         self.progress['value'] = 0
         self.progress_label.config(text="0%")
@@ -553,38 +759,42 @@ class LotteryGUI:
         messagebox.showerror("错误", f"任务执行失败:\n{error_msg}")
 
     def _append_log(self, text):
+        """向输出文本区追加内容并自动滚动到底部"""
         self.output_text.insert(tk.END, text)
         self.output_text.see(tk.END)
 
     def _clear_output(self):
+        """清空输出区并重新显示欢迎信息"""
         self.output_text.delete(1.0, tk.END)
         self._show_welcome()
 
     def _update_progress_ui(self, value, text=""):
+        """更新进度条值和进度文本"""
         self.progress['value'] = value
         self.progress_label.config(text=f"{int(value)}%")
         if text:
             self.task_status_label.config(text=text, fg=COLORS['text_secondary'])
 
     def _update_status_ui(self, text, color=COLORS['text_muted']):
+        """更新底部状态栏文字"""
         self.status_var.set(text)
 
     def _display_report(self, data):
+        """显示从后台线程传递来的报告数据"""
         if data.get('report'):
             self._append_log(data['report'])
 
     def _set_buttons_state(self, state):
+        """批量设置所有操作按钮的启用/禁用状态"""
         for btn in self._buttons:
             btn.config(state=state)
 
     # ============================================================
-    # 业务任务
+    # 业务任务 - 系统操作
     # ============================================================
 
-
-
     def _check_database(self, task_mgr):
-        """数据库检测"""
+        """数据库检测：验证MySQL连接、创建数据表、显示数据量统计"""
         task_mgr.log("正在检测数据库连接...")
 
         db = P5Database()
@@ -615,8 +825,12 @@ class LotteryGUI:
             task_mgr.log("✗ 数据库连接失败，请检查配置")
             self.stats_content.config(text="数据库连接失败", fg=COLORS['accent_danger'])
 
+    # ============================================================
+    # 业务任务 - 数据爬取
+    # ============================================================
+
     def _execute_crawl_incremental(self, task_mgr):
-        """执行增量爬取数据"""
+        """增量爬取数据：仅获取数据库中缺失的新期号数据，含历史+走势数据"""
         task_mgr.log("启动增量数据爬取...")
         task_mgr.progress(10, "初始化爬虫")
 
@@ -670,7 +884,7 @@ class LotteryGUI:
         task_mgr.log(f"\n增量爬取完成: 新增历史{history_success}条")
 
     def _execute_crawl_full(self, task_mgr):
-        """执行全量爬取数据"""
+        """全量爬取数据：重新爬取全部历史数据（最多2000条）和走势数据"""
         task_mgr.log("启动全量数据爬取...")
         task_mgr.progress(10, "初始化爬虫")
 
@@ -705,8 +919,12 @@ class LotteryGUI:
         task_mgr.progress(100, "完成")
         task_mgr.log(f"\n全量爬取完成: 历史{history_success}条, 走势{trend_success}条")
 
+    # ============================================================
+    # 业务任务 - 预测验证
+    # ============================================================
+
     def _execute_verify_predictions(self, task_mgr):
-        """执行预测验证"""
+        """预测验证：获取待验证预测，比对实际开奖结果，更新性能统计"""
         task_mgr.log("启动预测结果验证...")
         task_mgr.progress(20, "初始化验证器")
 
@@ -748,7 +966,7 @@ class LotteryGUI:
         task_mgr.log("\n预测验证流程结束")
 
     def _execute_performance_report(self, task_mgr):
-        """生成性能评估报告"""
+        """性能评估报告：生成AI预测命中率统计报告，含总预测数/完全猜中/平均准确率"""
         task_mgr.log("生成AI预测性能评估报告...")
         task_mgr.progress(30, "获取统计数据")
 
@@ -760,7 +978,7 @@ class LotteryGUI:
         task_mgr.progress(100, "完成")
 
     def _update_quick_stats(self, task_mgr):
-        """更新快捷统计面板"""
+        """更新快捷统计面板：从数据库获取历史数据量、AI报告数和预测验证统计"""
         task_mgr.log("更新快捷统计...")
 
         db = P5Database()
@@ -790,11 +1008,21 @@ class LotteryGUI:
         task_mgr.log("快捷统计更新完成")
 
     # ============================================================
-    # 优化后AI分析任务（v2.0）
+    # 业务任务 - AI分析核心流水线（v2.0）
     # ============================================================
 
     def _execute_optimized_p5_ai(self, task_mgr):
-        """执行优化后AI分析（v2.0）- 集成文章爬取与双阶段AI分析"""
+        """
+        AI智能分析核心流水线（5阶段）
+
+        阶段1: 文章爬取 - 从ydniu.com获取专家推荐文章
+        阶段2: 第一次AI分析 - 结构化整理文章内容，提取预测信息
+        阶段3: Redis存储 - 所有文章缓存到Redis，7天自动过期
+        阶段4: 第二次AI分析 - 整合文章分析结果+数据库历史数据，综合预测
+        阶段5: 数据库存储 - 保存最终分析报告到MySQL，生成JSON文件
+
+        输出: 各位置预测号码/置信度、推荐组合、趋势分析、统计特征、推理过程
+        """
         try:
             task_mgr.log("=" * 70)
             task_mgr.log("✨ 启动AI智能分析流程（集成文章爬取）")
@@ -826,11 +1054,6 @@ class LotteryGUI:
 
             articles = crawl_result['articles']
             task_mgr.log(f"✓ 成功爬取 {len(articles)} 篇文章")
-            
-            article_data = articles[0]
-            task_mgr.log(f"  使用第一篇文章: {article_data.get('title', '未知')[:50]}...")
-            task_mgr.log(f"  来源: {article_data.get('url', '未知')[:60]}...")
-            task_mgr.log(f"  内容长度: {len(article_data.get('content', ''))} 字符")
 
             task_mgr.progress(35, "文章爬取完成")
 
@@ -838,7 +1061,7 @@ class LotteryGUI:
             task_mgr.log("-" * 50)
             task_mgr.progress(40, "执行第一次AI分析")
 
-            first_ai_result = analyzer.first_ai_analysis(article_data)
+            first_ai_result = analyzer.first_ai_analysis(articles)
 
             if not first_ai_result:
                 task_mgr.log("✗ 第一次AI分析失败")
@@ -981,14 +1204,18 @@ class LotteryGUI:
             combinations = second_ai_result.get('recommended_combinations', [])
             for i, combo in enumerate(combinations, 1):
                 if isinstance(combo, dict):
-                    combo_str = combo.get('combination', '')
+                    combo_str = combo.get('combination', combo.get('numbers', ''))
+                    if isinstance(combo_str, list):
+                        combo_str = ''.join(str(n) for n in combo_str)
                     confidence = combo.get('confidence', '')
                     reason = combo.get('reason', '')
                     task_mgr.log(f"  {i}. {combo_str}")
                     if confidence:
-                        task_mgr.log(f"     置信度: {confidence:.2%}")
+                        task_mgr.log(f"     置信度: {confidence:.2%}" if isinstance(confidence, float) else f"     置信度: {confidence}")
                     if reason:
-                        task_mgr.log(f"     理由: {reason[:60]}...")
+                        task_mgr.log(f"     理由: {str(reason)[:60]}...")
+                elif isinstance(combo, list):
+                    task_mgr.log(f"  {i}. {''.join(str(n) for n in combo)}")
                 else:
                     task_mgr.log(f"  {i}. {combo}")
 
@@ -1008,20 +1235,31 @@ class LotteryGUI:
                 task_mgr.log(f"  冷号: {statistical_features.get('cold_numbers', '')}")
                 patterns = statistical_features.get('key_patterns', [])
                 for i, pattern in enumerate(patterns, 1):
-                    task_mgr.log(f"  模式{i}: {pattern[:60]}")
+                    task_mgr.log(f"  模式{i}: {str(pattern)[:60]}")
             else:
-                key_features = second_ai_result.get('key_features', [])
-                for i, feature in enumerate(key_features, 1):
-                    task_mgr.log(f"  {i}. {feature[:60]}...")
+                # 回退：尝试显示 key_conclusions 或 key_features
+                conclusions = (second_ai_result.get('key_conclusions')
+                               or second_ai_result.get('key_features', []))
+                if isinstance(conclusions, list):
+                    for i, c in enumerate(conclusions, 1):
+                        task_mgr.log(f"  {i}. {str(c)[:60]}")
+                elif conclusions:
+                    task_mgr.log(f"  {str(conclusions)[:200]}")
 
             task_mgr.log(f"\n【推理过程】")
             reasoning = second_ai_result.get('reasoning_process', '')
             if reasoning:
-                reasoning_parts = reasoning.split('；') if '；' in reasoning else reasoning.split(';')
-                for i, part in enumerate(reasoning_parts, 1):
-                    task_mgr.log(f"  {i}. {part.strip()[:80]}...")
+                if isinstance(reasoning, list):
+                    for i, part in enumerate(reasoning, 1):
+                        task_mgr.log(f"  {i}. {str(part)[:80]}...")
+                elif isinstance(reasoning, str):
+                    reasoning_parts = reasoning.split('；') if '；' in reasoning else reasoning.split(';')
+                    for i, part in enumerate(reasoning_parts, 1):
+                        task_mgr.log(f"  {i}. {part.strip()[:80]}...")
+                else:
+                    task_mgr.log(f"  {str(reasoning)[:200]}")
             else:
-                task_mgr.log(f"  {reasoning[:100]}..." if reasoning else "  暂无推理过程")
+                task_mgr.log("  暂无推理过程")
 
             task_mgr.log("\n" + "=" * 70)
             risk_warning = second_ai_result.get('risk_warning', '本分析基于历史数据统计，不保证中奖，请理性购彩。')
@@ -1055,7 +1293,17 @@ class LotteryGUI:
             task_mgr.progress(0, "异常终止")
 
     def _execute_backtest(self, task_mgr):
-        """执行历史回测"""
+        """
+        历史回测：使用OptimizedP5Predictor在历史数据上执行滚动预测回测
+
+        流程:
+        1. 加载全部历史数据（至少100期）
+        2. 从第50期开始，每期用前N期数据训练后预测下一期
+        3. 统计Top-1/Top-3命中率、综合得分、完全猜中次数
+        4. 生成回测报告文件
+
+        输出: 回测统计指标、前10期详情、报告文件路径
+        """
         try:
             task_mgr.log("正在执行历史回测...")
             task_mgr.progress(10, "初始化回测引擎")
@@ -1161,7 +1409,18 @@ class LotteryGUI:
             task_mgr.progress(0, "异常终止")
 
     def _execute_feature_analysis(self, task_mgr):
-        """执行特征分析"""
+        """
+        特征分析：提取全部历史数据的统计特征
+
+        提取的特征类型:
+        - 频率特征: 各位置热号/温号/冷号
+        - 012路特征: 各位置0路/1路/2路比例
+        - 连号特征: 平均连号数、连号出现率
+        - 重隔号特征: 重号率、隔号率、无重复率
+        - 和值与跨度特征: 和值范围/平均值、跨度范围/平均值
+
+        输出: 特征分析报告JSON文件（保存到 reports/features/）
+        """
         try:
             task_mgr.log("正在执行特征分析...")
             task_mgr.progress(10, "初始化特征工程")
@@ -1275,10 +1534,12 @@ class LotteryGUI:
 
 
 def main():
+    """启动排列5 AI智能分析系统GUI应用程序"""
     root = tk.Tk()
     app = LotteryGUI(root)
 
     def on_closing():
+        """窗口关闭时优雅关闭线程池"""
         app.task_mgr.shutdown()
         root.destroy()
 
