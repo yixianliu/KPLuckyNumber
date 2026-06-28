@@ -142,6 +142,19 @@ class RedisClient:
         prefix = self.get_key_prefix()
         return f'{prefix}combined:{issue}'
 
+    def get_trend_analysis_key(self, issue: str) -> str:
+        """
+        获取走势AI分析数据键名
+
+        Args:
+            issue: 期号
+
+        Returns:
+            键名
+        """
+        prefix = self.get_key_prefix()
+        return f'{prefix}trend_ai:{issue}'
+
     def get_article_key(self, article_id: Optional[str] = None) -> str:
         """
         获取文章数据键名（按文章ID存储）
@@ -598,6 +611,62 @@ class RedisClient:
             
         except Exception as e:
             logger.error(f'获取综合分析数据失败: {e}')
+            return None
+
+    def save_trend_analysis(self, issue: str, data: Dict[str, Any], expire_days: int = 7) -> bool:
+        """
+        保存走势AI分析数据到Redis
+
+        Args:
+            issue: 期号
+            data: 走势分析数据字典
+            expire_days: 过期天数
+
+        Returns:
+            是否保存成功
+        """
+        if not self.is_connected():
+            logger.error('Redis未连接')
+            return False
+
+        try:
+            key = self.get_trend_analysis_key(issue)
+            data['saved_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            data['issue'] = issue
+
+            self.client.set(key, json.dumps(data, ensure_ascii=False), ex=timedelta(days=expire_days))
+
+            logger.info(f'走势AI分析数据已保存: {key} (过期时间: {expire_days}天)')
+            return True
+
+        except Exception as e:
+            logger.error(f'保存走势AI分析数据失败: {e}')
+            return False
+
+    def get_trend_analysis(self, issue: str) -> Optional[Dict[str, Any]]:
+        """
+        获取走势AI分析数据
+
+        Args:
+            issue: 期号
+
+        Returns:
+            数据字典，失败返回None
+        """
+        if not self.is_connected():
+            logger.error('Redis未连接')
+            return None
+
+        try:
+            key = self.get_trend_analysis_key(issue)
+            data = self.client.get(key)
+            if data:
+                return json.loads(data)
+            logger.info(f'未找到走势AI分析数据: {key}')
+            return None
+
+        except Exception as e:
+            logger.error(f'获取走势AI分析数据失败: {e}')
             return None
 
     def backup_data(self, backup_dir: str = 'backups/redis') -> str:

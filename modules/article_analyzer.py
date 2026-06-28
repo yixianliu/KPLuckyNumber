@@ -973,6 +973,750 @@ class ArticleAnalyzer:
             logger.error(f'保存到数据库失败: {e}', exc_info=True)
             return None
 
+    # ============================================================
+    # 新流水线方法 - 走势AI分析（步骤2）
+    # ============================================================
+
+    def _build_trend_analysis_prompt(self, trend_data: Dict[str, Any]) -> str:
+        """
+        构建走势图AI分析提示词
+
+        将最近30期的走势图数据（基础走势+万/千/百/十/个位走势）
+        格式化为AI可理解的文本，要求输出结构化的走势分析报告JSON。
+
+        Args:
+            trend_data: 包含以下键的字典:
+                - basic_trend: 基础走势数据列表(最近30期)
+                - wan_trend: 万位走势数据列表
+                - qian_trend: 千位走势数据列表
+                - bai_trend: 百位走势数据列表
+                - shi_trend: 十位走势数据列表
+                - ge_trend: 个位走势数据列表
+
+        Returns:
+            完整的提示词文本
+        """
+        prompt_parts = []
+
+        prompt_parts.append("""
+你是一位专业的排列5数据分析专家。请对以下最近30期的走势图数据进行深度分析。
+
+【分析目标】
+基于走势图数据分析各位置数字的走势规律、冷热状态、遗漏趋势等，
+生成一份结构化的走势分析报告。
+
+【报告要求】
+请以严格的JSON格式输出，不要包含任何额外文字或markdown标记：
+
+""")
+
+        # ---- 基础走势数据 ----
+        prompt_parts.append("=" * 60)
+        prompt_parts.append("一、基础走势图数据（最近30期）")
+        prompt_parts.append("=" * 60)
+
+        basic = trend_data.get('basic_trend', [])
+        if basic:
+            prompt_parts.append("\n期号 | 日期 | 万 | 千 | 百 | 十 | 个 | 和值 | 奇偶比 | 大小比")
+            prompt_parts.append("-" * 55)
+            for item in basic[:30]:
+                issue = item.get('issue', '')
+                draw_date = item.get('draw_date', '')
+                wan = item.get('wan', 0)
+                qian = item.get('qian', 0)
+                bai = item.get('bai', 0)
+                shi = item.get('shi', 0)
+                ge = item.get('ge', 0)
+                hezhi = item.get('hezhi', '')
+                odd_even = item.get('odd_even_ratio', '')
+                big_small = item.get('big_small_ratio', '')
+                prompt_parts.append(f"{issue} | {draw_date} | {wan} | {qian} | {bai} | {shi} | {ge} | {hezhi} | {odd_even} | {big_small}")
+
+        # ---- 各位置走势数据 ----
+        position_configs = [
+            ('万位', 'wan_trend', 'wan_number', '万'),
+            ('千位', 'qian_trend', 'qian_number', '千'),
+            ('百位', 'bai_trend', 'bai_number', '百'),
+            ('十位', 'shi_trend', 'shi_number', '十'),
+            ('个位', 'ge_trend', 'ge_number', '个'),
+        ]
+
+        for pos_name, key, num_key, abbr in position_configs:
+            prompt_parts.append(f"\n{'=' * 60}")
+            prompt_parts.append(f"二-{abbr}、{pos_name}走势数据（最近30期）")
+            prompt_parts.append(f"{'=' * 60}")
+
+            pos_data = trend_data.get(key, [])
+            if pos_data:
+                prompt_parts.append(f"\n期号 | 数字 | 奇偶 | 大小 | 质合 | 遗漏值 | 冷热等级 | 连续次数")
+                prompt_parts.append("-" * 65)
+                for item in pos_data[:30]:
+                    issue = item.get('issue', '')
+                    num = item.get(num_key, 0)
+                    is_odd = '奇' if item.get('is_odd') else '偶'
+                    is_big = '大' if item.get('is_big') else '小'
+                    is_prime = '质' if item.get('is_prime') else '合'
+                    omission = item.get('omission', 0)
+                    hot_level = item.get('hot_level', '')
+                    consecutive = item.get('consecutive_count', 0)
+                    prompt_parts.append(f"{issue} | {num} | {is_odd} | {is_big} | {is_prime} | {omission} | {hot_level} | {consecutive}")
+
+                # 统计摘要
+                num_freq = {}
+                for item in pos_data[:30]:
+                    n = item.get(num_key, 0)
+                    num_freq[n] = num_freq.get(n, 0) + 1
+                sorted_nums = sorted(num_freq.items(), key=lambda x: x[1], reverse=True)
+                hot = [n for n, _ in sorted_nums[:3]]
+                cold = [n for n, _ in sorted_nums[-3:]]
+                max_omission = max((item.get('omission', 0) for item in pos_data[:30]), default=0)
+                prompt_parts.append(f"\n统计摘要: 热号{hot}, 冷号{cold}, 最大遗漏{max_omission}")
+
+        # ---- 输出格式要求 ----
+        prompt_parts.append(f"""
+{'=' * 60}
+输出格式要求
+{'=' * 60}
+
+请严格按照以下JSON格式输出走势分析报告：
+
+{{
+    "analysis_type": "走势图AI分析",
+    "analysis_time": "YYYY-MM-DD HH:MM:SS",
+    "data_period": "最近30期走势数据",
+    "trend_summary": {{
+        "overall_trend": "整体走势总结（100-200字）",
+        "hot_numbers_summary": "热号总体描述",
+        "cold_numbers_summary": "冷号总体描述",
+        "pattern_summary": "模式规律总结"
+    }},
+    "position_analysis": {{
+        "wan": {{
+            "hot_numbers": [],
+            "cold_numbers": [],
+            "trend_direction": "走势方向描述（向上/向下/震荡）",
+            "omission_analysis": "遗漏分析",
+            "recommended_numbers": []
+        }},
+        "qian": {{
+            "hot_numbers": [],
+            "cold_numbers": [],
+            "trend_direction": "走势方向描述",
+            "omission_analysis": "遗漏分析",
+            "recommended_numbers": []
+        }},
+        "bai": {{
+            "hot_numbers": [],
+            "cold_numbers": [],
+            "trend_direction": "走势方向描述",
+            "omission_analysis": "遗漏分析",
+            "recommended_numbers": []
+        }},
+        "shi": {{
+            "hot_numbers": [],
+            "cold_numbers": [],
+            "trend_direction": "走势方向描述",
+            "omission_analysis": "遗漏分析",
+            "recommended_numbers": []
+        }},
+        "ge": {{
+            "hot_numbers": [],
+            "cold_numbers": [],
+            "trend_direction": "走势方向描述",
+            "omission_analysis": "遗漏分析",
+            "recommended_numbers": []
+        }}
+    }},
+    "statistical_analysis": {{
+        "hezhi_analysis": "和值走势分析（50-100字）",
+        "span_analysis": "跨度分析（50-100字）",
+        "odd_even_analysis": "奇偶比趋势分析（50-100字）",
+        "big_small_analysis": "大小比趋势分析（50-100字）"
+    }},
+    "key_patterns": [
+        "发现的规律模式1",
+        "发现的规律模式2",
+        "发现的规律模式3"
+    ],
+    "risk_factors": [
+        "需要关注的风险因素1",
+        "需要关注的风险因素2"
+    ]
+}}
+
+注意事项：
+1. 必须严格按JSON格式输出，不要有额外文字
+2. 每个位置都有hot_numbers和cold_numbers（数字数组）
+3. trend_direction描述走势方向
+4. recommended_numbers为基于走势分析推荐的号码（数组）
+""")
+
+        return "\n".join(prompt_parts)
+
+    def trend_analysis_with_ai(self, trend_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        走势AI分析：将最近30期走势图数据喂给AI，生成走势分析报告
+
+        Args:
+            trend_data: 包含basic_trend和各位置走势数据的字典
+
+        Returns:
+            AI分析结果JSON（统一格式），失败返回None
+        """
+        logger.info('=' * 80)
+        logger.info('开始走势AI分析（最近30期走势图数据）')
+        logger.info('=' * 80)
+
+        self._init_ai_client()
+
+        if not self.ai_client:
+            logger.error('AI客户端未初始化')
+            return None
+
+        prompt = self._build_trend_analysis_prompt(trend_data)
+        logger.info(f'走势分析提示词长度: {len(prompt)}')
+
+        messages = [
+            {
+                "role": "system",
+                "content": "你是一位专业的排列5走势数据分析专家，擅长分析走势图数据并发现规律。请严格按照要求输出JSON格式。"
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+
+        try:
+            ai_response = self.ai_client._call_ai_model(messages=messages, max_tokens=6000, temperature=0.5)
+            if not ai_response:
+                logger.error('走势AI分析 - AI模型调用失败')
+                return None
+
+            ai_result = self.ai_client._parse_ai_response(ai_response)
+            if not ai_result:
+                logger.error('走势AI分析 - AI响应解析失败')
+                return None
+
+            logger.info('走势AI分析完成')
+            return ai_result
+
+        except Exception as e:
+            logger.error(f'走势AI分析异常: {e}', exc_info=True)
+            return None
+
+    def save_trend_analysis_to_redis(self, issue: str, trend_result: Dict[str, Any]) -> bool:
+        """
+        保存走势AI分析结果到Redis
+
+        Args:
+            issue: 期号
+            trend_result: 走势AI分析结果
+
+        Returns:
+            是否保存成功
+        """
+        self._init_redis()
+
+        if not self.redis_client or not self.redis_client.is_connected():
+            logger.error('Redis客户端未连接，无法保存走势分析')
+            return False
+
+        try:
+            return self.redis_client.save_trend_analysis(issue, trend_result)
+        except Exception as e:
+            logger.error(f'保存走势AI分析到Redis失败: {e}')
+            return False
+
+    def load_trend_analysis_from_redis(self, issue: str) -> Optional[Dict[str, Any]]:
+        """
+        从Redis加载走势AI分析结果
+
+        Args:
+            issue: 期号
+
+        Returns:
+            走势分析结果，失败返回None
+        """
+        self._init_redis()
+
+        if not self.redis_client or not self.redis_client.is_connected():
+            logger.error('Redis客户端未连接，无法加载走势分析')
+            return None
+
+        try:
+            return self.redis_client.get_trend_analysis(issue)
+        except Exception as e:
+            logger.error(f'从Redis加载走势AI分析失败: {e}')
+            return None
+
+    # ============================================================
+    # 新流水线方法 - 最终整合分析（步骤3）
+    # ============================================================
+
+    def _build_final_integrated_prompt(self,
+                                       articles_analyses: List[Dict[str, Any]],
+                                       trend_analysis: Optional[Dict[str, Any]],
+                                       db_history: Dict[str, Any]) -> str:
+        """
+        构建最终整合分析提示词：整合文章AI分析+走势AI分析+历史数据
+
+        将第一步的文章AI分析结果、第二步的走势AI分析报告、以及数据库历史数据
+        整合到一个综合prompt中，要求AI输出最终的预测报告。
+
+        Args:
+            articles_analyses: 文章AI分析结果列表
+            trend_analysis: 走势AI分析报告
+            db_history: 数据库历史数据
+
+        Returns:
+            完整的提示词文本
+        """
+        prompt_parts = []
+
+        prompt_parts.append("""
+你是一位顶尖的排列5综合预测专家。请整合以下多源数据进行深度综合分析，给出最终的号码预测报告。
+
+【任务说明】
+你将收到三类数据：
+1. 多篇专家文章的AI分析结果（各篇文章的结构化预测信息）
+2. 最近30期的走势图AI分析报告（走势规律、冷热号、遗漏趋势等）
+3. 最近30期的历史开奖数据
+请综合所有信息，给出最终的预测号码和详细推理过程。
+
+""")
+
+        # ---- 第一部分：文章AI分析结果汇总 ----
+        prompt_parts.append("=" * 60)
+        prompt_parts.append("一、文章AI分析结果汇总")
+        prompt_parts.append("=" * 60)
+
+        if articles_analyses:
+            prompt_parts.append(f"共 {len(articles_analyses)} 篇文章的分析结果：\n")
+            for idx, analysis in enumerate(articles_analyses, 1):
+                prompt_parts.append(f"--- 文章 {idx} ---")
+                title = analysis.get('article_info', {}).get('title', analysis.get('title', '未知'))
+                prompt_parts.append(f"标题: {title}")
+                prompt_parts.append(f"期号: {analysis.get('issue_number', '未知')}")
+                prompt_parts.append(f"置信度: {analysis.get('confidence_level', '未知')}")
+
+                forecast = analysis.get('forecast_numbers', {})
+                if forecast:
+                    pos_map = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+                    for pos_key, pos_name in pos_map.items():
+                        nums = forecast.get(pos_key, [])
+                        if nums:
+                            prompt_parts.append(f"  {pos_name}推荐: {nums}")
+
+                combos = analysis.get('recommended_combinations', [])
+                if combos:
+                    if isinstance(combos, list):
+                        prompt_parts.append(f"  推荐组合: {combos[:5]}")
+
+                key_points = analysis.get('key_points', [])
+                if key_points:
+                    for pt in key_points[:3]:
+                        prompt_parts.append(f"  要点: {pt}")
+
+                trend = analysis.get('trend_analysis', '')
+                if trend:
+                    prompt_parts.append(f"  趋势分析: {str(trend)[:100]}")
+
+                summary = analysis.get('summary', '')
+                if summary:
+                    prompt_parts.append(f"  总结: {str(summary)[:150]}")
+
+                prompt_parts.append("")
+
+        # ---- 第二部分：走势AI分析报告 ----
+        prompt_parts.append("=" * 60)
+        prompt_parts.append("二、走势图AI分析报告（基于最近30期）")
+        prompt_parts.append("=" * 60)
+
+        if trend_analysis:
+            trend_summary = trend_analysis.get('trend_summary', {})
+            if trend_summary:
+                prompt_parts.append(f"\n整体走势: {trend_summary.get('overall_trend', '')}")
+                prompt_parts.append(f"热号总结: {trend_summary.get('hot_numbers_summary', '')}")
+                prompt_parts.append(f"冷号总结: {trend_summary.get('cold_numbers_summary', '')}")
+                prompt_parts.append(f"规律总结: {trend_summary.get('pattern_summary', '')}")
+
+            pos_analysis = trend_analysis.get('position_analysis', {})
+            pos_names = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+            for pos_key, pos_name in pos_names.items():
+                pa = pos_analysis.get(pos_key, {})
+                if pa:
+                    prompt_parts.append(f"\n{pos_name}:")
+                    prompt_parts.append(f"  热号: {pa.get('hot_numbers', [])}")
+                    prompt_parts.append(f"  冷号: {pa.get('cold_numbers', [])}")
+                    prompt_parts.append(f"  走势方向: {pa.get('trend_direction', '')}")
+                    prompt_parts.append(f"  遗漏分析: {pa.get('omission_analysis', '')}")
+                    prompt_parts.append(f"  推荐号码: {pa.get('recommended_numbers', [])}")
+
+            stats = trend_analysis.get('statistical_analysis', {})
+            if stats:
+                prompt_parts.append(f"\n和值分析: {stats.get('hezhi_analysis', '')}")
+                prompt_parts.append(f"跨度分析: {stats.get('span_analysis', '')}")
+                prompt_parts.append(f"奇偶分析: {stats.get('odd_even_analysis', '')}")
+                prompt_parts.append(f"大小分析: {stats.get('big_small_analysis', '')}")
+
+            patterns = trend_analysis.get('key_patterns', [])
+            if patterns:
+                prompt_parts.append(f"\n发现规律: {'; '.join(patterns)}")
+
+            risks = trend_analysis.get('risk_factors', [])
+            if risks:
+                prompt_parts.append(f"\n风险因素: {'; '.join(risks)}")
+
+        # ---- 第三部分：历史开奖数据 ----
+        prompt_parts.append(f"\n{'=' * 60}")
+        prompt_parts.append("三、历史开奖数据（最近30期）")
+        prompt_parts.append("=" * 60)
+
+        if db_history:
+            prompt_parts.append(f"数据条数: {db_history.get('data_count', 0)}")
+            prompt_parts.append(f"最新期号: {db_history.get('latest_issue', '未知')}")
+
+            history = db_history.get('history_data', [])
+            if history:
+                prompt_parts.append("\n最近20期开奖记录：")
+                for item in history[:20]:
+                    issue = item.get('issue', '')
+                    wan = item.get('wan', 0)
+                    qian = item.get('qian', 0)
+                    bai = item.get('bai', 0)
+                    shi = item.get('shi', 0)
+                    ge = item.get('ge', 0)
+                    hezhi = item.get('hezhi', '')
+                    odd_even = item.get('odd_even_ratio', '')
+                    big_small = item.get('big_small_ratio', '')
+                    prompt_parts.append(f"  {issue}: {wan}{qian}{bai}{shi}{ge} 和值:{hezhi} 奇偶:{odd_even} 大小:{big_small}")
+
+        # ---- 输出格式要求 ----
+        prompt_parts.append(f"""
+{'=' * 60}
+四、最终分析要求
+{'=' * 60}
+
+请综合以上三类数据（文章分析+走势报告+历史数据），进行深度推理，输出最终的预测报告。
+
+请严格按照以下JSON格式输出（不要包含任何额外文字或markdown标记）：
+
+{{
+    "data_source": "文章AI分析+走势AI分析+历史数据综合",
+    "analysis_time": "YYYY-MM-DD HH:MM:SS",
+    "model_version": "综合预测模型v2.0",
+    "current_issue": "当前最新期号",
+    "next_issue": "预测目标期号",
+    "prediction": {{
+        "wan": {{"numbers": [], "confidence": [], "reason": ""}},
+        "qian": {{"numbers": [], "confidence": [], "reason": ""}},
+        "bai": {{"numbers": [], "confidence": [], "reason": ""}},
+        "shi": {{"numbers": [], "confidence": [], "reason": ""}},
+        "ge": {{"numbers": [], "confidence": [], "reason": ""}}
+    }},
+    "trend_analysis": {{
+        "summary": "整体综合分析总结",
+        "wan": "万位分析",
+        "qian": "千位分析",
+        "bai": "百位分析",
+        "shi": "十位分析",
+        "ge": "个位分析"
+    }},
+    "reasoning_process": [
+        "综合分析推理步骤1",
+        "综合分析推理步骤2",
+        "综合分析推理步骤3"
+    ],
+    "recommended_combinations": [
+        {{"combination": "5位号码字符串", "confidence": 0.85, "reason": "推荐理由"}}
+    ],
+    "statistical_features": {{
+        "hezhi_range": "和值范围",
+        "span_range": "跨度范围",
+        "odd_even_ratio": "奇偶比偏好",
+        "big_small_ratio": "大小比偏好",
+        "hot_numbers": "热号",
+        "cold_numbers": "冷号",
+        "key_patterns": ["模式1", "模式2"]
+    }},
+    "key_conclusions": ["关键结论1", "关键结论2", "关键结论3"],
+    "risk_warning": "风险提示文本"
+}}
+
+注意事项：
+1. prediction中每个位置必须包含numbers(号码数组)、confidence(置信度数组)、reason(推荐理由)
+2. numbers至少2个最多5个，confidence与numbers一一对应
+3. recommended_combinations至少3个，每个含combination/confidence/reason
+4. reasoning_process至少3步完整推理
+5. 综合考量文章专家意见、走势规律和历史数据，给出最有可能的预测
+""")
+
+        return "\n".join(prompt_parts)
+
+    def final_integrated_analysis(self,
+                                  articles_analyses: List[Dict[str, Any]],
+                                  trend_analysis: Optional[Dict[str, Any]],
+                                  db_history: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        最终整合AI分析：合并文章分析+走势分析+历史数据，生成最终预测报告
+
+        Args:
+            articles_analyses: 各篇文章的AI分析结果列表
+            trend_analysis: 走势AI分析报告
+            db_history: 数据库历史数据
+
+        Returns:
+            最终预测报告JSON，失败返回None
+        """
+        logger.info('=' * 80)
+        logger.info('开始最终整合AI分析（文章+走势+历史数据）')
+        logger.info('=' * 80)
+
+        self._init_ai_client()
+
+        if not self.ai_client:
+            logger.error('AI客户端未初始化')
+            return None
+
+        prompt = self._build_final_integrated_prompt(articles_analyses, trend_analysis, db_history)
+        logger.info(f'最终整合提示词长度: {len(prompt)}')
+
+        messages = [
+            {
+                "role": "system",
+                "content": "你是一位顶尖的排列5综合预测专家，擅长整合多元数据进行深度分析和精准预测。请严格按照要求输出JSON格式。"
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+
+        try:
+            ai_response = self.ai_client._call_ai_model(messages=messages, max_tokens=8000, temperature=0.6)
+            if not ai_response:
+                logger.error('最终整合AI分析 - AI模型调用失败')
+                return None
+
+            ai_result = self.ai_client._parse_ai_response(ai_response)
+            if not ai_result:
+                logger.error('最终整合AI分析 - AI响应解析失败')
+                return None
+
+            logger.info('最终整合AI分析完成')
+            logger.info(f'预测期号: {ai_result.get("next_issue", "未知")}')
+
+            return ai_result
+
+        except Exception as e:
+            logger.error(f'最终整合AI分析异常: {e}', exc_info=True)
+            # 回退：基于文章分析和走势分析构建基本结果
+            return self._build_fallback_integrated_result(articles_analyses, trend_analysis, db_history)
+
+    def _build_fallback_integrated_result(self,
+                                          articles_analyses: List[Dict[str, Any]],
+                                          trend_analysis: Optional[Dict[str, Any]],
+                                          db_history: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        当最终AI整合分析失败时，构建回退结果
+
+        整合文章分析中的forecast_numbers和走势分析中的recommended_numbers
+        """
+        prediction = {}
+        for pos_key in ['wan', 'qian', 'bai', 'shi', 'ge']:
+            # 从文章分析收集号码
+            article_nums = []
+            for analysis in articles_analyses:
+                forecast = analysis.get('forecast_numbers', {})
+                if isinstance(forecast, dict):
+                    nums = forecast.get(pos_key, [])
+                    if isinstance(nums, list):
+                        article_nums.extend(nums)
+
+            # 从走势分析收集推荐号码
+            trend_nums = []
+            if trend_analysis:
+                pa = trend_analysis.get('position_analysis', {})
+                pos_data = pa.get(pos_key, {})
+                if isinstance(pos_data, dict):
+                    rec = pos_data.get('recommended_numbers', [])
+                    if isinstance(rec, list):
+                        trend_nums.extend(rec)
+
+            # 合并去重
+            all_nums = list(dict.fromkeys(article_nums + trend_nums))[:5]
+            if not all_nums:
+                all_nums = list(range(10))[:5]
+
+            prediction[pos_key] = {
+                'numbers': all_nums,
+                'confidence': [0.5] * len(all_nums),
+                'reason': '回退结果：综合文章分析与走势分析推荐'
+            }
+
+        latest_issue = db_history.get('latest_issue', '')
+        next_issue = str(int(latest_issue) + 1) if latest_issue and str(latest_issue).isdigit() else ''
+
+        return {
+            'data_source': '回退：文章+走势+历史综合',
+            'analysis_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'model_version': 'fallback',
+            'current_issue': latest_issue,
+            'next_issue': next_issue,
+            'prediction': prediction,
+            'trend_analysis': {'summary': 'AI分析失败，使用回退结果'},
+            'reasoning_process': ['最终AI整合分析失败，使用回退整合方案'],
+            'recommended_combinations': [],
+            'statistical_features': {},
+            'key_conclusions': ['基于文章分析和走势分析的回退结果，请谨慎参考'],
+            'risk_warning': '最终AI分析失败，结果基于回退逻辑，仅供参考'
+        }
+
+    # ============================================================
+    # TXT报告生成
+    # ============================================================
+
+    def generate_txt_report(self, final_report: Dict[str, Any], output_path: str) -> str:
+        """
+        生成TXT格式的最终分析报告文本
+
+        Args:
+            final_report: 最终AI分析结果
+            output_path: 输出文件路径
+
+        Returns:
+            报告文本内容
+        """
+        lines = []
+
+        lines.append("=" * 70)
+        lines.append("  排列5 AI智能分析系统 - 综合预测报告")
+        lines.append("=" * 70)
+        lines.append("")
+
+        lines.append(f"【基本信息】")
+        lines.append(f"  数据来源: {final_report.get('data_source', '未知')}")
+        lines.append(f"  分析时间: {final_report.get('analysis_time', '未知')}")
+        lines.append(f"  当前期号: {final_report.get('current_issue', '未知')}")
+        lines.append(f"  预测期号: {final_report.get('next_issue', '未知')}")
+        lines.append("")
+
+        # 各位置预测
+        lines.append("【各位置预测】")
+        pos_names = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+        prediction = final_report.get('prediction', {})
+        for pos_key, pos_name in pos_names.items():
+            pos_data = prediction.get(pos_key, {})
+            numbers = pos_data.get('numbers', []) if isinstance(pos_data, dict) else []
+            confidence = pos_data.get('confidence', []) if isinstance(pos_data, dict) else []
+            reason = pos_data.get('reason', '') if isinstance(pos_data, dict) else ''
+
+            lines.append(f"\n  {pos_name}:")
+            if numbers:
+                for i, (num, conf) in enumerate(zip(numbers, confidence), 1):
+                    lines.append(f"    {i}. 号码 {num} (置信度: {conf:.2%})")
+            if reason:
+                lines.append(f"    理由: {reason}")
+        lines.append("")
+
+        # 推荐组合
+        lines.append("【推荐组合】")
+        combinations = final_report.get('recommended_combinations', [])
+        for i, combo in enumerate(combinations, 1):
+            if isinstance(combo, dict):
+                combo_str = combo.get('combination', combo.get('numbers', ''))
+                if isinstance(combo_str, list):
+                    combo_str = ''.join(str(n) for n in combo_str)
+                conf = combo.get('confidence', '')
+                reason = combo.get('reason', '')
+                lines.append(f"  {i}. {combo_str}")
+                if conf:
+                    lines.append(f"     置信度: {conf:.2%}" if isinstance(conf, float) else f"     置信度: {conf}")
+                if reason:
+                    lines.append(f"     理由: {str(reason)[:80]}")
+            elif isinstance(combo, list):
+                lines.append(f"  {i}. {''.join(str(n) for n in combo)}")
+            else:
+                lines.append(f"  {i}. {combo}")
+        lines.append("")
+
+        # 趋势分析
+        trend = final_report.get('trend_analysis', {})
+        if trend:
+            lines.append("【趋势分析】")
+            if isinstance(trend, dict):
+                summary = trend.get('summary', '')
+                if summary:
+                    lines.append(f"  综合分析: {summary}")
+                for pos_key, pos_name in pos_names.items():
+                    pos_analysis = trend.get(pos_key, '')
+                    if pos_analysis:
+                        lines.append(f"  {pos_name}: {pos_analysis}")
+            elif isinstance(trend, str):
+                lines.append(f"  {trend}")
+        lines.append("")
+
+        # 统计特征
+        lines.append("【关键统计特征】")
+        stats = final_report.get('statistical_features', {})
+        if stats:
+            lines.append(f"  和值范围: {stats.get('hezhi_range', '无')}")
+            lines.append(f"  跨度范围: {stats.get('span_range', '无')}")
+            lines.append(f"  奇偶比: {stats.get('odd_even_ratio', '无')}")
+            lines.append(f"  大小比: {stats.get('big_small_ratio', '无')}")
+            lines.append(f"  热号: {stats.get('hot_numbers', '无')}")
+            lines.append(f"  冷号: {stats.get('cold_numbers', '无')}")
+            patterns = stats.get('key_patterns', [])
+            for i, p in enumerate(patterns, 1):
+                lines.append(f"  模式{i}: {p}")
+        lines.append("")
+
+        # 推理过程
+        lines.append("【推理过程】")
+        reasoning = final_report.get('reasoning_process', [])
+        if isinstance(reasoning, list):
+            for i, step in enumerate(reasoning, 1):
+                lines.append(f"  步骤{i}: {step}")
+        elif reasoning:
+            lines.append(f"  {reasoning}")
+        else:
+            lines.append("  暂无推理过程")
+        lines.append("")
+
+        # 关键结论
+        lines.append("【关键结论】")
+        conclusions = final_report.get('key_conclusions', [])
+        if isinstance(conclusions, list):
+            for i, c in enumerate(conclusions, 1):
+                lines.append(f"  {i}. {c}")
+        elif conclusions:
+            lines.append(f"  {conclusions}")
+        lines.append("")
+
+        # 风险提示
+        lines.append("【风险提示】")
+        lines.append(f"  {final_report.get('risk_warning', '本分析基于历史数据统计，不保证中奖，请理性购彩。')}")
+        lines.append("")
+
+        lines.append("=" * 70)
+        lines.append(f"  报告生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"  系统版本: 排列5 AI智能分析系统 v2.0")
+        lines.append("=" * 70)
+
+        report_text = "\n".join(lines)
+
+        # 写入文件
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(report_text)
+            logger.info(f'TXT报告已生成: {output_path}')
+        except Exception as e:
+            logger.error(f'生成TXT报告失败: {e}')
+
+        return report_text
+
     def analyze_article_workflow(self, target_issue: Optional[str] = None, data_limit: int = 30) -> Dict[str, Any]:
         """
         完整的6步文章分析工作流（主入口方法）

@@ -3,13 +3,13 @@
 
 基于tkinter的桌面应用程序，提供以下核心功能：
 1. 数据爬取（增量/全量） - 从多个数据源获取排列5开奖数据并存储到MySQL
-2. AI智能分析 - 集成文章爬取、双阶段AI分析（文章初步分析+综合预测）
+2. AI智能分析 - 3步新流水线（文章逐篇AI分析→走势AI分析→整合综合预测）
 3. 历史回测 - 批量历史数据验证，评估模型Top-1/Top-3命中率
 4. 特征分析 - 提取频率、遗漏、012路、连号等统计特征
 5. 预测验证 - 自动比对预测与实际开奖结果，生成性能报告
 
 工作流程：
-  数据爬取 → AI智能分析（文章→初步AI→Redis→综合AI→数据库） → 预测验证
+  数据爬取 → AI智能分析（文章→逐篇AI→Redis | 走势→AI→Redis | 整合→AI→DB+TXT） → 预测验证
                                                                     ↓
                                历史回测 ← 特征分析 ← 性能评估报告
 
@@ -653,13 +653,11 @@ class LotteryGUI:
     [增量爬取数据] 仅获取数据库中缺失的新数据
     [全量爬取数据] 重新爬取全部历史数据和走势数据
 
-  【AI智能分析】（核心工作流）
+  【AI智能分析】（核心工作流 - 3步新流水线）
     [执行AI智能分析] 完整分析流水线：
-       阶段1: 文章爬取（从ydniu.com获取专家推荐）
-       阶段2: 第一次AI分析（结构化整理文章内容）
-       阶段3: Redis存储（所有文章缓存，7天过期）
-       阶段4: 第二次AI分析（整合文章+历史数据，综合预测）
-       阶段5: 数据库存储（保存最终分析报告）
+       步骤1: 爬取文章 → 逐篇AI分析 → 统一JSON格式 → Redis存储
+       步骤2: 走势图数据（最近30期）→ AI走势分析 → Redis存储
+       步骤3: Redis取出文章+走势分析 → 整合AI → 数据库+TXT报告
     [执行历史回测] 批量历史回测，验证模型Top-1/Top-3命中率
     [执行特征分析] 提取频率、遗漏、012路、连号、重隔号等统计特征
 
@@ -1013,28 +1011,30 @@ class LotteryGUI:
 
     def _execute_optimized_p5_ai(self, task_mgr):
         """
-        AI智能分析核心流水线（5阶段）
+        AI智能分析核心流水线（3步新版）
 
-        阶段1: 文章爬取 - 从ydniu.com获取专家推荐文章
-        阶段2: 第一次AI分析 - 结构化整理文章内容，提取预测信息
-        阶段3: Redis存储 - 所有文章缓存到Redis，7天自动过期
-        阶段4: 第二次AI分析 - 整合文章分析结果+数据库历史数据，综合预测
-        阶段5: 数据库存储 - 保存最终分析报告到MySQL，生成JSON文件
+        步骤1: 爬取文章 → 每篇文章单独AI分析 → 统一JSON格式 → 存入Redis
+        步骤2: 获取最近30期走势图 → AI走势分析 → 存入Redis
+        步骤3: 从Redis取出文章分析+走势分析 → 整合AI分析 → 存入DB + 生成TXT报告
 
         输出: 各位置预测号码/置信度、推荐组合、趋势分析、统计特征、推理过程
         """
         try:
             task_mgr.log("=" * 70)
-            task_mgr.log("✨ 启动AI智能分析流程（集成文章爬取）")
+            task_mgr.log("  排列5 AI智能分析系统 - 3步新流水线")
             task_mgr.log("=" * 70)
 
-            task_mgr.progress(5, "初始化分析器")
-
             analyzer = ArticleAnalyzer()
+            issue = None
 
-            task_mgr.log("\n【阶段1】文章爬取与存储")
-            task_mgr.log("-" * 50)
-            task_mgr.progress(10, "初始化爬虫模块")
+            # ============================================================
+            # 步骤1: 爬取文章 → 每篇AI分析 → 统一JSON → 存入Redis
+            # ============================================================
+            task_mgr.log("\n" + "▬" * 50)
+            task_mgr.log("【步骤1/3】爬取文章 & 逐篇AI分析 & 存入Redis")
+            task_mgr.log("▬" * 50)
+
+            task_mgr.progress(5, "初始化爬虫")
 
             analyzer._init_spider()
             if not analyzer.spider:
@@ -1043,7 +1043,7 @@ class LotteryGUI:
                 return
 
             task_mgr.log("正在爬取文章内容...")
-            task_mgr.progress(20, "爬取文章")
+            task_mgr.progress(10, "爬取文章中")
 
             crawl_result = analyzer.spider.crawl_all_articles(target_issue=None, max_articles=30)
 
@@ -1055,154 +1055,331 @@ class LotteryGUI:
             articles = crawl_result['articles']
             task_mgr.log(f"✓ 成功爬取 {len(articles)} 篇文章")
 
-            task_mgr.progress(35, "文章爬取完成")
-
-            task_mgr.log("\n【阶段2】初步AI分析（结构化整理）")
-            task_mgr.log("-" * 50)
-            task_mgr.progress(40, "执行第一次AI分析")
-
-            first_ai_result = analyzer.first_ai_analysis(articles)
-
-            if not first_ai_result:
-                task_mgr.log("✗ 第一次AI分析失败")
-                task_mgr.progress(0, "第一次AI分析失败")
-                return
-
-            task_mgr.log(f"✓ 第一次AI分析完成")
-            task_mgr.log(f"  期号: {first_ai_result.get('issue_number', '未知')}")
-            task_mgr.log(f"  置信度: {first_ai_result.get('confidence_level', '未知')}")
-
-            task_mgr.progress(50, "初步分析完成")
-
-            task_mgr.log("\n【阶段3】Redis存储")
-            task_mgr.log("-" * 50)
-            task_mgr.progress(55, "保存所有文章到Redis")
-
-            issue = first_ai_result.get('issue_number')
-            if issue:
-                redis_save_result = analyzer.save_all_articles_to_redis(issue, articles, first_ai_result)
-                if redis_save_result.get('success'):
-                    saved_count = redis_save_result.get('saved_count', 0)
-                    failed_count = redis_save_result.get('failed_count', 0)
-                    total_count = redis_save_result.get('total_count', 0)
-                    task_mgr.log(f"✓ 所有文章已保存到Redis")
-                    task_mgr.log(f"  总文章数: {total_count} 篇")
-                    task_mgr.log(f"  成功保存: {saved_count} 篇")
-                    if failed_count > 0:
-                        task_mgr.log(f"  保存失败: {failed_count} 篇")
-                    task_mgr.log(f"  过期策略: 7天自动过期")
-                else:
-                    error_msg = redis_save_result.get('error', '未知错误')
-                    task_mgr.log(f"⚠️ Redis保存失败: {error_msg}")
-                    task_mgr.log("  继续执行后续流程")
-            else:
-                task_mgr.log("⚠️ 无法确定期号，跳过Redis存储")
-
-            task_mgr.progress(65, "存储完成")
-
-            task_mgr.log("\n【阶段4】综合AI分析（整合数据预测）")
-            task_mgr.log("-" * 50)
-            task_mgr.progress(70, "获取历史数据")
-
-            db = P5Database()
-            if not db.connect():
-                task_mgr.log("✗ 数据库连接失败")
-                task_mgr.progress(0, "数据库连接失败")
-                return
-
-            history_data = db.get_history_data(limit=30, order_by='issue DESC')
-            db.disconnect()
-
-            if not history_data:
-                task_mgr.log("✗ 数据库中没有历史数据")
-                task_mgr.log("建议操作: 先执行「增量爬取数据」或「全量爬取数据」")
-                task_mgr.progress(0, "无数据")
-                return
-
-            current_issue = history_data[0].get('issue', '')
-            task_mgr.log(f"✓ 获取历史数据: {len(history_data)} 条")
-            task_mgr.log(f"  当前最新期号: {current_issue}")
-
-            task_mgr.progress(75, "准备第二次AI分析")
-
+            # 初始化AI和Redis客户端
+            task_mgr.progress(15, "初始化AI和Redis")
             analyzer._init_ai_client()
             if not analyzer.ai_client:
                 task_mgr.log("✗ AI客户端初始化失败")
                 task_mgr.progress(0, "AI客户端初始化失败")
                 return
 
-            db_history = analyzer.ai_client._fetch_data_from_database(limit=30)
-            if db_history.get('error'):
-                task_mgr.log(f"✗ 获取历史数据失败: {db_history['error']}")
-                task_mgr.progress(0, "数据获取失败")
+            analyzer._init_redis()
+            if not analyzer.redis_client or not analyzer.redis_client.is_connected():
+                task_mgr.log("⚠️ Redis客户端连接失败，尝试继续...")
+
+            # 提取期号
+            issue = analyzer._extract_issue_from_article(articles[0], None)
+            task_mgr.log(f"提取到期号: {issue}")
+
+            # 逐篇AI分析
+            task_mgr.log(f"\n开始逐篇AI分析（共{len(articles)}篇）...")
+            articles_analyses = []  # 存储每篇文章的统一JSON分析结果
+            saved_article_ids = []
+
+            from modules.html_cleaner import HTMLTextCleaner
+            html_cleaner = HTMLTextCleaner()
+
+            for idx, article in enumerate(articles):
+                article_num = idx + 1
+                progress_pct = 15 + int((article_num / len(articles)) * 25)  # 15%-40%
+                title = article.get('title', '未知')[:40]
+                task_mgr.progress(progress_pct, f"分析文章 {article_num}/{len(articles)}: {title}")
+
+                try:
+                    # 清洗HTML
+                    raw_content = article.get('content', '')
+                    clean_text = html_cleaner.clean_html(raw_content) if raw_content else ''
+
+                    # 构造AI分析用的文章数据
+                    article_for_ai = {
+                        'title': article.get('title', ''),
+                        'author': article.get('author', ''),
+                        'publish_time': article.get('publish_time', ''),
+                        'url': article.get('url', ''),
+                        'content': clean_text,
+                        'crawl_time': article.get('crawl_time', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                    }
+
+                    # 调用AI进行结构化分析（统一JSON格式）
+                    ai_result = analyzer.first_ai_analysis(article_for_ai)
+
+                    if ai_result:
+                        # 标准化字段，确保统一JSON格式
+                        unified_result = ai_result
+                        articles_analyses.append(unified_result)
+                        task_mgr.log(f"  ✓ 文章{article_num}: {title} - 分析完成 (置信度:{ai_result.get('confidence_level','?')})")
+
+                        # 保存单篇文章AI分析到Redis
+                        if analyzer.redis_client and analyzer.redis_client.is_connected():
+                            try:
+                                article_id = analyzer.redis_client.generate_article_id(
+                                    article.get('url', f'article_{article_num}'), article_num
+                                )
+                                article_data_to_save = {
+                                    'issue': issue,
+                                    'article_id': article_id,
+                                    'title': article.get('title', '')[:200],
+                                    'url': article.get('url', ''),
+                                    'ai_analysis': unified_result,
+                                    'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                }
+                                save_ok = analyzer.redis_client.save_article_data(
+                                    article_id, article_data_to_save, expire_days=7
+                                )
+                                if save_ok:
+                                    saved_article_ids.append(article_id)
+                            except Exception as redis_e:
+                                task_mgr.log(f"    ⚠️ Redis保存失败: {redis_e}")
+                    else:
+                        task_mgr.log(f"  ⚠️ 文章{article_num}: {title} - AI分析返回空结果")
+
+                except Exception as article_e:
+                    task_mgr.log(f"  ✗ 文章{article_num}分析异常: {article_e}")
+
+            if not articles_analyses:
+                task_mgr.log("✗ 所有文章AI分析均失败")
+                task_mgr.progress(0, "文章分析全部失败")
                 return
 
-            # 从Redis加载所有文章数据
-            redis_data = analyzer.load_from_redis(issue)
-            if not redis_data:
-                task_mgr.log("⚠️ 从Redis加载数据失败，使用当前数据继续")
-                redis_data = {
-                    'ai_analysis': first_ai_result,
-                    'articles': articles,
-                    'article_data': article_data,
-                    'issue': issue
+            task_mgr.log(f"\n✓ 步骤1完成: 成功分析 {len(articles_analyses)}/{len(articles)} 篇文章")
+
+            # 汇总保存到统一AI分析键（供步骤3延期号加载）
+            if issue:
+                try:
+                    aggregated = {
+                        'issue': issue,
+                        'articles_count': len(articles),
+                        'analyzed_count': len(articles_analyses),
+                        'articles': articles,
+                        'ai_analysis': articles_analyses[0] if articles_analyses else {},
+                        'all_ai_analyses': articles_analyses,
+                        'saved_article_ids': saved_article_ids,
+                        'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    if analyzer.redis_client and analyzer.redis_client.save_ai_analysis(issue, aggregated):
+                        task_mgr.log(f"✓ 文章分析汇总已保存到Redis")
+                    else:
+                        task_mgr.log(f"⚠️ 文章分析汇总保存到Redis失败(连接不可用)")
+                except Exception as agg_e:
+                    task_mgr.log(f"⚠️ 汇总保存到Redis失败: {agg_e}")
+
+            task_mgr.progress(40, "步骤1完成")
+
+            # ============================================================
+            # 步骤2: 获取走势图数据 → AI走势分析 → 存入Redis
+            # ============================================================
+            task_mgr.log("\n" + "▬" * 50)
+            task_mgr.log("【步骤2/3】走势图数据AI分析 & 存入Redis")
+            task_mgr.log("▬" * 50)
+
+            task_mgr.progress(45, "获取走势图数据")
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+
+            db.create_tables()
+
+            # 获取各类型走势数据（最近30期）
+            basic_trend = db.get_trend_data(limit=30)
+            wan_trend = db.get_wan_trend_data(limit=30)
+            qian_trend = db.get_qian_trend_data(limit=30)
+            bai_trend = db.get_bai_trend_data(limit=30)
+            shi_trend = db.get_shi_trend_data(limit=30)
+            ge_trend = db.get_ge_trend_data(limit=30)
+
+            task_mgr.log(f"走势数据获取完成:")
+            task_mgr.log(f"  基础走势: {len(basic_trend)} 期")
+            task_mgr.log(f"  万位走势: {len(wan_trend)} 期")
+            task_mgr.log(f"  千位走势: {len(qian_trend)} 期")
+            task_mgr.log(f"  百位走势: {len(bai_trend)} 期")
+            task_mgr.log(f"  十位走势: {len(shi_trend)} 期")
+            task_mgr.log(f"  个位走势: {len(ge_trend)} 期")
+
+            if not basic_trend:
+                task_mgr.log("⚠️ 走势数据为空，建议先执行增量爬取")
+                # 使用空数据继续
+                trend_data_dict = {
+                    'basic_trend': [],
+                    'wan_trend': [],
+                    'qian_trend': [],
+                    'bai_trend': [],
+                    'shi_trend': [],
+                    'ge_trend': []
+                }
+            else:
+                trend_data_dict = {
+                    'basic_trend': basic_trend,
+                    'wan_trend': wan_trend,
+                    'qian_trend': qian_trend,
+                    'bai_trend': bai_trend,
+                    'shi_trend': shi_trend,
+                    'ge_trend': ge_trend
                 }
 
-            task_mgr.log("正在执行第二次AI分析（整合文章+历史数据）...")
-            task_mgr.progress(85, "第二次AI分析")
+            task_mgr.progress(55, "AI走势分析中")
+            task_mgr.log("\n正在执行走势图AI分析（喂入最近30期数据）...")
 
-            second_ai_result = analyzer.second_ai_analysis(redis_data, db_history)
+            trend_ai_result = analyzer.trend_analysis_with_ai(trend_data_dict)
 
-            if not second_ai_result:
-                task_mgr.log("✗ 第二次AI分析失败")
-                task_mgr.progress(0, "第二次AI分析失败")
+            if trend_ai_result:
+                task_mgr.log("✓ 走势AI分析完成")
+
+                # 显示走势分析摘要
+                trend_summary = trend_ai_result.get('trend_summary', {})
+                if trend_summary:
+                    task_mgr.log(f"  整体走势: {trend_summary.get('overall_trend', '无')[:80]}...")
+
+                # 保存走势AI分析到Redis
+                if analyzer.redis_client and analyzer.redis_client.is_connected():
+                    save_ok = analyzer.save_trend_analysis_to_redis(issue, trend_ai_result)
+                    if save_ok:
+                        task_mgr.log(f"✓ 走势AI分析已保存到Redis")
+                    else:
+                        task_mgr.log(f"⚠️ 走势AI分析保存到Redis失败")
+            else:
+                task_mgr.log("⚠️ 走势AI分析失败，将在步骤3中使用空走势数据")
+
+            task_mgr.progress(65, "步骤2完成")
+
+            # ============================================================
+            # 步骤3: 从Redis取出+整合AI分析 → 存入DB + 生成TXT
+            # ============================================================
+            task_mgr.log("\n" + "▬" * 50)
+            task_mgr.log("【步骤3/3】整合分析 & 存入数据库 & 生成报告")
+            task_mgr.log("▬" * 50)
+
+            task_mgr.progress(70, "从Redis加载数据")
+
+            # 从Redis加载文章AI分析
+            redis_articles_data = None
+            if analyzer.redis_client and analyzer.redis_client.is_connected():
+                redis_articles_data = analyzer.load_from_redis(issue)
+                if redis_articles_data and redis_articles_data.get('all_ai_analyses'):
+                    task_mgr.log(f"✓ 从Redis加载文章AI分析: {len(redis_articles_data['all_ai_analyses'])} 篇")
+                    articles_analyses = redis_articles_data['all_ai_analyses']
+                else:
+                    task_mgr.log("⚠️ 从Redis加载文章AI分析失败，使用内存数据")
+
+            # 从Redis加载走势AI分析
+            redis_trend_data = None
+            if analyzer.redis_client and analyzer.redis_client.is_connected():
+                redis_trend_data = analyzer.load_trend_analysis_from_redis(issue)
+                if redis_trend_data:
+                    task_mgr.log("✓ 从Redis加载走势AI分析成功")
+                    trend_ai_result = redis_trend_data
+                else:
+                    task_mgr.log("⚠️ 从Redis加载走势AI分析失败，使用内存数据")
+
+            # 获取历史数据（用于最终整合分析）
+            task_mgr.progress(75, "获取历史数据")
+            history_data = db.get_history_data(limit=30, order_by='issue DESC')
+
+            current_issue = history_data[0].get('issue', '') if history_data else ''
+            task_mgr.log(f"✓ 历史数据: {len(history_data)} 条, 最新期号: {current_issue}")
+
+            # 构建db_history（兼容原有格式）
+            db_history = {
+                'data_count': len(history_data),
+                'latest_issue': current_issue,
+                'history_data': history_data,
+                'trend_data': basic_trend,
+                'wan_trend_data': wan_trend,
+                'qian_trend_data': qian_trend,
+                'bai_trend_data': bai_trend,
+                'shi_trend_data': shi_trend,
+                'ge_trend_data': ge_trend
+            }
+
+            # 执行最终整合AI分析
+            task_mgr.progress(80, "最终整合AI分析中")
+            task_mgr.log("\n正在执行最终整合AI分析（文章+走势+历史数据）...")
+
+            final_report = analyzer.final_integrated_analysis(
+                articles_analyses, trend_ai_result, db_history
+            )
+
+            if not final_report:
+                task_mgr.log("✗ 最终整合AI分析失败")
+                task_mgr.progress(0, "最终分析失败")
+                db.disconnect()
                 return
 
-            task_mgr.log("✓ 第二次AI分析完成")
+            task_mgr.log("✓ 最终整合AI分析完成")
 
-            task_mgr.log("\n【阶段5】数据库存储")
-            task_mgr.log("-" * 50)
-            task_mgr.progress(90, "保存到数据库")
+            # 保存到数据库
+            task_mgr.progress(90, "存入数据库")
+            task_mgr.log("\n正在保存报告到数据库...")
 
-            report_uuid = analyzer.save_to_database(second_ai_result, db_history)
-
+            report_uuid = analyzer.save_to_database(final_report, db_history)
             if report_uuid:
-                task_mgr.log(f"✓ 最终报告已保存到数据库")
-                task_mgr.log(f"  报告UUID: {report_uuid[:8]}...")
+                task_mgr.log(f"✓ 报告已存入数据库 (UUID: {report_uuid[:8]}...)")
             else:
                 task_mgr.log("⚠️ 数据库保存失败")
 
-            task_mgr.progress(95, "生成分析报告")
+            db.disconnect()
+
+            # 生成TXT报告
+            task_mgr.progress(93, "生成TXT报告")
+            os.makedirs('reports', exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            txt_filename = f'reports/ai_analysis_report_{timestamp}.txt'
+            json_filename = f'reports/ai_analysis_report_{timestamp}.json'
+
+            # 生成TXT文本报告
+            txt_content = analyzer.generate_txt_report(final_report, txt_filename)
+            task_mgr.log(f"✓ TXT报告已生成: {txt_filename}")
+
+            # 同时保存JSON备份
+            with open(json_filename, 'w', encoding='utf-8') as f:
+                json.dump(final_report, f, indent=2, ensure_ascii=False, default=str)
+            task_mgr.log(f"✓ JSON备份已生成: {json_filename}")
+
+            # 保存预测结果JSON
+            os.makedirs('predictions', exist_ok=True)
+            pred_filename = f'predictions/ai_prediction_{timestamp}.json'
+            with open(pred_filename, 'w', encoding='utf-8') as f:
+                json.dump(final_report, f, indent=2, ensure_ascii=False, default=str)
+            task_mgr.log(f"✓ 预测结果已保存: {pred_filename}")
+
+            # ============================================================
+            # 在GUI中显示最终报告摘要
+            # ============================================================
+            task_mgr.progress(95, "显示报告")
 
             task_mgr.log("\n" + "=" * 70)
-            task_mgr.log("📊 AI智能分析报告（综合版）")
+            task_mgr.log("  最终AI综合分析报告")
             task_mgr.log("=" * 70)
 
             task_mgr.log(f"\n【基本信息】")
-            task_mgr.log(f"  数据来源: {second_ai_result.get('data_source', '未知')}")
-            task_mgr.log(f"  分析时间: {second_ai_result.get('analysis_time', '未知')}")
-            task_mgr.log(f"  当前期号: {second_ai_result.get('current_issue', '未知')}")
-            task_mgr.log(f"  预测期号: {second_ai_result.get('next_issue', '未知')}")
+            task_mgr.log(f"  数据来源: {final_report.get('data_source', '未知')}")
+            task_mgr.log(f"  分析时间: {final_report.get('analysis_time', '未知')}")
+            task_mgr.log(f"  当前期号: {final_report.get('current_issue', '未知')}")
+            task_mgr.log(f"  预测期号: {final_report.get('next_issue', '未知')}")
 
             task_mgr.log(f"\n【各位置预测】")
             pos_names = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
-            prediction = second_ai_result.get('prediction', {})
+            prediction = final_report.get('prediction', {})
             for pos_key, pos_name in pos_names.items():
                 pos_data = prediction.get(pos_key, {})
-                numbers = pos_data.get('numbers', [])
-                confidence = pos_data.get('confidence', [])
-                reason = pos_data.get('reason', '')
+                if isinstance(pos_data, dict):
+                    numbers = pos_data.get('numbers', [])
+                    confidence = pos_data.get('confidence', [])
+                    reason = pos_data.get('reason', '')
+                else:
+                    numbers, confidence, reason = [], [], ''
 
                 task_mgr.log(f"\n{pos_name}:")
                 if numbers:
                     for i, (num, conf) in enumerate(zip(numbers, confidence), 1):
                         task_mgr.log(f"  {i}. 号码{num} (置信度: {conf:.2%})")
                 if reason:
-                    task_mgr.log(f"  理由: {reason[:50]}...")
+                    task_mgr.log(f"  理由: {str(reason)[:60]}...")
 
             task_mgr.log(f"\n【推荐组合】")
-            combinations = second_ai_result.get('recommended_combinations', [])
-            for i, combo in enumerate(combinations, 1):
+            combinations = final_report.get('recommended_combinations', [])
+            for i, combo in enumerate(combinations[:10], 1):
                 if isinstance(combo, dict):
                     combo_str = combo.get('combination', combo.get('numbers', ''))
                     if isinstance(combo_str, list):
@@ -1219,13 +1396,16 @@ class LotteryGUI:
                 else:
                     task_mgr.log(f"  {i}. {combo}")
 
-            if second_ai_result.get('trend_analysis'):
+            if final_report.get('trend_analysis'):
                 task_mgr.log(f"\n【趋势分析】")
-                trend_summary = second_ai_result['trend_analysis'].get('summary', '')
-                task_mgr.log(f"  {trend_summary[:100]}...")
+                trend = final_report['trend_analysis']
+                if isinstance(trend, dict):
+                    task_mgr.log(f"  综合: {trend.get('summary', '无')[:100]}...")
+                elif isinstance(trend, str):
+                    task_mgr.log(f"  {trend[:100]}...")
 
             task_mgr.log(f"\n【关键统计特征】")
-            statistical_features = second_ai_result.get('statistical_features', {})
+            statistical_features = final_report.get('statistical_features', {})
             if statistical_features:
                 task_mgr.log(f"  和值范围: {statistical_features.get('hezhi_range', '')}")
                 task_mgr.log(f"  跨度范围: {statistical_features.get('span_range', '')}")
@@ -1236,55 +1416,43 @@ class LotteryGUI:
                 patterns = statistical_features.get('key_patterns', [])
                 for i, pattern in enumerate(patterns, 1):
                     task_mgr.log(f"  模式{i}: {str(pattern)[:60]}")
-            else:
-                # 回退：尝试显示 key_conclusions 或 key_features
-                conclusions = (second_ai_result.get('key_conclusions')
-                               or second_ai_result.get('key_features', []))
-                if isinstance(conclusions, list):
-                    for i, c in enumerate(conclusions, 1):
-                        task_mgr.log(f"  {i}. {str(c)[:60]}")
-                elif conclusions:
-                    task_mgr.log(f"  {str(conclusions)[:200]}")
 
             task_mgr.log(f"\n【推理过程】")
-            reasoning = second_ai_result.get('reasoning_process', '')
+            reasoning = final_report.get('reasoning_process', '')
             if reasoning:
                 if isinstance(reasoning, list):
                     for i, part in enumerate(reasoning, 1):
                         task_mgr.log(f"  {i}. {str(part)[:80]}...")
                 elif isinstance(reasoning, str):
-                    reasoning_parts = reasoning.split('；') if '；' in reasoning else reasoning.split(';')
-                    for i, part in enumerate(reasoning_parts, 1):
+                    for i, part in enumerate(reasoning.split('；') if '；' in reasoning else reasoning.split(';'), 1):
                         task_mgr.log(f"  {i}. {part.strip()[:80]}...")
-                else:
-                    task_mgr.log(f"  {str(reasoning)[:200]}")
-            else:
-                task_mgr.log("  暂无推理过程")
+
+            task_mgr.log(f"\n【关键结论】")
+            conclusions = final_report.get('key_conclusions', [])
+            if isinstance(conclusions, list):
+                for i, c in enumerate(conclusions, 1):
+                    task_mgr.log(f"  {i}. {c[:80]}")
+            elif conclusions:
+                task_mgr.log(f"  {str(conclusions)[:200]}")
 
             task_mgr.log("\n" + "=" * 70)
-            risk_warning = second_ai_result.get('risk_warning', '本分析基于历史数据统计，不保证中奖，请理性购彩。')
-            task_mgr.log(f"⚠️ {risk_warning}")
+            risk_warning = final_report.get('risk_warning', '本分析基于历史数据统计，不保证中奖，请理性购彩。')
+            task_mgr.log(f"  {risk_warning}")
             task_mgr.log("=" * 70)
 
+            # 更新快捷统计
             stats_text = (
                 f"数据量: {db_history.get('data_count', 0)} 条\n"
                 f"最新期号: {current_issue}\n"
-                f"预测期号: {second_ai_result.get('next_issue', '未知')}\n"
+                f"预测期号: {final_report.get('next_issue', '未知')}\n"
                 f"报告UUID: {report_uuid[:8]}..." if report_uuid else ""
             )
             self.stats_content.config(text=stats_text, fg=COLORS['success'])
 
-            os.makedirs('predictions', exist_ok=True)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'predictions/article_ai_prediction_{timestamp}.json'
-
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(second_ai_result, f, indent=2, ensure_ascii=False, default=str)
-
-            task_mgr.log(f"\n✓ 预测结果已保存到: {filename}")
-
             task_mgr.progress(100, "任务完成")
-            task_mgr.log("\n✓ AI智能分析流程全部完成（集成文章爬取）")
+            task_mgr.log(f"\n✓ 3步AI智能分析流水线全部完成")
+            task_mgr.log(f"  TXT报告: {txt_filename}")
+            task_mgr.log(f"  JSON备份: {json_filename}")
 
         except Exception as e:
             error_detail = traceback.format_exc()
