@@ -13,6 +13,7 @@
   - 运行综合（二次）深度分析：python D:\PythonProject\KPLuckyNumber\main.py comprehensive --limit 30
   - 批量爬取并保存文章到Redis（可选择不提取预测）：python D:\PythonProject\KPLuckyNumber\main.py save-articles --max 100
   - 批量处理文章（爬取→AI→预处理→Redis存储）：python D:\PythonProject\KPLuckyNumber\main.py process-articles --max 10
+  - 四步流水线分析（新架构）：python D:\PythonProject\KPLuckyNumber\main.py pipeline --issue 2026166 --limit 50
 
 关键配置点
 - 全局配置文件：`D:\PythonProject\KPLuckyNumber\config.py`。
@@ -23,9 +24,10 @@
 - 抓取：`D:\PythonProject\KPLuckyNumber\modules\spider_p5.py`（增量抓取、页面解析、JS 混淆变量提取）
 - 存储/模式：`D:\PythonProject\KPLuckyNumber\modules\database_p5.py`（自动建库建表、插入/查询历史、趋势、AI 报告、预测记录）
 - Redis：`D:\PythonProject\KPLuckyNumber\modules\redis_client.py`（命名空间、备份/恢复、文章与原始数据缓存）
-- 预测：`D:\PythonProject\KPLuckyNumber\modules\p5_predictor.py`（原始）与 `D:\PythonProject\KPLuckyNumber\modules\optimized_p5_predictor.py`（修正与 AI 融合）
+- 预测：`D:\PythonProject\KPLuckyNumber\modules\optimized_p5_predictor.py`（修正与 AI 融合）
 - AI 分析器：`D:\PythonProject\KPLuckyNumber\modules\ernie_ai_analyzer.py`（构造 prompt、解析 JSON、写入 DB/文件）
-- 文章处理：`D:\PythonProject\KPLuckyNumber\modules\article_processor.py`、`modules/article_analyzer.py`
+- 文章处理（旧版兼容）：`D:\PythonProject\KPLuckyNumber\modules\article_processor.py`、`modules/article_analyzer.py`
+- 四步流水线（★ 推荐）：`D:\PythonProject\KPLuckyNumber\modules\four_step_pipeline.py`
 
 项目约定与实现细节（务必遵守）
 - 日志：每个模块写入 `D:\PythonProject\KPLuckyNumber\logs\*.log`，查看日志可快速定位错误。不要在变更时移除或改名现有日志文件路径。
@@ -60,19 +62,19 @@ AI 调用与结果解析要点
 - D:\PythonProject\KPLuckyNumber\modules\ernie_ai_analyzer.py
 - D:\PythonProject\KPLuckyNumber\modules\spider_p5.py
 - D:\PythonProject\KPLuckyNumber\modules\redis_client.py
- - D:\PythonProject\KPLuckyNumber\modules\feature_engineering.py
- - D:\PythonProject\KPLuckyNumber\modules\article_processor.py
- - D:\PythonProject\KPLuckyNumber\modules\article_analyzer.py
- - D:\PythonProject\KPLuckyNumber\modules\backtest_engine.py
- - D:\PythonProject\KPLuckyNumber\modules\prediction_extractor.py
- - D:\PythonProject\KPLuckyNumber\modules\prediction_validator.py
- - D:\PythonProject\KPLuckyNumber\modules\p5_prediction_tracker.py
+- D:\PythonProject\KPLuckyNumber\modules\four_step_pipeline.py       # ★ 推荐：四步串行流水线（v2.0）
+- D:\PythonProject\KPLuckyNumber\modules\feature_engineering.py
+- D:\PythonProject\KPLuckyNumber\modules\article_processor.py      # 旧版兼容
+- D:\PythonProject\KPLuckyNumber\modules\article_analyzer.py       # 旧版兼容
+- D:\PythonProject\KPLuckyNumber\modules\backtest_engine.py
+- D:\PythonProject\KPLuckyNumber\modules\prediction_validator.py   # GUI 专用
 
 仅凭此文件可安全开始修改：优先从 `optimized_p5_predictor.py` 做小幅改进并在本地用 `python main.py predict --model optimized` 验证输出格式与 `predictions/` 写入。其他常用验证：
 
 - 运行特征提取并生成报告：`python main.py analyze`
-- 运行 ERNIE/综合 AI 分析：`python main.py ernie --limit 30` 或 `python main.py comprehensive --limit 30`
-- 处理单篇/批量文章工作流：`python main.py process-article --url "..."` / `python main.py process-articles --max 10`
+- 运行 ERNIE/综合 AI 分析：`python main.py ernie --limit 30` 或 `python main.py comprehensive --limit 30`（已弃用）
+- 处理单篇/批量文章工作流：`python main.py process-article --url "..."` / `python main.py process-articles --max 10`（旧版兼容）
+- 四步流水线分析（推荐，v2.0）：`python main.py pipeline --issue 2026166`
 
 —— 结束 ——
 

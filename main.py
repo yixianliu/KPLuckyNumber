@@ -9,10 +9,9 @@
 3. 历史回测验证 (backtest)        - 滚动回测验证模型命中率
 4. 特征工程分析 (analyze)         - 提取频率/遗漏/012路/连号等统计特征
 5. ERNIE AI深度分析 (ernie)       - 调用百度ERNIE模型进行深度分析
-6. 综合分析 (comprehensive)       - 整合Redis+专家数据+AI分析的二次深度分析
-7. 文章分析工作流 (article)       - 爬取文章→AI分析→Redis→DB的完整流水线
-8. 批量文章保存 (save-articles)   - 批量爬取文章并保存到Redis
-9. 单篇/批量文章处理 (process-article/process-articles) - 爬取→AI→预处理→Redis存储
+6. 四步流水线分析 (pipeline)       - 推荐！全新四步串行分析：文章爬取→走势分析→专家整合→最终预测
+7. 批量文章保存 (save-articles)   - 批量爬取文章并保存到Redis
+8. 单篇/批量文章处理 (process-article/process-articles) - 爬取→AI→预处理→Redis存储
 
 用法示例：
     python main.py update                    # 更新并入库最新开奖
@@ -20,7 +19,9 @@
     python main.py backtest --mode compare   # 后测对比
     python main.py analyze                   # 分析历史特征并输出报告
     python main.py ernie --limit 30          # ERNIE深度分析
-    python main.py comprehensive --limit 30  # 综合二次深度分析
+    python main.py pipeline --issue 2026165  # 四步流水线分析（推荐！自动推算下一期）
+    python main.py pipeline --issue 2026165 --limit 50  # 指定期数和数据量
+    python main.py save-articles --max 100  # 批量爬取文章保存到Redis
     python main.py process-article --url "..." --title "..."  # 处理单篇文章
     python main.py process-articles --max 10 # 批量处理文章
 """
@@ -834,6 +835,87 @@ def run_process_article(url: str, title: str = '') -> bool:
         return False
 
 
+def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int = 40) -> bool:
+    """
+    执行全新的四步流水线分析
+
+    流程:
+    步骤1: 专家文章爬取与结构化AI分析 → Redis存储
+    步骤2: 走势图数据分析与AI预测 → Redis存储
+    步骤3: 专家报告整合分析 → Redis存储
+    步骤4: 最终预测结果生成与入库 → MySQL
+
+    Args:
+        target_issue: 目标期号，None则自动推算
+        data_limit: 历史数据期数限制
+
+    Returns:
+        bool: 是否执行成功
+    """
+    logger.info('=' * 80)
+    logger.info('开始执行四步流水线分析')
+    logger.info('=' * 80)
+
+    try:
+        from modules.four_step_pipeline import run_four_step_pipeline as pipeline_func
+
+        result = pipeline_func(target_issue=target_issue, data_limit=data_limit)
+
+        if result.get('success'):
+            logger.info('=' * 80)
+            logger.info('四步流水线分析完成')
+            logger.info('=' * 80)
+            logger.info(f'报告UUID: {result.get("report_uuid", "未知")}')
+            logger.info(f'总耗时: {result.get("total_duration", 0):.1f}s')
+
+            logger.info('')
+            logger.info('【各步骤执行详情】')
+            logger.info('-' * 50)
+            for stage in result.get('stages', []):
+                icon = '✓' if stage['success'] else '✗'
+                logger.info(f'  {icon} 步骤{stage["step"]}: {stage["name"]} ({stage["duration"]:.1f}s)')
+
+            final_report = result.get('final_report', {})
+            if final_report:
+                logger.info('')
+                logger.info('【最终预测结果】')
+                logger.info('-' * 50)
+                prediction = final_report.get('prediction', {})
+                for pos_key, pos_name in zip(['wan', 'qian', 'bai', 'shi', 'ge'],
+                                              ['万位', '千位', '百位', '十位', '个位']):
+                    pos_data = prediction.get(pos_key, {})
+                    nums = pos_data.get('numbers', [])
+                    conf = pos_data.get('confidence', [])
+                    if nums:
+                        logger.info(f'  {pos_name}: 号码{nums}, 置信度{conf}')
+
+                combos = final_report.get('recommended_combinations', [])
+                if combos:
+                    logger.info('')
+                    logger.info('  【推荐组合】')
+                    for i, combo in enumerate(combos[:5], 1):
+                        if isinstance(combo, dict):
+                            c = combo.get('combination', '')
+                            conf = combo.get('confidence', 0)
+                            logger.info(f'    {i}. {c} (置信度: {conf:.2f})')
+
+            logger.info('')
+            logger.info(f'  风险提示: {final_report.get("risk_warning", "理性购彩，量力而行")}')
+            logger.info('=' * 80)
+            return True
+        else:
+            logger.error(f'四步流水线分析失败: {result.get("error", "未知错误")}')
+            if 'stages' in result:
+                for stage in result['stages']:
+                    if not stage.get('success'):
+                        logger.error(f'  失败步骤{stage["step"]}: {stage.get("details", {}).get("error", "未知")}')
+            return False
+
+    except Exception as e:
+        logger.error(f'四步流水线执行异常: {e}', exc_info=True)
+        return False
+
+
 def run_process_multiple_articles(max_count: int = 10) -> bool:
     """
     批量处理文章：爬取→AI分析→预处理→Redis存储
@@ -958,16 +1040,23 @@ def main():
                               help='获取历史数据的期数限制（默认30期）')
 
     # 综合分析命令（二次深度分析）
-    comprehensive_parser = subparsers.add_parser('comprehensive', help='执行综合分析（二次深度分析）')
+    comprehensive_parser = subparsers.add_parser('comprehensive', help='执行综合分析（二次深度分析）→ 已弃用，请使用 pipeline 命令')
     comprehensive_parser.add_argument('--limit', type=int, default=30,
                                       help='获取历史数据的期数限制（默认30期）')
 
-    # 文章分析命令
-    article_parser = subparsers.add_parser('article', help='执行文章内容分析工作流')
+    # 文章分析命令（已弃用，使用 pipeline 代替）
+    article_parser = subparsers.add_parser('article', help='执行文章内容分析工作流 → 已弃用，请使用 pipeline 命令')
     article_parser.add_argument('--issue', type=str, default=None,
                                 help='目标期号（如2026165），不指定则爬取最新文章')
     article_parser.add_argument('--limit', type=int, default=30,
                                 help='获取历史数据的期数限制（默认30期）')
+
+    # 四步流水线分析命令（推荐）
+    pipeline_parser = subparsers.add_parser('pipeline', help='执行四步流水线分析：文章爬取→走势分析→专家整合→最终预测')
+    pipeline_parser.add_argument('--issue', type=str, default=None,
+                                 help='目标期号（如2026165），不指定则自动推算下一期')
+    pipeline_parser.add_argument('--limit', type=int, default=40,
+                                 help='历史数据期数限制（默认40期）')
 
     # 批量保存文章命令
     save_articles_parser = subparsers.add_parser('save-articles', help='批量爬取文章并保存到Redis，自动提取预测数据')
@@ -1009,9 +1098,13 @@ def main():
     elif args.command == 'ernie':
         success = run_ernie_ai_analysis(data_limit=args.limit)
     elif args.command == 'comprehensive':
+        logger.warning('⚠️ 综合分析报告已弃用，建议使用 pipeline 命令获得更完整的分析结果')
         success = run_comprehensive_analysis(data_limit=args.limit)
     elif args.command == 'article':
+        logger.warning('⚠️ 文章分析工作流已弃用，建议使用 pipeline 命令获得更完整的分析结果')
         success = run_article_analysis(target_issue=args.issue, data_limit=args.limit)
+    elif args.command == 'pipeline':
+        success = run_four_step_pipeline(target_issue=args.issue, data_limit=args.limit)
     elif args.command == 'save-articles':
         extract_predictions = not args.no_extract
         success = run_save_articles_to_redis(target_issue=args.issue, max_articles=args.max, extract_predictions=extract_predictions)

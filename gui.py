@@ -3,15 +3,17 @@
 
 基于tkinter的桌面应用程序，提供以下核心功能：
 1. 数据爬取（增量/全量） - 从多个数据源获取排列5开奖数据并存储到MySQL
-2. AI智能分析 - 3步新流水线（文章逐篇AI分析→走势AI分析→整合综合预测）
+2. 四步流水线分析（★推荐） - 文章爬取→走势分析→专家整合→最终预测（v2.0新架构）
 3. 历史回测 - 批量历史数据验证，评估模型Top-1/Top-3命中率
 4. 特征分析 - 提取频率、遗漏、012路、连号等统计特征
 5. 预测验证 - 自动比对预测与实际开奖结果，生成性能报告
+6. 旧版AI分析 - 3步流水线（文章→走势→整合，供兼容使用）
 
-工作流程：
-  数据爬取 → AI智能分析（文章→逐篇AI→Redis | 走势→AI→Redis | 整合→AI→DB+TXT） → 预测验证
-                                                                    ↓
-                               历史回测 ← 特征分析 ← 性能评估报告
+工作流程（四步流水线）：
+  步骤1: 爬取文章→逐篇AI分析→存入Redis
+  步骤2: 走势数据→AI分析→存入Redis
+  步骤3: 整合步骤1报告→AI综合分析→存入Redis
+  步骤4: 整合步骤2+3→最终预测→存入MySQL
 
 架构说明：
   - TaskManager: 异步任务管理器，通过ThreadPoolExecutor在后台线程执行耗时操作
@@ -403,8 +405,10 @@ class LotteryGUI:
         p5_card = self._create_card(parent, "AI智能分析", COLORS['accent_p5'])
         p5_card.pack(fill=tk.X, pady=(0, 8))
 
-        self._add_big_button(p5_card, "执行AI智能分析", COLORS['accent_p5'],
-                             lambda: self._on_button_click("AI智能分析", self._execute_optimized_p5_ai))
+        self._add_big_button(p5_card, "四步流水线分析 ★", COLORS['accent_p5'],
+                             lambda: self._on_button_click("四步流水线", self._execute_four_step_pipeline))
+        self._add_action_button(p5_card, "执行AI智能分析(旧版)", '#8b5cf6',
+                             lambda: self._on_button_click("AI智能分析(旧版)", self._execute_optimized_p5_ai))
         self._add_action_button(p5_card, "执行历史回测", '#22c55e',
                                 lambda: self._on_button_click("历史回测", self._execute_backtest))
         self._add_action_button(p5_card, "执行特征分析", '#f59e0b',
@@ -1457,6 +1461,95 @@ class LotteryGUI:
         except Exception as e:
             error_detail = traceback.format_exc()
             task_mgr.log(f"\n✗ AI分析过程发生异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
+
+    def _execute_four_step_pipeline(self, task_mgr):
+        """
+        四步流水线分析（推荐，v2.0新架构）
+
+        步骤1: 专家文章爬取与结构化AI分析 → Redis存储
+        步骤2: 走势图数据分析与AI预测 → Redis存储
+        步骤3: 专家报告整合分析 → Redis存储
+        步骤4: 最终预测结果生成与入库 → MySQL数据库
+
+        Args:
+            task_mgr: TaskManager实例，用于更新UI进度和日志
+        """
+        try:
+            task_mgr.log("=" * 70)
+            task_mgr.log("  四步流水线分析（v2.0 推荐架构）")
+            task_mgr.log("=" * 70)
+
+            from modules.four_step_pipeline import run_four_step_pipeline
+
+            # 获取数据库最新期号以确定目标期号
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败，无法确定目标期号")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+            db.cursor.execute('SELECT issue FROM p5_history ORDER BY issue DESC LIMIT 1')
+            row = db.cursor.fetchone()
+            latest_issue = row.get('issue', '') if row else ''
+            db.disconnect()
+
+            if not latest_issue:
+                task_mgr.log("✗ 数据库中无历史数据，请先执行数据爬取")
+                task_mgr.progress(0, "无历史数据")
+                return
+
+            target_issue = str(int(latest_issue) + 1)
+            task_mgr.log(f"最新期号: {latest_issue}, 目标预测期号: {target_issue}")
+
+            task_mgr.progress(0, "开始四步流水线分析...")
+
+            result = run_four_step_pipeline(target_issue=target_issue, data_limit=40)
+
+            if result.get('success'):
+                task_mgr.progress(100, "流水线完成")
+                task_mgr.log(f"\n✓ 四步流水线分析完成")
+                task_mgr.log(f"  报告UUID: {result.get('report_uuid', '未知')}")
+                task_mgr.log(f"  预测期号: {target_issue}")
+                task_mgr.log(f"  总耗时: {result.get('total_duration', 0):.1f}s")
+
+                # 显示各步骤详情
+                task_mgr.log(f"\n【各步骤执行详情】")
+                for stage in result.get('stages', []):
+                    icon = '✓' if stage['success'] else '✗'
+                    task_mgr.log(f"  {icon} 步骤{stage['step']}: {stage['name']} ({stage['duration']:.1f}s)")
+
+                # 显示预测结果
+                final_report = result.get('final_report', {})
+                if final_report:
+                    task_mgr.log(f"\n【最终预测结果】")
+                    prediction = final_report.get('prediction', {})
+                    for pos_key, pos_name in zip(['wan', 'qian', 'bai', 'shi', 'ge'],
+                                                  ['万位', '千位', '百位', '十位', '个位']):
+                        pos_data = prediction.get(pos_key, {})
+                        nums = pos_data.get('numbers', [])
+                        if nums:
+                            task_mgr.log(f"  {pos_name}: 号码{nums}")
+
+                    combos = final_report.get('recommended_combinations', [])
+                    if combos:
+                        task_mgr.log(f"\n  【推荐组合】")
+                        for i, combo in enumerate(combos[:5], 1):
+                            if isinstance(combo, dict):
+                                task_mgr.log(f"    {i}. {combo.get('combination', '')} (置信度: {combo.get('confidence', 0):.2f})")
+
+                    risk = final_report.get('risk_warning', '理性购彩，量力而行')
+                    task_mgr.log(f"\n  ⚠ 风险提示: {risk}")
+            else:
+                task_mgr.progress(0, "分析失败")
+                task_mgr.log(f"\n✗ 四步流水线分析失败: {result.get('error', '未知错误')}")
+                for stage in result.get('stages', []):
+                    if not stage.get('success'):
+                        task_mgr.log(f"  失败步骤{stage['step']}: {stage.get('details', {}).get('error', '未知')}")
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 四步流水线异常: {str(e)}")
             task_mgr.log(f"\n错误详情:\n{error_detail}")
             task_mgr.progress(0, "异常终止")
 
