@@ -7,7 +7,7 @@
   - 更新并入库最新开奖：python D:\PythonProject\KPLuckyNumber\main.py update
   - 运行预测（原始/优化模型）：python D:\PythonProject\KPLuckyNumber\main.py predict --model optimized
   - 后测对比：python D:\PythonProject\KPLuckyNumber\main.py backtest --mode compare --start 50 --count 50
-  - 调用 ERNIE 深度分析（需配置 API Key）：python D:\PythonProject\KPLuckyNumber\main.py ernie --limit 30
+  - 调用 AI 深度分析（需配置 API Key）：python D:\PythonProject\KPLuckyNumber\main.py ernie --limit 30
   - 处理单篇文章：python D:\PythonProject\KPLuckyNumber\main.py process-article --url "..." --title "..."
   - 分析历史特征并输出报告：python D:\PythonProject\KPLuckyNumber\main.py analyze
   - 运行综合（二次）深度分析：python D:\PythonProject\KPLuckyNumber\main.py comprehensive --limit 30
@@ -18,7 +18,7 @@
 关键配置点
 - 全局配置文件：`D:\PythonProject\KPLuckyNumber\config.py`。
   - 数据库连接与 `DB_CONFIG`（host/user/password/database）——`modules/database_p5.py` 的 `connect()` 会尝试在缺少数据库时自动创建。
-  - AI 接口：`QIANYAN_API_CONFIG`（api_url、api_key、model_name、timeout...）。若 `api_key` 为空，AI 路径会优雅跳过并记录警告。
+  - AI 接口：`AGNES_API_CONFIG`（api_url、api_key、model_name、timeout...）。若 `api_key` 为空，AI 路径会优雅跳过并记录警告。
 
 核心模块与职责（可修改点）
 - 抓取：`D:\PythonProject\KPLuckyNumber\modules\spider_p5.py`（增量抓取、页面解析、JS 混淆变量提取）
@@ -36,7 +36,7 @@
 - 预测器返回结构要求（保持兼容）: 字典必须包含键 `fused_probabilities`, `top_combinations`, `predict_time`, `predict_uuid`, `risk_warning`（多处代码与测试依赖这些字段）。
 
 AI 调用与结果解析要点
-- 两个模块（`optimized_p5_predictor.py` 与 `ernie_ai_analyzer.py`）通过 HTTP POST 调用 Qianfan/ERNIE。请求体中使用 `model` 与 `messages`（system/user）；参见 `modules/optimized_p5_predictor.py::_call_ai_model`。
+- 两个模块（`optimized_p5_predictor.py` 与 `ernie_ai_analyzer.py`）通过 HTTP POST 调用 AI 模型。请求体中使用 `model` 与 `messages`（system/user）；参见 `modules/optimized_p5_predictor.py::_call_ai_model`。
 - 模型回复解析策略：从返回文本中定位并提取第一个 JSON 对象（从第一个 '{' 到匹配的 '}'），然后解析为 JSON；不要假设返回纯 JSON。若你修改解析逻辑，必须同步修改两个模块。
 
 编码/变更注意事项
@@ -72,7 +72,7 @@ AI 调用与结果解析要点
 仅凭此文件可安全开始修改：优先从 `optimized_p5_predictor.py` 做小幅改进并在本地用 `python main.py predict --model optimized` 验证输出格式与 `predictions/` 写入。其他常用验证：
 
 - 运行特征提取并生成报告：`python main.py analyze`
-- 运行 ERNIE/综合 AI 分析：`python main.py ernie --limit 30` 或 `python main.py comprehensive --limit 30`（已弃用）
+- 运行 AI/综合 分析：`python main.py ernie --limit 30` 或 `python main.py comprehensive --limit 30`（已弃用）
 - 处理单篇/批量文章工作流：`python main.py process-article --url "..."` / `python main.py process-articles --max 10`（旧版兼容）
 - 四步流水线分析（推荐，v2.0）：`python main.py pipeline --issue 2026166`
 

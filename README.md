@@ -53,7 +53,7 @@ KPLuckyNumber/
 │   ├── spider_p5.py         # 爬虫层 — 多源历史开奖数据抓取
 │   ├── ydniu_spider.py      # 文章爬虫 — 亿点牛网站专家文章抓取
 │   ├── optimized_p5_predictor.py  # 预测引擎 — 五算法融合 + AI 集成
-│   ├── ernie_ai_analyzer.py # AI 分析器 — 百度千帆 API 封装与 prompt 管理
+│   ├── ernie_ai_analyzer.py # AI 分析器 — AGNES API 封装与 prompt 管理
 │   ├── article_analyzer.py  # 文章工作流 — 6步双阶段 AI 分析流水线（旧版兼容）
 │   ├── article_processor.py # 文章处理器 — 简化4步流程（爬取→AI→Redis，旧版兼容）
 │   ├── backtest_engine.py   # 回测引擎 — 滚动回测与可视化报告
@@ -125,7 +125,7 @@ pip install -r requirements.txt
 # 确保 Redis 服务在 localhost:6379 可访问，或修改 config.py 中的 Redis 连接参数
 
 # 5. （可选）配置 AI API
-# config.py 中的 QIANYAN_API_CONFIG 已预置 API 密钥，如需更换请自行替换
+# config.py 中的 AGNES_API_CONFIG 已预置 API 密钥，如需更换请自行替换
 ```
 
 ### 启动方式
@@ -222,7 +222,7 @@ kpluckynumber:pl5:issue_articles:{issue}# 期号文章索引（Set）
 | pattern_continuation | 15% | 奇偶/大小/质合形态延续规律 |
 
 **AI 模型集成：**
-- 通过 `QIANYAN_API_CONFIG` 调用百度千帆 LLM（默认 deepseek-v3.1）
+- 通过 `AGNES_API_CONFIG` 调用 AGNES AI 模型（默认 agnes-2.0-flash）
 - AI 输出与统计模型加权融合（默认 AI 权重 40%，统计权重 60%）
 - 响应解析容错：从第一个 `{` 到最后一个 `}` 提取 JSON 对象
 
@@ -262,9 +262,9 @@ DEFAULT_CONFIG = {
 
 ### 4. AI 分析模块
 
-#### ernie_ai_analyzer.py — ERNIE / 千帆 AI 深度分析
+#### ernie_ai_analyzer.py — AGNES AI 深度分析
 
-- 封装百度千帆 API 调用（POST `/v2/chat/completions`）
+- 封装 AGNES API 调用（POST `/v1/chat/completions`）
 - 支持综合分析师模式：整合历史数据 + 走势图 + 趋势数据
 - 解析 AI 返回的 JSON 格式预测报告并持久化到数据库
 
@@ -347,10 +347,10 @@ DB_CONFIG = {
 }
 
 # AI API 配置
-QIANYAN_API_CONFIG = {
-    'api_url': 'https://qianfan.baidubce.com/v2/chat/completions',
-    'api_key': '<YOUR_API_KEY>',   # 百度千帆 API 密钥
-    'model_name': 'deepseek-v3.1-250821',  # 模型名称
+AGNES_API_CONFIG = {
+    'api_url': 'https://apihub.agnes-ai.com/v1/chat/completions',
+    'api_key': '<YOUR_API_KEY>',   # AGNES AI API 密钥
+    'model_name': 'agnes-2.0-flash',  # 模型名称
     'timeout': 60,                   # 请求超时（秒）
     'temperature': 0.7,              # 采样温度
     'max_tokens': 2048               # 最大输出 Token 数
@@ -410,7 +410,7 @@ python main.py <command> [options]
 | `predict` | 预测下一期号码 | `--model optimized\|old` |
 | `backtest` | 历史回测验证 | `--mode compare\|old\|new`<br>`--start <N>` `--count <M>` |
 | `analyze` | 分析历史数据特征 | 无 |
-| `ernie` | ERNIE AI 深度分析 | `--limit <N>`（期数） |
+| `ernie` | AI 深度分析 | `--limit <N>`（期数） |
 | `comprehensive` | 综合分析（二次深度） | `--limit <N>` |
 | `article` | 文章分析工作流 | `--issue <期号>` `--limit <N>` |
 | `save-articles` | 批量保存文章到 Redis | `--issue` `--max <N>` `--no-extract` |
@@ -430,7 +430,7 @@ python main.py predict --model optimized
 # 执行回测对比
 python main.py backtest --mode compare --start 50 --count 50
 
-# ERNIE AI 深度分析（最近30期）
+# AI 深度分析（最近30期）
 python main.py ernie --limit 30
 
 # 完整文章分析工作流
@@ -530,7 +530,7 @@ python gui.py
 ┌─────────────▼─────┐ ┌────▼─────┐ ┌▼──────────────┐
 │  统计分析引擎      │ │ AI 分析  │ │ 文章分析工作流 │
 │ OptimizedP5Predict│ │ Analyzer │ │ ArticleAnalyzer│
-│ 五大算法融合       │ │ ERNIE    │ │ 双阶段AI       │
+│ 五大算法融合       │ │ AGNES    │ │ 双阶段AI       │
 └─────────┬─────────┘ └────┬─────┘ └───────┬───────┘
           │                │                │
           │     ┌──────────┼────────────────┤
@@ -597,7 +597,7 @@ python gui.py
 | 更新数据 | `python main.py update` |
 | 预测号码 | `python main.py predict --model optimized` |
 | 分析特征 | `python main.py analyze` |
-| ERNIE分析 | `python main.py ernie --limit 30` |
+| AI分析 | `python main.py ernie --limit 30` |
 | 文章分析 | `python main.py article --issue 2026165` |
 | 回测验证 | `python main.py backtest --mode compare` |
 | 启动GUI | `python gui.py` |

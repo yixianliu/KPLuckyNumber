@@ -12,7 +12,7 @@
 5. 增加概率归一化 - 确保概率总和为1
 6. 增加边界保护 - 限制极端输出
 7. 增加风险提示 - 明确说明仅作数据研究参考
-8. 集成AI大模型 - 支持调用百度千帆大语言模型进行深度分析
+8. 集成AI大模型 - 支持调用 AGNES API 进行深度分析
 """
 
 import logging
@@ -216,11 +216,11 @@ class OptimizedP5Predictor:
     def _init_ai_config(self):
         """初始化AI模型配置"""
         try:
-            from config import QIANYAN_API_CONFIG
-            self.api_config = QIANYAN_API_CONFIG
-            self.api_url = self.api_config.get('api_url', "https://qianfan.baidubce.com/v2/chat/completions")
+            from config import AGNES_API_CONFIG
+            self.api_config = AGNES_API_CONFIG
+            self.api_url = self.api_config.get('api_url', "https://apihub.agnes-ai.com/v1/chat/completions")
             self.api_key = self.api_config.get('api_key', '')
-            self.model_name = self.api_config.get('model_name', 'deepseek-v3.1-250821')
+            self.model_name = self.api_config.get('model_name', 'agnes-2.0-flash')
             self.ai_available = bool(self.api_key)
             
             if self.ai_available:
@@ -330,7 +330,7 @@ class OptimizedP5Predictor:
             "response_format": {"type": "json_object"}
         })
 
-        # 备注：payload 中使用 messages(system/user) 的结构与项目中其他调用 Qianfan/ERNIE 模型的实现保持一致，
+        # 备注：payload 中使用 messages(system/user) 的结构与项目中其他调用 AI 模型的实现保持一致，
         #       便于统一管理和解析。response_format 期望返回JSON对象，但服务端常常返回带杂讯的文本，
         #       因此后续需使用 _parse_ai_response 做容错解析。
 

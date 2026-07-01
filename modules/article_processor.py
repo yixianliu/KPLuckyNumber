@@ -99,7 +99,7 @@ class ArticleProcessor:
         初始化对象:
         - YDNiuSpider: 文章爬虫（ydniu.com）
         - RedisClient: Redis缓存客户端
-        - ERNIEAIAnalyzer: 百度ERNIE AI分析器
+        - ERNIEAIAnalyzer: AI分析器（调用AGNES API）
 
         注意: 与 ArticleAnalyzer 采用懒加载（首次使用时初始化）不同，
               ArticleProcessor 在构造时主动初始化所有组件，

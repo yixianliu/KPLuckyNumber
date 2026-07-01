@@ -124,7 +124,7 @@ class ArticleAnalyzer:
         """
         懒加载初始化AI客户端 (ERNIEAIAnalyzer)
 
-        ERNIEAIAnalyzer封装了百度Qianfan API的调用和响应解析，
+        ERNIEAIAnalyzer封装了AGNES API的调用和响应解析，
         本模块通过其 _call_ai_model() 和 _parse_ai_response() 进行AI交互。
         """
         try:

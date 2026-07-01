@@ -1,18 +1,18 @@
 """
-排列5 ERNIE AI分析模块
+排列5 AI分析模块
 
-基于百度千帆大语言模型（ERNIE-X1.1），整合多数据源进行深度分析，
+基于 AGNES AI 大语言模型，整合多数据源进行深度分析，
 生成结构化AI分析报告并存储到数据库。
 
 核心功能：
 1. 数据源整合 - 读取30期走势图、万位/千位/百位/十位走势图数据
-2. AI模型调用 - 使用百度千帆API（X1.1版本）进行深度分析
+2. AI模型调用 - 使用 AGNES API 进行深度分析
 3. 报告生成 - 生成包含预测结果、置信度、趋势分析的结构化报告
 4. 数据库存储 - 将报告完整存入p5_ai_report表
 
 参考接口规范：
-- API端点：https://qianfan.baidubce.com/v2/chat/completions
-- 模型：deepseek-v3.1-250821
+- API端点：https://apihub.agnes-ai.com/v1/chat/completions
+- 模型：agnes-2.0-flash
 - 认证方式：Bearer Token
 """
 
@@ -37,15 +37,14 @@ if not logger.handlers:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-# 说明：本模块负责调用ERNIE并生成结构化报告。AI配置优先从项目根的 config.py 加载，
-# 若未配置则尝试从 api/ai_ERNIE_X1.1.py 中提取密钥，属于容错兼容逻辑。
+# 说明：本模块负责调用 AI 并生成结构化报告。AI 配置从 config.py 的 AGNES_API_CONFIG 加载。
 
 
 class ERNIEAIAnalyzer:
     """
-    排列5 ERNIE AI分析器
+    排列5 AI分析器
 
-    整合多数据源，调用百度千帆大语言模型（X1.1版本）进行深度分析，
+    整合多数据源，调用 AGNES AI 大语言模型进行深度分析，
     生成结构化分析报告并存储到数据库。
     """
 
@@ -55,14 +54,14 @@ class ERNIEAIAnalyzer:
         self.position_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
 
     def _init_ai_config(self):
-        """初始化AI模型配置（从ai_ERNIE_X1.1.py读取）"""
+        """初始化AI模型配置（从config.py读取AGNES配置）"""
         try:
             # 尝试从config.py加载配置（使用模块导入以避免在except路径中出现未定义名警告）
             import config as cfg
-            self.api_config = getattr(cfg, 'QIANYAN_API_CONFIG', {}) or {}
-            self.api_url = self.api_config.get('api_url', "https://qianfan.baidubce.com/v2/chat/completions")
+            self.api_config = getattr(cfg, 'AGNES_API_CONFIG', {}) or {}
+            self.api_url = self.api_config.get('api_url', "https://apihub.agnes-ai.com/v1/chat/completions")
             self.api_key = self.api_config.get('api_key', '')
-            self.model_name = self.api_config.get('model_name', 'deepseek-v3.1-250821')
+            self.model_name = self.api_config.get('model_name', 'agnes-2.0-flash')
             self.ai_available = bool(self.api_key)
 
             if self.ai_available:
@@ -74,57 +73,22 @@ class ERNIEAIAnalyzer:
             else:
                 logger.warning('config.py中未配置API密钥')
         except Exception:
-            # 如果无法导入config模块，使用空配置继续后续的回退逻辑
+            # 如果无法导入config模块，使用空配置继续
             self.api_config = {}
-            self.api_url = "https://qianfan.baidubce.com/v2/chat/completions"
+            self.api_url = "https://apihub.agnes-ai.com/v1/chat/completions"
             self.api_key = ''
-            self.model_name = 'deepseek-v3.1-250821'
+            self.model_name = 'agnes-2.0-flash'
             self.ai_available = False
-            logger.info('未能从config.py加载配置，准备尝试api/目录下的回退配置')
-
-        # 如果没有从config加载，使用 api/ 目录下的 ai_ERNIE_X1.1.py 的配置作为回退方案
-        # 该逻辑确保在未统一配置config.py的情况下也能进行AI调试（非生产安全方式）
-        if not getattr(self, 'api_key', ''):
-            try:
-                # 读取ai_ERNIE_X1.1.py文件获取API密钥
-                api_file_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    'api', 'ai_ERNIE_X1.1.py'
-                )
-                if os.path.exists(api_file_path):
-                    with open(api_file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        # 从文件中提取API密钥
-                        import re
-                        key_match = re.search(r'Authorization.*?Bearer\s+([^\']+)', content)
-                        if key_match:
-                            self.api_key = key_match.group(1)
-                            self.api_url = "https://qianfan.baidubce.com/v2/chat/completions"
-                            self.model_name = 'deepseek-v3.1-250821'
-                            self.headers = {
-                                'Content-Type': 'application/json',
-                                'Authorization': f'Bearer {self.api_key}'
-                            }
-                            self.ai_available = True
-                            logger.info(f'从ai_ERNIE_X1.1.py加载API配置成功: {self.model_name}')
-                        else:
-                            self.ai_available = False
-                            logger.warning('无法从ai_ERNIE_X1.1.py提取API密钥')
-                else:
-                    self.ai_available = False
-                    logger.warning(f'ai_ERNIE_X1.1.py文件不存在: {api_file_path}')
-            except Exception as e:
-                self.ai_available = False
-                logger.error(f'读取ai_ERNIE_X1.1.py失败: {e}')
+            logger.info('未能从config.py加载配置')
 
     def _call_ai_model(self, messages: List[Dict[str, Any]],
                        max_tokens: int = 8000,
                        temperature: float = 0.7) -> Optional[str]:
         """
-        调用百度千帆AI模型（X1.1版本）
+        调用 AGNES AI 模型
 
         参考接口规范：
-        - POST https://qianfan.baidubce.com/v2/chat/completions
+        - POST https://apihub.agnes-ai.com/v1/chat/completions
         - Content-Type: application/json
         - Authorization: Bearer <token>
 
@@ -140,7 +104,7 @@ class ERNIEAIAnalyzer:
             logger.warning('AI模型不可用（未配置API密钥）')
             return None
 
-        logger.info(f'=== 开始调用ERNIE AI模型(X1.1): {self.model_name} ===')
+        logger.info(f'=== 开始调用AI模型: {self.model_name} ===')
 
         # 构建请求payload，参考function call接口规范
         # 注意：payload 尽量保持简洁，response 可能包含非严格 JSON 的文本，因此解析需增加容错。
@@ -165,20 +129,20 @@ class ERNIEAIAnalyzer:
 
             if 'choices' in result and len(result['choices']) > 0:
                 content = result['choices'][0]['message']['content']
-                logger.info(f'ERNIE AI模型(X1.1)调用成功，返回长度: {len(content)}')
+                logger.info(f'AI模型调用成功，返回长度: {len(content)}')
                 return content
 
-            logger.error(f'ERNIE AI模型返回格式异常: {result}')
+            logger.error(f'AI模型返回格式异常: {result}')
             return None
 
         except requests.exceptions.RequestException as e:
-            logger.error(f'ERNIE AI模型调用失败: {e}')
+            logger.error(f'AI模型调用失败: {e}')
             return None
         except json.JSONDecodeError as e:
-            logger.error(f'ERNIE AI响应JSON解析失败: {e}')
+            logger.error(f'AI响应JSON解析失败: {e}')
             return None
         except Exception as e:
-            logger.error(f'ERNIE AI模型调用异常: {e}')
+            logger.error(f'AI模型调用异常: {e}')
             return None
 
     def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
@@ -692,7 +656,7 @@ class ERNIEAIAnalyzer:
             分析结果字典，包含报告内容和数据库存储状态
         """
         logger.info('=' * 80)
-        logger.info('开始执行ERNIE AI分析')
+        logger.info('开始执行AI分析')
         logger.info('=' * 80)
 
         # 1. 获取数据源
@@ -718,7 +682,7 @@ class ERNIEAIAnalyzer:
         logger.info(f'提示词长度: {len(prompt)}')
 
         # 3. 调用AI模型
-        logger.info('步骤3：调用ERNIE AI模型...')
+        logger.info('步骤3：调用AI模型...')
         messages = [
             {
                 "role": "system",
@@ -778,7 +742,7 @@ class ERNIEAIAnalyzer:
         }
 
         logger.info('=' * 80)
-        logger.info('ERNIE AI分析完成')
+        logger.info('AI分析完成')
         logger.info(f'报告UUID: {report_uuid}')
         logger.info(f'报告文件: {report_file}')
         logger.info('=' * 80)
@@ -855,7 +819,7 @@ class ERNIEAIAnalyzer:
 
 def run_ernie_ai_analysis(data_limit: int = 30) -> Dict[str, Any]:
     """
-    便捷函数：执行ERNIE AI分析
+    便捷函数：执行AI分析
 
     Args:
         data_limit: 获取历史数据的期数限制
@@ -992,7 +956,6 @@ class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
         
         if ai_preliminary:
             prompt_parts.append(f"模型版本: {ai_preliminary.get('model_version', '未知')}")
-            prompt_parts.append(f"分析时间: {ai_preliminary.get('analysis_time', '未知')}")
             
             if ai_preliminary.get('recommended_numbers'):
                 nums = ai_preliminary['recommended_numbers']
@@ -1022,7 +985,7 @@ class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
 {
     "data_source": "综合分析（原始数据+专家分析+AI初步分析）",
     "analysis_time": "YYYY-MM-DD HH:MM:SS",
-    "model_version": "deepseek-v3.1-250821",
+    "model_version": "agnes-2.0-flash",
     "data_period": "最近30期",
     "next_issue": "预测期号",
     
@@ -1132,7 +1095,7 @@ class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
         logger.info(f'提示词长度: {len(prompt)}')
 
         # 6. 调用AI模型进行二次分析
-        logger.info('步骤6：调用ERNIE AI模型进行二次深度分析...')
+        logger.info('步骤6：调用AI模型进行二次深度分析...')
         messages = [
             {
                 "role": "system",
@@ -1216,7 +1179,7 @@ def run_comprehensive_analysis(data_limit: int = 30) -> Dict[str, Any]:
 
 if __name__ == '__main__':
     print('=' * 80)
-    print('排列5 ERNIE AI分析模块测试')
+    print('排列5 AI分析模块测试')
     print('=' * 80)
 
     analyzer = ERNIEAIAnalyzer()
