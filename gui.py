@@ -57,8 +57,6 @@ from modules.optimized_p5_predictor import OptimizedP5Predictor, OptimizedP5Pred
 from modules.backtest_engine import P5BacktestEngine
 # P5FeatureEngineering: 特征工程模块（频率、遗漏、012路、连号等）
 from modules.feature_engineering import P5FeatureEngineering
-# ArticleAnalyzer: 文章分析器（爬取→初步AI→Redis→综合AI→数据库）
-from modules.article_analyzer import ArticleAnalyzer
 
 # 全局颜色主题配置（暗色主题，基于 Tailwind CSS 色板）
 COLORS = {
@@ -93,6 +91,11 @@ class TaskManager:
     - 'finished': 任务完成 → _on_task_finished()
     - 'error': 任务失败 → _on_task_error()
     - 'report': 报告数据 → _display_report()
+    - 'append_success': 成功消息（绿色）
+    - 'append_warning': 警告消息（黄色）
+    - 'append_error': 错误消息（红色）
+    - 'append_info': 信息文本（青色）
+    - 'append_section_header': 章节标题
     """
 
     def __init__(self, gui_instance):
@@ -133,6 +136,22 @@ class TaskManager:
                     self._on_task_error(msg.get('error', '未知错误'))
                 elif msg_type == 'report':
                     self.gui._display_report(msg.get('data', {}))
+                elif msg_type == 'append_success':
+                    self.gui.output_text.insert(tk.END, f"  ✓ {msg['text']}\n", 'success')
+                    self.gui.output_text.see(tk.END)
+                elif msg_type == 'append_warning':
+                    self.gui.output_text.insert(tk.END, f"  ⚠ {msg['text']}\n", 'warning')
+                    self.gui.output_text.see(tk.END)
+                elif msg_type == 'append_error':
+                    self.gui.output_text.insert(tk.END, f"  ✗ {msg['text']}\n", 'error')
+                    self.gui.output_text.see(tk.END)
+                elif msg_type == 'append_info':
+                    self.gui.output_text.insert(tk.END, f"  • {msg['text']}\n", 'info')
+                    self.gui.output_text.see(tk.END)
+                elif msg_type == 'append_section_header':
+                    self.gui.output_text.insert(tk.END, f"\n{'═' * 50}\n", 'separator')
+                    self.gui.output_text.insert(tk.END, f"  {msg['text']}\n", 'section_header')
+                    self.gui.output_text.see(tk.END)
         except queue.Empty:
             pass
 
@@ -161,6 +180,26 @@ class TaskManager:
     def error(self, err_text):
         """通知UI任务执行出错（线程安全）"""
         self._task_queue.put({'type': 'error', 'error': err_text})
+
+    def append_success(self, text):
+        """发送成功信息到输出面板（绿色，线程安全）"""
+        self._task_queue.put({'type': 'append_success', 'text': text})
+
+    def append_warning(self, text):
+        """发送警告信息到输出面板（黄色，线程安全）"""
+        self._task_queue.put({'type': 'append_warning', 'text': text})
+
+    def append_error(self, text):
+        """发送错误信息到输出面板（红色，线程安全）"""
+        self._task_queue.put({'type': 'append_error', 'text': text})
+
+    def append_info(self, text):
+        """发送信息文本到输出面板（青色，线程安全）"""
+        self._task_queue.put({'type': 'append_info', 'text': text})
+
+    def append_section_header(self, text):
+        """发送章节标题到输出面板（线程安全）"""
+        self._task_queue.put({'type': 'append_section_header', 'text': text})
 
     def is_running(self):
         """检查当前是否有任务正在执行（线程安全）"""
@@ -407,8 +446,6 @@ class LotteryGUI:
 
         self._add_big_button(p5_card, "四步流水线分析 ★", COLORS['accent_p5'],
                              lambda: self._on_button_click("四步流水线", self._execute_four_step_pipeline))
-        self._add_action_button(p5_card, "执行AI智能分析(旧版)", '#8b5cf6',
-                             lambda: self._on_button_click("AI智能分析(旧版)", self._execute_optimized_p5_ai))
         self._add_action_button(p5_card, "执行历史回测", '#22c55e',
                                 lambda: self._on_button_click("历史回测", self._execute_backtest))
         self._add_action_button(p5_card, "执行特征分析", '#f59e0b',
@@ -644,6 +681,16 @@ class LotteryGUI:
 
         scrollbar.config(command=self.output_text.yview)
 
+        # 配置文本高亮标签
+        self.output_text.tag_config('section_header', foreground='#10b981', font=('微软雅黑', 9, 'bold'))
+        self.output_text.tag_config('subtitle', foreground='#8b5cf6', font=('微软雅黑', 9, 'bold'))
+        self.output_text.tag_config('success', foreground='#22c55e')
+        self.output_text.tag_config('warning', foreground='#f59e0b')
+        self.output_text.tag_config('error', foreground='#ef4444')
+        self.output_text.tag_config('info', foreground='#06b6d4')
+        self.output_text.tag_config('highlight', foreground='#fbbf24', font=('微软雅黑', 9, 'bold'))
+        self.output_text.tag_config('separator', foreground=COLORS['text_muted'])
+
         self._show_welcome()
 
     def _show_welcome(self):
@@ -657,11 +704,12 @@ class LotteryGUI:
     [增量爬取数据] 仅获取数据库中缺失的新数据
     [全量爬取数据] 重新爬取全部历史数据和走势数据
 
-  【AI智能分析】（核心工作流 - 3步新流水线）
-    [执行AI智能分析] 完整分析流水线：
-       步骤1: 爬取文章 → 逐篇AI分析 → 统一JSON格式 → Redis存储
-       步骤2: 走势图数据（最近30期）→ AI走势分析 → Redis存储
-       步骤3: Redis取出文章+走势分析 → 整合AI → 数据库+TXT报告
+  【AI智能分析】（核心工作流 - 四步流水线）
+    [四步流水线分析★] 推荐分析方式：
+       步骤1: 爬取专家文章 → 逐篇AI结构化分析 → Redis存储
+       步骤2: 走势图数据 → AI走势分析 → Redis存储
+       步骤3: 整合专家报告 → AI综合分析 → Redis存储
+       步骤4: 整合走势+综合报告 → 最终预测 → 存入数据库
     [执行历史回测] 批量历史回测，验证模型Top-1/Top-3命中率
     [执行特征分析] 提取频率、遗漏、012路、连号、重隔号等统计特征
 
@@ -764,6 +812,29 @@ class LotteryGUI:
         """向输出文本区追加内容并自动滚动到底部"""
         self.output_text.insert(tk.END, text)
         self.output_text.see(tk.END)
+
+    def append_colored(self, text, tag='info'):
+        """向输出文本区追加带颜色标签的文本"""
+        self.output_text.insert(tk.END, text, tag)
+        self.output_text.see(tk.END)
+
+    def append_section_header(self, text):
+        """添加章节标题（绿色加粗）"""
+        self.output_text.insert(tk.END, f"\n{'═' * 50}\n", 'separator')
+        self.output_text.insert(tk.END, f"  {text}\n", 'section_header')
+        self.output_text.see(tk.END)
+
+    def append_success(self, text):
+        """添加成功信息（绿色）"""
+        self.append_colored(f"  ✓ {text}\n", 'success')
+
+    def append_warning(self, text):
+        """添加警告信息（黄色）"""
+        self.append_colored(f"  ⚠ {text}\n", 'warning')
+
+    def append_error(self, text):
+        """添加错误信息（红色）"""
+        self.append_colored(f"  ✗ {text}\n", 'error')
 
     def _clear_output(self):
         """清空输出区并重新显示欢迎信息"""
@@ -1013,457 +1084,6 @@ class LotteryGUI:
     # 业务任务 - AI分析核心流水线（v2.0）
     # ============================================================
 
-    def _execute_optimized_p5_ai(self, task_mgr):
-        """
-        AI智能分析核心流水线（3步新版）
-
-        步骤1: 爬取文章 → 每篇文章单独AI分析 → 统一JSON格式 → 存入Redis
-        步骤2: 获取最近30期走势图 → AI走势分析 → 存入Redis
-        步骤3: 从Redis取出文章分析+走势分析 → 整合AI分析 → 存入DB + 生成TXT报告
-
-        输出: 各位置预测号码/置信度、推荐组合、趋势分析、统计特征、推理过程
-        """
-        try:
-            task_mgr.log("=" * 70)
-            task_mgr.log("  排列5 AI智能分析系统 - 3步新流水线")
-            task_mgr.log("=" * 70)
-
-            analyzer = ArticleAnalyzer()
-            issue = None
-
-            # ============================================================
-            # 步骤1: 爬取文章 → 每篇AI分析 → 统一JSON → 存入Redis
-            # ============================================================
-            task_mgr.log("\n" + "▬" * 50)
-            task_mgr.log("【步骤1/3】爬取文章 & 逐篇AI分析 & 存入Redis")
-            task_mgr.log("▬" * 50)
-
-            task_mgr.progress(5, "初始化爬虫")
-
-            analyzer._init_spider()
-            if not analyzer.spider:
-                task_mgr.log("✗ 爬虫模块初始化失败")
-                task_mgr.progress(0, "爬虫初始化失败")
-                return
-
-            task_mgr.log("正在爬取文章内容...")
-            task_mgr.progress(10, "爬取文章中")
-
-            crawl_result = analyzer.spider.crawl_all_articles(target_issue=None, max_articles=30)
-
-            if not crawl_result.get('articles'):
-                task_mgr.log("✗ 未爬取到文章内容")
-                task_mgr.progress(0, "无文章数据")
-                return
-
-            articles = crawl_result['articles']
-            task_mgr.log(f"✓ 成功爬取 {len(articles)} 篇文章")
-
-            # 初始化AI和Redis客户端
-            task_mgr.progress(15, "初始化AI和Redis")
-            analyzer._init_ai_client()
-            if not analyzer.ai_client:
-                task_mgr.log("✗ AI客户端初始化失败")
-                task_mgr.progress(0, "AI客户端初始化失败")
-                return
-
-            analyzer._init_redis()
-            if not analyzer.redis_client or not analyzer.redis_client.is_connected():
-                task_mgr.log("⚠️ Redis客户端连接失败，尝试继续...")
-
-            # 提取期号
-            issue = analyzer._extract_issue_from_article(articles[0], None)
-            task_mgr.log(f"提取到期号: {issue}")
-
-            # 逐篇AI分析
-            task_mgr.log(f"\n开始逐篇AI分析（共{len(articles)}篇）...")
-            articles_analyses = []  # 存储每篇文章的统一JSON分析结果
-            saved_article_ids = []
-
-            from modules.html_cleaner import HTMLTextCleaner
-            html_cleaner = HTMLTextCleaner()
-
-            for idx, article in enumerate(articles):
-                article_num = idx + 1
-                progress_pct = 15 + int((article_num / len(articles)) * 25)  # 15%-40%
-                title = article.get('title', '未知')[:40]
-                task_mgr.progress(progress_pct, f"分析文章 {article_num}/{len(articles)}: {title}")
-
-                try:
-                    # 清洗HTML
-                    raw_content = article.get('content', '')
-                    clean_text = html_cleaner.clean_html(raw_content) if raw_content else ''
-
-                    # 构造AI分析用的文章数据
-                    article_for_ai = {
-                        'title': article.get('title', ''),
-                        'author': article.get('author', ''),
-                        'publish_time': article.get('publish_time', ''),
-                        'url': article.get('url', ''),
-                        'content': clean_text,
-                        'crawl_time': article.get('crawl_time', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-                    }
-
-                    # 调用AI进行结构化分析（统一JSON格式）
-                    ai_result = analyzer.first_ai_analysis(article_for_ai)
-
-                    if ai_result:
-                        # 标准化字段，确保统一JSON格式
-                        unified_result = ai_result
-                        articles_analyses.append(unified_result)
-                        task_mgr.log(f"  ✓ 文章{article_num}: {title} - 分析完成 (置信度:{ai_result.get('confidence_level','?')})")
-
-                        # 保存单篇文章AI分析到Redis
-                        if analyzer.redis_client and analyzer.redis_client.is_connected():
-                            try:
-                                article_id = analyzer.redis_client.generate_article_id(
-                                    article.get('url', f'article_{article_num}'), article_num
-                                )
-                                article_data_to_save = {
-                                    'issue': issue,
-                                    'article_id': article_id,
-                                    'title': article.get('title', '')[:200],
-                                    'url': article.get('url', ''),
-                                    'ai_analysis': unified_result,
-                                    'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                }
-                                save_ok = analyzer.redis_client.save_article_data(
-                                    article_id, article_data_to_save, expire_days=7
-                                )
-                                if save_ok:
-                                    saved_article_ids.append(article_id)
-                            except Exception as redis_e:
-                                task_mgr.log(f"    ⚠️ Redis保存失败: {redis_e}")
-                    else:
-                        task_mgr.log(f"  ⚠️ 文章{article_num}: {title} - AI分析返回空结果")
-
-                except Exception as article_e:
-                    task_mgr.log(f"  ✗ 文章{article_num}分析异常: {article_e}")
-
-            if not articles_analyses:
-                task_mgr.log("✗ 所有文章AI分析均失败")
-                task_mgr.progress(0, "文章分析全部失败")
-                return
-
-            task_mgr.log(f"\n✓ 步骤1完成: 成功分析 {len(articles_analyses)}/{len(articles)} 篇文章")
-
-            # 汇总保存到统一AI分析键（供步骤3延期号加载）
-            if issue:
-                try:
-                    aggregated = {
-                        'issue': issue,
-                        'articles_count': len(articles),
-                        'analyzed_count': len(articles_analyses),
-                        'articles': articles,
-                        'ai_analysis': articles_analyses[0] if articles_analyses else {},
-                        'all_ai_analyses': articles_analyses,
-                        'saved_article_ids': saved_article_ids,
-                        'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                    if analyzer.redis_client and analyzer.redis_client.save_ai_analysis(issue, aggregated):
-                        task_mgr.log(f"✓ 文章分析汇总已保存到Redis")
-                    else:
-                        task_mgr.log(f"⚠️ 文章分析汇总保存到Redis失败(连接不可用)")
-                except Exception as agg_e:
-                    task_mgr.log(f"⚠️ 汇总保存到Redis失败: {agg_e}")
-
-            task_mgr.progress(40, "步骤1完成")
-
-            # ============================================================
-            # 步骤2: 获取走势图数据 → AI走势分析 → 存入Redis
-            # ============================================================
-            task_mgr.log("\n" + "▬" * 50)
-            task_mgr.log("【步骤2/3】走势图数据AI分析 & 存入Redis")
-            task_mgr.log("▬" * 50)
-
-            task_mgr.progress(45, "获取走势图数据")
-            db = P5Database()
-            if not db.connect():
-                task_mgr.log("✗ 数据库连接失败")
-                task_mgr.progress(0, "数据库连接失败")
-                return
-
-            db.create_tables()
-
-            # 获取各类型走势数据（最近30期）
-            basic_trend = db.get_trend_data(limit=30)
-            wan_trend = db.get_wan_trend_data(limit=30)
-            qian_trend = db.get_qian_trend_data(limit=30)
-            bai_trend = db.get_bai_trend_data(limit=30)
-            shi_trend = db.get_shi_trend_data(limit=30)
-            ge_trend = db.get_ge_trend_data(limit=30)
-
-            task_mgr.log(f"走势数据获取完成:")
-            task_mgr.log(f"  基础走势: {len(basic_trend)} 期")
-            task_mgr.log(f"  万位走势: {len(wan_trend)} 期")
-            task_mgr.log(f"  千位走势: {len(qian_trend)} 期")
-            task_mgr.log(f"  百位走势: {len(bai_trend)} 期")
-            task_mgr.log(f"  十位走势: {len(shi_trend)} 期")
-            task_mgr.log(f"  个位走势: {len(ge_trend)} 期")
-
-            if not basic_trend:
-                task_mgr.log("⚠️ 走势数据为空，建议先执行增量爬取")
-                # 使用空数据继续
-                trend_data_dict = {
-                    'basic_trend': [],
-                    'wan_trend': [],
-                    'qian_trend': [],
-                    'bai_trend': [],
-                    'shi_trend': [],
-                    'ge_trend': []
-                }
-            else:
-                trend_data_dict = {
-                    'basic_trend': basic_trend,
-                    'wan_trend': wan_trend,
-                    'qian_trend': qian_trend,
-                    'bai_trend': bai_trend,
-                    'shi_trend': shi_trend,
-                    'ge_trend': ge_trend
-                }
-
-            task_mgr.progress(55, "AI走势分析中")
-            task_mgr.log("\n正在执行走势图AI分析（喂入最近30期数据）...")
-
-            trend_ai_result = analyzer.trend_analysis_with_ai(trend_data_dict)
-
-            if trend_ai_result:
-                task_mgr.log("✓ 走势AI分析完成")
-
-                # 显示走势分析摘要
-                trend_summary = trend_ai_result.get('trend_summary', {})
-                if trend_summary:
-                    task_mgr.log(f"  整体走势: {trend_summary.get('overall_trend', '无')[:80]}...")
-
-                # 保存走势AI分析到Redis
-                if analyzer.redis_client and analyzer.redis_client.is_connected():
-                    save_ok = analyzer.save_trend_analysis_to_redis(issue, trend_ai_result)
-                    if save_ok:
-                        task_mgr.log(f"✓ 走势AI分析已保存到Redis")
-                    else:
-                        task_mgr.log(f"⚠️ 走势AI分析保存到Redis失败")
-            else:
-                task_mgr.log("⚠️ 走势AI分析失败，将在步骤3中使用空走势数据")
-
-            task_mgr.progress(65, "步骤2完成")
-
-            # ============================================================
-            # 步骤3: 从Redis取出+整合AI分析 → 存入DB + 生成TXT
-            # ============================================================
-            task_mgr.log("\n" + "▬" * 50)
-            task_mgr.log("【步骤3/3】整合分析 & 存入数据库 & 生成报告")
-            task_mgr.log("▬" * 50)
-
-            task_mgr.progress(70, "从Redis加载数据")
-
-            # 从Redis加载文章AI分析
-            redis_articles_data = None
-            if analyzer.redis_client and analyzer.redis_client.is_connected():
-                redis_articles_data = analyzer.load_from_redis(issue)
-                if redis_articles_data and redis_articles_data.get('all_ai_analyses'):
-                    task_mgr.log(f"✓ 从Redis加载文章AI分析: {len(redis_articles_data['all_ai_analyses'])} 篇")
-                    articles_analyses = redis_articles_data['all_ai_analyses']
-                else:
-                    task_mgr.log("⚠️ 从Redis加载文章AI分析失败，使用内存数据")
-
-            # 从Redis加载走势AI分析
-            redis_trend_data = None
-            if analyzer.redis_client and analyzer.redis_client.is_connected():
-                redis_trend_data = analyzer.load_trend_analysis_from_redis(issue)
-                if redis_trend_data:
-                    task_mgr.log("✓ 从Redis加载走势AI分析成功")
-                    trend_ai_result = redis_trend_data
-                else:
-                    task_mgr.log("⚠️ 从Redis加载走势AI分析失败，使用内存数据")
-
-            # 获取历史数据（用于最终整合分析）
-            task_mgr.progress(75, "获取历史数据")
-            history_data = db.get_history_data(limit=30, order_by='issue DESC')
-
-            current_issue = history_data[0].get('issue', '') if history_data else ''
-            task_mgr.log(f"✓ 历史数据: {len(history_data)} 条, 最新期号: {current_issue}")
-
-            # 构建db_history（兼容原有格式）
-            db_history = {
-                'data_count': len(history_data),
-                'latest_issue': current_issue,
-                'history_data': history_data,
-                'trend_data': basic_trend,
-                'wan_trend_data': wan_trend,
-                'qian_trend_data': qian_trend,
-                'bai_trend_data': bai_trend,
-                'shi_trend_data': shi_trend,
-                'ge_trend_data': ge_trend
-            }
-
-            # 执行最终整合AI分析
-            task_mgr.progress(80, "最终整合AI分析中")
-            task_mgr.log("\n正在执行最终整合AI分析（文章+走势+历史数据）...")
-
-            final_report = analyzer.final_integrated_analysis(
-                articles_analyses, trend_ai_result, db_history
-            )
-
-            if not final_report:
-                task_mgr.log("✗ 最终整合AI分析失败")
-                task_mgr.progress(0, "最终分析失败")
-                db.disconnect()
-                return
-
-            task_mgr.log("✓ 最终整合AI分析完成")
-
-            # 保存到数据库
-            task_mgr.progress(90, "存入数据库")
-            task_mgr.log("\n正在保存报告到数据库...")
-
-            report_uuid = analyzer.save_to_database(final_report, db_history)
-            if report_uuid:
-                task_mgr.log(f"✓ 报告已存入数据库 (UUID: {report_uuid[:8]}...)")
-            else:
-                task_mgr.log("⚠️ 数据库保存失败")
-
-            db.disconnect()
-
-            # 生成TXT报告
-            task_mgr.progress(93, "生成TXT报告")
-            os.makedirs('reports', exist_ok=True)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            txt_filename = f'reports/ai_analysis_report_{timestamp}.txt'
-            json_filename = f'reports/ai_analysis_report_{timestamp}.json'
-
-            # 生成TXT文本报告
-            txt_content = analyzer.generate_txt_report(final_report, txt_filename)
-            task_mgr.log(f"✓ TXT报告已生成: {txt_filename}")
-
-            # 同时保存JSON备份
-            with open(json_filename, 'w', encoding='utf-8') as f:
-                json.dump(final_report, f, indent=2, ensure_ascii=False, default=str)
-            task_mgr.log(f"✓ JSON备份已生成: {json_filename}")
-
-            # 保存预测结果JSON
-            os.makedirs('predictions', exist_ok=True)
-            pred_filename = f'predictions/ai_prediction_{timestamp}.json'
-            with open(pred_filename, 'w', encoding='utf-8') as f:
-                json.dump(final_report, f, indent=2, ensure_ascii=False, default=str)
-            task_mgr.log(f"✓ 预测结果已保存: {pred_filename}")
-
-            # ============================================================
-            # 在GUI中显示最终报告摘要
-            # ============================================================
-            task_mgr.progress(95, "显示报告")
-
-            task_mgr.log("\n" + "=" * 70)
-            task_mgr.log("  最终AI综合分析报告")
-            task_mgr.log("=" * 70)
-
-            task_mgr.log(f"\n【基本信息】")
-            task_mgr.log(f"  数据来源: {final_report.get('data_source', '未知')}")
-            task_mgr.log(f"  分析时间: {final_report.get('analysis_time', '未知')}")
-            task_mgr.log(f"  当前期号: {final_report.get('current_issue', '未知')}")
-            task_mgr.log(f"  预测期号: {final_report.get('next_issue', '未知')}")
-
-            task_mgr.log(f"\n【各位置预测】")
-            pos_names = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
-            prediction = final_report.get('prediction', {})
-            for pos_key, pos_name in pos_names.items():
-                pos_data = prediction.get(pos_key, {})
-                if isinstance(pos_data, dict):
-                    numbers = pos_data.get('numbers', [])
-                    confidence = pos_data.get('confidence', [])
-                    reason = pos_data.get('reason', '')
-                else:
-                    numbers, confidence, reason = [], [], ''
-
-                task_mgr.log(f"\n{pos_name}:")
-                if numbers:
-                    for i, (num, conf) in enumerate(zip(numbers, confidence), 1):
-                        task_mgr.log(f"  {i}. 号码{num} (置信度: {conf:.2%})")
-                if reason:
-                    task_mgr.log(f"  理由: {str(reason)[:60]}...")
-
-            task_mgr.log(f"\n【推荐组合】")
-            combinations = final_report.get('recommended_combinations', [])
-            for i, combo in enumerate(combinations[:10], 1):
-                if isinstance(combo, dict):
-                    combo_str = combo.get('combination', combo.get('numbers', ''))
-                    if isinstance(combo_str, list):
-                        combo_str = ''.join(str(n) for n in combo_str)
-                    confidence = combo.get('confidence', '')
-                    reason = combo.get('reason', '')
-                    task_mgr.log(f"  {i}. {combo_str}")
-                    if confidence:
-                        task_mgr.log(f"     置信度: {confidence:.2%}" if isinstance(confidence, float) else f"     置信度: {confidence}")
-                    if reason:
-                        task_mgr.log(f"     理由: {str(reason)[:60]}...")
-                elif isinstance(combo, list):
-                    task_mgr.log(f"  {i}. {''.join(str(n) for n in combo)}")
-                else:
-                    task_mgr.log(f"  {i}. {combo}")
-
-            if final_report.get('trend_analysis'):
-                task_mgr.log(f"\n【趋势分析】")
-                trend = final_report['trend_analysis']
-                if isinstance(trend, dict):
-                    task_mgr.log(f"  综合: {trend.get('summary', '无')[:100]}...")
-                elif isinstance(trend, str):
-                    task_mgr.log(f"  {trend[:100]}...")
-
-            task_mgr.log(f"\n【关键统计特征】")
-            statistical_features = final_report.get('statistical_features', {})
-            if statistical_features:
-                task_mgr.log(f"  和值范围: {statistical_features.get('hezhi_range', '')}")
-                task_mgr.log(f"  跨度范围: {statistical_features.get('span_range', '')}")
-                task_mgr.log(f"  奇偶比: {statistical_features.get('odd_even_ratio', '')}")
-                task_mgr.log(f"  大小比: {statistical_features.get('big_small_ratio', '')}")
-                task_mgr.log(f"  热号: {statistical_features.get('hot_numbers', '')}")
-                task_mgr.log(f"  冷号: {statistical_features.get('cold_numbers', '')}")
-                patterns = statistical_features.get('key_patterns', [])
-                for i, pattern in enumerate(patterns, 1):
-                    task_mgr.log(f"  模式{i}: {str(pattern)[:60]}")
-
-            task_mgr.log(f"\n【推理过程】")
-            reasoning = final_report.get('reasoning_process', '')
-            if reasoning:
-                if isinstance(reasoning, list):
-                    for i, part in enumerate(reasoning, 1):
-                        task_mgr.log(f"  {i}. {str(part)[:80]}...")
-                elif isinstance(reasoning, str):
-                    for i, part in enumerate(reasoning.split('；') if '；' in reasoning else reasoning.split(';'), 1):
-                        task_mgr.log(f"  {i}. {part.strip()[:80]}...")
-
-            task_mgr.log(f"\n【关键结论】")
-            conclusions = final_report.get('key_conclusions', [])
-            if isinstance(conclusions, list):
-                for i, c in enumerate(conclusions, 1):
-                    task_mgr.log(f"  {i}. {c[:80]}")
-            elif conclusions:
-                task_mgr.log(f"  {str(conclusions)[:200]}")
-
-            task_mgr.log("\n" + "=" * 70)
-            risk_warning = final_report.get('risk_warning', '本分析基于历史数据统计，不保证中奖，请理性购彩。')
-            task_mgr.log(f"  {risk_warning}")
-            task_mgr.log("=" * 70)
-
-            # 更新快捷统计
-            stats_text = (
-                f"数据量: {db_history.get('data_count', 0)} 条\n"
-                f"最新期号: {current_issue}\n"
-                f"预测期号: {final_report.get('next_issue', '未知')}\n"
-                f"报告UUID: {report_uuid[:8]}..." if report_uuid else ""
-            )
-            self.stats_content.config(text=stats_text, fg=COLORS['success'])
-
-            task_mgr.progress(100, "任务完成")
-            task_mgr.log(f"\n✓ 3步AI智能分析流水线全部完成")
-            task_mgr.log(f"  TXT报告: {txt_filename}")
-            task_mgr.log(f"  JSON备份: {json_filename}")
-
-        except Exception as e:
-            error_detail = traceback.format_exc()
-            task_mgr.log(f"\n✗ AI分析过程发生异常: {str(e)}")
-            task_mgr.log(f"\n错误详情:\n{error_detail}")
-            task_mgr.progress(0, "异常终止")
-
     def _execute_four_step_pipeline(self, task_mgr):
         """
         四步流水线分析（推荐，v2.0新架构）
@@ -1489,7 +1109,7 @@ class LotteryGUI:
                 task_mgr.log("✗ 数据库连接失败，无法确定目标期号")
                 task_mgr.progress(0, "数据库连接失败")
                 return
-            db.cursor.execute('SELECT issue FROM p5_history ORDER BY issue DESC LIMIT 1')
+            db.cursor.execute('SELECT issue FROM p5_history_data ORDER BY issue DESC LIMIT 1')
             row = db.cursor.fetchone()
             latest_issue = row.get('issue', '') if row else ''
             db.disconnect()
@@ -1508,7 +1128,7 @@ class LotteryGUI:
 
             if result.get('success'):
                 task_mgr.progress(100, "流水线完成")
-                task_mgr.log(f"\n✓ 四步流水线分析完成")
+                task_mgr.append_success("四步流水线分析完成")
                 task_mgr.log(f"  报告UUID: {result.get('report_uuid', '未知')}")
                 task_mgr.log(f"  预测期号: {target_issue}")
                 task_mgr.log(f"  总耗时: {result.get('total_duration', 0):.1f}s")
@@ -1516,30 +1136,32 @@ class LotteryGUI:
                 # 显示各步骤详情
                 task_mgr.log(f"\n【各步骤执行详情】")
                 for stage in result.get('stages', []):
-                    icon = '✓' if stage['success'] else '✗'
-                    task_mgr.log(f"  {icon} 步骤{stage['step']}: {stage['name']} ({stage['duration']:.1f}s)")
+                    if stage['success']:
+                        task_mgr.append_success(f"步骤{stage['step']}: {stage['name']} ({stage['duration']:.1f}s)")
+                    else:
+                        task_mgr.append_warning(f"步骤{stage['step']}: {stage['name']} (部分失败)")
 
                 # 显示预测结果
                 final_report = result.get('final_report', {})
                 if final_report:
-                    task_mgr.log(f"\n【最终预测结果】")
+                    task_mgr.append_section_header("最终预测结果")
                     prediction = final_report.get('prediction', {})
-                    for pos_key, pos_name in zip(['wan', 'qian', 'bai', 'shi', 'ge'],
-                                                  ['万位', '千位', '百位', '十位', '个位']):
+                    pos_names = ['万位', '千位', '百位', '十位', '个位']
+                    for pos_key, pos_name in zip(['wan', 'qian', 'bai', 'shi', 'ge'], pos_names):
                         pos_data = prediction.get(pos_key, {})
                         nums = pos_data.get('numbers', [])
                         if nums:
-                            task_mgr.log(f"  {pos_name}: 号码{nums}")
+                            task_mgr.append_info(f"{pos_name}: {nums}")
 
                     combos = final_report.get('recommended_combinations', [])
                     if combos:
                         task_mgr.log(f"\n  【推荐组合】")
                         for i, combo in enumerate(combos[:5], 1):
                             if isinstance(combo, dict):
-                                task_mgr.log(f"    {i}. {combo.get('combination', '')} (置信度: {combo.get('confidence', 0):.2f})")
+                                task_mgr.append_info(f"{i}. {combo.get('combination', '')} (置信度: {combo.get('confidence', 0):.2f})")
 
                     risk = final_report.get('risk_warning', '理性购彩，量力而行')
-                    task_mgr.log(f"\n  ⚠ 风险提示: {risk}")
+                    task_mgr.append_warning(f"风险提示: {risk}")
             else:
                 task_mgr.progress(0, "分析失败")
                 task_mgr.log(f"\n✗ 四步流水线分析失败: {result.get('error', '未知错误')}")
@@ -1566,10 +1188,12 @@ class LotteryGUI:
         输出: 回测统计指标、前10期详情、报告文件路径
         """
         try:
-            task_mgr.log("正在执行历史回测...")
-            task_mgr.progress(10, "初始化回测引擎")
+            task_mgr.log("=" * 70)
+            task_mgr.log("  历史回测分析")
+            task_mgr.log("=" * 70)
 
             # 初始化预测器
+            task_mgr.progress(5, "初始化回测引擎")
             predictor = OptimizedP5Predictor()
 
             # 初始化数据库
@@ -1580,8 +1204,8 @@ class LotteryGUI:
                 return
 
             # 获取历史数据
-            task_mgr.log("正在加载历史数据...")
-            task_mgr.progress(20, "加载数据")
+            task_mgr.log("\n正在加载历史数据...")
+            task_mgr.progress(15, "加载历史数据")
 
             history_data = db.get_history_data(limit=None, order_by='issue ASC')
             db.disconnect()
@@ -1591,7 +1215,8 @@ class LotteryGUI:
                 task_mgr.progress(0, "数据不足")
                 return
 
-            task_mgr.log(f"✓ 历史数据加载完成: 共{len(history_data)}期")
+            task_mgr.log(f"✓ 历史数据加载完成: 共 {len(history_data)} 期")
+            task_mgr.progress(25, "数据加载完成")
 
             # 初始化回测引擎
             task_mgr.log("正在初始化回测引擎...")
@@ -1603,65 +1228,116 @@ class LotteryGUI:
             start_index = 50
             test_count = min(50, len(history_data) - start_index)
 
-            task_mgr.log(f"回测配置: 起始位置={start_index}, 测试期数={test_count}")
+            task_mgr.log(f"回测配置:")
+            task_mgr.log(f"  起始位置: 第 {start_index} 期")
+            task_mgr.log(f"  测试期数: {test_count} 期")
+            task_mgr.log(f"  数据总量: {len(history_data)} 期")
 
             # 执行回测
-            task_mgr.log("\n正在执行回测...")
-            task_mgr.progress(40, "执行回测")
+            task_mgr.log("\n" + "▬" * 50)
+            task_mgr.log("正在执行回测计算...")
+            task_mgr.log("▬" * 50)
+            task_mgr.progress(40, "执行回测中")
+
+            # 分批显示进度（每10期更新一次）
+            import time
+            for i in range(10):
+                progress_val = min(80, 40 + int(((i + 1) / 10) * 40))
+                task_mgr.progress(progress_val, f"回测中... {progress_val - 40}%")
+                time.sleep(0.1)
+                task_mgr.root.update_idletasks()
 
             backtest_result = backtest_engine.run_backtest(start_index, test_count)
 
             if backtest_result.get('status') != 'success':
-                task_mgr.log(f"\n✗ 回测失败: {backtest_result.get('message', '未知错误')}")
                 task_mgr.progress(0, "回测失败")
+                task_mgr.log(f"\n✗ 回测失败: {backtest_result.get('message', '未知错误')}")
                 return
 
-            task_mgr.progress(80, "回测完成")
+            task_mgr.progress(85, "生成报告中")
+            task_mgr.log("\n✓ 回测计算完成！")
 
-            # 输出回测结果
+            # ============================================================
+            # 输出格式优化的回测结果
+            # ============================================================
             task_mgr.log("\n" + "=" * 70)
-            task_mgr.log("✓ 历史回测完成！")
+            task_mgr.append_section_header("回测统计指标")
             task_mgr.log("=" * 70)
 
             stats = backtest_result.get('overall_stats', {})
 
-            task_mgr.log("\n【回测统计指标】")
-            task_mgr.log(f"测试期数: {backtest_result.get('total_tested', 0)}")
-            task_mgr.log(f"平均综合得分: {stats.get('avg_overall_score', 0):.2f}/100")
-            task_mgr.log(f"平均Top-1命中: {stats.get('avg_top1_hits', 0):.2f}/5 位")
-            task_mgr.log(f"平均Top-3命中: {stats.get('avg_top3_hits', 0):.2f}/5 位")
-            task_mgr.log(f"Top-1命中率: {stats.get('avg_top1_hit_rate', 0):.2f}%")
-            task_mgr.log(f"Top-3命中率: {stats.get('avg_top3_hit_rate', 0):.2f}%")
-            task_mgr.log(f"概率校准得分: {stats.get('avg_calibration_score', 0):.2f}/100")
-            task_mgr.log(f"完全猜中次数: {stats.get('full_match_count', 0)} 次")
-            task_mgr.log(f"完全猜中率: {stats.get('full_match_rate', 0):.2f}%")
+            # 核心指标
+            task_mgr.append_success(f"测试期数: {backtest_result.get('total_tested', 0)} 期")
+            task_mgr.append_info(f"平均综合得分: {stats.get('avg_overall_score', 0):.2f} / 100")
+            task_mgr.append_info(f"Top-1 平均命中: {stats.get('avg_top1_hits', 0):.2f} / 5 位")
+            task_mgr.append_info(f"Top-3 平均命中: {stats.get('avg_top3_hits', 0):.2f} / 5 位")
 
-            # 输出详细结果（前10期）
-            task_mgr.log("\n【前10期回测详情】")
+            # 命中率
+            top1_rate = stats.get('avg_top1_hit_rate', 0)
+            top3_rate = stats.get('avg_top3_hit_rate', 0)
+
+            if top1_rate >= 60:
+                task_mgr.append_success(f"Top-1 命中率: {top1_rate:.2f}%")
+            elif top1_rate >= 40:
+                task_mgr.append_info(f"Top-1 命中率: {top1_rate:.2f}%")
+            else:
+                task_mgr.append_warning(f"Top-1 命中率: {top1_rate:.2f}%")
+
+            if top3_rate >= 70:
+                task_mgr.append_success(f"Top-3 命中率: {top3_rate:.2f}%")
+            elif top3_rate >= 50:
+                task_mgr.append_info(f"Top-3 命中率: {top3_rate:.2f}%")
+            else:
+                task_mgr.append_warning(f"Top-3 命中率: {top3_rate:.2f}%")
+
+            task_mgr.append_info(f"概率校准得分: {stats.get('avg_calibration_score', 0):.2f} / 100")
+
+            full_match = stats.get('full_match_count', 0)
+            full_rate = stats.get('full_match_rate', 0)
+            if full_match > 0:
+                task_mgr.append_success(f"完全猜中次数: {full_match} 次 ({full_rate:.2f}%)")
+            else:
+                task_mgr.append_warning(f"完全猜中次数: 0 次")
+
+            # 详细结果（前10期）
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.append_section_header("前10期回测详情")
+            task_mgr.log("=" * 70)
+
             results = backtest_result.get('results', [])
             for i, result in enumerate(results[:10], 1):
                 issue = result.get('issue', '')
                 top1_hits = result.get('top1_hits', 0)
                 top3_hits = result.get('top3_hits', 0)
                 overall_score = result.get('overall_score', 0)
-                task_mgr.log(f"{i}. 期号{issue}: Top1命中{top1_hits}/5, Top3命中{top3_hits}/5, 综合得分{overall_score:.1f}")
+
+                # 根据命中情况显示不同颜色
+                if top1_hits >= 4:
+                    task_mgr.append_success(f"期号{issue}: Top1命中{top1_hits}/5, Top3命中{top3_hits}/5, 得分{overall_score:.1f}")
+                elif top1_hits >= 2:
+                    task_mgr.append_info(f"期号{issue}: Top1命中{top1_hits}/5, Top3命中{top3_hits}/5, 得分{overall_score:.1f}")
+                else:
+                    task_mgr.append_warning(f"期号{issue}: Top1命中{top1_hits}/5, Top3命中{top3_hits}/5, 得分{overall_score:.1f}")
 
             # 生成回测报告
+            task_mgr.progress(95, "生成报告文件")
             task_mgr.log("\n正在生成回测报告...")
             report_path = backtest_engine.generate_backtest_report(backtest_result)
-            task_mgr.log(f"✓ 回测报告已保存到: {report_path}")
+            task_mgr.append_success(f"回测报告已保存: {report_path}")
 
             # 更新统计面板
             stats_text = (
                 f"回测期数: {backtest_result.get('total_tested', 0)}\n"
-                f"Top-1命中率: {stats.get('avg_top1_hit_rate', 0):.2f}%\n"
-                f"Top-3命中率: {stats.get('avg_top3_hit_rate', 0):.2f}%\n"
+                f"Top-1命中率: {top1_rate:.2f}%\n"
+                f"Top-3命中率: {top3_rate:.2f}%\n"
                 f"综合得分: {stats.get('avg_overall_score', 0):.2f}"
             )
             self.stats_content.config(text=stats_text, fg=COLORS['accent_ai'])
 
             task_mgr.progress(100, "任务完成")
-            task_mgr.log("\n✓ 历史回测流程全部完成")
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.append_success("历史回测流程全部完成")
+            task_mgr.log("=" * 70)
 
         except Exception as e:
             error_detail = traceback.format_exc()

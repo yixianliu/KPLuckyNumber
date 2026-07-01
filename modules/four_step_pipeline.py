@@ -453,14 +453,14 @@ class FourStepPipeline:
 
             # 获取历史开奖数据
             self.db_client.cursor.execute(
-                'SELECT * FROM p5_history ORDER BY issue DESC LIMIT %s',
+                'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT %s',
                 (data_limit,)
             )
             history_data = self.db_client.cursor.fetchall()
 
             # 获取基础走势图数据
             self.db_client.cursor.execute(
-                'SELECT * FROM p5_trend ORDER BY issue DESC LIMIT %s',
+                'SELECT * FROM p5_trend_data ORDER BY issue DESC LIMIT %s',
                 (data_limit,)
             )
             trend_data = self.db_client.cursor.fetchall()
@@ -478,7 +478,7 @@ class FourStepPipeline:
             for pos_abbr in ['wan', 'qian', 'bai', 'shi', 'ge']:
                 self.db_client.cursor.execute(
                     f'SELECT issue, {pos_abbr}_number, is_odd, is_big, is_prime, omission, hot_level, '
-                    f'consecutive_count FROM p5_position_trend '
+                    f'consecutive_count FROM p5_{pos_abbr}_trend_data '
                     f'ORDER BY issue DESC LIMIT {data_limit}'
                 )
                 position_trends[f'{pos_abbr}_trend'] = self.db_client.cursor.fetchall()
@@ -756,7 +756,7 @@ class FourStepPipeline:
             db_history = {}
             if self.db_client and self.db_client.connection:
                 self.db_client.cursor.execute(
-                    'SELECT * FROM p5_history ORDER BY issue DESC LIMIT 30'
+                    'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT 30'
                 )
                 db_history['history'] = self.db_client.cursor.fetchall()
                 if db_history['history']:
@@ -1024,7 +1024,7 @@ class FourStepPipeline:
                 logger.info('使用内存中的综合分析报告')
 
             # 4. 获取历史数据
-            self.db_client.cursor.execute('SELECT * FROM p5_history ORDER BY issue DESC LIMIT 30')
+            self.db_client.cursor.execute('SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT 30')
             history_data = self.db_client.cursor.fetchall()
             latest_issue = history_data[0].get('issue', '') if history_data else ''
 
@@ -1295,7 +1295,6 @@ class FourStepPipeline:
                 return None
 
             success = db.insert_ai_report(
-                report_uuid=report_uuid,
                 report_content=report_content,
                 data_count=30,
                 latest_issue=latest_issue,
@@ -1508,7 +1507,7 @@ def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int =
         from modules.database_p5 import P5Database
         db = P5Database()
         if db.connect():
-            db.cursor.execute('SELECT issue FROM p5_history ORDER BY issue DESC LIMIT 1')
+            db.cursor.execute('SELECT issue FROM p5_history_data ORDER BY issue DESC LIMIT 1')
             row = db.cursor.fetchone()
             if row:
                 latest_issue = row.get('issue', '')
