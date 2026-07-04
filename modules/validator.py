@@ -8,7 +8,7 @@
 4. 建立完整的AI预测性能评估档案（含历史趋势）
 
 调用路径：
-    gui.py → P5PredictionValidator → P5Database（读写预测验证数据）
+    gui.py → Validator → P5Database（读写预测验证数据）
 
 数据库依赖表：
     - ai_predictions: 预测记录源（含待验证状态）
@@ -34,7 +34,7 @@ if not logger.handlers:
     logger.addHandler(file_handler)
 
 
-class P5PredictionValidator:
+class Validator:
     """
     排列5预测验证器
 
@@ -61,7 +61,7 @@ class P5PredictionValidator:
         遵循项目延迟导入模式，避免导入时因MySQL不可用而失败
         """
         if self.db is None:
-            from modules.database_p5 import P5Database
+            from modules.database import P5Database
             self.db = P5Database()
     
     def verify_prediction(self, report_uuid: str, target_issue: str,
@@ -376,7 +376,7 @@ class P5PredictionValidator:
 
 def test_validator():
     """测试预测验证器的完整功能链路"""
-    validator = P5PredictionValidator()
+    validator = Validator()
 
     print('=== 测试获取待验证预测 ===')
     pending = validator.get_pending_predictions()

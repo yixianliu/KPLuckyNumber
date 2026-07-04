@@ -19,7 +19,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
-class P5FeatureEngineering:
+class P5Features:
     """
     排列5特征工程类
 
@@ -781,6 +781,340 @@ class P5FeatureEngineering:
         logger.info('特征提取完成')
         return all_features
 
+    def calculate_bayesian_features(self, data, prior_weights=None, window=30):
+        """贝叶斯特征计算 (v3.0 新增)
+
+        基于历史频率构建先验分布,根据近期验证反馈更新后验概率。
+
+        核心思想:
+        - 先验概率 prior: 基于长期历史频率分布
+        - 似然值 likelihood: 基于近期 window 期窗口内的观测频率
+        - 后验概率 posterior: 通过贝叶斯公式更新: P(A|B) = P(B|A)*P(A) / P(B)
+        - 意外度 surprise: posterior - prior,衡量号码出现的"出人意料"程度
+
+        Args:
+            data: 历史开奖数据列表
+            prior_weights: 先验权重字典 {position: {number: prior_prob}}
+                           如果为None,则基于全局历史频率自动计算先验
+            window: 验证窗口期数,用于计算似然值
+
+        Returns:
+            Bayesian特征字典,格式:
+            {
+                'positions': [
+                    {
+                        'prior': {0:0.1, 1:0.1, ...},  # 先验概率
+                        'likelihood': {0:0.12, 1:0.08, ...},  # 似然值
+                        'posterior': {0:0.11, 1:0.09, ...},  # 后验概率
+                        'evidence': 0.10,  # 边际概率
+                        'surprise': {0:0.1, 1:-0.01, ...}  # 意外度 = posterior - prior
+                    },
+                    ...
+                ]
+            }
+        """
+        if not data:
+            logger.warning('贝叶斯特征计算: 数据为空')
+            return {'positions': [{} for _ in range(self.positions)]}
+
+        total = len(data)
+        # 使用窗口内数据计算似然
+        window_data = data[-window:] if window and len(data) > window else data
+        window_count = len(window_data)
+
+        # ---- Step 1: 计算先验概率 ----
+        global_counts = [defaultdict(int) for _ in range(self.positions)]
+        for item in data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                for pos, num in enumerate(numbers):
+                    global_counts[pos][int(num)] += 1
+
+        # 优先使用传入的先验权重,否则基于全局频率构建
+        prior_weights_raw = prior_weights or {}
+        priors = []
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+
+            if pos_name in prior_weights_raw:
+                prior = {str(n): prior_weights_raw[pos_name].get(str(n), 0.1) for n in self.number_range}
+            else:
+                counts = global_counts[pos]
+                prior = {str(n): (counts.get(n, 0) + 1) / (total + 10) for n in self.number_range}
+
+            # 归一化
+            total_prior = sum(prior.values())
+            prior = {k: v / total_prior for k, v in prior.items()}
+            priors.append(prior)
+
+        # ---- Step 2: 计算似然值 ----
+        likelihoods = []
+        for pos in range(self.positions):
+            counts = defaultdict(int)
+            for item in window_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    counts[int(numbers[pos])] += 1
+
+            likelihood = {str(n): (counts.get(n, 0) + 1) / (window_count + 10) for n in self.number_range}
+            total_like = sum(likelihood.values())
+            likelihood = {k: v / total_like for k, v in likelihood.items()}
+            likelihoods.append(likelihood)
+
+        # ---- Step 3: 计算后验概率 & 边际概率 ----
+        bayesian_positions = []
+        for pos in range(self.positions):
+            prior = priors[pos]
+            likelihood = likelihoods[pos]
+
+            posterior = {}
+            evidence = 0.0
+            surprise = {}
+
+            for key in self.number_range:
+                p_key = str(key)
+                l_val = likelihood[p_key]
+                p_val = prior[p_key]
+                # Bayes: posterior ∝ likelihood * prior
+                posterior[p_key] = l_val * p_val
+                evidence += posterior[p_key]
+                # 意外度
+                surprise[p_key] = posterior[p_key] - p_val
+
+            # 归一化后验
+            if evidence > 0:
+                posterior = {k: v / evidence for k, v in posterior.items()}
+                # 重新计算意外度
+                surprise = {k: posterior[k] - prior[k] for k in posterior}
+            else:
+                evidence = 1.0 / 10  # 兜底均匀分布
+
+            bayesian_positions.append({
+                'prior': prior,
+                'likelihood': likelihood,
+                'posterior': posterior,
+                'evidence': round(evidence, 6),
+                'surprise': surprise,
+            })
+
+        return {'positions': bayesian_positions}
+
+    def calculate_feature_importance(self, data, top_n=5):
+        """计算特征重要性得分 (v3.0 新增)
+
+        基于各特征在历史预测中的区分能力来计算重要性。
+        使用熵减和互信息方法评估每个特征的重要性。
+
+        核心方法:
+        - 对各特征类型(频率/遗漏/趋势等),分别计算其信息熵
+        - 使用互信息衡量特征与目标变量(下期开奖号码)的依赖程度
+        - 互信息越高,说明该特征的预测价值越大
+
+        Args:
+            data: 历史开奖数据列表
+            top_n: 返回最重要的前N个特征类型
+
+        Returns:
+            {
+                'feature_importance': {
+                    'frequency': 0.35,
+                    'omission': 0.25,
+                    'trend': 0.12,
+                    'markov': 0.10,
+                    'pattern': 0.08,
+                    'bayesian': 0.10,
+                },
+                'ranking': ['frequency', 'omission', 'trend', ...],
+            }
+        """
+        if not data or len(data) < 10:
+            logger.warning('特征重要性计算: 数据不足')
+            return {
+                'feature_importance': {},
+                'ranking': [],
+            }
+
+        feature_types = ['frequency', 'omission', 'trend', 'markov', 'pattern', 'bayesian']
+        scores = {}
+
+        for ft in feature_types:
+            try:
+                score = self._compute_feature_score(data, ft)
+                scores[ft] = max(score, 1e-9)  # 避免零值
+            except Exception as e:
+                logger.warning(f'特征重要性计算失败 [{ft}]: {e}')
+                scores[ft] = 1e-9  # 兜底最小分数
+
+        total = sum(scores.values())
+        if total > 0:
+            importance = {k: round(v / total, 4) for k, v in scores.items()}
+        else:
+            importance = {k: 1.0 / len(feature_types) for k in feature_types}
+
+        ranking = sorted(importance.keys(), key=lambda x: importance[x], reverse=True)
+
+        # 返回 top_n
+        top_importance = {k: importance[k] for k in ranking[:top_n]}
+        top_ranking = ranking[:top_n]
+
+        return {
+            'feature_importance': top_importance,
+            'ranking': top_ranking,
+        }
+
+    def _calculate_entropy(self, distribution):
+        """计算信息熵,用于特征重要性评估
+
+        H(X) = -Σ p(x) * log2(p(x))
+
+        Args:
+            distribution: 概率分布字典或列表
+
+        Returns:
+            信息熵值 (float),若输入无效则返回0
+        """
+        if isinstance(distribution, dict):
+            probs = list(distribution.values())
+        elif hasattr(distribution, '__iter__'):
+            probs = list(distribution)
+        else:
+            return 0.0
+
+        # 过滤非正数
+        probs = [p for p in probs if p > 0]
+        if not probs:
+            return 0.0
+
+        try:
+            entropy = -sum(p * np.log2(p) for p in probs)
+            return float(entropy)
+        except (ValueError, OverflowError):
+            return 0.0
+
+    def _mutual_information(self, x_values, y_values):
+        """计算互信息,评估两个变量之间的依赖程度
+
+        MI(X;Y) = Σ Σ p(x,y) * log2(p(x,y) / (p(x)*p(y)))
+
+        离散变量的互信息估计,用于衡量特征与目标的相关性。
+
+        Args:
+            x_values: 第一个变量取值列表
+            y_values: 第二个变量取值列表
+
+        Returns:
+            互信息值 (float),若无法计算则返回0
+        """
+        if len(x_values) != len(y_values) or len(x_values) < 2:
+            return 0.0
+
+        n = len(x_values)
+        pairs = Counter(zip(x_values, y_values))
+
+        # 边缘概率
+        px = Counter(x_values)
+        py = Counter(y_values)
+
+        mi = 0.0
+        for (x, y), count in pairs.items():
+            p_xy = count / n
+            p_x = px[x] / n
+            p_y = py[y] / n
+
+            if p_x > 0 and p_y > 0:
+                mi += p_xy * np.log2(p_xy / (p_x * p_y))
+
+        return float(max(mi, 0.0))
+
+    def _compute_feature_score(self, data, feature_type):
+        """内部方法:计算单个特征类型的得分
+
+        通过对每个位置的每个号码,比较该特征与下期实际开奖的关系,
+        用互信息给出该特征的评分。
+
+        Args:
+            data: 历史数据
+            feature_type: 特征类型名称
+
+        Returns:
+            特征得分 (float)
+        """
+        feature_seq_x = []
+        target_seq_y = []
+
+        for i in range(1, len(data)):
+            feat_val = self._get_feature_representative_value(data, feature_type, i)
+            target_num = int(data[i].get('numbers', [0])[0])
+
+            if feat_val is not None:
+                feature_seq_x.append(feat_val)
+                target_seq_y.append(target_num)
+
+        if len(feature_seq_x) < 5:
+            return 1e-9
+
+        mi = self._mutual_information(feature_seq_x, target_seq_y)
+        feat_entropy = self._calculate_entropy(feature_seq_x)
+        return mi * (1 + feat_entropy)
+
+    def _get_feature_representative_value(self, data, feature_type, idx):
+        """获取指定特征在给定数据点上的代表值
+
+        Args:
+            data: 历史数据
+            feature_type: 特征类型
+            idx: 数据索引
+
+        Returns:
+            代表数值,无法获取时返回None
+        """
+        if idx < 0 or idx >= len(data):
+            return None
+
+        if feature_type == 'frequency':
+            fe = P5Features()
+            freq = fe.calculate_frequency_features(data[:idx])
+            pos_name = fe.position_names[0]
+            if pos_name in freq:
+                freq_data = freq[pos_name].get('frequencies', {})
+                return int(max(freq_data, key=freq_data.get)) if freq_data else None
+
+        elif feature_type == 'omission':
+            fe = P5Features()
+            om = fe.calculate_omission_features(data[:idx])
+            pos_name = fe.position_names[0]
+            if pos_name in om:
+                om_data = om[pos_name].get('omission_probs', {})
+                return int(max(om_data, key=om_data.get)) if om_data else None
+
+        elif feature_type == 'trend':
+            fe = P5Features()
+            if len(data) >= 10:
+                trends = fe.calculate_trend_features(data[:idx])
+                pos_name = fe.position_names[0]
+                if pos_name in trends:
+                    t = trends[pos_name].get('recent_values', [])
+                    return int(np.mean(t[-3:])) if t else None
+
+        elif feature_type in ('markov', 'pattern'):
+            if idx > 0:
+                nums = data[idx - 1].get('numbers', [])
+                return int(nums[0]) if nums else None
+
+        elif feature_type == 'bayesian':
+            fe = P5Features()
+            bfeat = fe.calculate_bayesian_features(data[:idx])
+            pos_data = bfeat.get('positions', [])
+            if pos_data:
+                surprise = pos_data[0].get('surprise', {})
+                if surprise:
+                    return int(max(surprise, key=surprise.get))
+
+        if idx > 0 and data[idx - 1].get('numbers'):
+            return int(data[idx - 1]['numbers'][0])
+
+        return None
+
     def get_feature_vector(self, features: Dict[str, Any], position: int) -> np.ndarray:
         """
         获取指定位置的特征向量（用于机器学习模型输入）
@@ -842,7 +1176,7 @@ if __name__ == '__main__':
         {'issue': '2024005', 'numbers': [5, 6, 7, 8, 9]},
     ]
 
-    fe = P5FeatureEngineering()
+    fe = P5Features()
     features = fe.extract_all_features(test_data)
 
     print('特征提取完成')

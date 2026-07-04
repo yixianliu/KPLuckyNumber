@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('logs/spider_p5.log', encoding='utf-8')
+    file_handler = logging.FileHandler('logs/data_fetcher.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -1898,7 +1898,7 @@ class P5Spider:
         Returns:
             (新增历史数据条数, 跳过历史数据条数, 新增走势数据条数, 跳过走势数据条数)
         """
-        from modules.database_p5 import P5Database
+        from modules.database import P5Database
         
         db = P5Database()
         if not db.connect():
@@ -1939,7 +1939,7 @@ class P5Spider:
         Returns:
             (新增历史数据条数, 跳过历史数据条数, 新增走势数据条数, 跳过走势数据条数)
         """
-        from modules.database_p5 import P5Database
+        from modules.database import P5Database
         
         db = P5Database()
         if not db.connect():

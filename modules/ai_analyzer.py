@@ -40,7 +40,7 @@ if not logger.handlers:
 # 说明：本模块负责调用 AI 并生成结构化报告。AI 配置从 config.py 的 AGNES_API_CONFIG 加载。
 
 
-class ERNIEAIAnalyzer:
+class AIAnalyzer:
     """
     排列5 AI分析器
 
@@ -178,7 +178,7 @@ class ERNIEAIAnalyzer:
             包含所有数据源的字典
         """
         try:
-            from modules.database_p5 import P5Database
+            from modules.database import P5Database
             db = P5Database()
             if not db.connect():
                 logger.error('数据库连接失败，无法加载数据')
@@ -600,7 +600,7 @@ class ERNIEAIAnalyzer:
             报告UUID，失败返回None
         """
         try:
-            from modules.database_p5 import P5Database
+            from modules.database import P5Database
             db = P5Database()
             if not db.connect():
                 logger.error('数据库连接失败，无法保存报告')
@@ -767,7 +767,7 @@ class ERNIEAIAnalyzer:
     def get_latest_report(self) -> Optional[Dict[str, Any]]:
         """获取最新的AI分析报告"""
         try:
-            from modules.database_p5 import P5Database
+            from modules.database import P5Database
             db = P5Database()
             if not db.connect():
                 return None
@@ -796,7 +796,7 @@ class ERNIEAIAnalyzer:
     def list_reports(self, limit: int = 10) -> List[Dict[str, Any]]:
         """获取AI分析报告列表"""
         try:
-            from modules.database_p5 import P5Database
+            from modules.database import P5Database
             db = P5Database()
             if not db.connect():
                 return []
@@ -827,11 +827,11 @@ def run_ernie_ai_analysis(data_limit: int = 30) -> Dict[str, Any]:
     Returns:
         分析结果字典
     """
-    analyzer = ERNIEAIAnalyzer()
+    analyzer = AIAnalyzer()
     return analyzer.analyze(data_limit=data_limit)
 
 
-class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
+class ComprehensiveAnalyzer(AIAnalyzer):
     """
     综合分析器
 
@@ -844,13 +844,14 @@ class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
     def __init__(self):
         super().__init__()
         self.redis_client = None
+        # 专家分析器模块已整合到pipeline.py中,此处保留兼容性但不初始化
         self.expert_analyzer = None
 
     def _init_redis(self):
         """初始化Redis客户端"""
         try:
-            from modules.redis_client import RedisClient
-            self.redis_client = RedisClient()
+            from modules.cache import CacheClient
+            self.redis_client = CacheClient()
             if self.redis_client.is_connected():
                 logger.info('Redis客户端初始化成功')
             else:
@@ -858,14 +859,9 @@ class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
         except ImportError:
             logger.warning('无法导入Redis模块')
 
-    def _init_expert_analyzer(self):
-        """初始化专家分析器"""
-        try:
-            from modules.expert_analyzer import ExpertAnalyzer
-            self.expert_analyzer = ExpertAnalyzer()
-            logger.info('专家分析器初始化成功')
-        except ImportError:
-            logger.warning('无法导入专家分析器模块')
+    # NOTE: _init_expert_analyzer() 已被移除。
+    # 原方法尝试导入 modules.expert_analyzer 但该文件不存在。
+    # 专家分析功能已迁移到 pipeline.py 的 step1_crawl_articles_and_analyze() 中。
 
     def _build_comprehensive_prompt(self, 
                                     raw_data: Dict[str, Any],
@@ -1047,7 +1043,7 @@ class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
         logger.info('=' * 80)
 
         self._init_redis()
-        self._init_expert_analyzer()
+        # expert_analyzer已移除,专家分析功能在pipeline.py中
 
         # 1. 获取数据库历史数据
         logger.info('步骤1：获取数据库历史数据...')
@@ -1067,11 +1063,10 @@ class ComprehensiveAnalyzer(ERNIEAIAnalyzer):
                 if raw_data_list:
                     raw_data = raw_data_list[0]
 
-        # 3. 获取网络专家分析数据
+        # 3. 获取网络专家分析数据（已迁移到pipeline.py）
         logger.info('步骤3：获取网络专家分析数据...')
         expert_data = {}
-        if self.expert_analyzer:
-            expert_data = self.expert_analyzer.get_combined_expert_analysis()
+        # 专家分析已整合到pipeline的step1中,此处保留空字典兼容
 
         # 4. 获取AI初步分析数据
         logger.info('步骤4：获取AI初步分析数据...')
@@ -1182,7 +1177,7 @@ if __name__ == '__main__':
     print('排列5 AI分析模块测试')
     print('=' * 80)
 
-    analyzer = ERNIEAIAnalyzer()
+    analyzer = AIAnalyzer()
     result = analyzer.analyze(data_limit=30)
 
     if result['success']:

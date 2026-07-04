@@ -65,8 +65,8 @@ def update_data():
     logger.info('=' * 80)
 
     try:
-        from modules.spider_p5 import P5Spider
-        from modules.database_p5 import P5Database
+        from modules.data_fetcher import P5Spider
+        from modules.database import P5Database
 
         # 初始化爬虫
         spider = P5Spider()
@@ -106,7 +106,7 @@ def predict_next_issue(use_optimized=True):
 
     流程:
     1. 连接数据库，获取最近200期历史数据
-    2. 初始化OptimizedP5Predictor（统计模型+AI融合）
+    2. 初始化P5Predictor（统计模型+AI融合）
     3. 调用predict()方法执行预测
     4. 输出各位置推荐号码（Top-3）和推荐组合（Top-5）
     5. 保存预测结果JSON到 predictions/ 目录
@@ -131,9 +131,9 @@ def predict_next_issue(use_optimized=True):
     try:
         # 导入模块
         # 始终使用优化后的预测器（旧版 p5_predictor.py 已删除，功能已整合到优化版）
-        from modules.optimized_p5_predictor import OptimizedP5Predictor as Predictor
+        from modules.predictor import P5Predictor as Predictor
 
-        from modules.database_p5 import P5Database
+        from modules.database import P5Database
 
         # 连接数据库
         logger.info('连接数据库...')
@@ -144,7 +144,7 @@ def predict_next_issue(use_optimized=True):
 
         # 获取历史数据
         logger.info('加载历史数据...')
-        history_data = db.get_history_data(limit=200, order='DESC')
+        history_data = db.get_history_data(limit=200, order_by='issue DESC')
 
         if not history_data:
             logger.error('历史数据为空')
@@ -248,9 +248,9 @@ def run_backtest(mode='compare', start=50, count=50):
 
     try:
         # 导入模块
-        from modules.optimized_p5_predictor import OptimizedP5Predictor
-        from modules.backtest_engine import P5BacktestEngine
-        from modules.database_p5 import P5Database
+        from modules.predictor import P5Predictor
+        from modules.backtester import Backtester
+        from modules.database import P5Database
 
         # 初始化数据库
         logger.info('连接数据库...')
@@ -274,11 +274,11 @@ def run_backtest(mode='compare', start=50, count=50):
         logger.info('初始化预测器...')
         # 回测对比模式下，使用两个独立实例模拟"优化前"和"优化后"对比
         # 两者均为优化后的预测器，但可通过配置区分行为
-        old_predictor = OptimizedP5Predictor()
-        new_predictor = OptimizedP5Predictor()
+        old_predictor = P5Predictor()
+        new_predictor = P5Predictor()
 
         # 初始化回测引擎
-        backtest_engine = P5BacktestEngine(old_predictor, db)
+        backtest_engine = Backtester(old_predictor, db)
 
         logger.info(f'回测配置：起始位置={start}，测试期数={count}')
 
@@ -363,7 +363,7 @@ def run_ernie_ai_analysis(data_limit=30):
     执行ERNIE AI深度分析：调用百度ERNIE模型对历史数据进行AI分析
 
     流程:
-    1. 初始化ERNIEAIAnalyzer（封装Qianfan API调用）
+    1. 初始化AIAnalyzer（封装Qianfan API调用）
     2. 从数据库获取最近data_limit期历史数据
     3. 构造分析prompt，调用ERNIE模型
     4. 解析AI返回的JSON结果
@@ -380,11 +380,11 @@ def run_ernie_ai_analysis(data_limit=30):
     logger.info('=' * 80)
 
     try:
-        from modules.ernie_ai_analyzer import ERNIEAIAnalyzer
+        from modules.ai_analyzer import AIAnalyzer
 
         logger.info(f'配置参数：数据期数={data_limit}')
 
-        analyzer = ERNIEAIAnalyzer()
+        analyzer = AIAnalyzer()
         result = analyzer.analyze(data_limit=data_limit)
 
         if result['success']:
@@ -444,7 +444,7 @@ def run_comprehensive_analysis(data_limit=30):
     logger.info('=' * 80)
 
     try:
-        from modules.ernie_ai_analyzer import ComprehensiveAnalyzer
+        from modules.ai_analyzer import ComprehensiveAnalyzer
 
         logger.info(f'配置参数：数据期数={data_limit}')
 
@@ -512,8 +512,8 @@ def analyze_features():
     logger.info('=' * 80)
 
     try:
-        from modules.feature_engineering import P5FeatureEngineering
-        from modules.database_p5 import P5Database
+        from modules.features import P5Features
+        from modules.database import P5Database
 
         # 连接数据库
         logger.info('连接数据库...')
@@ -535,7 +535,7 @@ def analyze_features():
 
         # 初始化特征工程
         logger.info('初始化特征工程...')
-        fe = P5FeatureEngineering()
+        fe = P5Features()
 
         # 提取所有特征
         logger.info('开始提取特征...')
@@ -621,7 +621,7 @@ def run_article_analysis(target_issue=None, data_limit=30):
     logger.info('=' * 80)
 
     try:
-        from modules.article_analyzer import ArticleAnalyzer
+        from modules.article_handler import ArticleAnalyzer
 
         logger.info(f'配置参数：目标期号={target_issue or "最新"}, 数据期数={data_limit}')
 
@@ -699,7 +699,7 @@ def run_save_articles_to_redis(target_issue=None, max_articles=100, extract_pred
     logger.info('=' * 80)
 
     try:
-        from modules.article_analyzer import ArticleAnalyzer
+        from modules.article_handler import ArticleAnalyzer
 
         logger.info(f'配置参数：目标期号={target_issue or "全部"}, 最大文章数={max_articles}, 预测提取={extract_predictions}')
 
@@ -780,7 +780,7 @@ def run_process_article(url: str, title: str = '') -> bool:
     logger.info('=' * 80)
 
     try:
-        from modules.article_processor import ArticleProcessor
+        from modules.article_handler import ArticleProcessor
 
         logger.info(f'文章URL: {url}')
         if title:
@@ -857,7 +857,7 @@ def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int =
     logger.info('=' * 80)
 
     try:
-        from modules.four_step_pipeline import run_four_step_pipeline as pipeline_func
+        from modules.pipeline import run_four_step_pipeline as pipeline_func
 
         result = pipeline_func(target_issue=target_issue, data_limit=data_limit)
 
@@ -916,6 +916,55 @@ def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int =
         return False
 
 
+# ================================================================
+# 命中率统计
+# ================================================================
+
+def run_hit_rate_report(days: int = 30, output_file: Optional[str] = None) -> bool:
+    """
+    运行命中率统计报告
+    
+    Args:
+        days: 最近N天数据
+        output_file: 输出文件路径（可选）
+    
+    Returns:
+        是否成功
+    """
+    try:
+        logger.info(f'开始生成命中率统计报告（最近{days}天）')
+        
+        from modules.database import P5Database
+        from modules.hitrate_tracker import HitRateTracker
+        
+        db = P5Database()
+        if not db.connect():
+            logger.error('数据库连接失败')
+            return False
+        
+        tracker = HitRateTracker(db)
+        report = tracker.generate_hit_rate_report(days=days)
+        
+        # 打印到控制台
+        print('\n')
+        print(report)
+        print('\n')
+        
+        # 如果指定了输出文件，保存到文件
+        if output_file:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(report)
+            logger.info(f'命中率报告已保存到: {output_file}')
+            print(f'报告已保存到: {output_file}')
+        
+        db.disconnect()
+        return True
+        
+    except Exception as e:
+        logger.error(f'命中率统计失败: {e}', exc_info=True)
+        return False
+
+
 def run_process_multiple_articles(max_count: int = 10) -> bool:
     """
     批量处理文章：爬取→AI分析→预处理→Redis存储
@@ -936,7 +985,7 @@ def run_process_multiple_articles(max_count: int = 10) -> bool:
     logger.info('=' * 80)
 
     try:
-        from modules.article_processor import ArticleProcessor
+        from modules.article_handler import ArticleProcessor
 
         processor = ArticleProcessor()
 
@@ -1078,6 +1127,13 @@ def main():
     process_articles_parser = subparsers.add_parser('process-articles', help='批量处理文章：爬取→AI分析→预处理→Redis存储')
     process_articles_parser.add_argument('--max', type=int, default=10,
                                          help='最大处理文章数（默认10）')
+    
+    # 命中率统计命令
+    hitrate_parser = subparsers.add_parser('hitrate', help='查看历史预测命中率统计报告')
+    hitrate_parser.add_argument('--days', type=int, default=30, dest='days',
+                                help='最近N天数据（默认30天）')
+    hitrate_parser.add_argument('--output', type=str, default=None, dest='output',
+                                help='输出到文件（可选，默认仅打印到控制台）')
 
     args = parser.parse_args()
 
@@ -1112,6 +1168,8 @@ def main():
         success = run_process_article(url=args.url, title=args.title)
     elif args.command == 'process-articles':
         success = run_process_multiple_articles(max_count=args.max)
+    elif args.command == 'hitrate':
+        success = run_hit_rate_report(args.days, args.output)
     else:
         logger.error(f'未知命令：{args.command}')
         success = False

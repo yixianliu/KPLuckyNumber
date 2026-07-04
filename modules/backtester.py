@@ -36,7 +36,7 @@ os.makedirs('reports/backtest', exist_ok=True)
 logger = logging.getLogger(__name__)
 
 
-class P5BacktestEngine:
+class Backtester:
     """
     排列5回测引擎
 
@@ -58,7 +58,7 @@ class P5BacktestEngine:
     def _get_db(self):
         """获取数据库连接（懒加载）"""
         if self.db is None:
-            from modules.database_p5 import P5Database
+            from modules.database import P5Database
             self.db = P5Database()
         return self.db
 
@@ -732,10 +732,10 @@ class P5BacktestEngine:
 
 if __name__ == '__main__':
     # 测试回测引擎
-    from modules.optimized_p5_predictor import OptimizedP5Predictor
+    from modules.predictor import P5Predictor
 
-    predictor = OptimizedP5Predictor()
-    backtest_engine = P5BacktestEngine(predictor)
+    predictor = P5Predictor()
+    backtest_engine = Backtester(predictor)
 
     # 执行回测
     result = backtest_engine.run_backtest(start_index=50, test_count=50)

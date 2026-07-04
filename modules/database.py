@@ -485,8 +485,30 @@ class P5Database:
             '''
             self.cursor.execute(sql_expert_recommendation)
             
+            sql_weight_history = '''
+            CREATE TABLE IF NOT EXISTS p5_weight_history (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                algo_name VARCHAR(50) NOT NULL COMMENT '算法名称(frequency_weighted/omission_regression等)',
+                position VARCHAR(10) NOT NULL COMMENT '位置(wan/qian/bai/shi/ge/all)',
+                weight_type VARCHAR(20) NOT NULL DEFAULT 'prior' COMMENT '权重类型(prior/posterior/adaptive)',
+                number_value TINYINT NULL DEFAULT NULL COMMENT '号码值(0-9,部分位置为NULL)',
+                weight_value DECIMAL(10,6) NOT NULL COMMENT '权重值',
+                prior_probability DECIMAL(10,6) NULL DEFAULT NULL COMMENT '先验概率(贝叶斯)',
+                likelihood DECIMAL(10,6) NULL DEFAULT NULL COMMENT '似然值(贝叶斯)',
+                posterior_probability DECIMAL(10,6) NULL DEFAULT NULL COMMENT '后验概率(贝叶斯)',
+                evidence_count INT NULL DEFAULT 1 COMMENT '证据累计次数',
+                validation_result VARCHAR(20) NULL DEFAULT NULL COMMENT '验证结果(hit/miss/partial)',
+                match_count INT NULL DEFAULT 0 COMMENT '命中位数',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                INDEX idx_algo_position (algo_name, position) USING BTREE,
+                INDEX idx_created_at (created_at DESC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5算法权重历史记录表';
+            '''
+            self.cursor.execute(sql_weight_history)
+            
             self.connection.commit()
-            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐）')
+            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐、权重历史记录）')
             return True
         except Exception as e:
             logger.error(f'创建数据表失败: {e}')
@@ -2107,6 +2129,246 @@ class P5Database:
         except Exception as e:
             logger.error(f'获取专家推荐数据总数失败: {e}')
             return 0
+    
+    # ============================================================
+    # 在线学习引擎支持方法
+    # ============================================================
+    
+    def get_prediction_with_details(self, report_uuid: str, target_issue: str) -> Optional[Dict[str, Any]]:
+        """
+        获取预测记录的详细信息（供在线学习引擎使用）
+        
+        Returns:
+            预测记录字典，包含预测号码、组合等详细信息
+        """
+        try:
+            sql = '''
+            SELECT * FROM p5_prediction_record 
+            WHERE report_uuid = %s AND target_issue = %s
+            '''
+            self.cursor.execute(sql, (report_uuid, target_issue))
+            record = self.cursor.fetchone()
+            
+            if record:
+                # 解析JSON字段
+                record['predicted_numbers'] = json.loads(record['predicted_numbers']) if record.get('predicted_numbers') else {}
+                record['predicted_combinations'] = json.loads(record['predicted_combinations']) if record.get('predicted_combinations') else []
+                record['confidence_scores'] = json.loads(record['confidence_scores']) if record.get('confidence_scores') else {}
+            
+            return record
+            
+        except Exception as e:
+            logger.error(f'获取预测详情失败: {e}')
+            return None
+    
+    def get_verified_predictions(self, days: int = 30, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        获取已验证的预测记录（供学习报告生成使用）
+        
+        Args:
+            days: 查询最近N天的数据
+            limit: 返回记录数限制
+            
+        Returns:
+            预测记录列表
+        """
+        try:
+            sql = '''
+            SELECT * FROM p5_prediction_record 
+            WHERE verification_status = 'verified'
+            AND verified_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
+            ORDER BY verified_at DESC
+            LIMIT %s
+            '''
+            self.cursor.execute(sql, (days, limit))
+            return self.cursor.fetchall()
+            
+        except Exception as e:
+            logger.error(f'获取已验证预测失败: {e}')
+            return []
+    
+    def update_prediction_verification_batch(self, verification_results: List[Dict[str, Any]]) -> int:
+        """
+        批量更新预测验证结果（供在线学习引擎增量学习使用）
+        
+        Args:
+            verification_results: 验证结果列表，每项包含：
+                - report_uuid: 报告UUID
+                - target_issue: 目标期号
+                - actual_numbers: 实际号码列表
+                - match_count: 命中位数
+                
+        Returns:
+            成功更新的记录数
+        """
+        try:
+            updated_count = 0
+            for result in verification_results:
+                report_uuid = result.get('report_uuid')
+                target_issue = result.get('target_issue')
+                actual_numbers = result.get('actual_numbers', [])
+                match_count = result.get('match_count', 0)
+                
+                if report_uuid and target_issue and actual_numbers:
+                    is_matched = 1 if match_count == 5 else 0
+                    accuracy_rate = round(match_count / 5 * 100, 2)
+                    
+                    # 更新验证状态
+                    sql = '''
+                    UPDATE p5_prediction_record 
+                    SET 
+                        actual_numbers = %s,
+                        actual_issue = %s,
+                        is_matched = %s,
+                        match_count = %s,
+                        accuracy_rate = %s,
+                        verification_status = 'verified',
+                        verified_at = NOW()
+                    WHERE report_uuid = %s AND target_issue = %s
+                    '''
+                    
+                    self.cursor.execute(sql, (
+                        json.dumps(actual_numbers, ensure_ascii=False),
+                        target_issue,
+                        is_matched,
+                        match_count,
+                        accuracy_rate,
+                        report_uuid,
+                        target_issue
+                    ))
+                    
+                    if self.cursor.rowcount > 0:
+                        updated_count += 1
+            
+            self.connection.commit()
+            logger.info(f'批量更新验证结果成功: {updated_count}条')
+            return updated_count
+            
+        except Exception as e:
+            self.connection.rollback()
+            logger.error(f'批量更新验证结果失败: {e}')
+            return 0
+    
+    # ============================================================
+    # v3.0 自适应权重持久化
+    # ============================================================
+    
+    def insert_weight_history(self, algo_name, position, weight_value, weight_type='prior',
+                              number_value=None, prior_prob=None, likelihood=None,
+                              posterior_prob=None, evidence_count=1, validation_result=None,
+                              match_count=0):
+        """插入单条权重历史记录"""
+        try:
+            sql = '''
+            INSERT INTO p5_weight_history 
+            (algo_name, position, weight_type, number_value, weight_value, 
+             prior_probability, likelihood, posterior_probability, 
+             evidence_count, validation_result, match_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            '''
+            self.cursor.execute(sql, (
+                algo_name, position, weight_type, number_value, weight_value,
+                prior_prob, likelihood, posterior_prob,
+                evidence_count, validation_result, match_count
+            ))
+            self.connection.commit()
+            logger.info(f'权重历史记录插入成功: algo={algo_name}, position={position}, weight={weight_value}')
+            return self.cursor.lastrowid
+        except Exception as e:
+            self.connection.rollback()
+            logger.error(f'插入权重历史记录失败: {e}')
+            return None
+    
+    def get_weight_history(self, algo_name=None, position=None, limit=100, days=30):
+        """获取权重历史记录"""
+        try:
+            sql = 'SELECT * FROM p5_weight_history WHERE 1=1'
+            params = []
+            
+            if algo_name:
+                sql += ' AND algo_name = %s'
+                params.append(algo_name)
+            
+            if position:
+                sql += ' AND position = %s'
+                params.append(position)
+            
+            if days:
+                sql += ' AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)'
+                params.append(days)
+            
+            sql += ' ORDER BY created_at DESC LIMIT %s'
+            params.append(limit)
+            
+            self.cursor.execute(sql, params)
+            results = self.cursor.fetchall()
+            logger.info(f'查询权重历史记录: {len(results)}条')
+            return results
+        except Exception as e:
+            logger.error(f'查询权重历史记录失败: {e}')
+            return []
+    
+    def get_algorithm_performance(self, days=30):
+        """获取各算法性能统计"""
+        try:
+            sql = '''
+            SELECT algo_name, validation_result, match_count, COUNT(*) as total,
+                   AVG(match_count) as avg_match 
+            FROM p5_weight_history 
+            WHERE created_at >= DATE_SUB(NOW(), INTERVAL %s DAY) 
+            GROUP BY algo_name, validation_result
+            '''
+            self.cursor.execute(sql, (days,))
+            results = self.cursor.fetchall()
+            logger.info(f'算法性能统计查询成功: {len(results)}条')
+            return results
+        except Exception as e:
+            logger.error(f'获取算法性能统计失败: {e}')
+            return []
+    
+    def save_adaptive_weights(self, weights_json, version='v3.0'):
+        """保存当前自适应权重配置到JSON文件"""
+        try:
+            weight_dir = 'predictions'
+            os.makedirs(weight_dir, exist_ok=True)
+            filepath = os.path.join(weight_dir, 'adaptive_weights.json')
+            
+            config = {
+                'version': version,
+                'updated_at': datetime.now().isoformat(),
+                'weights': weights_json if isinstance(weights_json, dict) else json.loads(weights_json)
+            }
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f'自适应权重配置已保存: {filepath}')
+            return True
+        except Exception as e:
+            logger.error(f'保存自适应权重配置失败: {e}')
+            return False
+    
+    def load_adaptive_weights(self, version='v3.0'):
+        """加载自适应权重配置"""
+        try:
+            filepath = os.path.join('predictions', 'adaptive_weights.json')
+            
+            if not os.path.exists(filepath):
+                logger.warning(f'权重配置文件不存在: {filepath}')
+                return None
+            
+            with open(filepath, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            if config.get('version') != version:
+                logger.warning(f'权重配置版本不匹配: 期望={version}, 实际={config.get("version")}')
+                return None
+            
+            logger.info(f'自适应权重配置加载成功: version={version}')
+            return config.get('weights', {})
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f'加载自适应权重配置失败: {e}')
+            return None
 
 
 def test_database():

@@ -35,6 +35,30 @@
 - Redis key 前缀：`kpluckynumber:pl5:`（见 `D:\PythonProject\KPLuckyNumber\modules\redis_client.py::get_key_prefix`）。示例键：`kpluckynumber:pl5:raw:20260101`、`kpluckynumber:pl5:article:list`。
 - 预测器返回结构要求（保持兼容）: 字典必须包含键 `fused_probabilities`, `top_combinations`, `predict_time`, `predict_uuid`, `risk_warning`（多处代码与测试依赖这些字段）。
 
+★ 新增核心模块 (Phase 2, 2026-07-02)
+- 在线学习引擎：`D:\PythonProject\KPLuckyNumber\modules\online_learner.py`
+  - `track_prediction_result(issue, actual_numbers, prediction)`: 自动追踪预测结果
+  - `_incremental_update_weights(hit_rate, position_hits)`: 增量更新5种算法权重
+  - `generate_learning_report(days=30)`: 生成学习报告
+- Redis存储管理器：`D:\PythonProject\KPLuckyNumber\modules\redis_storage_manager.py`
+  - 统一定义所有Key命名空间 (`kpluckynumber:pl5:{module}:{identifier}`)
+  - `safe_hset(key, field, value, ttl_days)`: 安全写入（防止覆盖已有数据）
+  - `health_check()`: Redis数据健康检查
+- 增强版文章处理器：`D:\PythonProject\KPLuckyNumber\modules\enhanced_article_processor.py`
+  - `process_enhanced_article(article_data, target_issue)`: 提取软约束特征
+  - `merge_expert_constraints(expert_reports)`: 多专家软约束融合
+  - 软约束包括：奇偶倾向、大小倾向、和值偏好、热点号码、连号倾向
+- Pipeline 升级：`D:\PythonProject\KPLuckyNumber\modules\four_step_pipeline.py`
+  - 新增 `_init_redis_key_manager()`, `_init_online_learner()`, `_init_enhanced_article_processor()`
+  - 步骤1自动提取软约束特征并存入Redis
+  - 步骤4后自动注册预测记录供验证
+
+★ GUI集成 (Phase 3, 2026-07-03)
+- 新增"在线学习引擎"功能卡片：
+  - "查看学习报告" → `_execute_learning_report(task_mgr)`: 生成30天验证统计、算法权重变化、专家信誉排名
+  - "重置模型权重" → `_execute_reset_weights(task_mgr)`: 清除累积权重恢复到v2.1默认配置
+- 新增"手动验证指定期号"按钮 → `_execute_manual_verification(task_mgr)`: 弹窗输入期号和开奖号码，即时验证并触发在线学习
+
 AI 调用与结果解析要点
 - 两个模块（`optimized_p5_predictor.py` 与 `ernie_ai_analyzer.py`）通过 HTTP POST 调用 AI 模型。请求体中使用 `model` 与 `messages`（system/user）；参见 `modules/optimized_p5_predictor.py::_call_ai_model`。
 - 模型回复解析策略：从返回文本中定位并提取第一个 JSON 对象（从第一个 '{' 到匹配的 '}'），然后解析为 JSON；不要假设返回纯 JSON。若你修改解析逻辑，必须同步修改两个模块。
@@ -43,6 +67,19 @@ AI 调用与结果解析要点
 - 保持“延迟/懒加载”模式：数据库、Redis、AI 客户端通常在函数内部导入以避免导入时失败；修改时尽量保留此模式。
 - 若在 `database_p5.create_tables()` 调整 schema，务必兼容已有列与历史数据，且保持 `connect()` 的自动创建行为。
 - 抓取器（`spider_p5.py`）依赖站点特定解析规则，改动时增加稳健性（重试、延迟、断言网页结构匹配）并保留原始抓取样本以便回溯。
+
+Database 新方法 (Phase 2)
+- `get_prediction_with_details(report_uuid, target_issue)`: 获取预测详情供学习引擎
+- `get_verified_predictions(days, limit)`: 查询已验证记录
+- `update_prediction_verification_batch(results)`: 批量更新验证结果
+
+Redis Key 规范 (Phase 2)
+- `kpluckynumber:pl5:expert_report:{article_id}` — 专家报告 (7天)
+- `kpluckynumber:pl5:merged_constraints:{issue}` — 融合软约束 (7天)
+- `kpluckynumber:pl5:expert_credibility` — 专家信誉 (90天)
+- `kpluckynumber:pl5:prediction_record:{uuid}` — 验证记录 (90天)
+- `kpluckynumber:pl5:weight_history` — 模型权重历史 (1年)
+- `kpluckynumber:pl5:counter_examples:{issue}` — 反例 (60天)
 
 运行与测试
 - 安装依赖：在项目根目录运行：

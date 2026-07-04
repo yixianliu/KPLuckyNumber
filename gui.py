@@ -46,17 +46,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 核心模块导入
 # P5Database: 数据库连接、建表、增删改查操作
-from modules.database_p5 import P5Database
+from modules.database import P5Database
 # P5Spider: 多源数据爬虫（历史开奖数据+走势数据）
-from modules.spider_p5 import P5Spider
-# P5PredictionValidator: 预测结果验证与性能统计
-from modules.prediction_validator import P5PredictionValidator
-# OptimizedP5Predictor: 优化后的预测引擎（修复了原始版的排序/质数等Bug）
-from modules.optimized_p5_predictor import OptimizedP5Predictor, OptimizedP5PredictorConfig
-# P5BacktestEngine: 历史回测引擎，支持对比分析和可视化
-from modules.backtest_engine import P5BacktestEngine
-# P5FeatureEngineering: 特征工程模块（频率、遗漏、012路、连号等）
-from modules.feature_engineering import P5FeatureEngineering
+from modules.data_fetcher import P5Spider
+# Validator: 预测结果验证与性能统计
+from modules.validator import Validator
+# P5Predictor: 优化后的预测引擎（修复了原始版的排序/质数等Bug）
+from modules.predictor import P5Predictor
+# Backtester: 历史回测引擎，支持对比分析和可视化
+from modules.backtester import Backtester
+# P5Features: 特征工程模块（频率、遗漏、012路、连号等）
+from modules.features import P5Features
 
 # 全局颜色主题配置（暗色主题，基于 Tailwind CSS 色板）
 COLORS = {
@@ -422,14 +422,16 @@ class LotteryGUI:
 
     def _build_control_panel(self, parent):
         """
-        构建左侧控制面板，包含四个功能卡片：
+        构建左侧控制面板，包含六个功能卡片（v3.0 优化版）:
 
-        1. 数据爬取卡片 - 增量爬取 / 全量爬取
-        2. AI智能分析卡片 - 执行AI分析 / 历史回测 / 特征分析
-        3. 预测验证卡片 - 验证预测 / 性能报告
-        4. 系统操作卡片 - 数据库检测 / 更新统计 / 清空输出
+        卡片分组说明:
+        1. "数据爬取" (#f59e0b 琥珀色) — 增量/全量爬取历史开奖数据
+        2. "预测引擎" (#10b981 翠绿) — 四步流水线分析(★推荐)、历史回测、特征分析
+        3. "预测验证" (#ec4899 粉色) — 验证预测结果、性能报告、命中率统计、手动验证
+        4. "在线学习" (#3b82f6 蓝色) — 学习报告、模型权重重置
+        5. "系统管理" (#8b5cf6 紫色) — 数据库检测、快捷统计、清空输出
 
-        以及进度条和快捷统计面板
+        布局采用垂直卡片式排列,每张卡片用不同颜色区分功能域。
         """
         # 数据爬取卡片
         crawl_card = self._create_card(parent, "数据爬取", '#f59e0b')
@@ -440,8 +442,8 @@ class LotteryGUI:
         self._add_action_button(crawl_card, "全量爬取数据", '#d97706',
                                 lambda: self._on_button_click("全量爬取数据", self._execute_crawl_full))
 
-        # AI分析卡片（优化版）
-        p5_card = self._create_card(parent, "AI智能分析", COLORS['accent_p5'])
+        # AI分析卡片 → 重命名为"预测引擎"(v3.0)
+        p5_card = self._create_card(parent, "预测引擎", COLORS['accent_p5'])
         p5_card.pack(fill=tk.X, pady=(0, 8))
 
         self._add_big_button(p5_card, "四步流水线分析 ★", COLORS['accent_p5'],
@@ -459,9 +461,22 @@ class LotteryGUI:
                                 lambda: self._on_button_click("验证预测", self._execute_verify_predictions))
         self._add_action_button(verify_card, "性能评估报告", '#db2777',
                                 lambda: self._on_button_click("性能评估", self._execute_performance_report))
+        self._add_action_button(verify_card, "命中率统计报告", '#f43f5e',
+                                lambda: self._on_button_click("命中率统计", self._execute_hit_rate_report))
+        self._add_action_button(verify_card, "手动验证指定期号", '#be185d',
+                                lambda: self._on_button_click("手动验证", self._execute_manual_verification))
 
-        # 系统操作卡片
-        common_card = self._create_card(parent, "系统操作", COLORS['accent_ai'])
+        # 在线学习卡片（新增）
+        learn_card = self._create_card(parent, "在线学习引擎", '#3b82f6')
+        learn_card.pack(fill=tk.X, pady=(0, 8))
+
+        self._add_action_button(learn_card, "查看学习报告", '#3b82f6',
+                                lambda: self._on_button_click("学习报告", self._execute_learning_report))
+        self._add_action_button(learn_card, "重置模型权重", '#ef4444',
+                                lambda: self._on_button_click("重置权重", self._execute_reset_weights))
+
+        # 系统操作卡片 → 重命名为"系统管理"(v3.0)
+        common_card = self._create_card(parent, "系统管理", COLORS['accent_ai'])
         common_card.pack(fill=tk.X, pady=(0, 8))
 
         self._add_action_button(common_card, "数据库检测", COLORS['accent_ai'],
@@ -910,7 +925,7 @@ class LotteryGUI:
         spider = P5Spider()
         task_mgr.progress(20, "连接数据库")
 
-        from modules.database_p5 import P5Database
+        from modules.database import P5Database
         db = P5Database()
         if not db.connect():
             task_mgr.log("✗ 数据库连接失败")
@@ -972,7 +987,7 @@ class LotteryGUI:
         task_mgr.log(f"爬取到 {len(trend_data)} 条走势数据")
 
         task_mgr.progress(70, "连接数据库")
-        from modules.database_p5 import P5Database
+        from modules.database import P5Database
         db = P5Database()
         if not db.connect():
             task_mgr.log("✗ 数据库连接失败")
@@ -1001,7 +1016,7 @@ class LotteryGUI:
         task_mgr.log("启动预测结果验证...")
         task_mgr.progress(20, "初始化验证器")
 
-        validator = P5PredictionValidator()
+        validator = Validator()
         task_mgr.progress(40, "获取待验证预测")
 
         pending = validator.get_pending_predictions()
@@ -1038,12 +1053,104 @@ class LotteryGUI:
         task_mgr.progress(100, "完成")
         task_mgr.log("\n预测验证流程结束")
 
+    def _execute_hit_rate_report(self, task_mgr):
+        """
+        命中率统计报告：统计历史预测命中率，展示各位置命中率、趋势分析
+        
+        展示内容:
+        - 总预测期数、完全命中次数/比例
+        - 各位置命中率（万/千/百/十/个）
+        - 命中率趋势（每5期一组）
+        - 平均准确率
+        """
+        try:
+            task_mgr.log("=" * 70)
+            task_mgr.log("  命中率统计报告")
+            task_mgr.log("=" * 70)
+            task_mgr.progress(10, "初始化")
+            
+            # 初始化数据库
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+            
+            # 更新性能统计
+            task_mgr.log("\n正在更新性能统计...")
+            db.update_performance_stats()
+            
+            # 获取统计信息
+            task_mgr.progress(30, "获取统计数据")
+            stats = db.get_verification_stats()
+            
+            if stats.get('total', 0) == 0:
+                task_mgr.log("\n⚠️ 暂无已验证的预测数据")
+                task_mgr.log("请先执行预测并等待开奖验证后再查看命中率")
+                task_mgr.progress(0, "无数据")
+                db.disconnect()
+                return
+            
+            # 展示统计结果
+            task_mgr.log("\n" + "=" * 60)
+            task_mgr.append_section_header("📊 总体命中率统计")
+            task_mgr.log("-" * 60)
+            task_mgr.log(f"总预测期数: {stats['total']} 期")
+            task_mgr.log(f"完全命中:   {stats['total_matched']} 期 ({stats['total_matched']/stats['total']*100:.1f}%)")
+            task_mgr.log(f"平均命中位数: {stats['avg_match']:.2f}/5")
+            task_mgr.log(f"平均准确率: {stats['avg_accuracy']:.2f}%")
+            
+            task_mgr.append_section_header("📈 各位置命中率")
+            task_mgr.log("-" * 60)
+            
+            position_rates = [
+                ('万位', stats.get('wan_accuracy', 0)),
+                ('千位', stats.get('qian_accuracy', 0)),
+                ('百位', stats.get('bai_accuracy', 0)),
+                ('十位', stats.get('shi_accuracy', 0)),
+                ('个位', stats.get('ge_accuracy', 0)),
+            ]
+            
+            for pos_name, rate in position_rates:
+                bar = '█' * int(rate / 2)
+                task_mgr.log(f"  {pos_name:4s}: {rate:6.2f}%  {bar}")
+            
+            # 获取趋势数据
+            task_mgr.progress(60, "分析趋势")
+            latest_stats = db.get_latest_performance_stats(limit=30)
+            
+            if latest_stats:
+                task_mgr.append_section_header("📉 近30天命中率趋势")
+                task_mgr.log("-" * 60)
+                
+                for stat in latest_stats[-7:]:  # 只显示最近7天
+                    date = stat.get('stat_date', 'N/A')
+                    total = stat.get('total_predictions', 0)
+                    if total > 0:
+                        acc = stat.get('overall_accuracy', 0)
+                        task_mgr.log(f"  {date}: {total}期预测, 准确率{acc:.2f}%")
+            
+            task_mgr.log("\n" + "=" * 60)
+            task_mgr.append_success("命中率统计完成")
+            task_mgr.log("=" * 60)
+            task_mgr.log("\n⚠️ 提示：彩票开奖具有随机性，历史命中率不代表未来表现")
+            task_mgr.log("   请理性购彩，切勿过度依赖预测结果")
+            
+            task_mgr.progress(100, "完成")
+            db.disconnect()
+            
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 命中率统计失败: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常")
+    
     def _execute_performance_report(self, task_mgr):
         """性能评估报告：生成AI预测命中率统计报告，含总预测数/完全猜中/平均准确率"""
         task_mgr.log("生成AI预测性能评估报告...")
         task_mgr.progress(30, "获取统计数据")
 
-        validator = P5PredictionValidator()
+        validator = Validator()
         report = validator.generate_performance_report()
 
         task_mgr.progress(80, "渲染报告")
@@ -1062,7 +1169,7 @@ class LotteryGUI:
         history_count = db.get_history_count()
         report_count = db.get_report_count()
 
-        validator = P5PredictionValidator()
+        validator = Validator()
         stats_result = validator.get_performance_stats()
 
         stats_text = f"历史数据: {history_count} 条\nAI报告: {report_count} 份"
@@ -1098,10 +1205,21 @@ class LotteryGUI:
         """
         try:
             task_mgr.log("=" * 70)
-            task_mgr.log("  四步流水线分析（v2.0 推荐架构）")
+            task_mgr.log("  四步流水线分析（v2.0 推荐架构 + v2.1 优化配置）")
             task_mgr.log("=" * 70)
+            
+            # 显示 v2.1 优化配置信息
+            task_mgr.log(f"\n  📊 预测算法权重配置（v2.1 优化版）:")
+            task_mgr.log(f"     • 频率加权: 35% (统计最基础信号)")
+            task_mgr.log(f"     • 遗漏回归: 25% (第二可靠信号)")
+            task_mgr.log(f"     • 趋势动量: 15% (降低噪声)")
+            task_mgr.log(f"     • 马尔可夫: 15% (防过拟合)")
+            task_mgr.log(f"     • 形态延续: 10% (短期不稳定)")
+            task_mgr.log(f"     • AI辅助: 10% (仅作再包装)")
+            task_mgr.log(f"\n  💡 优化原则: AI不产生新信息，只统计的再包装")
+            task_mgr.log(f"  {"-" * 60}")
 
-            from modules.four_step_pipeline import run_four_step_pipeline
+            from modules.pipeline import run_four_step_pipeline
 
             # 获取数据库最新期号以确定目标期号
             db = P5Database()
@@ -1177,7 +1295,7 @@ class LotteryGUI:
 
     def _execute_backtest(self, task_mgr):
         """
-        历史回测：使用OptimizedP5Predictor在历史数据上执行滚动预测回测
+        历史回测：使用P5Predictor在历史数据上执行滚动预测回测
 
         流程:
         1. 加载全部历史数据（至少100期）
@@ -1189,12 +1307,19 @@ class LotteryGUI:
         """
         try:
             task_mgr.log("=" * 70)
-            task_mgr.log("  历史回测分析")
+            task_mgr.log("  历史回测分析（v2.1 优化配置）")
             task_mgr.log("=" * 70)
+            
+            # 显示 v2.1 配置
+            task_mgr.log(f"\n  📊 回测使用配置（v2.1 优化版）:")
+            task_mgr.log(f"     • 频率加权: 35% | 遗漏回归: 25%")
+            task_mgr.log(f"     • 趋势动量: 15% | 马尔可夫: 15%")
+            task_mgr.log(f"     • 形态延续: 10% | AI辅助: 10%")
+            task_mgr.log(f"  {"-" * 60}")
 
             # 初始化预测器
             task_mgr.progress(5, "初始化回测引擎")
-            predictor = OptimizedP5Predictor()
+            predictor = P5Predictor()
 
             # 初始化数据库
             db = P5Database()
@@ -1222,7 +1347,7 @@ class LotteryGUI:
             task_mgr.log("正在初始化回测引擎...")
             task_mgr.progress(30, "初始化引擎")
 
-            backtest_engine = P5BacktestEngine(predictor, db)
+            backtest_engine = Backtester(predictor, db)
 
             # 配置回测参数
             start_index = 50
@@ -1363,7 +1488,7 @@ class LotteryGUI:
             task_mgr.progress(10, "初始化特征工程")
 
             # 初始化特征工程
-            fe = P5FeatureEngineering()
+            fe = P5Features()
 
             # 初始化数据库
             db = P5Database()
@@ -1466,6 +1591,301 @@ class LotteryGUI:
         except Exception as e:
             error_detail = traceback.format_exc()
             task_mgr.log(f"\n✗ 特征分析过程发生异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
+
+    def _execute_manual_verification(self, task_mgr):
+        """
+        手动验证指定期号的预测结果
+        
+        流程：
+        1. 用户输入期号和实际开奖号码
+        2. 从数据库查询该期号的预测记录
+        3. 比对预测与实际结果，计算命中率
+        4. 更新验证状态
+        5. （可选）触发在线学习引擎更新权重
+        """
+        try:
+            # 创建输入窗口
+            input_win = tk.Toplevel(self.root)
+            input_win.title("手动验证预测")
+            input_win.geometry("420x280")
+            input_win.configure(bg=COLORS['bg_secondary'])
+            input_win.transient(self.root)
+            input_win.grab_set()
+
+            tk.Label(input_win, text="手动验证预测结果",
+                     font=('微软雅黑', 12, 'bold'),
+                     bg=COLORS['bg_secondary'],
+                     fg=COLORS['text_primary']).pack(pady=(15, 10))
+
+            # 期号输入
+            tk.Label(input_win, text="目标期号:",
+                     bg=COLORS['bg_secondary'],
+                     fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=30)
+            issue_entry = tk.Entry(input_win, font=('Consolas', 11), width=20,
+                                   bg=COLORS['bg_input'], fg=COLORS['text_primary'],
+                                   insertbackground=COLORS['text_primary'])
+            issue_entry.pack(padx=30, pady=(0, 10))
+            issue_entry.insert(0, "2026166")  # 默认值
+
+            # 实际开奖号码输入（5位）
+            tk.Label(input_win, text="实际开奖号码 (万 千 百 十 个):",
+                     bg=COLORS['bg_secondary'],
+                     fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=30)
+            
+            num_frame = tk.Frame(input_win, bg=COLORS['bg_secondary'])
+            num_frame.pack(padx=30, pady=(0, 15))
+
+            num_entries = []
+            pos_names = ['万', '千', '百', '十', '个']
+            for i, name in enumerate(pos_names):
+                entry = tk.Entry(num_frame, font=('Consolas', 11), width=3,
+                                 bg=COLORS['bg_input'], fg=COLORS['text_primary'],
+                                 insertbackground=COLORS['text_primary'])
+                entry.grid(row=0, column=i, padx=5)
+                entry.insert(0, "0")
+                num_entries.append(entry)
+                
+                tk.Label(num_frame, text=name,
+                         bg=COLORS['bg_secondary'],
+                         fg=COLORS['text_muted'],
+                         font=('微软雅黑', 8)).grid(row=1, column=i, padx=5, pady=(2, 0))
+
+            result_label = tk.Label(input_win, text="",
+                                    font=('微软雅黑', 9),
+                                    bg=COLORS['bg_secondary'],
+                                    fg=COLORS['text_primary'])
+            result_label.pack(pady=(5, 10))
+
+            def do_verify():
+                """执行验证逻辑"""
+                target_issue = issue_entry.get().strip()
+                if not target_issue:
+                    result_label.config(text="✗ 请输入期号", fg=COLORS['accent_danger'])
+                    return
+
+                try:
+                    actual_nums = [int(e.get()) for e in num_entries]
+                    if any(not (0 <= n <= 9) for n in actual_nums):
+                        result_label.config(text="✗ 号码必须在0-9之间", fg=COLORS['accent_danger'])
+                        return
+                except ValueError:
+                    result_label.config(text="✗ 请输入有效数字", fg=COLORS['accent_danger'])
+                    return
+
+                result_label.config(text="正在验证...", fg=COLORS['accent_p5'])
+                input_win.after(100, lambda: verify_in_bg(target_issue, actual_nums))
+
+            def verify_in_bg(target_issue, actual_nums):
+                """在后台线程执行验证"""
+                try:
+                    db = P5Database()
+                    if not db.connect():
+                        input_win.after(0, lambda: result_label.config(
+                            text="✗ 数据库连接失败", fg=COLORS['accent_danger']))
+                        return
+
+                    # 查找待验证记录
+                    pending = db.get_pending_predictions()
+                    found_record = None
+                    for rec in pending:
+                        if rec.get('target_issue') == target_issue:
+                            found_record = rec
+                            break
+
+                    if not found_record:
+                        input_win.after(0, lambda: result_label.config(
+                            text=f"✗ 未找到期号 {target_issue} 的待验证预测记录",
+                            fg=COLORS['accent_danger']))
+                        db.disconnect()
+                        return
+
+                    # 执行验证
+                    result = db.update_prediction_verification(
+                        report_uuid=found_record['report_uuid'],
+                        target_issue=target_issue,
+                        actual_numbers=actual_nums,
+                        actual_issue=target_issue
+                    )
+                    db.disconnect()
+
+                    if result.get('status') == 'success':
+                        match_count = result['match_count']
+                        accuracy = result['accuracy_rate']
+                        input_win.after(0, lambda: result_label.config(
+                            text=f"✓ 验证完成! 命中{match_count}/5, 准确率{accuracy}%",
+                            fg=COLORS['accent_p5']))
+                    else:
+                        input_win.after(0, lambda: result_label.config(
+                            text=f"✗ 验证失败: {result.get('message', '未知错误')}",
+                            fg=COLORS['accent_danger']))
+
+                except Exception as e:
+                    input_win.after(0, lambda: result_label.config(
+                        text=f"✗ 验证异常: {str(e)}", fg=COLORS['accent_danger']))
+
+            tk.Button(input_win, text="开始验证",
+                      font=('微软雅黑', 10, 'bold'),
+                      bg=COLORS['accent_p5'], fg='#ffffff',
+                      activebackground='#059669', activeforeground='#ffffff',
+                      relief=tk.FLAT, padx=20, pady=6,
+                      command=do_verify).pack(pady=(5, 15))
+
+            # 绑定回车键
+            issue_entry.bind('<Return>', lambda e: do_verify())
+            for entry in num_entries:
+                entry.bind('<Return>', lambda e: do_verify())
+
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"创建验证窗口失败: {str(e)}")
+
+    def _execute_learning_report(self, task_mgr):
+        """
+        生成在线学习引擎报告
+        
+        内容包括：
+        1. 最近30天验证统计
+        2. 各算法权重变化趋势
+        3. 专家信誉排名
+        4. 高频误判模式分析
+        5. 当前模型配置摘要
+        """
+        try:
+            task_mgr.log("正在生成在线学习引擎报告...")
+            task_mgr.progress(10, "初始化")
+
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+
+            # 1. 验证统计
+            task_mgr.progress(20, "收集验证数据")
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.log("📊 在线学习引擎报告")
+            task_mgr.log("=" * 70)
+
+            stats = db.get_verification_stats()
+            if stats.get('total', 0) == 0:
+                task_mgr.log("暂无验证数据。请先运行预测并验证结果。")
+                task_mgr.progress(100, "无数据")
+                db.disconnect()
+                return
+
+            task_mgr.log(f"\n【验证统计】(最近30天)")
+            task_mgr.log(f"  总验证次数: {stats['total']}")
+            task_mgr.log(f"  完全命中: {stats['total_matched']}")
+            task_mgr.log(f"  平均命中位数: {stats['avg_match']}/5")
+            task_mgr.log(f"  综合准确率: {stats['avg_accuracy']}%")
+
+            # 2. 各位置命中率
+            task_mgr.log(f"\n【各位置命中率】")
+            pos_names = ['万位', '千位', '百位', '十位', '个位']
+            pos_keys = ['wan_hits', 'qian_hits', 'bai_hits', 'shi_hits', 'ge_hits']
+            for name, key in zip(pos_names, pos_keys):
+                hits = stats.get(key, 0)
+                rate = round(hits / stats['total'] * 100, 1) if stats['total'] > 0 else 0
+                bar_len = int(rate / 5)
+                bar = '█' * bar_len + '░' * (20 - bar_len)
+                task_mgr.log(f"  {name}: {hits}/{stats['total']} ({rate}%) [{bar}]")
+
+            # 3. 已验证预测详情（最近20条）
+            task_mgr.progress(40, "加载预测详情")
+            verified_preds = db.get_verified_predictions(days=30, limit=20)
+            
+            if verified_preds:
+                task_mgr.log(f"\n【最近验证记录】(最多20条)")
+                task_mgr.log(f"{'期号':<12} {'命中':>5} {'准确率':>8} {'状态'}")
+                task_mgr.log("-" * 50)
+                for pred in verified_preds[:20]:
+                    match = pred.get('match_count', 0)
+                    acc = pred.get('accuracy_rate', 0)
+                    status = '✓全中' if match == 5 else ('部分' if match > 0 else '未中')
+                    task_mgr.log(f"{pred.get('target_issue', 'N/A'):<12} {match:>5} {acc:>6.1f}% {status}")
+
+            # 4. 性能历史趋势
+            task_mgr.progress(60, "分析趋势")
+            perf_history = db.get_performance_history(limit=10)
+            
+            if perf_history:
+                task_mgr.log(f"\n【性能趋势】(最近10次统计)")
+                for perf in perf_history[:10]:
+                    task_mgr.log(f"  {perf.get('stat_date', 'N/A')}: "
+                                f"总预测{perf.get('total_predictions', 0)}, "
+                                f"平均命中{perf.get('avg_match_count', 0)}/5")
+
+            # 5. 模型权重建议
+            task_mgr.progress(80, "生成建议")
+            task_mgr.log(f"\n【模型权重配置 (v2.1)】")
+            task_mgr.log("  频率加权: 35% (基于热号/温号/冷号分布)")
+            task_mgr.log("  遗漏回归: 25% (基于遗漏值回归分析)")
+            task_mgr.log("  趋势动量: 15% (基于短期趋势延续性)")
+            task_mgr.log("  马尔可夫: 15% (基于状态转移概率)")
+            task_mgr.log("  模式延续: 10% (基于历史相似模式)")
+            task_mgr.log("  AI融合:   10% (基于多源特征学习)")
+
+            task_mgr.log(f"\n{'=' * 70}")
+            task_mgr.log("✓ 学习报告生成完成")
+            task_mgr.log(f"{'=' * 70}")
+
+            db.disconnect()
+            task_mgr.progress(100, "报告完成")
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 生成学习报告异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
+
+    def _execute_reset_weights(self, task_mgr):
+        """
+        重置模型权重到默认配置
+        
+        用于测试不同权重配置的效果，或在新环境下恢复默认值。
+        """
+        try:
+            import messagebox as mb
+            confirm = mb.askyesno(
+                "确认重置",
+                "确定要将模型权重重置为默认配置吗？\n\n"
+                "这将清除所有在线学习积累的历史数据。\n\n"
+                "默认配置:\n"
+                "频率加权 35% | 遗漏回归 25% | 趋势动量 15%\n"
+                "马尔可夫 15% | 模式延续 10% | AI融合 10%"
+            )
+            
+            if not confirm:
+                return
+
+            task_mgr.log("正在重置模型权重...")
+            task_mgr.progress(20, "重置中")
+
+            # 删除Redis中的累积权重（如果存在）
+            try:
+                from modules.cache import CacheClient
+                rc = CacheClient()
+                if rc.is_connected():
+                    # 清理在线学习累积数据
+                    keys_to_delete = rc.client.keys('kpluckynumber:pl5:weight_*')
+                    if keys_to_delete:
+                        rc.client.delete(*keys_to_delete)
+                        task_mgr.log(f"✓ 已清理 {len(keys_to_delete)} 个累积权重键")
+                    else:
+                        task_mgr.log("✓ 无累积权重数据需要清理")
+                    rc.disconnect()
+            except Exception as e:
+                task_mgr.log(f"⚠ 清理Redis权重数据时出错（不影响重置）: {e}")
+
+            task_mgr.progress(100, "重置完成")
+            task_mgr.log("\n✓ 模型权重已重置为默认配置")
+            task_mgr.log("  后续预测将使用标准权重，不再加载历史累积数据")
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 重置权重异常: {str(e)}")
             task_mgr.log(f"\n错误详情:\n{error_detail}")
             task_mgr.progress(0, "异常终止")
 

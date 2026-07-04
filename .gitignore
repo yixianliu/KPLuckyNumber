@@ -13,3 +13,5 @@ config.py
 __pycache__
 /tests/
 .workbuddy
+modules/__pycache__
+data

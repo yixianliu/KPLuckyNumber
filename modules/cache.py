@@ -27,7 +27,7 @@ if not logger.handlers:
     logger.addHandler(file_handler)
 
 
-class RedisClient:
+class CacheClient:
     """
     Redis客户端封装类
 
@@ -792,14 +792,125 @@ class RedisClient:
                 logger.info(f'已清空 {len(keys)} 条数据')
             
             return True
-            
+
         except Exception as e:
             logger.error(f'清空数据失败: {e}')
             return False
 
+    # ============================================================
+    # RedisKeyManager 兼容接口
+    # ============================================================
+    
+    def safe_hset(self, key: str, field: str, value: Any, ttl_days: int = 7) -> bool:
+        """
+        安全的Hash设置（兼容RedisKeyManager接口）
+        
+        Args:
+            key: Redis Key
+            field: Hash字段
+            value: 要存储的值
+            ttl_days: 过期天数
+            
+        Returns:
+            是否成功
+        """
+        try:
+            if not self.is_connected():
+                logger.error('Redis未连接')
+                return False
+            
+            # 如果Key已存在且有数据，警告但不覆盖
+            if self.client.exists(key):
+                existing = self.client.hget(key, field)
+                if existing:
+                    logger.warning(f'Key.Field已存在，跳过写入: {key}.{field}')
+                    return False
+            
+            # 存储数据
+            self.client.hset(
+                key,
+                field,
+                json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+            )
+            
+            # 设置过期时间
+            if ttl_days:
+                self.client.expire(key, ttl_days * 86400)
+            
+            logger.info(f'数据写入成功: {key}.{field}')
+            return True
+            
+        except Exception as e:
+            logger.error(f'写入Redis失败: {e}')
+            return False
+    
+    def safe_hset_existed(self, key: str, field: str, value: Any, ttl_days: int = 7) -> bool:
+        """
+        安全的Hash设置-允许更新已存在字段（兼容RedisKeyManager接口）
+        
+        Args:
+            key: Redis Key
+            field: Hash字段
+            value: 要存储的值
+            ttl_days: 过期天数
+            
+        Returns:
+            是否成功
+        """
+        try:
+            if not self.is_connected():
+                logger.error('Redis未连接')
+                return False
+            
+            # 存储或更新字段
+            self.client.hset(
+                key,
+                field,
+                json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+            )
+            
+            # 如果Key不存在则创建并设置TTL
+            if not self.client.exists(key):
+                self.client.set(key, '')
+            
+            if ttl_days:
+                self.client.expire(key, ttl_days * 86400)
+            
+            logger.info(f'字段更新成功: {key}.{field}')
+            return True
+            
+        except Exception as e:
+            logger.error(f'更新Redis字段失败: {e}')
+            return False
+    
+    def stream_append(self, stream_key: str, data: Dict[str, Any], max_len: int = 1000) -> bool:
+        """
+        追加数据到Stream（兼容RedisKeyManager接口）
+        
+        Args:
+            stream_key: Stream的Key
+            data: 要追加的数据（字典形式）
+            max_len: Stream最大长度
+            
+        Returns:
+            是否成功
+        """
+        try:
+            if not self.is_connected():
+                logger.error('Redis未连接')
+                return False
+            
+            self.client.xadd(stream_key, data, maxlen=max_len, approximate=True)
+            logger.info(f'Stream追加成功: {stream_key}')
+            return True
+            
+        except Exception as e:
+            logger.error(f'Stream追加失败: {e}')
+            return False
+
 
 if __name__ == '__main__':
-    client = RedisClient()
+    client = CacheClient()
     if client.is_connected():
         test_data = {
             'test_key': 'test_value',
