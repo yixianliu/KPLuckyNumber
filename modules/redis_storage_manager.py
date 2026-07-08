@@ -111,9 +111,10 @@ class RedisKeyManager:
             是否成功
         """
         try:
-            # 检查Key是否已存在
-            if self.redis.client.exists(key):
-                logger.warning(f'Key已存在，跳过写入: {key}')
+            # 仅当该 field 已存在时才跳过，避免覆盖已有字段；
+            # 其余 field 仍可正常写入，防止流水线(pipeline)静默丢字段（B10）
+            if self.redis.client.hexists(key, field):
+                logger.warning(f'Field已存在，跳过写入: {key}.{field}')
                 return False
             
             # 存储数据
@@ -146,6 +147,12 @@ class RedisKeyManager:
             是否成功
         """
         try:
+            # 若 Key 已作为 string 类型存在，hset 会触发 WRONGTYPE 错误被吞；
+            # 写入前校验类型，已是 string 则先删除再写入 hash 字段（B11）
+            if self.redis.client.type(key) == 'string':
+                logger.warning(f'Key {key} 已是 string 类型，先删除再写入 hash 字段')
+                self.redis.client.delete(key)
+
             # 即使Key不存在也能安全写入（自动创建）
             self.redis.client.hset(key, field, json.dumps(value, ensure_ascii=False)
                                    if not isinstance(value, str) else value)

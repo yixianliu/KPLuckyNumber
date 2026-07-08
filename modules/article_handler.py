@@ -697,24 +697,56 @@ class ArticleHandler:
                 return result
             articles = crawl_result['articles']
             logger.info(f'成功爬取 {len(articles)} 篇文章')
-            article_data = articles[0]
             result['step1_crawl'] = True
 
-            issue = self._extract_issue_from_article(article_data, target_issue)
-            if not issue or not re.match(r'^\d{6,8}$', str(issue)):
-                result['error'] = '无法确定期号'
+            # B3 修复：原仅对 articles[0] 做AI并存储，其余文章被丢弃；
+            # 现循环对全部文章做首次AI分析并各自存储（控制限流，避免串行过慢）
+            self._init_redis()
+            if not self.redis_client or not self.redis_client.is_connected():
+                result['error'] = 'Redis客户端连接失败'
                 return result
 
-            first_ai_result = self.first_ai_analysis(article_data)
+            per_article = []  # (article_data, issue, ai_result)
+            for idx, article_data in enumerate(articles, 1):
+                art_issue = self._extract_issue_from_article(article_data, target_issue)
+                if not art_issue or not re.match(r'^\d{6,8}$', str(art_issue)):
+                    logger.warning(f'文章 {idx} 无法确定期号，跳过AI分析')
+                    continue
+                ai_res = self.first_ai_analysis(article_data)
+                per_article.append((article_data, art_issue, ai_res))
+                time.sleep(1)  # 限流，避免连续AI调用过快
+
+            if not per_article:
+                result['error'] = '没有可分析的可用文章（全部无法确定期号）'
+                return result
+
+            # 存储每篇文章（含各自AI分析）
+            for article_data, art_issue, ai_res in per_article:
+                try:
+                    url = article_data.get('url', article_data.get('link_url', ''))
+                    article_id = self.redis_client.generate_article_id(url, article_data.get('article_index', 0))
+                    store = {'issue': art_issue, 'article_id': article_id,
+                             'title': article_data.get('title', '')[:200], 'url': url,
+                             'ai_analysis': ai_res,
+                             'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                    self.redis_client.save_article_data(article_id, store, expire_days=7)
+                except Exception as e:
+                    logger.error(f'存储文章失败: {e}')
+
+            # 以首篇作为整合流程主分析（保持向后兼容）
+            main_article, main_issue, first_ai_result = per_article[0]
             if not first_ai_result:
                 result['error'] = '第一次AI分析失败'
                 return result
             result['step2_first_ai'] = True
+            issue = main_issue
 
-            redis_save_result = self.save_all_articles_to_redis(issue, articles, first_ai_result)
-            if not redis_save_result.get('success'):
-                result['error'] = f'保存到Redis失败: {redis_save_result.get("error")}'
-                return result
+            # 设置组合键，供 load_from_redis 读取（ai_analysis 取首篇，articles 保留全量）
+            combined = {'issue': main_issue, 'articles': articles,
+                        'ai_analysis': first_ai_result,
+                        'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            combined_key = self.redis_client.get_ai_analysis_key(main_issue)
+            self.redis_client.client.setex(combined_key, 86400 * 7, json.dumps(combined, ensure_ascii=False))
             result['step3_redis_save'] = True
 
             redis_data = self.load_from_redis(issue)
@@ -778,6 +810,15 @@ class ArticleHandler:
                 result['error'] = 'Redis客户端连接失败'
                 return result
 
+            # 初始化增强文章处理器用于提取预测号码（B2，纯文本提取，不调用AI）
+            enhanced_proc = None
+            if extract_predictions:
+                try:
+                    from modules.enhanced_article_processor import EnhancedArticleProcessor
+                    enhanced_proc = EnhancedArticleProcessor()
+                except Exception as e:
+                    logger.warning(f'增强文章处理器不可用，跳过预测提取: {e}')
+
             for i, article_data in enumerate(articles, 1):
                 try:
                     issue = self._extract_issue_from_article(article_data, target_issue)
@@ -796,16 +837,62 @@ class ArticleHandler:
                                       'content': clean_text, 'crawl_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     ai_analysis = self.first_ai_analysis(article_for_ai)
 
+                    # 预测数据提取（B2 修复：原 extract_predictions 形参被忽略，统计恒为0）
+                    prediction_entry = None
+                    quality_score = 0.0
+                    has_pred = False
+                    if extract_predictions and enhanced_proc is not None:
+                        try:
+                            enhanced = enhanced_proc.process_enhanced_article(
+                                {'content': clean_text, 'title': article_data.get('title', ''),
+                                 'author': article_data.get('author', '')}, issue)
+                            if enhanced and 'error' not in enhanced:
+                                recs = enhanced.get('recommendations', {}) or {}
+                                base = enhanced.get('base_analysis', {}) or {}
+                                position = recs.get('position_specific', {}) or {}
+                                direct = recs.get('direct_numbers', []) or []
+                                raw_nums = base.get('raw_numbers', []) or []
+                                has_pred = bool(position) or bool(direct) or bool(raw_nums)
+                                confs = base.get('confidences', []) or []
+                                quality_score = max(confs) if confs else 0.5
+                                if has_pred:
+                                    parts = []
+                                    for pos in ['wan', 'qian', 'bai', 'shi', 'ge']:
+                                        nums = position.get(pos, [])
+                                        if nums:
+                                            parts.append(f'{pos}:{",".join(str(n) for n in nums[:5])}')
+                                    if direct:
+                                        parts.append(f'直选:{",".join(str(n) for n in direct[:10])}')
+                                    summary = '; '.join(parts) if parts else f'提取号码 {len(raw_nums)} 组'
+                                    prediction_entry = {
+                                        'article_id': article_id,
+                                        'issue': issue,
+                                        'quality_score': round(quality_score, 2),
+                                        'prediction_summary': summary,
+                                        'recommendations': recs,
+                                    }
+                                    result['predictions'].append(prediction_entry)
+                                    result['extracted_predictions'] += 1
+                                    if quality_score >= 0.7:
+                                        result['high_quality_predictions'] += 1
+                        except Exception as ex:
+                            logger.warning(f'预测提取失败(文章 {i}): {ex}')
+
                     redis_store = {'issue': issue, 'article_id': article_id,
                                    'title': article_data.get('title', '')[:200], 'url': url,
                                    'ai_analysis': ai_analysis,
+                                   'prediction': prediction_entry,
+                                   'has_prediction': has_pred,
+                                   'quality_score': round(quality_score, 2),
                                    'save_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     save_success = self.redis_client.save_article_data(article_id, redis_store, expire_days=7)
                     if save_success:
                         result['saved_articles'] += 1
                         result['articles'].append({'article_id': article_id, 'issue': issue,
                                                    'title': article_data.get('title', '未知')[:50],
-                                                   'has_ai_analysis': ai_analysis is not None})
+                                                   'has_ai_analysis': ai_analysis is not None,
+                                                   'has_prediction': has_pred,
+                                                   'quality_score': round(quality_score, 2)})
                     else:
                         result['failed_articles'] += 1
                 except Exception as e:

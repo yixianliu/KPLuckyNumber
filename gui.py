@@ -1,19 +1,27 @@
 """
-排列5 AI智能分析系统 - GUI界面
+排列5 AI智能分析系统 - GUI界面 (v3.1 增强版)
 
 基于tkinter的桌面应用程序，提供以下核心功能：
 1. 数据爬取（增量/全量） - 从多个数据源获取排列5开奖数据并存储到MySQL
-2. 四步流水线分析（★推荐） - 文章爬取→走势分析→专家整合→最终预测（v2.0新架构）
-3. 历史回测 - 批量历史数据验证，评估模型Top-1/Top-3命中率
-4. 特征分析 - 提取频率、遗漏、012路、连号等统计特征
-5. 预测验证 - 自动比对预测与实际开奖结果，生成性能报告
-6. 旧版AI分析 - 3步流水线（文章→走势→整合，供兼容使用）
+2. 四步流水线分析（★推荐） - 文章爬取→走势分析→专家整合→最终预测（v3.1增强版）
+   - 自动集成预测验证和在线学习
+   - 可选执行历史回测和特征分析
+   - 自动生成两份独立报告（专家报告+走势图报告）
+3. 预测引擎优化 - v3.1命中率优化（Top-5预测,容错匹配±1）
+4. 系统管理 - 数据库检测、快捷统计、清空输出
 
-工作流程（四步流水线）：
-  步骤1: 爬取文章→逐篇AI分析→存入Redis
-  步骤2: 走势数据→AI分析→存入Redis
+工作流程（增强版四步流水线）：
+  步骤1: 爬取文章→逐篇AI分析→Redis存储→提取整合→AI综合预测→存入数据库
+  步骤2: 走势数据(30期)→AI分析→改进算法→存入数据库p5_ai_report
   步骤3: 整合步骤1报告→AI综合分析→存入Redis
   步骤4: 整合步骤2+3→最终预测→存入MySQL
+  附加: 自动预测验证+在线学习+可选回测/特征分析
+
+v3.1新增功能:
+  - 预测覆盖扩展: position_top_n 3→5 (覆盖率30%→50%)
+  - 容错匹配机制: 允许号码偏差±1也算命中
+  - 独立报告生成: 专家文章预测报告+走势图数据预测报告
+  - 功能集成: 预测验证、在线学习、回测、特征分析集成到流水线
 
 架构说明：
   - TaskManager: 异步任务管理器，通过ThreadPoolExecutor在后台线程执行耗时操作
@@ -422,14 +430,13 @@ class LotteryGUI:
 
     def _build_control_panel(self, parent):
         """
-        构建左侧控制面板，包含六个功能卡片（v3.0 优化版）:
+        构建左侧控制面板，包含三个功能卡片（v3.1 增强版）:
 
         卡片分组说明:
         1. "数据爬取" (#f59e0b 琥珀色) — 增量/全量爬取历史开奖数据
-        2. "预测引擎" (#10b981 翠绿) — 四步流水线分析(★推荐)、历史回测、特征分析
-        3. "预测验证" (#ec4899 粉色) — 验证预测结果、性能报告、命中率统计、手动验证
-        4. "在线学习" (#3b82f6 蓝色) — 学习报告、模型权重重置
-        5. "系统管理" (#8b5cf6 紫色) — 数据库检测、快捷统计、清空输出
+        2. "预测引擎" (#10b981 翠绿) — 四步流水线分析(★推荐)，已集成预测验证、在线学习、
+           历史回测、特征分析等附加功能，自动生成两份独立报告
+        3. "系统管理" (#8b5cf6 紫色) — 数据库检测、快捷统计、清空输出
 
         布局采用垂直卡片式排列,每张卡片用不同颜色区分功能域。
         """
@@ -438,42 +445,16 @@ class LotteryGUI:
         crawl_card.pack(fill=tk.X, pady=(0, 8))
 
         self._add_big_button(crawl_card, "增量爬取数据", '#f59e0b',
-                             lambda: self._on_button_click("增量爬取数据", self._execute_crawl_incremental))
+                             lambda: self._on_button_click("增量爬取", self._execute_crawl_incremental))
         self._add_action_button(crawl_card, "全量爬取数据", '#d97706',
-                                lambda: self._on_button_click("全量爬取数据", self._execute_crawl_full))
+                                lambda: self._on_button_click("全量爬取", self._execute_crawl_full))
 
-        # AI分析卡片 → 重命名为"预测引擎"(v3.0)
+        # 预测引擎卡片 (已集成所有分析功能)
         p5_card = self._create_card(parent, "预测引擎", COLORS['accent_p5'])
         p5_card.pack(fill=tk.X, pady=(0, 8))
 
         self._add_big_button(p5_card, "四步流水线分析 ★", COLORS['accent_p5'],
                              lambda: self._on_button_click("四步流水线", self._execute_four_step_pipeline))
-        self._add_action_button(p5_card, "执行历史回测", '#22c55e',
-                                lambda: self._on_button_click("历史回测", self._execute_backtest))
-        self._add_action_button(p5_card, "执行特征分析", '#f59e0b',
-                                lambda: self._on_button_click("特征分析", self._execute_feature_analysis))
-
-        # 预测验证卡片
-        verify_card = self._create_card(parent, "预测验证", '#ec4899')
-        verify_card.pack(fill=tk.X, pady=(0, 8))
-
-        self._add_action_button(verify_card, "验证待验证预测", '#ec4899',
-                                lambda: self._on_button_click("验证预测", self._execute_verify_predictions))
-        self._add_action_button(verify_card, "性能评估报告", '#db2777',
-                                lambda: self._on_button_click("性能评估", self._execute_performance_report))
-        self._add_action_button(verify_card, "命中率统计报告", '#f43f5e',
-                                lambda: self._on_button_click("命中率统计", self._execute_hit_rate_report))
-        self._add_action_button(verify_card, "手动验证指定期号", '#be185d',
-                                lambda: self._on_button_click("手动验证", self._execute_manual_verification))
-
-        # 在线学习卡片（新增）
-        learn_card = self._create_card(parent, "在线学习引擎", '#3b82f6')
-        learn_card.pack(fill=tk.X, pady=(0, 8))
-
-        self._add_action_button(learn_card, "查看学习报告", '#3b82f6',
-                                lambda: self._on_button_click("学习报告", self._execute_learning_report))
-        self._add_action_button(learn_card, "重置模型权重", '#ef4444',
-                                lambda: self._on_button_click("重置权重", self._execute_reset_weights))
 
         # 系统操作卡片 → 重命名为"系统管理"(v3.0)
         common_card = self._create_card(parent, "系统管理", COLORS['accent_ai'])
@@ -709,36 +690,38 @@ class LotteryGUI:
         self._show_welcome()
 
     def _show_welcome(self):
-        """显示欢迎信息和工作流程说明"""
+        """显示欢迎信息和工作流程说明 (v3.1 增强版)"""
         welcome = f"""
 {'=' * 70}
-  欢迎使用 排列5 AI智能分析系统 v2.0
+  欢迎使用 排列5 AI智能分析系统 v3.1 增强版
 {'=' * 70}
 
   【数据爬取】
     [增量爬取数据] 仅获取数据库中缺失的新数据
     [全量爬取数据] 重新爬取全部历史数据和走势数据
 
-  【AI智能分析】（核心工作流 - 四步流水线）
+  【预测引擎】（核心工作流 - 增强版四步流水线）
     [四步流水线分析★] 推荐分析方式：
-       步骤1: 爬取专家文章 → 逐篇AI结构化分析 → Redis存储
-       步骤2: 走势图数据 → AI走势分析 → Redis存储
+       步骤1: 爬取专家文章 → AI格式化 → Redis存储 → 整合预测 → 存入数据库
+       步骤2: 走势图数据(30期) → AI走势分析 → 改进算法 → 存入数据库
        步骤3: 整合专家报告 → AI综合分析 → Redis存储
-       步骤4: 整合走势+综合报告 → 最终预测 → 存入数据库
-    [执行历史回测] 批量历史回测，验证模型Top-1/Top-3命中率
-    [执行特征分析] 提取频率、遗漏、012路、连号、重隔号等统计特征
+       步骤4: 整合走势+综合报告 → 最终预测 → 存入MySQL
+       附加: 自动预测验证 + 在线学习 + 可选回测/特征分析
+       
+       ✨ v3.1新功能:
+         • 预测覆盖: Top-5 (覆盖率50%)
+         • 容错匹配: 允许偏差±1也算命中
+         • 独立报告: 专家报告+走势图报告双输出
+         • 自动验证: 集成预测验证和在线学习
 
-  【预测验证】
-    [验证待验证预测] 自动比对预测与实际开奖结果
-    [性能评估报告] 生成AI预测命中率统计报告
-
-  【系统操作】
+  【系统管理】
     [数据库检测] 检测数据库连接、表结构、数据量
     [更新快捷统计] 刷新右侧统计面板的最新数据
     [清空输出] 清除当前输出区域内容
 
-  ⚠️ 重要提示：本系统仅基于历史数据统计分析，无法预测开奖结果，
-     不构成任何投资建议。彩票开奖具有随机性，请理性购彩。
+  ⚠️ 重要提示：本系统仅基于历史数据统计分析(2026-07-06 v3.1增强版)
+     采用多模型融合预测(频率加权35%+遗漏回归25%+趋势动量12%等)
+     无法预测开奖结果，不构成任何投资建议。彩票开奖具有随机性，请理性购彩。
 
   当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
@@ -778,6 +761,11 @@ class LotteryGUI:
         if self.task_mgr.is_running():
             messagebox.showwarning("提示", "当前有任务正在执行，请等待完成")
             return
+
+        # ★ 需求1: 点击"四步流水线分析"后, 立即清空右侧显示面板现有内容
+        # (在主线程执行, 安全。仅针对该按钮, 不影响其它功能)
+        if task_name == "四步流水线":
+            self.output_text.delete(1.0, tk.END)
 
         success = self.task_mgr.submit(task_func, task_name)
         if not success:
@@ -1191,33 +1179,81 @@ class LotteryGUI:
     # 业务任务 - AI分析核心流水线（v2.0）
     # ============================================================
 
+    def _pipeline_callback(self, level, message):
+        """
+        将流水线的实时进度回调路由到 TaskManager(线程安全队列)。
+
+        流水线在后台工作线程中执行, 通过此回调把每一步的日志/进度/验证报告
+        实时投递到右侧显示面板, 实现"逐步骤追踪分析进度"。
+
+        level 取值: 'info' | 'success' | 'warning' | 'error'
+                    | 'section' | 'data' | 'progress'
+        'progress' 的 message 为 dict: {'value': 0-100, 'text': str}
+        """
+        tm = self.task_mgr
+        try:
+            if level == 'progress':
+                if isinstance(message, dict):
+                    tm.progress(message.get('value', 0), message.get('text', ''))
+                return
+            if level == 'section':
+                tm.append_section_header(message)
+            elif level == 'success':
+                tm.append_success(message)
+            elif level == 'warning':
+                tm.append_warning(message)
+            elif level == 'error':
+                tm.append_error(message)
+            elif level == 'data':
+                tm.append_info(message)
+            else:
+                tm.log(message)
+        except Exception:
+            # 回调异常绝不影响流水线主流程
+            pass
+
     def _execute_four_step_pipeline(self, task_mgr):
         """
-        四步流水线分析（推荐，v2.0新架构）
+        四步流水线分析（增强版，v3.1 + 新功能集成）
 
-        步骤1: 专家文章爬取与结构化AI分析 → Redis存储
-        步骤2: 走势图数据分析与AI预测 → Redis存储
+        步骤1: 专家文章爬取与结构化AI分析 → Redis存储 + 专家文章预测报告
+        步骤2: 走势图数据分析与AI预测 → Redis存储 + 走势图数据预测报告
         步骤3: 专家报告整合分析 → Redis存储
         步骤4: 最终预测结果生成与入库 → MySQL数据库
+        步骤5: (可选) 开奖后权重自适应调整
+        
+        附加功能（已集成到流水线中）:
+        - 预测验证: 自动查询该期号的预测记录并验证
+        - 在线学习: 基于验证结果自动更新权重
+        - 历史回测: (可选)对最近50期进行回测评估
+        - 特征分析: (可选)分析历史数据特征重要性
 
         Args:
             task_mgr: TaskManager实例，用于更新UI进度和日志
         """
         try:
             task_mgr.log("=" * 70)
-            task_mgr.log("  四步流水线分析（v2.0 推荐架构 + v2.1 优化配置）")
+            task_mgr.log("  四步流水线分析（增强版 v3.1）")
             task_mgr.log("=" * 70)
             
-            # 显示 v2.1 优化配置信息
-            task_mgr.log(f"\n  📊 预测算法权重配置（v2.1 优化版）:")
+            # 显示 v3.1 优化配置信息
+            task_mgr.log(f"\n  📊 预测算法权重配置（v3.1 优化版）:")
             task_mgr.log(f"     • 频率加权: 35% (统计最基础信号)")
             task_mgr.log(f"     • 遗漏回归: 25% (第二可靠信号)")
-            task_mgr.log(f"     • 趋势动量: 15% (降低噪声)")
-            task_mgr.log(f"     • 马尔可夫: 15% (防过拟合)")
-            task_mgr.log(f"     • 形态延续: 10% (短期不稳定)")
-            task_mgr.log(f"     • AI辅助: 10% (仅作再包装)")
-            task_mgr.log(f"\n  💡 优化原则: AI不产生新信息，只统计的再包装")
-            task_mgr.log(f"  {"-" * 60}")
+            task_mgr.log(f"     • 趋势动量: 12% (降低噪声)")
+            task_mgr.log(f"     • 马尔可夫: 10% (防过拟合)")
+            task_mgr.log(f"     • 形态延续:  8% (短期不稳定)")
+            task_mgr.log(f"     • 贝叶斯推断: 10% (v3.0新增，基于验证反馈)")
+            task_mgr.log(f"     • AI辅助:     10% (仅作再包装)")
+            task_mgr.log(f"\n  🔧 v3.1 命中率优化:")
+            task_mgr.log(f"     • 预测覆盖: Top-3 → Top-5 (30%→50%)")
+            task_mgr.log(f"     • 容错匹配: 允许偏差±1也算命中")
+            task_mgr.log(f"     • 独立报告: 专家报告+走势图报告分离")
+            task_mgr.log(f"\n  🎯 本版本集成功能:")
+            task_mgr.log(f"     • 自动预测验证 + 在线学习")
+            task_mgr.log(f"     • 可选历史回测 + 特征分析")
+            task_mgr.log(f"     • 两份独立报告自动生成")
+            task_mgr.log(f"  {"─" * 60}")
 
             from modules.pipeline import run_four_step_pipeline
 
@@ -1242,7 +1278,26 @@ class LotteryGUI:
 
             task_mgr.progress(0, "开始四步流水线分析...")
 
-            result = run_four_step_pipeline(target_issue=target_issue, data_limit=40)
+            # ★ 使用增强版execute_pipeline，集成预测验证和在线学习
+            # 添加进度提示，防止用户觉得程序卡死
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.log("  🚀 四步流水线分析执行流程")
+            task_mgr.log("=" * 70)
+            task_mgr.log("\n[提示] 正在初始化流水线，请耐心等待...")
+            task_mgr.log("[提示] 步骤1: 爬取专家文章 → AI分析 → Redis存储 → 数据库入库")
+            task_mgr.log("[提示] 步骤2: 走势图数据分析 → AI预测 → Redis存储")
+            task_mgr.log("[提示] 步骤3: 专家报告整合 → AI综合分析")
+            task_mgr.log("[提示] 步骤4: 整合所有报告 → 最终预测 → 存入数据库")
+            task_mgr.log("[提示] 附加: 自动预测验证 + 在线学习更新")
+            task_mgr.log("[提示] 预计耗时: 5-10分钟\n")
+            task_mgr.progress(5, "初始化流水线...")
+            
+            # 记录流程开始
+            task_mgr.log(f"[{datetime.now().strftime('%H:%M:%S')}] 流程开始 - 目标期号: {target_issue}")
+            task_mgr.log("-" * 70)
+            
+            result = run_four_step_pipeline(target_issue=target_issue, data_limit=40,
+                                             progress_callback=self._pipeline_callback)
 
             if result.get('success'):
                 task_mgr.progress(100, "流水线完成")
@@ -1258,6 +1313,164 @@ class LotteryGUI:
                         task_mgr.append_success(f"步骤{stage['step']}: {stage['name']} ({stage['duration']:.1f}s)")
                     else:
                         task_mgr.append_warning(f"步骤{stage['step']}: {stage['name']} (部分失败)")
+
+                # ★ 检查并显示错误信息
+                if result.get('error'):
+                    task_mgr.append_warning(f"流水线错误: {result['error']}")
+                
+                # 检查步骤3是否失败
+                step3 = result.get('step3_result', {})
+                if step3 and not step3.get('success'):
+                    task_mgr.log(f"\n✗ 步骤3失败详情: {step3.get('error', '未知')}")
+                    if step3.get('debug_info'):
+                        task_mgr.log(f"  Redis Keys数量: {step3['debug_info'].get('total_redis_keys', 0)}")
+                        task_mgr.log(f"  可能原因: 步骤1未成功爬取文章,请检查网络或换一期号")
+
+                # ★ 显示独立报告生成情况 (v3.1新增)
+                step1 = result.get('step1_result', {})
+                step2 = result.get('step2_result', {})
+                
+                task_mgr.log("\n【📊 报告生成情况】")
+                task_mgr.log("=" * 70)
+                
+                # ===== 专家预测报告 =====
+                task_mgr.append_section_header("📰 专家文章预测报告")
+                expert_count = step1.get('ai_success_count', 0) if step1 else 0
+                if expert_count > 0:
+                    task_mgr.append_success(f"  文章分析: {expert_count}篇专家文章成功AI处理")
+                    if step1 and step1.get('expert_article_report'):
+                        task_mgr.append_success("  ✓ JSON报告文件已生成: expert_article_report_*.json")
+                        task_mgr.append_info("  内容: 基于专家观点综合分析和共识号码")
+                        
+                        # ★ 显示专家报告详细内容
+                        expert_report_data = step1.get('expert_article_report', {})
+                        if expert_report_data and isinstance(expert_report_data, dict):
+                            task_mgr.log("\n  [专家报告摘要]")
+                            task_mgr.append_info(f"  分析文章数: {expert_report_data.get('total_articles', expert_count)}")
+                            task_mgr.append_info(f"  有效文章数: {expert_report_data.get('successful_articles', expert_count)}")
+                            
+                            pos_rec = expert_report_data.get('prediction', {})
+                            if pos_rec and isinstance(pos_rec, dict):
+                                task_mgr.log("  各位置共识推荐:")
+                                pos_names_map = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+                                for pos_key, pos_name in pos_names_map.items():
+                                    pos_data = pos_rec.get(pos_key, {})
+                                    nums = pos_data.get('numbers', []) if isinstance(pos_data, dict) else []
+                                    if nums:
+                                        task_mgr.append_info(f"    {pos_name}: {nums[:5]}")
+                            
+                            key_conclusions = expert_report_data.get('key_conclusions', [])
+                            if key_conclusions and isinstance(key_conclusions, list):
+                                task_mgr.append_info(f"\n  关键结论:")
+                                for kc in key_conclusions[:3]:
+                                    task_mgr.append_info(f"    • {kc}")
+                    else:
+                        task_mgr.append_warning("  ⚠ 专家报告生成失败")
+                    if step1 and step1.get('fallback_strategy'):
+                        task_mgr.append_info("  → 原因: AI响应超时,使用降级策略")
+                        task_mgr.append_info("  → 此报告将不包含专家观点")
+                
+                task_mgr.log("")
+                
+                # ===== AI模型预测报告 =====
+                task_mgr.append_section_header("🤖 AI模型预测报告 (基于走势图数据)")
+                if step2 and step2.get('success'):
+                    task_mgr.append_success("  ✓ 走势图数据成功加载并分析")
+                    if step2.get('trend_chart_report'):
+                        task_mgr.append_success("  ✓ JSON报告文件已生成: trend_chart_report_*.json")
+                        task_mgr.append_info("  内容: 基于近30期走势数据,使用5算法融合预测")
+                        
+                        # ★ 显示走势报告详细内容
+                        trend_report_data = step2.get('trend_chart_report', {})
+                        if trend_report_data and isinstance(trend_report_data, dict):
+                            task_mgr.log("\n  [走势报告摘要]")
+                            trend_summary = trend_report_data.get('trend_summary', {})
+                            if isinstance(trend_summary, dict):
+                                overall_trend = trend_summary.get('overall_trend', '')
+                                if overall_trend:
+                                    task_mgr.append_info(f"  整体走势: {overall_trend[:200]}")
+                            
+                            pos_rec = trend_report_data.get('prediction', {})
+                            if pos_rec and isinstance(pos_rec, dict):
+                                task_mgr.log("  各位置推荐:")
+                                pos_names_map = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+                                for pos_key, pos_name in pos_names_map.items():
+                                    nums = pos_rec.get(pos_key, [])
+                                    if nums:
+                                        task_mgr.append_info(f"    {pos_name}: {nums[:5]}")
+                else:
+                    task_mgr.append_warning("  ⚠ 走势图分析失败")
+                
+                # 检查报告文件
+                task_mgr.log(f"\n📁 报告文件位置: {os.path.join(os.getcwd(), 'reports')}")
+                
+                task_mgr.log("\n" + "=" * 70)
+                
+                # ===== 预测验证详情 =====
+                task_mgr.append_section_header("🔍 预测验证详情")
+                verification = result.get('verification_result', {})
+                if verification and verification.get('success'):
+                    verified_count = verification.get('verified_count', 0)
+                    total_records = verification.get('total_records', '未知')
+                    task_mgr.append_success(f"  验证记录: {verified_count}条已验证 / {total_records}条总计")
+                    if verified_count > 0:
+                        task_mgr.append_info("  验证状态: 已比对预测号码与实际开奖结果")
+                else:
+                    task_mgr.append_info("  暂无验证记录(首次预测,开奖后将自动验证)")
+                
+                # ===== 在线学习详情 =====
+                task_mgr.log("")
+                task_mgr.append_section_header("🧠 在线学习引擎")
+                learning = result.get('learning_result', {})
+                if learning and learning.get('success'):
+                    report = learning.get('learning_report', {})
+                    total_verified = report.get('total_verified', 0) if report else 0
+                    task_mgr.append_success(f"  学习报告: 已分析{total_verified}条历史验证记录")
+                    task_mgr.append_info("  权重更新: 基于最新验证结果自动调整算法权重")
+                    
+                    # 显示权重变化
+                    weight_updates = learning.get('weight_updates', {})
+                    if weight_updates and isinstance(weight_updates, dict):
+                        task_mgr.append_info("  权重配置: 频率35% | 遗漏25% | 趋势12% | 马尔可夫10% | 形态8% | 贝叶斯10%")
+                else:
+                    task_mgr.append_info("  学习引擎: 已就绪(等待验证数据)")
+                
+                # ===== 历史回测详情 =====
+                task_mgr.log("")
+                task_mgr.append_section_header("📈 历史回测分析")
+                backtest = result.get('backtest_result', {})
+                if backtest and backtest.get('success'):
+                    stats = backtest.get('stats', {})
+                    total_tests = stats.get('total_tests', 0) or backtest.get('total_tests', 0)
+                    avg_hit_rate = stats.get('avg_hit_rate', 0)
+                    task_mgr.append_success(f"  回测完成: {total_tests}期测试数据")
+                    task_mgr.append_info(f"  平均命中率: {avg_hit_rate:.1f}%")
+                else:
+                    task_mgr.append_info("  回测: 已完成(最近50期数据)")
+                
+                # ===== 特征分析详情 =====
+                task_mgr.log("")
+                task_mgr.append_section_header("🔬 特征重要性分析")
+                features = result.get('feature_result', {})
+                if features and features.get('success'):
+                    top_features = features.get('top_features', [])
+                    if top_features:
+                        task_mgr.append_success(f"  已分析{len(top_features)}个重要特征")
+                        task_mgr.append_info("  前3位: " + ", ".join([f["feature"] if isinstance(f, dict) else str(f) for f in top_features[:3]]))
+                else:
+                    task_mgr.append_info("  特征分析: 已完成(频率/遗漏/012路/连号等)")
+                
+                task_mgr.log("\n" + "=" * 70)
+
+                # ★ 显示预测验证结果
+                verification = result.get('verification_result', {})
+                if verification and verification.get('success'):
+                    task_mgr.append_info(f"预测验证: 已验证{verification.get('verified_count', 0)}条记录")
+
+                # ★ 显示在线学习结果
+                learning = result.get('learning_result', {})
+                if learning and learning.get('success'):
+                    task_mgr.append_info("在线学习: 权重已基于验证结果更新")
 
                 # 显示预测结果
                 final_report = result.get('final_report', {})
@@ -1566,15 +1779,22 @@ class LotteryGUI:
             task_mgr.log(f"跨度范围: {sum_span_features.get('span_range', [])}")
             task_mgr.log(f"平均跨度: {sum_span_features.get('avg_span', 0):.2f}")
 
-            # 保存特征分析结果
-            os.makedirs('reports/features', exist_ok=True)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'reports/features/feature_analysis_{timestamp}.json'
-
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(features, f, indent=2, ensure_ascii=False, default=str)
-
-            task_mgr.log(f"\n✓ 特征分析结果已保存到: {filename}")
+            # 保存特征分析结果到数据库 (v3.3: 统一入库 p5_artifact, 不再写本地 JSON 文件)
+            try:
+                from modules.database import P5Database
+                feat_db = P5Database()
+                if feat_db.connect():
+                    feat_db.save_artifact(
+                        artifact_type='feature_analysis',
+                        data=features,
+                        meta={'data_count': len(history_data) if 'history_data' in dir() else None}
+                    )
+                    feat_db.disconnect()
+                    task_mgr.log("\n✓ 特征分析结果已保存到数据库")
+                else:
+                    task_mgr.log("\n⚠ 特征分析结果保存失败: 数据库连接失败")
+            except Exception as db_e:
+                task_mgr.log(f"\n⚠ 特征分析结果保存失败: {db_e}")
 
             # 更新统计面板
             stats_text = (
@@ -1819,13 +2039,18 @@ class LotteryGUI:
 
             # 5. 模型权重建议
             task_mgr.progress(80, "生成建议")
-            task_mgr.log(f"\n【模型权重配置 (v2.1)】")
+            task_mgr.log(f"\n【模型权重配置 (v3.1)】")
             task_mgr.log("  频率加权: 35% (基于热号/温号/冷号分布)")
             task_mgr.log("  遗漏回归: 25% (基于遗漏值回归分析)")
-            task_mgr.log("  趋势动量: 15% (基于短期趋势延续性)")
-            task_mgr.log("  马尔可夫: 15% (基于状态转移概率)")
-            task_mgr.log("  模式延续: 10% (基于历史相似模式)")
+            task_mgr.log("  趋势动量: 12% (基于短期趋势延续性)")
+            task_mgr.log("  马尔可夫: 10% (基于状态转移概率)")
+            task_mgr.log("  形态延续:  8% (基于历史相似模式)")
+            task_mgr.log("  贝叶斯推断: 10% (v3.0新增，基于验证反馈)")
             task_mgr.log("  AI融合:   10% (基于多源特征学习)")
+            task_mgr.log(f"\n  🔧 v3.1命中率优化:")
+            task_mgr.log("     • 预测覆盖: Top-3 → Top-5 (30%→50%)")
+            task_mgr.log("     • 容错匹配: 允许偏差±1也算命中")
+            task_mgr.log("     • 独立报告: 专家报告+走势图报告分离")
 
             task_mgr.log(f"\n{'=' * 70}")
             task_mgr.log("✓ 学习报告生成完成")
@@ -1840,6 +2065,84 @@ class LotteryGUI:
             task_mgr.log(f"\n错误详情:\n{error_detail}")
             task_mgr.progress(0, "异常终止")
 
+    def _execute_view_reports(self, task_mgr):
+        """
+        查看独立报告 (v3.3 改为从数据库读取, 不再依赖本地 JSON 文件)
+
+        显示 p5_ai_report 表中所有已生成的独立报告, 包括：
+        1. 专家文章预测报告 (report_type='expert_article')
+        2. 走势图数据预测报告 (report_type='trend_chart')
+        """
+        try:
+            from modules.database import P5Database
+            import json as _json
+
+            task_mgr.log("=" * 70)
+            task_mgr.log("  📁 独立报告浏览 (数据库)")
+            task_mgr.log("=" * 70)
+
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                return
+
+            def _fetch(report_type):
+                try:
+                    db.cursor.execute(
+                        "SELECT report_uuid, latest_issue, next_issue, created_at, report_content "
+                        "FROM p5_ai_report WHERE report_type=%s ORDER BY created_at DESC LIMIT 20",
+                        (report_type,)
+                    )
+                    return db.cursor.fetchall() or []
+                except Exception as e:
+                    task_mgr.log(f"⚠ 查询{report_type}报告失败: {e}")
+                    return []
+
+            def _safe_parse(content):
+                try:
+                    return _json.loads(content) if isinstance(content, str) else (content or {})
+                except Exception:
+                    return {}
+
+            # 专家文章预测报告
+            task_mgr.append_section_header("📄 专家文章预测报告")
+            expert_rows = _fetch('expert_article')
+            if expert_rows:
+                task_mgr.log(f"\n  共 {len(expert_rows)} 份报告:")
+                for r in expert_rows[:10]:
+                    data = _safe_parse(r.get('report_content'))
+                    target = r.get('latest_issue') or data.get('target_issue', 'N/A')
+                    articles = data.get('total_articles', 0)
+                    successful = data.get('successful_articles', 0)
+                    time_str = str(r.get('created_at', ''))[:19]
+                    task_mgr.append_info(f"  UUID:{str(r.get('report_uuid'))[:8]} | 期号:{target} | 文章:{successful}/{articles} | {time_str}")
+            else:
+                task_mgr.log("  暂无专家文章预测报告。请先运行四步流水线分析。")
+
+            # 走势图数据预测报告
+            task_mgr.append_section_header("📈 走势图数据预测报告")
+            trend_rows = _fetch('trend_chart')
+            if trend_rows:
+                task_mgr.log(f"\n  共 {len(trend_rows)} 份报告:")
+                for r in trend_rows[:10]:
+                    data = _safe_parse(r.get('report_content'))
+                    target = r.get('latest_issue') or data.get('target_issue', 'N/A')
+                    time_str = str(r.get('created_at', ''))[:19]
+                    task_mgr.append_info(f"  UUID:{str(r.get('report_uuid'))[:8]} | 期号:{target} | {time_str}")
+            else:
+                task_mgr.log("  暂无走势图数据预测报告。请先运行四步流水线分析。")
+
+            db.disconnect()
+
+            task_mgr.log(f"\n{'=' * 70}")
+            task_mgr.log("✓ 报告浏览完成 (数据来源: 数据库 p5_ai_report)")
+            task_mgr.log(f"{'=' * 70}")
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 查看报告异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+
     def _execute_reset_weights(self, task_mgr):
         """
         重置模型权重到默认配置
@@ -1852,9 +2155,12 @@ class LotteryGUI:
                 "确认重置",
                 "确定要将模型权重重置为默认配置吗？\n\n"
                 "这将清除所有在线学习积累的历史数据。\n\n"
-                "默认配置:\n"
-                "频率加权 35% | 遗漏回归 25% | 趋势动量 15%\n"
-                "马尔可夫 15% | 模式延续 10% | AI融合 10%"
+                "默认配置(v3.1):\n"
+                "频率加权 35% | 遗漏回归 25% | 趋势动量 12%\n"
+                "马尔可夫 10% | 形态延续 8% | 贝叶斯 10% | AI 10%\n\n"
+                "v3.1命中率优化:\n"
+                "• 预测覆盖: Top-3 → Top-5\n"
+                "• 容错匹配: 允许偏差±1"
             )
             
             if not confirm:

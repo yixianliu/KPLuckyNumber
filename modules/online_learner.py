@@ -395,7 +395,7 @@ class OnlineLearner:
         except Exception as e:
             logger.error(f'存储追踪数据到Redis失败: {e}', exc_info=True)
     
-    def generate_learning_report(self, days: int = 30) -> Dict[str, Any]:
+    def generate_learning_report(self, target_issue: str = '', days: int = 30) -> Dict[str, Any]:
         """
         生成学习报告 - 包含模型表现、专家评估、改进建议
         
@@ -411,20 +411,43 @@ class OnlineLearner:
             
             db = P5Database()
             db.connect()
-            
+            # 使用刚建立的本地连接(而非可能已超时的外部传入连接)
+            self.db = db
+
             # 获取历史追踪数据
             recent_issues = self._get_recent_issues(days)
             
+            total_verified = len(recent_issues)
             report = {
                 'report_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'statistics_period_days': days,
-                'total_issues_tracked': len(recent_issues),
+                'total_issues_tracked': total_verified,
+                'total_verified': total_verified,
                 'model_performance': self._analyze_model_performance(recent_issues),
                 'expert_evaluation': self._evaluate_experts(recent_issues),
                 'improvement_suggestions': self._generate_suggestions(recent_issues),
                 'trend_analysis': self._analyze_trends(recent_issues)
             }
-            
+
+            # ★ 记录本次学习到p5_learning_history
+            # 注意: 必须在 db.disconnect() 之前使用本地刚建立的连接写入
+            try:
+                if db.connection:
+                    model_perf = report.get('model_performance', {})
+                    db.cursor.execute('''
+                        INSERT INTO p5_learning_history
+                        (learning_type, issue, change_reason, impact_score)
+                        VALUES ('weight_update', %s, %s, %s)
+                    ''', (
+                        target_issue,
+                        f'生成学习报告: 基于{days}天,{total_verified}期数据,全中率{model_perf.get("full_match_rate", 0)*100:.1f}%',
+                        str(total_verified)
+                    ))
+                    db.connection.commit()
+                    logger.info(f'学习记录已写入p5_learning_history表: {target_issue}')
+            except Exception as e:
+                logger.warning(f'写入学习记录失败(不影响主流程): {e}')
+
             db.disconnect()
             return report
             
@@ -435,14 +458,13 @@ class OnlineLearner:
     def _get_recent_issues(self, days: int) -> List[str]:
         """获取最近N期的目标期号"""
         try:
-            self.db.cursor.execute(
-                '''SELECT target_issue FROM p5_prediction_record 
-                   WHERE verification_status = 'verified'
-                   AND verified_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
-                   ORDER BY verified_at DESC
-                   LIMIT 50''',
-                (days,)
-            )
+            sql = '''SELECT target_issue FROM p5_prediction_record
+                     WHERE verification_status = 'verified'
+                     AND verified_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
+                     ORDER BY verified_at DESC
+                     LIMIT 50'''
+            # 使用带自动重连的查询, 避免长时运行后连接断开
+            self.db.execute_with_reconnect(sql, (days,))
             return [row['target_issue'] for row in self.db.cursor.fetchall()]
         except Exception as e:
             logger.error(f'获取近期期号失败: {e}')

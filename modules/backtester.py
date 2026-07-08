@@ -475,13 +475,23 @@ class Backtester:
         lines.append('  彩票开奖具有随机性，历史规律不代表未来趋势，请理性购彩')
         lines.append('=' * 80)
 
-        # 保存报告
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
+        report_text = '\n'.join(lines)
 
-        logger.info(f'回测报告已保存: {output_path}')
-        return output_path
+        # 持久化到数据库 (v3.3: 统一入库 p5_artifact, 不再写本地 .txt 文件)
+        try:
+            db = self._get_db()
+            if getattr(db, 'connection', None) is None:
+                db.connect()
+            db.save_artifact(
+                artifact_type='backtest_report',
+                data={'report_text': report_text, 'stats': stats, 'config': config},
+                meta={'report_kind': 'backtest'}
+            )
+            logger.info('回测报告已保存(数据库 p5_artifact)')
+        except Exception as e:
+            logger.warning(f'回测报告入库失败(非致命): {e}')
+
+        return '数据库 p5_artifact(type=backtest_report)'
 
     def generate_comparison_report(self, comparison_result: Dict[str, Any],
                                   output_path: Optional[str] = None) -> str:
@@ -621,13 +631,23 @@ class Backtester:
         lines.append('  彩票开奖具有随机性，历史规律不代表未来趋势，请理性购彩')
         lines.append('=' * 80)
 
-        # 保存报告
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
+        report_text = '\n'.join(lines)
 
-        logger.info(f'对比报告已保存: {output_path}')
-        return output_path
+        # 持久化到数据库 (v3.3: 统一入库 p5_artifact, 不再写本地 .txt 文件)
+        try:
+            db = self._get_db()
+            if getattr(db, 'connection', None) is None:
+                db.connect()
+            db.save_artifact(
+                artifact_type='backtest_report',
+                data={'report_text': report_text, 'improvements': improvements, 'config': config},
+                meta={'report_kind': 'comparison'}
+            )
+            logger.info('对比报告已保存(数据库 p5_artifact)')
+        except Exception as e:
+            logger.warning(f'对比报告入库失败(非致命): {e}')
+
+        return '数据库 p5_artifact(type=backtest_report)'
 
     def visualize_backtest_results(self, backtest_result: Dict[str, Any],
                                   output_path: Optional[str] = None) -> str:

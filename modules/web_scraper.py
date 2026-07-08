@@ -30,8 +30,10 @@ import os
 import time
 import re
 import json
+import random
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -89,12 +91,28 @@ class YDNiuSpider:
         self.max_retries = 3  # 最大重试次数
         self.retry_delay = 5  # 重试等待时间（秒）
 
+    def _get_random_user_agent(self) -> str:
+        """从随机UA池中选择一个 User-Agent，缓解反爬（B16）"""
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+        ]
+        return random.choice(user_agents)
+
     def _make_request(self, url: str, method: str = 'GET', data: Optional[Dict] = None) -> Optional[str]:
         """
-        发起HTTP请求（带重试和频率限制）
+        发起HTTP请求（带UA池、编码探测、按状态码处理的重试与频率限制）
 
         每次请求后自动sleep(request_interval)秒以确保频率控制。
-        若请求失败，等待retry_delay秒后重试，最多max_retries次。
+        - 200：返回正文
+        - 403/429：反爬/限流，退避后重试
+        - 其它4xx：客户端错误，不重试直接返回None
+        - 5xx：服务端错误，退避后重试
+        最多重试 max_retries 次。
 
         Args:
             url: 请求URL
@@ -106,24 +124,43 @@ class YDNiuSpider:
         """
         for attempt in range(self.max_retries):
             try:
+                # 每次请求随机UA，缓解固定UA反爬（B16）
+                headers = dict(self.headers)
+                headers['User-Agent'] = self._get_random_user_agent()
                 logger.info(f'请求URL: {url} (尝试 {attempt + 1}/{self.max_retries})')
 
                 if method.upper() == 'POST':
-                    response = requests.post(url, headers=self.headers, data=data, timeout=30)
+                    response = requests.post(url, headers=headers, data=data, timeout=30)
                 else:
-                    response = requests.get(url, headers=self.headers, timeout=30)
+                    response = requests.get(url, headers=headers, timeout=30)
 
-                response.raise_for_status()
+                # 探测响应编码，避免 GBK/GB2312 页面乱码（B5）
+                response.encoding = response.apparent_encoding or 'utf-8'
 
-                time.sleep(self.request_interval)
+                status = response.status_code
+                if status == 200:
+                    time.sleep(self.request_interval)
+                    return response.text
 
-                return response.text
+                # 反爬/限流：退避后重试
+                if status in (403, 429):
+                    logger.warning(f'请求被拒绝(状态码 {status})，退避后重试: {url}')
+                    time.sleep(self.retry_delay * (attempt + 1))
+                    continue
+
+                # 其它4xx客户端错误：不重试
+                if 400 <= status < 500:
+                    logger.error(f'客户端错误(状态码 {status})，停止重试: {url}')
+                    return None
+
+                # 5xx服务端错误：退避后重试
+                logger.warning(f'服务端错误(状态码 {status})，退避后重试: {url}')
+                time.sleep(self.retry_delay * (attempt + 1))
 
             except requests.exceptions.RequestException as e:
-                logger.error(f'请求失败: {e}')
+                logger.error(f'请求异常: {e}')
                 if attempt < self.max_retries - 1:
-                    logger.info(f'等待 {self.retry_delay} 秒后重试...')
-                    time.sleep(self.retry_delay)
+                    time.sleep(self.retry_delay * (attempt + 1))
 
         logger.error(f'请求{url}超过最大重试次数')
         return None
@@ -207,17 +244,23 @@ class YDNiuSpider:
         Returns:
             更新后的链接列表
         """
-        url = a_tag.get('href', '')
+        url = (a_tag.get('href') or '').strip()
         title = a_tag.get_text(strip=True)
 
         if not url or not title:
             return links
 
-        if not url.startswith('http'):
-            if url.startswith('/'):
-                url = self.base_url + url
-            else:
-                url = self.base_url + '/' + url
+        # 过滤伪链接：javascript:/mailto:/tel:/data:/纯锚点 #（B18）
+        lower = url.lower()
+        if lower.startswith(('javascript:', 'mailto:', 'tel:', 'data:', '#')):
+            return links
+
+        # 用 urljoin 补全相对路径（含协议相对 // 与 /path 形式）
+        url = urljoin(self.base_url, url)
+
+        # 仅保留 http/https 链接
+        if not urlparse(url).scheme.startswith('http'):
+            return links
 
         links.append({
             'url': url,
@@ -227,58 +270,89 @@ class YDNiuSpider:
 
         return links
 
-    def crawl_with_pagination(self, max_pages: int = 5) -> List[Dict[str, Any]]:
+    def get_next_page_url(self, current_page: int) -> str:
         """
-        分页爬取文章列表（支持自动终止）
+        返回"下一页"的 URL (实现分页导航)。
 
-        分页URL格式:
-        - 第1页: {pl5_zjtj_url}（即 https://www.ydniu.com/info/pl5/zjtj/）
-        - 第N页: {pl5_zjtj_url}index_{N}.html
+        参考页规则(https://www.ydniu.com/info/pl5/zjtj/2/):
+        分页页码作为路径段且带末尾斜杠, 即 /info/pl5/zjtj/{N}/。
+        """
+        return f'{self.pl5_zjtj_url}{current_page + 1}/'
+
+    def _build_page_urls(self, page: int) -> List[str]:
+        """
+        生成第 N 页的分页 URL。
+
+        参考页 https://www.ydniu.com/info/pl5/zjtj/2/ 的分页规则:
+        第1页为板块根路径 /info/pl5/zjtj/, 后续页码作为路径段且带末尾斜杠
+        (如 /info/pl5/zjtj/2/、/info/pl5/zjtj/3/)。与参考页保持一致。
+        调用方依次尝试, 首个能解析到链接的命名即被采用(此处仅单一正确规则)。
+        """
+        if page == 1:
+            return [self.pl5_zjtj_url]
+        return [f'{self.pl5_zjtj_url}{page}/']
+
+    def crawl_with_pagination(self, max_pages: int = 5, stop_no_new: int = 2) -> List[Dict[str, Any]]:
+        """
+        分页爬取文章列表（支持自动终止，B8 修复）
+
+        分页URL：见 _build_page_urls（多种命名依次尝试）。
 
         终止条件:
-        1. 某页爬取失败 → 停止
-        2. 某页链接少于5个 → 可能已到最后一页，停止
-        3. 达到 max_pages 页 → 停止
+        1. 连续 stop_no_new 页无新增链接 → 可能已到末页，停止
+        2. 达到 max_pages 页 → 停止
+        中页请求失败：记录日志并继续（尝试同页其它命名/下一页），不硬 break。
 
         Args:
             max_pages: 最大爬取页数（默认5页）
+            stop_no_new: 连续多少页无新增链接即停止（默认2）
 
         Returns:
             所有页面去重后的链接列表 [{url, title, crawl_time}, ...]
         """
         all_links = []
+        seen_urls = set()
+        consecutive_no_new = 0
 
         for page in range(1, max_pages + 1):
-            if page == 1:
-                url = self.pl5_zjtj_url
+            page_urls = self._build_page_urls(page)
+            page_got_new = False
+
+            for url in page_urls:
+                logger.info(f'爬取第 {page} 页: {url}')
+
+                html = self._make_request(url)
+                if not html:
+                    logger.warning(f'第 {page} 页({url})爬取失败，尝试下一命名/下一页')
+                    continue
+
+                page_links = self.parse_zx_list_links(html)
+                new_count = 0
+                for link in page_links:
+                    if link['url'] not in seen_urls:
+                        seen_urls.add(link['url'])
+                        all_links.append(link)
+                        new_count += 1
+
+                logger.info(f'第 {page} 页({url})解析到 {len(page_links)} 个链接，新增 {new_count} 个')
+
+                if new_count > 0:
+                    page_got_new = True
+                # 该命名已解析到链接，无需再尝试同页其它命名
+                if page_links:
+                    break
+
+            if page_got_new:
+                consecutive_no_new = 0
             else:
-                url = f'{self.pl5_zjtj_url}index_{page}.html'
+                consecutive_no_new += 1
+                logger.info(f'第 {page} 页无新增链接（连续 {consecutive_no_new} 页）')
+                if consecutive_no_new >= stop_no_new:
+                    logger.info(f'连续 {stop_no_new} 页无新链接，停止分页')
+                    break
 
-            logger.info(f'爬取第 {page} 页: {url}')
-
-            html = self._make_request(url)
-            if not html:
-                logger.warning(f'第 {page} 页爬取失败，停止分页')
-                break
-
-            page_links = self.parse_zx_list_links(html)
-            all_links.extend(page_links)
-            logger.info(f'第 {page} 页解析到 {len(page_links)} 个链接')
-
-            if len(page_links) < 5:
-                logger.info(f'第 {page} 页链接少于5个，可能已到最后一页')
-                break
-
-        # 去重
-        seen_urls = set()
-        unique_links = []
-        for link in all_links:
-            if link['url'] not in seen_urls:
-                seen_urls.add(link['url'])
-                unique_links.append(link)
-
-        logger.info(f'分页爬取完成，共获取 {len(unique_links)} 个唯一链接')
-        return unique_links
+        logger.info(f'分页爬取完成，共获取 {len(all_links)} 个唯一链接')
+        return all_links
 
     def filter_links_by_issue(self, links: List[Dict[str, Any]], target_issue: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -352,8 +426,25 @@ class YDNiuSpider:
         try:
             soup = BeautifulSoup(html, 'html.parser')
 
-            # 查找class为"zx_article"的元素
-            article_div = soup.find('div', class_='zx_article')
+            # 候选文章容器选择器（B6）：优先 zx_article，再兜底到语义标签/其它常见 class
+            candidate_containers = []
+            zx_div = soup.find('div', class_='zx_article')
+            if zx_div:
+                candidate_containers.append(zx_div)
+            article_tag = soup.find('article')
+            if article_tag:
+                candidate_containers.append(article_tag)
+            for cls in ['article_content', 'content_detail', 'art_content', 'news_content',
+                        'article', 'content', 'detail']:
+                for el in soup.find_all('div', class_=re.compile(cls)):
+                    candidate_containers.append(el)
+
+            # 选取正文文本最长的容器作为文章主体
+            article_div = None
+            for c in candidate_containers:
+                if len(c.get_text(strip=True)) > 100:
+                    article_div = c
+                    break
 
             if article_div:
                 # 提取标题
@@ -392,19 +483,14 @@ class YDNiuSpider:
 
                 logger.info(f'成功解析文章内容，标题: {content_data["title"][:50]}...')
             else:
-                logger.warning('未找到class为"zx_article"的元素')
-
-                # 尝试查找其他可能的文章容器
-                possible_containers = soup.find_all('div', class_=re.compile(r'article|content|detail'))
-                for container in possible_containers:
-                    text = container.get_text(strip=True)
-                    if len(text) > 100:  # 假设文章内容至少100个字符
-                        content_data['content'] = text
-                        logger.info('使用备用解析方式获取文章内容')
-                        break
+                logger.warning('未找到可用文章容器（zx_article/语义标签/class兜底均失败）')
+                # 解析失败返回 None，交由调用方计数（B6）
+                return None
 
         except Exception as e:
             logger.error(f'解析文章内容失败: {e}')
+            # 解析异常同样返回 None，避免静默返回空 dict（B6）
+            return None
 
         return content_data
 
@@ -430,6 +516,10 @@ class YDNiuSpider:
 
         # 解析文章内容
         article_data = self.parse_zx_article_content(html)
+        if not article_data:
+            logger.error(f'解析文章内容失败或无内容: {url}')
+            return None
+
         article_data['url'] = url
         article_data['crawl_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 

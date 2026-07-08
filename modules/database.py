@@ -30,6 +30,18 @@ if not logger.handlers:
     logger.addHandler(file_handler)
 
 
+def _safe_json_loads(raw):
+    """安全解析 JSON 字符串, 失败返回原字符串或 None。"""
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
+
+
 class P5Database:
     """
     排列5数据库操作类（完整版）
@@ -76,12 +88,41 @@ class P5Database:
                     database=db_name,
                     charset='utf8mb4',
                     cursorclass=pymysql.cursors.DictCursor,
-                    connect_timeout=10
+                    connect_timeout=10,
+                    read_timeout=30,
+                    write_timeout=30
                 )
                 self.cursor = self.connection.cursor()
                 logger.info('MySQL数据库连接成功（排列5）')
                 return True
             except pymysql.err.OperationalError as e:
+                error_code = e.args[0] if e.args else 0
+                
+                # 处理"MySQL server has gone away"错误(错误码2006)
+                if error_code == 2006 or "MySQL server has gone away" in str(e):
+                    logger.warning('MySQL连接已断开，尝试重连...')
+                    try:
+                        import time
+                        time.sleep(1)  # 等待1秒后重试
+                        self.connection = pymysql.connect(
+                            host=DB_CONFIG['host'],
+                            user=DB_CONFIG['user'],
+                            password=DB_CONFIG['password'],
+                            database=db_name,
+                            charset='utf8mb4',
+                            cursorclass=pymysql.cursors.DictCursor,
+                            connect_timeout=10,
+                            read_timeout=30,
+                            write_timeout=30
+                        )
+                        self.cursor = self.connection.cursor()
+                        logger.info('MySQL重连成功')
+                        return True
+                    except Exception as reconnect_error:
+                        logger.error(f'MySQL重连失败: {reconnect_error}')
+                        return False
+                
+                # 处理"Unknown database"错误
                 if "Unknown database" in str(e):
                     logger.info(f'数据库 {db_name} 不存在，尝试自动创建...')
                     conn = pymysql.connect(
@@ -119,7 +160,54 @@ class P5Database:
         """断开数据库连接"""
         if self.connection:
             self.connection.close()
-        logger.info('MySQL数据库连接已关闭')
+            logger.info('MySQL数据库连接已关闭')
+
+    def execute_with_reconnect(self, query, params=None):
+        """
+        执行SQL查询，自动处理连接超时并重连
+        
+        Args:
+            query: SQL查询语句
+            params: 查询参数
+            
+        Returns:
+            查询结果，失败返回None
+        """
+        try:
+            if params:
+                return self.cursor.execute(query, params)
+            else:
+                return self.cursor.execute(query)
+        except pymysql.err.OperationalError as e:
+            error_code = e.args[0] if e.args else 0
+            
+            # 处理"MySQL server has gone away"
+            if error_code == 2006 or "MySQL server has gone away" in str(e):
+                logger.warning('检测到连接断开，尝试重连...')
+                
+                # 关闭旧游标和连接
+                if self.cursor:
+                    try:
+                        self.cursor.close()
+                    except:
+                        pass
+                
+                # 重新连接
+                if self.connect():
+                    logger.info('重连成功，重试查询...')
+                    # 重试一次
+                    try:
+                        if params:
+                            return self.cursor.execute(query, params)
+                        else:
+                            return self.cursor.execute(query)
+                    except Exception as retry_error:
+                        logger.error(f'重连后查询仍失败: {retry_error}')
+                        return None
+                else:
+                    logger.error('重连失败')
+                    return None
+            raise
     
     def create_tables(self):
         """创建排列5数据表（完整版）"""
@@ -211,6 +299,23 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5AI分析报告表';
             '''
             self.cursor.execute(sql_ai_report)
+
+            # 安全扩展: 为 p5_ai_report 增加 report_type 列(区分 expert_article/trend_chart/final)。
+            # 由于 CREATE TABLE IF NOT EXISTS 不会给已存在的表加列, 这里用 ALTER 补齐,
+            # 忽略 "Duplicate column" (1060) 错误以兼容老表。
+            try:
+                self.cursor.execute(
+                    "ALTER TABLE p5_ai_report "
+                    "ADD COLUMN report_type VARCHAR(20) NULL DEFAULT 'final' "
+                    "COMMENT '报告类型(expert_article/trend_chart/final)'"
+                )
+                logger.info('p5_ai_report.report_type 列已添加')
+            except Exception as e:
+                err_code = getattr(e, 'args', (None,))[0]
+                if err_code == 1060:  # Duplicate column name
+                    pass
+                else:
+                    logger.warning(f'添加 report_type 列跳过(非致命): {e}')
             
             # 预测验证记录表
             sql_prediction = '''
@@ -244,6 +349,28 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5预测验证记录表';
             '''
             self.cursor.execute(sql_prediction)
+            
+            # ★ 预测验证明细记录表 (新增)
+            sql_verification_detail = '''
+            CREATE TABLE IF NOT EXISTS p5_verification_detail (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                verification_id INT NOT NULL COMMENT '关联验证记录ID(p5_prediction_record.id)',
+                issue VARCHAR(20) NOT NULL COMMENT '期号',
+                position VARCHAR(10) NOT NULL COMMENT '位置(wan/qian/bai/shi/ge)',
+                predicted_numbers TEXT NULL DEFAULT NULL COMMENT '预测号码(JSON数组)',
+                actual_number INT NULL DEFAULT NULL COMMENT '实际开奖号码',
+                is_hit TINYINT(1) NULL DEFAULT 0 COMMENT '是否命中(1=是,0=否)',
+                tolerance_hit TINYINT(1) NULL DEFAULT 0 COMMENT '容错命中(偏差±1,1=是,0=否)',
+                deviation INT NULL DEFAULT NULL COMMENT '偏差值(实际-预测)',
+                algo_name VARCHAR(50) NULL DEFAULT NULL COMMENT '算法名称',
+                confidence DECIMAL(5,4) NULL DEFAULT NULL COMMENT '置信度',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                INDEX idx_verification_id (verification_id ASC) USING BTREE,
+                INDEX idx_issue_position (issue ASC, position ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5预测验证明细记录表';
+            '''
+            self.cursor.execute(sql_verification_detail)
             
             # 预测性能统计表
             sql_performance = '''
@@ -507,8 +634,52 @@ class P5Database:
             '''
             self.cursor.execute(sql_weight_history)
             
+            # ★ 在线学习历史记录表 (新增)
+            sql_learning_history = '''
+            CREATE TABLE IF NOT EXISTS p5_learning_history (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                learning_type VARCHAR(50) NOT NULL COMMENT '学习类型(weight_update/pattern_discovery/expert_credit)',
+                issue VARCHAR(20) NULL DEFAULT NULL COMMENT '关联期号',
+                algo_name VARCHAR(50) NULL DEFAULT NULL COMMENT '算法名称',
+                position VARCHAR(10) NULL DEFAULT NULL COMMENT '位置',
+                old_value TEXT NULL DEFAULT NULL COMMENT '变更前值(JSON)',
+                new_value TEXT NULL DEFAULT NULL COMMENT '变更后值(JSON)',
+                change_reason TEXT NULL DEFAULT NULL COMMENT '变更原因',
+                confidence DECIMAL(5,4) NULL DEFAULT NULL COMMENT '置信度',
+                verified_result VARCHAR(20) NULL DEFAULT NULL COMMENT '验证结果(hit/miss/partial)',
+                impact_score DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT '影响评分(-100到100)',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                INDEX idx_learning_type (learning_type ASC) USING BTREE,
+                INDEX idx_issue (issue ASC) USING BTREE,
+                INDEX idx_created_at (created_at DESC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5在线学习历史记录表';
+            '''
+            self.cursor.execute(sql_learning_history)
+
+            # ★ 运行时产物统一存储表 (v3.3 新增)
+            # 用于替代所有运行时生成的 JSON 文件(在线学习报告/验证报告/贝叶斯结果/权重历史/
+            # 自适应权重/预测结果/特征分析/回测报告等), 统一持久化到数据库, 并保留元信息。
+            sql_artifact = '''
+            CREATE TABLE IF NOT EXISTS p5_artifact (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                artifact_type VARCHAR(40) NOT NULL COMMENT '数据类型(weight_history/adaptive_weights/prediction/feature_analysis/backtest_report/bayesian_result/learning_report/verification_report等)',
+                issue VARCHAR(20) NULL DEFAULT NULL COMMENT '关联期号',
+                ref_uuid VARCHAR(36) NULL DEFAULT NULL COMMENT '关联UUID(如report_uuid)',
+                data_json MEDIUMTEXT NOT NULL COMMENT '完整内容JSON',
+                meta_json MEDIUMTEXT NULL COMMENT '元信息JSON(来源/算法版本/数据量等)',
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP COMMENT '生成时间',
+                PRIMARY KEY (id) USING BTREE,
+                INDEX idx_type (artifact_type ASC) USING BTREE,
+                INDEX idx_issue (issue ASC) USING BTREE,
+                INDEX idx_ref (ref_uuid ASC) USING BTREE,
+                INDEX idx_created (created_at DESC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5运行时产物统一存储表';
+            '''
+            self.cursor.execute(sql_artifact)
+
             self.connection.commit()
-            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐、权重历史记录）')
+            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、验证明细、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐、权重历史、学习历史、运行时产物）')
             return True
         except Exception as e:
             logger.error(f'创建数据表失败: {e}')
@@ -602,18 +773,54 @@ class P5Database:
             logger.error(f'获取最新历史期号失败: {e}')
             return None
     
-    def get_history_data(self, limit: int = 500, order_by: str = 'issue DESC') -> List[Dict[str, Any]]:
+    def get_history_data(self, limit: int = 500, order_by: str = 'issue DESC',
+                         order: str = None) -> List[Dict[str, Any]]:
         """
         获取历史开奖数据
-        
+
         Args:
-            limit: 返回数量限制
-            order_by: 排序方式
+            limit: 返回数量限制; 为 None 时返回全部
+            order_by: 排序方式(内部固定列, 非用户输入)
+            order: 兼容旧调用, 'ASC'/'DESC' 简写, 会被转换为 order_by
         """
         try:
-            sql = f'SELECT * FROM p5_history_data WHERE is_valid = 1 ORDER BY {order_by} LIMIT %s'
-            self.cursor.execute(sql, (limit,))
-            return self.cursor.fetchall()
+            # 兼容旧调用: order='ASC' -> 'issue ASC'
+            ob = order_by
+            if order:
+                direction = 'ASC' if str(order).upper() == 'ASC' else 'DESC'
+                ob = f'issue {direction}'
+
+            sql = 'SELECT * FROM p5_history_data WHERE is_valid = 1'
+            params = []
+            if limit is not None:
+                sql += f' ORDER BY {ob} LIMIT %s'
+                params.append(limit)
+            else:
+                sql += f' ORDER BY {ob}'
+
+            # 使用带自动重连的查询, 避免长时运行后 "MySQL server has gone away"
+            self.execute_with_reconnect(sql, params if params else None)
+            rows = self.cursor.fetchall() or []
+
+            # 统一补上 numbers 字段: 数据库将号码拆分为 wan/qian/bai/shi/ge 五列,
+            # 但 features / backtester / predictor 都依赖 row['numbers'] 数组格式。
+            # 在此出口处归一化, 确保所有消费者拿到符合契约的数据
+            # (predictor 的 _normalize_history_data 对已有 numbers 的行是"保留"逻辑, 完全兼容)。
+            for row in rows:
+                if not row:
+                    continue
+                nums = row.get('numbers')
+                if isinstance(nums, list) and len(nums) == 5:
+                    continue  # 已是正确格式, 跳过
+                if all(k in row for k in ('wan', 'qian', 'bai', 'shi', 'ge')):
+                    row['numbers'] = [
+                        int(row['wan']) if row.get('wan') is not None else 0,
+                        int(row['qian']) if row.get('qian') is not None else 0,
+                        int(row['bai']) if row.get('bai') is not None else 0,
+                        int(row['shi']) if row.get('shi') is not None else 0,
+                        int(row['ge']) if row.get('ge') is not None else 0,
+                    ]
+            return rows
         except Exception as e:
             logger.error(f'获取历史数据失败: {e}')
             return []
@@ -718,8 +925,14 @@ class P5Database:
                          trend_analysis=None, probability_stats=None,
                          recommended_numbers=None, recommended_combinations=None,
                          confidence_scores=None, recommendation_reasons=None,
-                         key_conclusions=None, risk_warning=None, report_format='TEXT'):
-        """插入排列5AI分析报告"""
+                         key_conclusions=None, risk_warning=None, report_format='TEXT',
+                         report_type='final'):
+        """插入排列5AI分析报告
+
+        Args:
+            report_type: 报告类型, 用于区分 'expert_article'(专家文章预测报告) /
+                         'trend_chart'(走势图数据预测报告) / 'final'(最终预测, 默认)
+        """
         try:
             report_uuid = str(uuid.uuid4())
             report_date = datetime.now().strftime('%Y-%m-%d')
@@ -729,24 +942,57 @@ class P5Database:
                 report_date, report_uuid, data_count, latest_issue, next_issue,
                 trend_analysis, probability_stats, recommended_numbers,
                 recommended_combinations, confidence_scores, recommendation_reasons,
-                key_conclusions, risk_warning, report_content, report_format
+                key_conclusions, risk_warning, report_content, report_format, report_type
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             '''
 
-            self.cursor.execute(sql, (
+            params = (
                 report_date, report_uuid, data_count, latest_issue, next_issue,
                 trend_analysis, probability_stats, recommended_numbers,
                 recommended_combinations, confidence_scores, recommendation_reasons,
-                key_conclusions, risk_warning, report_content, report_format
-            ))
-            self.connection.commit()
-            logger.info(f'成功插入排列5AI分析报告, UUID: {report_uuid}')
+                key_conclusions, risk_warning, report_content, report_format, report_type
+            )
+
+            try:
+                self.execute_with_reconnect(sql, params)
+                self.connection.commit()
+            except Exception as e:
+                err_code = getattr(e, 'args', (None, None))[0]
+                # 1054 = Unknown column 'report_type' —— 老表尚未加该列, 运行时动态补齐
+                if err_code == 1054:
+                    self._ensure_report_type_column()
+                    self.execute_with_reconnect(sql, params)
+                    self.connection.commit()
+                else:
+                    raise
+
+            logger.info(f'成功插入排列5AI分析报告(report_type={report_type}), UUID: {report_uuid}')
             return report_uuid
         except Exception as e:
             logger.error(f'插入排列5AI分析报告失败: {e}')
             return None
+
+    def _ensure_report_type_column(self):
+        """运行时安全补齐 p5_ai_report.report_type 列(兼容老表, 幂等)。
+
+        早期版本的表没有 report_type 列, 而 create_tables 仅在初始化命令时调用,
+        流水线运行时不会触发, 故这里在插入失败时自愈式补列。
+        """
+        try:
+            self.execute_with_reconnect(
+                "ALTER TABLE p5_ai_report "
+                "ADD COLUMN report_type VARCHAR(20) NULL DEFAULT 'final' "
+                "COMMENT '报告类型(expert_article/trend_chart/final)'"
+            )
+            logger.info('p5_ai_report.report_type 列已动态补齐')
+        except Exception as e:
+            err_code = getattr(e, 'args', (None, None))[0]
+            if err_code == 1060:  # Duplicate column name, 已存在则忽略
+                pass
+            else:
+                logger.warning(f'动态补齐 report_type 列跳过(非致命): {e}')
     
     def get_latest_ai_report(self):
         """获取最新的AI分析报告"""
@@ -834,12 +1080,38 @@ class P5Database:
             # 解析预测号码
             predicted = json.loads(record['predicted_numbers'])
             
-            # 比对结果
-            wan_match = int(actual_numbers[0]) in predicted.get('wan', [])
-            qian_match = int(actual_numbers[1]) in predicted.get('qian', [])
-            bai_match = int(actual_numbers[2]) in predicted.get('bai', [])
-            shi_match = int(actual_numbers[3]) in predicted.get('shi', [])
-            ge_match = int(actual_numbers[4]) in predicted.get('ge', [])
+            # 启用容错匹配机制(v3.1优化)
+            tolerance_enabled = True  # 允许号码偏差±1也算命中
+            
+            def check_match(actual_num, pred_nums):
+                """
+                检查匹配(支持容错机制)
+                
+                规则:
+                - 严格匹配: actual_num in pred_nums
+                - 容错匹配: abs(actual_num - pred_num) <= 1
+                """
+                if not isinstance(pred_nums, list):
+                    return False
+                
+                # 先尝试严格匹配
+                if int(actual_num) in pred_nums:
+                    return True
+                
+                # 容错匹配:检查是否有号码在±1范围内
+                if tolerance_enabled:
+                    for pred_num in pred_nums:
+                        if abs(int(actual_num) - int(pred_num)) <= 1:
+                            return True
+                
+                return False
+            
+            # 比对结果(支持容错)
+            wan_match = check_match(actual_numbers[0], predicted.get('wan', []))
+            qian_match = check_match(actual_numbers[1], predicted.get('qian', []))
+            bai_match = check_match(actual_numbers[2], predicted.get('bai', []))
+            shi_match = check_match(actual_numbers[3], predicted.get('shi', []))
+            ge_match = check_match(actual_numbers[4], predicted.get('ge', []))
             
             match_count = sum([wan_match, qian_match, bai_match, shi_match, ge_match])
             is_matched = 1 if match_count == 5 else 0
@@ -859,6 +1131,38 @@ class P5Database:
                 if not match_details[pos]['matched']:
                     pred_nums = predicted.get(pos, [])
                     deviation.append(f"{pos}: 预测{pred_nums} vs 实际{actual_numbers[i]}")
+            
+            # 写入p5_verification_detail表(每位置一条记录)
+            for i, pos in enumerate(positions):
+                actual_num = actual_numbers[i]
+                pred_nums = predicted.get(pos, [])
+                matched = wan_match if pos == 'wan' else qian_match if pos == 'qian' else bai_match if pos == 'bai' else shi_match if pos == 'shi' else ge_match
+                
+                # 计算容错命中和偏差
+                tolerance_hit = 0
+                dev_val = None
+                if not matched and tolerance_enabled and pred_nums:
+                    min_diff = min(abs(actual_num - int(p)) for p in pred_nums)
+                    if min_diff == 1:
+                        tolerance_hit = 1
+                        dev_val = actual_num - int(pred_nums[0])
+                
+                # 获取置信度(简化处理)
+                confidence = 0.0
+                
+                self.cursor.execute('''
+                    INSERT INTO p5_verification_detail 
+                    (verification_id, issue, position, predicted_numbers, actual_number, 
+                     is_hit, tolerance_hit, deviation, confidence)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (
+                    record['id'], target_issue, pos,
+                    json.dumps(pred_nums, ensure_ascii=False), actual_num,
+                    1 if matched else 0, tolerance_hit, dev_val, confidence
+                ))
+            
+            self.connection.commit()
+            logger.info(f'验证详情已写入p5_verification_detail表: 期号{target_issue}')
             
             sql = '''
             UPDATE p5_prediction_record SET
@@ -2327,48 +2631,152 @@ class P5Database:
             return []
     
     def save_adaptive_weights(self, weights_json, version='v3.0'):
-        """保存当前自适应权重配置到JSON文件"""
+        """保存当前自适应权重配置到数据库 p5_artifact(type='adaptive_weights') (v3.3 起替代本地文件)"""
         try:
-            weight_dir = 'predictions'
-            os.makedirs(weight_dir, exist_ok=True)
-            filepath = os.path.join(weight_dir, 'adaptive_weights.json')
-            
             config = {
                 'version': version,
                 'updated_at': datetime.now().isoformat(),
                 'weights': weights_json if isinstance(weights_json, dict) else json.loads(weights_json)
             }
-            
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-            
-            logger.info(f'自适应权重配置已保存: {filepath}')
-            return True
+            ok = self.save_artifact('adaptive_weights', config, meta={'version': version})
+            if ok:
+                logger.info(f'自适应权重配置已保存(数据库): version={version}')
+            return ok
         except Exception as e:
             logger.error(f'保存自适应权重配置失败: {e}')
             return False
     
     def load_adaptive_weights(self, version='v3.0'):
-        """加载自适应权重配置"""
+        """加载自适应权重配置 (v3.3: 优先从数据库 p5_artifact 读取, 不再依赖本地文件)"""
         try:
-            filepath = os.path.join('predictions', 'adaptive_weights.json')
-            
-            if not os.path.exists(filepath):
-                logger.warning(f'权重配置文件不存在: {filepath}')
+            artifact = self.get_latest_artifact('adaptive_weights')
+            if not artifact:
+                logger.warning('数据库无常权重配置记录')
                 return None
-            
-            with open(filepath, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            
-            if config.get('version') != version:
-                logger.warning(f'权重配置版本不匹配: 期望={version}, 实际={config.get("version")}')
+            data = artifact.get('data') or {}
+            if data.get('version') != version:
+                logger.warning(f'权重配置版本不匹配: 期望={version}, 实际={data.get("version")}')
                 return None
-            
             logger.info(f'自适应权重配置加载成功: version={version}')
-            return config.get('weights', {})
-        except (json.JSONDecodeError, IOError) as e:
+            return data.get('weights', {})
+        except Exception as e:
             logger.error(f'加载自适应权重配置失败: {e}')
             return None
+
+    # ============================================================
+    # 运行时产物统一存储 (v3.3 新增, 替代所有运行时 JSON 文件)
+    # ============================================================
+
+    def save_artifact(self, artifact_type: str, data: Any, issue: str = None,
+                      ref_uuid: str = None, meta: Dict[str, Any] = None) -> bool:
+        """
+        统一持久化运行时产物到 p5_artifact 表(替代原先写入磁盘的 JSON 文件)。
+
+        Args:
+            artifact_type: 数据类型, 如 'weight_history'/'adaptive_weights'/'prediction'/
+                           'feature_analysis'/'backtest_report'/'bayesian_result'/
+                           'learning_report'/'verification_report'
+            data: 完整内容(dict/list/可序列化对象)
+            issue: 关联期号(可选)
+            ref_uuid: 关联UUID(可选, 如 report_uuid)
+            meta: 元信息(dict, 如来源/算法版本/数据量)
+        Returns:
+            是否保存成功
+        """
+        try:
+            data_json = json.dumps(data, ensure_ascii=False, default=str)
+            meta_json = json.dumps(meta, ensure_ascii=False, default=str) if meta is not None else None
+            sql = (
+                'INSERT INTO p5_artifact (artifact_type, issue, ref_uuid, data_json, meta_json) '
+                'VALUES (%s, %s, %s, %s, %s)'
+            )
+            params = (artifact_type, issue, ref_uuid, data_json, meta_json)
+            try:
+                self.execute_with_reconnect(sql, params)
+                self.connection.commit()
+            except Exception as e:
+                err_code = getattr(e, 'args', (None, None))[0]
+                if err_code == 1146:  # Table doesn't exist
+                    self._ensure_artifact_table()
+                    self.execute_with_reconnect(sql, params)
+                    self.connection.commit()
+                else:
+                    raise
+            return True
+        except Exception as e:
+            logger.error(f'保存产物失败(type={artifact_type}): {e}')
+            return False
+
+    def _ensure_artifact_table(self):
+        """运行时安全补齐 p5_artifact 表(幂等, 兼容未执行 create_tables 的旧库)。"""
+        try:
+            self.execute_with_reconnect('''
+            CREATE TABLE IF NOT EXISTS p5_artifact (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                artifact_type VARCHAR(40) NOT NULL,
+                issue VARCHAR(20) NULL DEFAULT NULL,
+                ref_uuid VARCHAR(36) NULL DEFAULT NULL,
+                data_json MEDIUMTEXT NOT NULL,
+                meta_json MEDIUMTEXT NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id) USING BTREE,
+                INDEX idx_type (artifact_type ASC) USING BTREE,
+                INDEX idx_issue (issue ASC) USING BTREE,
+                INDEX idx_ref (ref_uuid ASC) USING BTREE,
+                INDEX idx_created (created_at DESC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5运行时产物统一存储表'
+            ''')
+        except Exception as e:
+            logger.warning(f'补齐 p5_artifact 表失败(非致命): {e}')
+
+    def get_artifacts(self, artifact_type: str = None, issue: str = None,
+                      ref_uuid: str = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        查询运行时产物(按生成时间倒序)。
+
+        Returns: [{id, artifact_type, issue, ref_uuid, created_at, data, meta}, ...]
+        """
+        try:
+            conds = []
+            params = []
+            if artifact_type:
+                conds.append('artifact_type = %s')
+                params.append(artifact_type)
+            if issue:
+                conds.append('issue = %s')
+                params.append(issue)
+            if ref_uuid:
+                conds.append('ref_uuid = %s')
+                params.append(ref_uuid)
+            where = (' WHERE ' + ' AND '.join(conds)) if conds else ''
+            sql = (
+                'SELECT id, artifact_type, issue, ref_uuid, data_json, meta_json, created_at '
+                f'FROM p5_artifact{where} ORDER BY created_at DESC LIMIT %s'
+            )
+            params.append(limit)
+            self.execute_with_reconnect(sql, params)
+            rows = self.cursor.fetchall()
+            result = []
+            for r in rows:
+                result.append({
+                    'id': r.get('id'),
+                    'artifact_type': r.get('artifact_type'),
+                    'issue': r.get('issue'),
+                    'ref_uuid': r.get('ref_uuid'),
+                    'created_at': r.get('created_at'),
+                    'data': _safe_json_loads(r.get('data_json')),
+                    'meta': _safe_json_loads(r.get('meta_json')),
+                })
+            return result
+        except Exception as e:
+            logger.error(f'查询产物失败: {e}')
+            return []
+
+    def get_latest_artifact(self, artifact_type: str, issue: str = None,
+                            ref_uuid: str = None) -> Optional[Dict[str, Any]]:
+        """获取指定类型最新一条产物, 无则返回 None。"""
+        items = self.get_artifacts(artifact_type=artifact_type, issue=issue, ref_uuid=ref_uuid, limit=1)
+        return items[0] if items else None
 
 
 def test_database():

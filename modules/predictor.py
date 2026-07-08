@@ -55,6 +55,7 @@ import logging
 import os
 import json
 import math
+import time
 import uuid
 import copy
 from collections import defaultdict, Counter
@@ -63,6 +64,8 @@ from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # 确保日志和报告目录存在
 os.makedirs('logs', exist_ok=True)
@@ -152,6 +155,20 @@ class AdaptiveWeightManager:
         return adaptive_weights
 
 
+    def load_from_records(self, records: List[Dict]):
+        """
+        从验证记录回放,恢复EWMA状态(实现跨进程持久化)
+
+        历史记录保存在 predictions/weights_history.json,
+        每条含 algo_evaluations(各算法命中率)。回放这些记录可让
+        自适应权重在多次运行间累积学习成果,而非每进程重置。
+        """
+        for r in records:
+            evals = r.get('algo_evaluations', {})
+            for algo, hit in evals.items():
+                if algo in self.algo_hit_rates and isinstance(hit, (int, float)):
+                    self.record_verification(algo, float(hit))
+
 class P5PredictorConfig:
     """
     排列5预测器配置类
@@ -235,13 +252,24 @@ class P5PredictorConfig:
                     'penalize_miss': 0.85,     # 未命中惩罚系数
                     'reward_hit': 1.15,        # 命中奖励系数
                 }
+            },
+            'feature_engineering': {
+                'enabled': True,
+                'weight': 0.10,  # 特征工程(连号/重号/012路)融合信号
+                'params': {
+                    'freq_weight': 0.30,
+                    'omission_weight': 0.25,
+                    'road_weight': 0.15,
+                    'repeat_weight': 0.15,
+                    'consecutive_weight': 0.15,
+                }
             }
         },
         'global': {
             'hot_threshold_percentile': 70,
             'cold_threshold_percentile': 30,
             'combination_count': 10,
-            'position_top_n': 3,
+            'position_top_n': 6,  # v3.2优化: 从5扩大到6,覆盖率提升至60%
             'probability_calibration': True,
             'min_data_required': 30,
             'enable_feature_engineering': True,
@@ -259,6 +287,7 @@ class P5PredictorConfig:
             'span_max': 8,           # 新增:跨度上限
             'odd_even_tolerance': 0.4,  # 新增:奇偶比容忍度
             'sum_of_squares_penalty': True,  # 新增:方差惩罚
+            'tolerance_matching': True,  # v3.1新增:启用容错匹配(偏差±1也算命中)
         }
     }
 
@@ -326,11 +355,13 @@ class P5PredictorConfig:
             if cfg.get('enabled', False):
                 w = cfg.get('weight', 0)
                 # 如果启用自适应权重,基于历史命中率微调
+                ewma = 0.0
                 if enable_adaptive and hasattr(self, 'weight_manager'):
                     ewma = self.weight_manager.algo_hit_rates.get(name, {}).get('ewma', 0)
-                    if ewma > 0:
-                        # 混合原始权重和历史表现
-                        w = 0.7 * w + 0.3 * ewma * total
+                if ewma > 0:
+                    # 混合原始权重和历史表现(EWMA)
+                    # 注意: 不再乘 total——total 是累计未归一化和,会导致后加入的算法权重被错误放大
+                    w = 0.7 * w + 0.3 * ewma
                 weights[name] = w
                 total += w
                 
@@ -382,6 +413,14 @@ class P5Predictor:
         # 延迟加载特征工程
         self._feature_engineering = None
 
+        # 跨进程恢复自适应权重(EWMA):从验证记录回放,避免每进程重置
+        try:
+            records = self._load_verification_records()
+            if records:
+                self.config.weight_manager.load_from_records(records)
+        except Exception:
+            pass
+
         # AI模型配置
         self._init_ai_config()
 
@@ -390,7 +429,7 @@ class P5Predictor:
         if self._feature_engineering is None and self.config.get_global_param('enable_feature_engineering'):
             # 延迟导入特征工程模块以避免在导入阶段出现依赖错误（延迟/懒加载模式）
             from modules.features import P5Features
-            self._feature_engineering = P5FeatureEngineering()
+            self._feature_engineering = P5Features()
         return self._feature_engineering
 
     def _init_ai_config(self):
@@ -514,29 +553,59 @@ class P5Predictor:
         #       便于统一管理和解析。response_format 期望返回JSON对象，但服务端常常返回带杂讯的文本，
         #       因此后续需使用 _parse_ai_response 做容错解析。
 
-        try:
-            response = requests.request("POST", self.api_url, headers=self.headers, data=payload)
-            response.raise_for_status()
+        # 构建带自动重试的 Session, 应对 SSL EOF / 连接中断等瞬时错误
+        session = self._build_ai_session()
 
-            result = response.json()
+        last_err = None
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                response = session.request(
+                    "POST", self.api_url, headers=self.headers, data=payload, timeout=60
+                )
+                response.raise_for_status()
 
-            if 'choices' in result and len(result['choices']) > 0:
-                content = result['choices'][0]['message']['content']
-                logger.info(f'AI模型调用成功，返回长度: {len(content)}')
-                return content
+                result = response.json()
 
-            logger.error(f'AI模型返回格式异常: {result}')
-            return None
+                if 'choices' in result and len(result['choices']) > 0:
+                    content = result['choices'][0]['message']['content']
+                    logger.info(f'AI模型调用成功(第{attempt + 1}次), 返回长度: {len(content)}')
+                    return content
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f'AI模型调用失败: {e}')
-            return None
-        except json.JSONDecodeError as e:
-            logger.error(f'AI响应JSON解析失败: {e}')
-            return None
-        except Exception as e:
-            logger.error(f'AI模型调用异常: {e}')
-            return None
+                logger.error(f'AI模型返回格式异常: {result}')
+                return None
+
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                wait = 0.8 * (2 ** attempt)  # 指数退避: 0.8s, 1.6s, 3.2s
+                logger.warning(f'AI模型调用第{attempt + 1}次失败: {e}; {wait:.1f}s 后重试')
+                if attempt < max_attempts - 1:
+                    time.sleep(wait)
+            except json.JSONDecodeError as e:
+                logger.error(f'AI响应JSON解析失败: {e}')
+                return None
+            except Exception as e:
+                logger.error(f'AI模型调用异常: {e}')
+                return None
+
+        logger.error(f'AI模型调用在 {max_attempts} 次重试后仍失败: {last_err}')
+        return None
+
+    @staticmethod
+    def _build_ai_session() -> requests.Session:
+        """构建带重试策略的 requests Session, 应对 SSL EOF / 连接中断 / 5xx 等瞬时错误。"""
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(['POST', 'GET']),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=10)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        return session
 
     def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
         """解析AI响应"""
@@ -1262,7 +1331,8 @@ class P5Predictor:
         """
         加载历史验证记录
 
-        从 predictions/weights_history.json 文件读取历史预测验证记录。
+        从数据库 p5_artifact(type='weight_history') 读取历史预测验证记录
+        (v3.3 起替代原先的 predictions/weights_history.json 文件)。
         这些记录包含每次预测的目标期号、推荐号码和实际开奖号码,
         用于贝叶斯推断算法计算似然概率。
 
@@ -1276,12 +1346,15 @@ class P5Predictor:
                 - algo_evaluations: 各算法评估得分
         """
         try:
-            os.makedirs('predictions', exist_ok=True)
-            weights_file = os.path.join('predictions', 'weights_history.json')
-            if os.path.exists(weights_file):
-                with open(weights_file, 'r', encoding='utf-8') as f:
-                    records = json.load(f)
-                    return records
+            from modules.database import P5Database
+            db = P5Database()
+            if not db.connect():
+                logger.warning('加载验证记录: 数据库连接失败')
+                return []
+            artifacts = db.get_artifacts('weight_history', limit=1000)
+            db.disconnect()
+            records = [a.get('data', {}) for a in artifacts if a.get('data')]
+            return records
         except Exception as e:
             logger.warning(f'加载验证记录失败: {e}')
         return []
@@ -1315,75 +1388,93 @@ class P5Predictor:
             各位置号码的综合概率分布列表
         """
         try:
-            features = fe.extract_all_features(data)
+            positions = self.positions
+            total = len(data)
+            if total == 0:
+                return [{n: 0.1 for n in self.number_range} for _ in range(positions)]
 
-            # 获取各类特征数据
-            freq_features = features.get('frequency', {})
-            omission_features = features.get('omission', {})
-            road_features = features.get('road_012', {})
-            consecutive_features = features.get('consecutive', {})  # 连号特征
-            repeat_features = features.get('repeat', {})            # 重号特征
-            
+            # 频率统计
+            freq_counts = [defaultdict(int) for _ in range(positions)]
+            for item in data:
+                nums = item.get('numbers', [])
+                if len(nums) == positions:
+                    for pos, num in enumerate(nums):
+                        freq_counts[pos][int(num)] += 1
+
+            # 遗漏统计（当前遗漏期数）
+            last_occurrence = [{} for _ in range(positions)]
+            for idx, item in enumerate(data):
+                nums = item.get('numbers', [])
+                if len(nums) == positions:
+                    for pos, num in enumerate(nums):
+                        last_occurrence[pos][int(num)] = idx
+
+            # 上期号码（用于重号/连号特征）
+            prev_nums = []
+            if total >= 2:
+                p = data[-1].get('numbers', [])
+                if len(p) == positions:
+                    prev_nums = [int(x) for x in p]
+
+            fe_cfg = self.config.config['algorithms']['feature_engineering']['params']
+            w_freq = fe_cfg.get('freq_weight', 0.30)
+            w_omis = fe_cfg.get('omission_weight', 0.25)
+            w_road = fe_cfg.get('road_weight', 0.15)
+            w_rep = fe_cfg.get('repeat_weight', 0.15)
+            w_consec = fe_cfg.get('consecutive_weight', 0.15)
+
             probs = []
-            for pos in range(self.positions):
-                pos_name = self.position_names[pos]
-
-                # 提取频率特征
-                freq_data = freq_features.get(pos_name, {})
-                frequencies = freq_data.get('frequencies', {})
-
-                # 提取遗漏特征
-                omission_data = omission_features.get(pos_name, {})
-                omission_probs = omission_data.get('omission_probs', {})
-
-                # 提取012路特征
-                road_data = road_features.get(pos_name, {})
-                road_ratios = road_data.get('road_ratios', {})
-                current_road = road_data.get('current_road', -1)
-                
-                # 提取连号特征
-                consec_data = consecutive_features.get(pos_name, {})
-                consec_probs = consec_data.get('consec_probs', {})
-                
-                # 提取重号特征
-                repeat_data = repeat_features.get(pos_name, {})
-                repeat_probs = repeat_data.get('repeat_probs', {})
-
-                # 多维特征融合
-                pos_probs = {}
+            for pos in range(positions):
+                # 频率概率（拉普拉斯平滑）
+                freq_probs = {}
                 for num in self.number_range:
-                    # 基础频率
-                    base_prob = frequencies.get(num, 0.1)
+                    freq_probs[num] = (freq_counts[pos].get(num, 0) + 0.1) / (total + 1.0)
 
-                    # 遗漏加成
-                    omission_boost = omission_probs.get(num, 0.1)
+                # 遗漏概率（指数回归, 归一化）
+                omis_raw = {}
+                for num in self.number_range:
+                    li = last_occurrence[pos].get(num, -1)
+                    omission = total - 1 - li if li >= 0 else total
+                    omis_raw[num] = math.exp(0.02 * min(omission, 50))
+                omis_max = max(omis_raw.values()) or 1
+                omis_probs = {n: v / omis_max for n, v in omis_raw.items()}
 
-                    # 012路加成 — 根据号码所属路的近期表现调整
-                    num_road = 0 if num in fe.road_0 else (1 if num in fe.road_1 else 2)
-                    road_boost = road_ratios.get(num_road, 0.33)
-                    
-                    # 连号加成
-                    consec_boost = consec_probs.get(num, 0.1)
-                    
-                    # 重号加成（如果该号码在上期出现）
-                    repeat_boost = repeat_probs.get(num, 0.1)
+                # 012路分布（基于历史频率）
+                road_counts = defaultdict(int)
+                for item in data:
+                    nums = item.get('numbers', [])
+                    if len(nums) == positions:
+                        road_counts[int(nums[pos]) % 3] += 1
+                road_total = sum(road_counts.values()) or 1
+                road_probs = {}
+                for num in self.number_range:
+                    road_probs[num] = (road_counts[num % 3] + 0.1) / (road_total + 0.3)
 
-                    # 综合概率加权融合
-                    pos_probs[num] = (
-                        base_prob * 0.30 + 
-                        omission_boost * 0.25 + 
-                        road_boost * 0.15 +
-                        consec_boost * 0.15 +
-                        repeat_boost * 0.15
+                # 重号加成（上期出现 → 惯性）
+                repeat_boost = {num: 1.3 if num in prev_nums else 1.0 for num in self.number_range}
+                # 连号加成（与上期某号码相邻）
+                consec_boost = {num: 1.0 for num in self.number_range}
+                for pn in prev_nums:
+                    for d in (-1, 1):
+                        nb = pn + d
+                        if 0 <= nb <= 9:
+                            consec_boost[nb] = 1.3
+
+                # 多维特征融合（归一化子分布 + 轻量boost）
+                fused = {}
+                for num in self.number_range:
+                    fused[num] = (
+                        w_freq * freq_probs[num] +
+                        w_omis * omis_probs[num] +
+                        w_road * road_probs[num] +
+                        w_rep * repeat_boost[num] * 0.1 +
+                        w_consec * consec_boost[num] * 0.1
                     )
 
-                # 归一化概率
-                total = sum(pos_probs.values())
-                if total > 0:
-                    for num in self.number_range:
-                        pos_probs[num] /= total
-
-                probs.append(pos_probs)
+                s = sum(fused.values())
+                if s > 0:
+                    fused = {num: v / s for num, v in fused.items()}
+                probs.append(fused)
 
             return probs
 
@@ -1475,55 +1566,64 @@ class P5Predictor:
             if score <= 0:
                 continue
             
-            # 约束1: 相邻位置号码差距惩罚
-            # 原理: 相邻位置号码过于接近(相差≤1)的情况较少见
+            # 约束1: 相邻位置号码差距惩罚（轻度）
             adjacent_similar = 0
             for i in range(self.positions - 1):
                 if abs(combo[i] - combo[i+1]) <= 1:
                     adjacent_similar += 1
-            if adjacent_similar > 2:  # 如果超过2对相邻号码过于接近，降低概率
-                score *= 0.7
-            
-            # 约束2: 和值范围约束
-            # 原理: 根据中心极限定理,5个独立均匀分布变量之和近似正态分布
+            if adjacent_similar > 2:
+                score *= 0.85  # 轻度惩罚,不致命
+
+            # 约束2: 和值范围约束（软惩罚,仅极端越界才强惩罚）
             hezhi = sum(combo)
             if hezhi < hezhi_min or hezhi > hezhi_max:
-                score *= 0.5  # 极端和值大幅降低
-            
-            # 约束3: 奇偶比约束
-            # 原理: 全奇或全偶的概率极低(2/10^5 ≈ 0.2%)
+                score *= 0.85   # 轻度惩罚,保留命中可能
+            elif hezhi < 5 or hezhi > 40:
+                score *= 0.6    # 仅极端和值才强惩罚
+
+            # 约束3: 奇偶比约束（避免全奇/全偶,但不致命）
             odd_count = sum(1 for num in combo if num % 2 == 1)
-            if odd_count == 0 or odd_count == 5:  # 全奇或全偶极不可能
-                score *= 0.3
-            
-            # 约束4: 平方和偏差(SSD)惩罚
-            # SSD衡量组合号码偏离理论均值(4.5)的程度
-            # SSD过小 → 所有号码集中在均值附近(过于均衡)
-            # SSD过大 → 极端远离均值(过于偏态)
+            if odd_count == 0 or odd_count == 5:
+                score *= 0.6
+
+            # 约束4: 平方和偏差(SSD)惩罚（软化）
             if enable_ssd_penalty:
                 ssd = sum((num - position_mean) ** 2 for num in combo) / self.positions
-                # 理论SSD的合理范围: [1, 20]
                 if ssd < 1.0:
-                    score *= 0.7   # 太均衡,惩罚
+                    score *= 0.9
                 elif ssd > 20.0:
-                    score *= 0.6   # 太偏态,惩罚
+                    score *= 0.85
                 elif ssd > 15.0:
-                    score *= 0.85  # 轻度偏态,轻微惩罚
-            
-            # 约束5: 跨度约束 (Span = max - min)
-            # 跨度衡量一组号码的离散程度
+                    score *= 0.95
+
+            # 约束5: 跨度约束（软化）
             combo_span = max(combo) - min(combo)
             if combo_span < span_min:
-                # 跨度太小,号码过于集中
-                score *= 0.6
+                score *= 0.85
             elif combo_span > span_max:
-                # 跨度太大,号码过于分散
-                score *= 0.75
+                score *= 0.9
             
             combination_scores.append((combo, score))
 
         # 按综合得分降序排序
         combination_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # 保底:始终包含一个"无约束"组合(各位置概率最高的号码),
+        # 避免硬约束把理论可达的中奖组合挤出 Top 列表,人为压低命中率上限。
+        if combination_scores:
+            wildcard = tuple(
+                sorted(fused_probs[pos].items(), key=lambda x: x[1], reverse=True)[0][0]
+                for pos in range(self.positions)
+            )
+            if wildcard not in [c for c, _ in combination_scores]:
+                wscore = 1.0
+                for pos, num in enumerate(wildcard):
+                    wscore *= fused_probs[pos].get(num, 0.1)
+                combination_scores.append((wildcard, wscore))
+                combination_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # 置信度改为相对值(相对Top组合得分,0-100%),避免原 score*100 得到 ~0.01% 的误导值
+        max_base = combination_scores[0][1] if combination_scores else 0.0
 
         # 取前N个高质量组合,附带各项指标
         top_combinations = []
@@ -1531,13 +1631,13 @@ class P5Predictor:
             hezhi = sum(combo)
             span = max(combo) - min(combo)
             ssd = sum((n - position_mean) ** 2 for n in combo) / self.positions
-            
+
             top_combinations.append({
                 'rank': rank,
                 'combination': ''.join(map(str, combo)),      # 号码字符串形式
                 'numbers': list(combo),                        # 号码列表形式
                 'probability': round(score, 6),               # 综合概率得分
-                'confidence': round(score * 100, 2),          # 置信度百分比
+                'confidence': round(100.0 * (score / max_base), 2) if max_base > 0 else 0.0,  # 相对置信度
                 'hezhi': hezhi,                               # 和值
                 'span': span,                                 # 跨度
                 'ssd': round(ssd, 4)                          # 平方和偏差
@@ -2103,8 +2203,12 @@ class P5Predictor:
             return {'success': False, 'error': '号码数量不匹配'}
 
         try:
-            os.makedirs('predictions', exist_ok=True)
-            weights_file = os.path.join('predictions', 'weights_history.json')
+            # 步骤0: 连接数据库(替代原先写入 predictions/weights_history.json 文件, v3.3)
+            from modules.database import P5Database
+            db = P5Database()
+            if not db.connect():
+                logger.error('记录验证结果: 数据库连接失败')
+                return {'success': False, 'error': '数据库连接失败'}
 
             # 步骤1: 提取推荐号码(取排名第一的组合)
             top_combs = prediction_record.get('top_combinations', [])
@@ -2150,22 +2254,13 @@ class P5Predictor:
                 'algo_evaluations': algo_evaluations,           # 算法评估
             }
 
-            # 步骤6: 加载/创建历史记录文件
-            existing_records = []
-            if os.path.exists(weights_file):
-                try:
-                    with open(weights_file, 'r', encoding='utf-8') as f:
-                        existing_records = json.load(f)
-                except (json.JSONDecodeError, IOError):
-                    existing_records = []
-
-            # 追加新记录(保留最近1000条,防止文件无限膨胀)
-            existing_records.append(verification_entry)
-            existing_records = existing_records[-1000:]
-
-            # 步骤7: 持久化到文件
-            with open(weights_file, 'w', encoding='utf-8') as f:
-                json.dump(existing_records, f, ensure_ascii=False, indent=2, default=str)
+            # 步骤6: 持久化到数据库 p5_artifact(type='weight_history'), 替代原文件方式
+            db.save_artifact(
+                artifact_type='weight_history',
+                data=verification_entry,
+                issue=verification_entry.get('target_issue', ''),
+            )
+            db.disconnect()
 
             logger.info(f'验证记录已保存: 期号={verification_entry["target_issue"]}, '
                         f'预测={predicted_combo}, 实际={actual_numbers}')
@@ -2186,8 +2281,9 @@ class P5Predictor:
         """
         加载历史权重调整记录
 
-        从 predictions/weights_history.json 读取所有保存的验证记录和
+        从数据库 p5_artifact(type='weight_history') 读取所有保存的验证记录和
         权重管理器当前的自适应权重状态。同时计算各算法的累计命中率统计。
+        (v3.3 起替代原先的 predictions/weights_history.json 文件)
 
         返回的数据可用于:
         - 可视化展示各算法的历史表现
@@ -2200,34 +2296,23 @@ class P5Predictor:
                 - verification_records: 历史验证记录列表 (最多1000条)
                 - adaptive_weights: 当前自适应权重状态
                 - total_verifications: 累计验证次数
-                - summary: 各算法累计命中率统计,格式:
-                    {
-                        'frequency_weighted': {
-                            'cumulative_hits': 0.85,
-                            'evaluation_count': 10,
-                            'average_hit_rate': 0.085
-                        },
-                        ...
-                    }
+                - summary: 各算法累计命中率统计
                 - error: 出错时的错误信息
         """
         try:
-            os.makedirs('predictions', exist_ok=True)
-            weights_file = os.path.join('predictions', 'weights_history.json')
-
-            # 文件不存在时返回空记录
-            if not os.path.exists(weights_file):
-                logger.info('暂无权重历史记录')
+            from modules.database import P5Database
+            db = P5Database()
+            if not db.connect():
+                logger.info('暂无权重历史记录(数据库连接失败)')
                 return {
                     'verification_records': [],
                     'adaptive_weights': self.config.weight_manager.get_adaptive_weights() if hasattr(self.config, 'weight_manager') else {},
                     'total_verifications': 0,
                     'summary': {}
                 }
-
-            # 加载历史验证记录
-            with open(weights_file, 'r', encoding='utf-8') as f:
-                records = json.load(f)
+            artifacts = db.get_artifacts('weight_history', limit=1000)
+            db.disconnect()
+            records = [a.get('data', {}) for a in artifacts if a.get('data')]
 
             # 计算各算法累计命中率统计
             algo_total_hits = defaultdict(float)

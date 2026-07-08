@@ -19,11 +19,14 @@
 import logging
 import os
 import json
+import time
 import uuid
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 os.makedirs('logs', exist_ok=True)
 
@@ -116,34 +119,65 @@ class AIAnalyzer:
             "stream": False
         }
 
-        try:
-            response = requests.request(
-                "POST",
-                self.api_url,
-                headers=self.headers,
-                data=json.dumps(payload)
-            )
-            response.raise_for_status()
+        # 构建带自动重试的 Session, 应对瞬时网络/SSL错误:
+        # - SSLEOFError / 连接中断 等会被 requests 归类为 RequestException, 由下方方法级重试捕获
+        # - 5xx / 429 由 urllib3 Retry 适配器自动重试
+        session = self._build_ai_session()
 
-            result = response.json()
+        last_err = None
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                response = session.request(
+                    "POST",
+                    self.api_url,
+                    headers=self.headers,
+                    data=json.dumps(payload),
+                    timeout=60
+                )
+                response.raise_for_status()
 
-            if 'choices' in result and len(result['choices']) > 0:
-                content = result['choices'][0]['message']['content']
-                logger.info(f'AI模型调用成功，返回长度: {len(content)}')
-                return content
+                result = response.json()
 
-            logger.error(f'AI模型返回格式异常: {result}')
-            return None
+                if 'choices' in result and len(result['choices']) > 0:
+                    content = result['choices'][0]['message']['content']
+                    logger.info(f'AI模型调用成功(第{attempt + 1}次), 返回长度: {len(content)}')
+                    return content
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f'AI模型调用失败: {e}')
-            return None
-        except json.JSONDecodeError as e:
-            logger.error(f'AI响应JSON解析失败: {e}')
-            return None
-        except Exception as e:
-            logger.error(f'AI模型调用异常: {e}')
-            return None
+                logger.error(f'AI模型返回格式异常: {result}')
+                return None
+
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                wait = 0.8 * (2 ** attempt)  # 指数退避: 0.8s, 1.6s, 3.2s
+                logger.warning(f'AI模型调用第{attempt + 1}次失败: {e}; {wait:.1f}s 后重试')
+                if attempt < max_attempts - 1:
+                    time.sleep(wait)
+            except json.JSONDecodeError as e:
+                logger.error(f'AI响应JSON解析失败: {e}')
+                return None
+            except Exception as e:
+                logger.error(f'AI模型调用异常: {e}')
+                return None
+
+        logger.error(f'AI模型调用在 {max_attempts} 次重试后仍失败: {last_err}')
+        return None
+
+    @staticmethod
+    def _build_ai_session() -> requests.Session:
+        """构建带重试策略的 requests Session, 应对 SSL EOF / 连接中断 / 5xx 等瞬时错误。"""
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(['POST', 'GET']),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=10)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        return session
 
     def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
         """解析AI响应为JSON格式"""
@@ -721,19 +755,14 @@ class AIAnalyzer:
         logger.info('步骤5：生成结构化报告...')
         report = self._generate_structured_report(ai_result, data)
 
-        # 6. 保存报告到数据库
+        # 6. 保存报告到数据库 (v3.3 起不再写本地 JSON 文件, 统一入库 p5_ai_report)
         logger.info('步骤6：保存报告到数据库...')
         report_uuid = self._save_report_to_database(report)
-
-        # 7. 保存报告到文件
-        logger.info('步骤7：保存报告到文件...')
-        report_file = self._save_report_to_file(report)
 
         result = {
             'success': True,
             'report': report,
             'report_uuid': report_uuid,
-            'report_file': report_file,
             'model_version': self.model_name,
             'data_count': data['data_count'],
             'latest_issue': data['latest_issue'],
@@ -744,25 +773,9 @@ class AIAnalyzer:
         logger.info('=' * 80)
         logger.info('AI分析完成')
         logger.info(f'报告UUID: {report_uuid}')
-        logger.info(f'报告文件: {report_file}')
         logger.info('=' * 80)
 
         return result
-
-    def _save_report_to_file(self, report: Dict[str, Any]) -> str:
-        """保存报告到本地文件"""
-        os.makedirs('reports', exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f'reports/p5_ernie_ai_report_{timestamp}.json'
-
-        try:
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(report, f, ensure_ascii=False, indent=2)
-            logger.info(f'报告已保存到文件: {filename}')
-            return filename
-        except Exception as e:
-            logger.error(f'保存报告文件失败: {e}')
-            return ''
 
     def get_latest_report(self) -> Optional[Dict[str, Any]]:
         """获取最新的AI分析报告"""

@@ -8,22 +8,10 @@
 2. AI预测推理 (predict)           - 基于历史数据的统计模型+AI融合预测
 3. 历史回测验证 (backtest)        - 滚动回测验证模型命中率
 4. 特征工程分析 (analyze)         - 提取频率/遗漏/012路/连号等统计特征
-5. ERNIE AI深度分析 (ernie)       - 调用百度ERNIE模型进行深度分析
-6. 四步流水线分析 (pipeline)       - 推荐！全新四步串行分析：文章爬取→走势分析→专家整合→最终预测
-7. 批量文章保存 (save-articles)   - 批量爬取文章并保存到Redis
-8. 单篇/批量文章处理 (process-article/process-articles) - 爬取→AI→预处理→Redis存储
-
-用法示例：
-    python main.py update                    # 更新并入库最新开奖
-    python main.py predict --model optimized # 运行优化模型预测
-    python main.py backtest --mode compare   # 后测对比
-    python main.py analyze                   # 分析历史特征并输出报告
-    python main.py ernie --limit 30          # ERNIE深度分析
-    python main.py pipeline --issue 2026165  # 四步流水线分析（推荐！自动推算下一期）
-    python main.py pipeline --issue 2026165 --limit 50  # 指定期数和数据量
-    python main.py save-articles --max 100  # 批量爬取文章保存到Redis
-    python main.py process-article --url "..." --title "..."  # 处理单篇文章
-    python main.py process-articles --max 10 # 批量处理文章
+5. 四步流水线分析 (pipeline)       - 推荐！全新四步串行分析：文章爬取→走势分析→专家整合→最终预测
+6. 批量文章保存 (save-articles)   - 批量爬取文章并保存到Redis
+7. 单篇/批量文章处理 (process-article/process-articles) - 爬取→AI→预处理→Redis存储
+8. 命中率统计 (hitrate)           - 查看历史预测命中率统计报告
 """
 
 import sys
@@ -201,16 +189,20 @@ def predict_next_issue(use_optimized=True):
         logger.info(result['risk_warning'])
         logger.info('=' * 80)
 
-        # 保存预测结果
-        os.makedirs('predictions', exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f'predictions/prediction_{timestamp}.json'
-
-        import json
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
-
-        logger.info(f'预测结果已保存：{filename}')
+        # 保存预测结果到数据库 (v3.3: 统一入库 p5_artifact, 不再写本地 JSON 文件)
+        from modules.database import P5Database
+        save_db = P5Database()
+        if save_db.connect():
+            save_db.save_artifact(
+                artifact_type='prediction',
+                data=result,
+                issue=result.get('target_issue', ''),
+                meta={'model': 'optimized', 'data_samples': result.get('data_samples')}
+            )
+            save_db.disconnect()
+            logger.info(f'预测结果已保存(数据库): 期号={result.get("target_issue", "")}')
+        else:
+            logger.warning('预测结果保存失败: 数据库连接失败')
 
         return True
 
@@ -358,137 +350,6 @@ def run_backtest(mode='compare', start=50, count=50):
         return False
 
 
-def run_ernie_ai_analysis(data_limit=30):
-    """
-    执行ERNIE AI深度分析：调用百度ERNIE模型对历史数据进行AI分析
-
-    流程:
-    1. 初始化AIAnalyzer（封装Qianfan API调用）
-    2. 从数据库获取最近data_limit期历史数据
-    3. 构造分析prompt，调用ERNIE模型
-    4. 解析AI返回的JSON结果
-    5. 保存报告到数据库和reports/目录
-
-    Args:
-        data_limit: 获取历史数据的期数限制（默认30期）
-
-    Returns:
-        bool: 是否分析成功
-    """
-    logger.info('=' * 80)
-    logger.info('开始执行ERNIE AI分析')
-    logger.info('=' * 80)
-
-    try:
-        from modules.ai_analyzer import AIAnalyzer
-
-        logger.info(f'配置参数：数据期数={data_limit}')
-
-        analyzer = AIAnalyzer()
-        result = analyzer.analyze(data_limit=data_limit)
-
-        if result['success']:
-            logger.info('=' * 80)
-            logger.info('ERNIE AI分析完成')
-            logger.info('=' * 80)
-            logger.info(f'报告UUID：{result["report_uuid"]}')
-            logger.info(f'最新期号：{result["latest_issue"]}')
-            logger.info(f'预测期号：{result["next_issue"]}')
-            logger.info(f'数据条数：{result["data_count"]}')
-            logger.info(f'模型版本：{result["model_version"]}')
-            logger.info(f'报告文件：{result["report_file"]}')
-            logger.info('')
-            logger.info('【报告内容预览】')
-            logger.info('-' * 50)
-            report_content = result['report']['report_content']
-            preview_lines = report_content.split('\n')[:40]
-            logger.info('\n'.join(preview_lines))
-            logger.info('...')
-            logger.info('')
-            logger.info(f'风险提示：{result["risk_warning"]}')
-            logger.info('=' * 80)
-
-            return True
-        else:
-            logger.error(f'ERNIE AI分析失败：{result["error"]}')
-            return False
-
-    except Exception as e:
-        logger.error(f'ERNIE AI分析执行失败：{e}', exc_info=True)
-        return False
-
-
-def run_comprehensive_analysis(data_limit=30):
-    """
-    执行综合分析（二次深度分析）：整合多源数据进行深度AI分析
-
-    数据源:
-    - Redis中的原始文章数据（从ydniu.com爬取的专家推荐）
-    - 网络专家数据（文章中的预测信息）
-    - AI初步分析数据（第一次AI分析的中间结果）
-    - 数据库历史开奖数据
-
-    流程:
-    1. 初始化ComprehensiveAnalyzer
-    2. 调用analyze_with_multi_sources()整合多源数据
-    3. 输出多源数据汇总和预测结果
-
-    Args:
-        data_limit: 获取历史数据的期数限制（默认30期）
-
-    Returns:
-        bool: 是否分析成功
-    """
-    logger.info('=' * 80)
-    logger.info('开始执行综合分析（二次深度分析）')
-    logger.info('=' * 80)
-
-    try:
-        from modules.ai_analyzer import ComprehensiveAnalyzer
-
-        logger.info(f'配置参数：数据期数={data_limit}')
-
-        analyzer = ComprehensiveAnalyzer()
-        result = analyzer.analyze_with_multi_sources(data_limit=data_limit)
-
-        if result['success']:
-            logger.info('=' * 80)
-            logger.info('综合分析完成')
-            logger.info('=' * 80)
-            logger.info(f'报告UUID：{result["report_uuid"]}')
-            logger.info(f'最新期号：{result["latest_issue"]}')
-            logger.info(f'预测期号：{result["next_issue"]}')
-            logger.info(f'数据条数：{result["data_count"]}')
-            logger.info(f'模型版本：{result["model_version"]}')
-            logger.info(f'报告文件：{result["report_file"]}')
-            
-            sources = result.get('data_sources', {})
-            logger.info('')
-            logger.info('【数据源汇总】')
-            logger.info('-' * 50)
-            logger.info(f'Redis原始数据：{"已加载" if sources.get("redis_raw_data") else "未加载"}')
-            logger.info(f'网络专家数据：{sources.get("expert_data", 0)}条')
-            logger.info(f'AI初步分析：{"已加载" if sources.get("ai_preliminary") else "未加载"}')
-            
-            logger.info('')
-            logger.info('【报告内容预览】')
-            logger.info('-' * 50)
-            report_content = result['report']['report_content']
-            preview_lines = report_content.split('\n')[:40]
-            logger.info('\n'.join(preview_lines))
-            logger.info('...')
-            logger.info('')
-            logger.info(f'风险提示：{result["report"].get("risk_warning", "")}')
-            logger.info('=' * 80)
-
-            return True
-        else:
-            logger.error(f'综合分析失败：{result["error"]}')
-            return False
-
-    except Exception as e:
-        logger.error(f'综合分析执行失败：{e}', exc_info=True)
-        return False
 
 
 def analyze_features():
@@ -578,17 +439,20 @@ def analyze_features():
         logger.info(f'重号率：{repeat_features.get("repeat_rate", 0):.2%}')
         logger.info(f'隔号率：{repeat_features.get("skip_rate", 0):.2%}')
 
-        # 保存特征分析结果
-        os.makedirs('reports/features', exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f'reports/features/feature_analysis_{timestamp}.json'
-
-        import json
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(features, f, indent=2, ensure_ascii=False, default=str)
-
-        logger.info('')
-        logger.info(f'特征分析结果已保存：{filename}')
+        # 保存特征分析结果到数据库 (v3.3: 统一入库 p5_artifact, 不再写本地 JSON 文件)
+        from modules.database import P5Database
+        feat_db = P5Database()
+        if feat_db.connect():
+            feat_db.save_artifact(
+                artifact_type='feature_analysis',
+                data=features,
+                meta={'data_count': len(history_data) if 'history_data' in dir() else None}
+            )
+            feat_db.disconnect()
+            logger.info('')
+            logger.info('特征分析结果已保存(数据库)')
+        else:
+            logger.warning('特征分析结果保存失败: 数据库连接失败')
 
         return True
 
@@ -596,82 +460,6 @@ def analyze_features():
         logger.error(f'特征分析失败: {e}', exc_info=True)
         return False
 
-
-def run_article_analysis(target_issue=None, data_limit=30):
-    """
-    执行文章内容分析工作流：完整的6步分析流水线
-
-    步骤:
-    步骤1: 爬取文章 - 从ydniu.com获取专家推荐文章
-    步骤2: 第一次AI分析 - 结构化整理文章内容
-    步骤3: 保存Redis - 将分析结果缓存到Redis（7天过期）
-    步骤4: 加载Redis - 从Redis读取缓存数据
-    步骤5: 第二次AI分析 - 整合文章分析+历史数据，综合预测
-    步骤6: 保存数据库 - 将最终报告写入MySQL
-
-    Args:
-        target_issue: 目标期号（如"2026165"），None则爬取最新文章
-        data_limit: 获取历史数据的期数限制（默认30期）
-
-    Returns:
-        bool: 是否分析成功
-    """
-    logger.info('=' * 80)
-    logger.info('开始执行文章内容分析工作流')
-    logger.info('=' * 80)
-
-    try:
-        from modules.article_handler import ArticleAnalyzer
-
-        logger.info(f'配置参数：目标期号={target_issue or "最新"}, 数据期数={data_limit}')
-
-        analyzer = ArticleAnalyzer()
-        result = analyzer.analyze_article_workflow(target_issue=target_issue, data_limit=data_limit)
-
-        if result['success']:
-            logger.info('=' * 80)
-            logger.info('文章分析工作流完成')
-            logger.info('=' * 80)
-            logger.info(f'报告UUID：{result["report_uuid"]}')
-            logger.info(f'预测期号：{result["final_report"].get("next_issue", "未知")}')
-            
-            logger.info('')
-            logger.info('【执行步骤】')
-            logger.info('-' * 50)
-            logger.info(f'步骤1（爬取文章）：{"成功" if result["step1_crawl"] else "失败"}')
-            logger.info(f'步骤2（第一次AI分析）：{"成功" if result["step2_first_ai"] else "失败"}')
-            logger.info(f'步骤3（保存Redis）：{"成功" if result["step3_redis_save"] else "失败"}')
-            logger.info(f'步骤4（加载Redis）：{"成功" if result["step4_redis_load"] else "失败"}')
-            logger.info(f'步骤5（第二次AI分析）：{"成功" if result["step5_second_ai"] else "失败"}')
-            logger.info(f'步骤6（保存数据库）：{"成功" if result["step6_db_save"] else "失败"}')
-            
-            logger.info('')
-            logger.info('【预测结果】')
-            logger.info('-' * 50)
-            prediction = result['final_report'].get('prediction', {})
-            for pos_name, pos_key in zip(['万位', '千位', '百位', '十位', '个位'], ['wan', 'qian', 'bai', 'shi', 'ge']):
-                if prediction.get(pos_key):
-                    pos_data = prediction[pos_key]
-                    logger.info(f'{pos_name}：{pos_data.get("numbers", [])} (置信度: {pos_data.get("confidence", [])})')
-            
-            if result['final_report'].get('recommended_combinations'):
-                logger.info('')
-                logger.info('【推荐组合】')
-                for i, combo in enumerate(result['final_report']['recommended_combinations'], 1):
-                    logger.info(f'  组合{i}：{combo}')
-            
-            logger.info('')
-            logger.info(f'风险提示：{result["final_report"].get("risk_warning", "")}')
-            logger.info('=' * 80)
-
-            return True
-        else:
-            logger.error(f'文章分析工作流失败：{result["error"]}')
-            return False
-
-    except Exception as e:
-        logger.error(f'文章分析工作流执行失败：{e}', exc_info=True)
-        return False
 
 
 def run_save_articles_to_redis(target_issue=None, max_articles=100, extract_predictions=True):
@@ -991,6 +779,10 @@ def run_process_multiple_articles(max_count: int = 10) -> bool:
 
         # 获取文章URL列表（从爬虫获取）
         logger.info('获取文章列表...')
+        # B1 修复：ArticleProcessor 默认 lazy=True，spider 初始为 None，
+        # 必须先初始化爬虫再访问，否则 process-articles 命令 100% 走 else 报错
+        if not processor.spider:
+            processor._init_spider()
         if processor.spider:
             crawl_result = processor.spider.crawl_all_articles()
             articles = crawl_result.get('articles', [])[:max_count]
@@ -1051,9 +843,7 @@ def main():
     - predict: 预测下一期（--model optimized/old）
     - backtest: 历史回测（--mode compare/old/new, --start, --count）
     - analyze: 分析历史数据特征
-    - ernie: ERNIE AI深度分析（--limit）
-    - comprehensive: 综合分析/二次深度分析（--limit）
-    - article: 文章内容分析工作流（--issue, --limit）
+    - pipeline: 四步流水线分析（--issue, --limit）
     - save-articles: 批量爬取文章并保存到Redis（--issue, --max, --no-extract）
     - process-article: 处理单篇文章（--url, --title）
     - process-articles: 批量处理文章（--max）
@@ -1083,22 +873,8 @@ def main():
     # 特征分析命令
     analyze_parser = subparsers.add_parser('analyze', help='分析历史数据特征')
 
-    # ERNIE AI分析命令
-    ernie_parser = subparsers.add_parser('ernie', help='执行ERNIE AI深度分析')
-    ernie_parser.add_argument('--limit', type=int, default=30,
-                              help='获取历史数据的期数限制（默认30期）')
 
-    # 综合分析命令（二次深度分析）
-    comprehensive_parser = subparsers.add_parser('comprehensive', help='执行综合分析（二次深度分析）→ 已弃用，请使用 pipeline 命令')
-    comprehensive_parser.add_argument('--limit', type=int, default=30,
-                                      help='获取历史数据的期数限制（默认30期）')
 
-    # 文章分析命令（已弃用，使用 pipeline 代替）
-    article_parser = subparsers.add_parser('article', help='执行文章内容分析工作流 → 已弃用，请使用 pipeline 命令')
-    article_parser.add_argument('--issue', type=str, default=None,
-                                help='目标期号（如2026165），不指定则爬取最新文章')
-    article_parser.add_argument('--limit', type=int, default=30,
-                                help='获取历史数据的期数限制（默认30期）')
 
     # 四步流水线分析命令（推荐）
     pipeline_parser = subparsers.add_parser('pipeline', help='执行四步流水线分析：文章爬取→走势分析→专家整合→最终预测')
@@ -1151,14 +927,6 @@ def main():
         success = run_backtest(args.mode, args.start, args.count)
     elif args.command == 'analyze':
         success = analyze_features()
-    elif args.command == 'ernie':
-        success = run_ernie_ai_analysis(data_limit=args.limit)
-    elif args.command == 'comprehensive':
-        logger.warning('⚠️ 综合分析报告已弃用，建议使用 pipeline 命令获得更完整的分析结果')
-        success = run_comprehensive_analysis(data_limit=args.limit)
-    elif args.command == 'article':
-        logger.warning('⚠️ 文章分析工作流已弃用，建议使用 pipeline 命令获得更完整的分析结果')
-        success = run_article_analysis(target_issue=args.issue, data_limit=args.limit)
     elif args.command == 'pipeline':
         success = run_four_step_pipeline(target_issue=args.issue, data_limit=args.limit)
     elif args.command == 'save-articles':

@@ -159,7 +159,9 @@ class P5Spider:
                 
                 self.session.headers.update(self._get_random_headers())
                 response = self.session.get(url, timeout=30)
-                response.encoding = 'utf-8'
+                # B4 修复：原为写死的 'utf-8'（55128.cn 为 GBK 会乱码）；
+                # 改为优先探测响应编码，回退 utf-8
+                response.encoding = response.apparent_encoding or 'utf-8'
                 
                 if response.status_code == 200:
                     logger.debug(f'成功获取页面: {url}')
@@ -2568,6 +2570,40 @@ class P5Spider:
             logger.error(f'解析专家推荐页面失败: {e}')
             return None
     
+    def _find_matching_brace(self, text: str, open_idx: int) -> int:
+        """
+        从 text[open_idx]（应为 '{'）开始，查找与之匹配的 '}' 索引。
+        扫描时跳过字符串字面量（单/双/反引号及转义），避免字符串内的
+        大括号干扰配对（B7）。未找到返回 -1。
+        """
+        if open_idx < 0 or open_idx >= len(text) or text[open_idx] != '{':
+            return -1
+        depth = 0
+        i = open_idx
+        n = len(text)
+        while i < n:
+            c = text[i]
+            if c in ('"', "'", '`'):
+                quote = c
+                i += 1
+                while i < n:
+                    if text[i] == '\\':
+                        i += 2
+                        continue
+                    if text[i] == quote:
+                        break
+                    i += 1
+                i += 1
+                continue
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
     def parse_expert_schema(self, html):
         """
         解析专家推荐详情页面，提取推荐内容和预测期数
@@ -2600,17 +2636,11 @@ class P5Spider:
             logger.info(f'参数名称数量: {len(param_names)}')
             
             body_start = params_end + 1
-            brace_count = 0
-            body_end = -1
-            for i in range(body_start, len(html)):
-                if html[i] == '{':
-                    brace_count += 1
-                elif html[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        body_end = i
-                        break
-            
+            brace_open = html.find('{', body_start)
+            if brace_open == -1:
+                logger.warning('专家详情页面-未找到函数体起始 {')
+                return None
+            body_end = self._find_matching_brace(html, brace_open)
             if body_end == -1:
                 logger.warning('专家详情页面-未找到函数结束符')
                 return None
@@ -2636,17 +2666,21 @@ class P5Spider:
             replaced_str = self._replace_params(body_str, value_map)
             logger.info(f'replaced_str长度: {len(replaced_str)}')
             
-            issue_info_pattern = r'issueInfo:\{([^}]*?)\}'
-            issue_info_match = re.search(issue_info_pattern, replaced_str)
-            
-            if not issue_info_match:
+            # B7 修复：原正则 issueInfo:\{([^}]*?)\} 非贪婪遇嵌套 { 即截断；
+            # 改为按大括号配对提取（排除字符串内括号）
+            issue_info_marker = replaced_str.find('issueInfo:')
+            if issue_info_marker == -1:
                 logger.warning('专家详情页面-未找到issueInfo数据')
-                idx = replaced_str.find('issueInfo')
-                if idx > 0:
-                    logger.info(f'issueInfo附近内容: {replaced_str[idx:idx+200]}')
                 return None
-            
-            issue_info_str = issue_info_match.group(1)
+            issue_open = replaced_str.find('{', issue_info_marker)
+            if issue_open == -1:
+                logger.warning('专家详情页面-未找到issueInfo起始 {')
+                return None
+            issue_close = self._find_matching_brace(replaced_str, issue_open)
+            if issue_close == -1:
+                logger.warning('专家详情页面-未找到issueInfo结束 }')
+                return None
+            issue_info_str = replaced_str[issue_open + 1:issue_close]
             issue_info = {}
             for field in issue_info_str.split(','):
                 field = field.strip()
@@ -2657,22 +2691,17 @@ class P5Spider:
                     issue_info[key] = val
             logger.info(f'issue_info: {issue_info}')
             
-            detail_start = replaced_str.find('detail:{')
-            if detail_start == -1:
+            detail_marker = replaced_str.find('detail:{')
+            if detail_marker == -1:
                 logger.warning('专家详情页面-未找到detail数据')
                 return None
             
-            detail_start += len('detail:{')
-            depth = 1
-            detail_end = detail_start
-            while detail_end < len(replaced_str) and depth > 0:
-                if replaced_str[detail_end] == '{':
-                    depth += 1
-                elif replaced_str[detail_end] == '}':
-                    depth -= 1
-                detail_end += 1
-            
-            detail_str = replaced_str[detail_start:detail_end-1]
+            detail_start = detail_marker + len('detail:{')
+            detail_end = self._find_matching_brace(replaced_str, detail_start)
+            if detail_end == -1:
+                logger.warning('专家详情页面-未找到detail结束 }')
+                return None
+            detail_str = replaced_str[detail_start:detail_end]
             logger.info(f'detail_str长度: {len(detail_str)}')
             
             nick_name_match = re.search(r'nickName:"([^"]*)"', detail_str)
@@ -2940,8 +2969,10 @@ class P5Spider:
             
             latest_issue = self.parse_expert_recommend(html)
             if not latest_issue:
-                latest_issue = '2026163'
-                logger.warning(f'未获取到专家最新推荐期号，使用默认期号: {latest_issue}')
+                # B9 修复：不再写死历史期号 '2026163'（会过期），
+                # 改为按当前日期动态推断最近一期（年+年内天数，排列5期号格式）
+                latest_issue = datetime.now().strftime('%Y%j')
+                logger.warning(f'未获取到专家最新推荐期号，使用动态默认期号: {latest_issue}')
             
             time.sleep(random.uniform(2, 4))
         
