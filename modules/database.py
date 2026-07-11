@@ -522,7 +522,95 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5个位走势图数据表';
             '''
             self.cursor.execute(sql_ge_trend)
-            
+
+            # ★ 兼容迁移: 旧版曾以"后三/和尾"schema 创建过 p5_spjzs_data / p5_hzzst_data,
+            #   与当前"基于实际爬取5位号码"的 schema(wan/qian/bai/shi/ge/hezhi/...)不兼容。
+            #   若旧表存在且不带 wan 列(即旧schema), 先 DROP 再交由下方 CREATE 重建,
+            #   避免 CREATE TABLE IF NOT EXISTS 失效导致后续 INSERT 列不匹配。
+            #   (仅当表为空/旧schema时重建, 已含 wan 列的正确表不受影响)
+            for _t in ('p5_spjzs_data', 'p5_hzzst_data'):
+                try:
+                    self.cursor.execute(f'SELECT wan FROM {_t} LIMIT 0')
+                except Exception:
+                    # 表不存在 或 无 wan 列(旧schema) -> 重建
+                    try:
+                        self.cursor.execute(f'DROP TABLE IF EXISTS {_t}')
+                        self.connection.commit()
+                        logger.warning(f'检测到 {_t} 为旧schema/缺失, 已重建为新schema(基于爬取5位号码)')
+                    except Exception as _e2:
+                        logger.warning(f'重建 {_t} 失败(非致命): {_e2}')
+
+            # 升平降走势数据表（一定牛 spjzs 图表, 通过 GraphQL get_trend_result 抓取）
+            # 字段以爬取到的实际数据为准: issue_name(期号) + issue_number(5位号码) + 各位置升平降遗漏数组。
+            # wan/qian/bai/shi/ge/hezhi/hewei/kuadu/avg 由 issue_number 本地派生(更稳健),
+            # miss_json 保留升平降遗漏原始数据供深入分析。
+            sql_spjzs_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_spjzs_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                numbers VARCHAR(10) NULL DEFAULT NULL COMMENT '5位开奖号码',
+                wan TINYINT NULL DEFAULT NULL COMMENT '万位号码(0-9)',
+                qian TINYINT NULL DEFAULT NULL COMMENT '千位号码(0-9)',
+                bai TINYINT NULL DEFAULT NULL COMMENT '百位号码(0-9)',
+                shi TINYINT NULL DEFAULT NULL COMMENT '十位号码(0-9)',
+                ge TINYINT NULL DEFAULT NULL COMMENT '个位数字(0-9)',
+                hezhi INT NULL DEFAULT NULL COMMENT '和数值',
+                hewei TINYINT NULL DEFAULT NULL COMMENT '和尾值',
+                kuadu TINYINT NULL DEFAULT NULL COMMENT '跨度值',
+                avg DECIMAL(6,2) NULL DEFAULT NULL COMMENT '平均值(和值/5)',
+                miss_json LONGTEXT NULL DEFAULT NULL COMMENT '升平降遗漏原始数据(JSON)',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_hezhi (hezhi ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5升平降走势图数据表';
+            '''
+            self.cursor.execute(sql_spjzs_trend)
+
+            # 和值走势数据表（一定牛 hzzst 图表, 通过 GraphQL get_trend_result 抓取）
+            # 字段以爬取到的实际数据为准: issue_name(期号) + issue_number(5位号码) + 和值/和尾遗漏数组。
+            sql_hzzst_trend = '''
+            CREATE TABLE IF NOT EXISTS p5_hzzst_data (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '期号（唯一）',
+                numbers VARCHAR(10) NULL DEFAULT NULL COMMENT '5位开奖号码',
+                wan TINYINT NULL DEFAULT NULL COMMENT '万位号码(0-9)',
+                qian TINYINT NULL DEFAULT NULL COMMENT '千位号码(0-9)',
+                bai TINYINT NULL DEFAULT NULL COMMENT '百位号码(0-9)',
+                shi TINYINT NULL DEFAULT NULL COMMENT '十位号码(0-9)',
+                ge TINYINT NULL DEFAULT NULL COMMENT '个位数字(0-9)',
+                hezhi INT NULL DEFAULT NULL COMMENT '和值',
+                kuadu TINYINT NULL DEFAULT NULL COMMENT '跨度',
+                hewei TINYINT NULL DEFAULT NULL COMMENT '和尾',
+                miss_json LONGTEXT NULL DEFAULT NULL COMMENT '和值/和尾走势遗漏原始数据(JSON)',
+                source VARCHAR(50) NULL DEFAULT NULL COMMENT '数据来源',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_hezhi (hezhi ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5和值走势图数据表';
+            '''
+            self.cursor.execute(sql_hzzst_trend)
+
+            # 贝叶斯推断结果专用表 (v3.5 新增, 按 issue 增量持久化, 避免每次重算/调AI)
+            sql_bayesian = '''
+            CREATE TABLE IF NOT EXISTS p5_bayesian_result (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                issue VARCHAR(20) NOT NULL COMMENT '计算所基于的最新开奖期号(唯一)',
+                target_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '预测目标期号',
+                bayes_json MEDIUMTEXT NOT NULL COMMENT '各位置后验概率分布 JSON: List[Dict[int,float]] (万/千/百/十/个)',
+                top_numbers_json VARCHAR(255) NULL DEFAULT NULL COMMENT '各位置概率最高的号码 JSON: [wan,qian,bai,shi,ge]',
+                created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_issue (issue ASC) USING BTREE,
+                INDEX idx_created_at (created_at ASC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5贝叶斯推断后验概率专用表(增量复用)';
+            '''
+            self.cursor.execute(sql_bayesian)
+
             # 和尾走势数据表
             sql_sum_end_trend = '''
             CREATE TABLE IF NOT EXISTS p5_sum_end_trend_data (
@@ -771,6 +859,17 @@ class P5Database:
             return result['issue'] if result else None
         except Exception as e:
             logger.error(f'获取最新历史期号失败: {e}')
+            return None
+    
+    def get_latest_trend_issue(self) -> Optional[str]:
+        """获取数据库中最新的走势数据期号"""
+        try:
+            sql = 'SELECT issue FROM p5_trend_data ORDER BY issue DESC LIMIT 1'
+            self.cursor.execute(sql)
+            result = self.cursor.fetchone()
+            return result['issue'] if result else None
+        except Exception as e:
+            logger.error(f'获取最新走势期号失败: {e}')
             return None
     
     def get_history_data(self, limit: int = 500, order_by: str = 'issue DESC',
@@ -1970,7 +2069,161 @@ class P5Database:
         except Exception as e:
             logger.error(f'根据期号获取个位走势数据失败: {e}')
             return None
-    
+
+    # ============================================================
+    # 升平降走势 / 和值走势（一定牛 spjzs / hzzst 图表）
+    # ============================================================
+
+    def insert_spjzs_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入升平降走势数据（智能去重, 幂等）。
+
+        Args:
+            data: 已归一化的升平降走势数据列表(每条含 issue/numbers/wan../hezhi/.../miss_json)
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        success_count = 0
+        skip_count = 0
+        try:
+            self.cursor.execute('SELECT issue FROM p5_spjzs_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            sql = '''
+            INSERT INTO p5_spjzs_data
+            (issue, numbers, wan, qian, bai, shi, ge, hezhi, hewei, kuadu, avg, miss_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                numbers = VALUES(numbers), wan = VALUES(wan), qian = VALUES(qian),
+                bai = VALUES(bai), shi = VALUES(shi), ge = VALUES(ge),
+                hezhi = VALUES(hezhi), hewei = VALUES(hewei), kuadu = VALUES(kuadu),
+                avg = VALUES(avg), miss_json = VALUES(miss_json), source = VALUES(source)
+            '''
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                try:
+                    wan = int(item.get('wan'))
+                    if not (0 <= wan <= 9):
+                        skip_count += 1
+                        continue
+                except (TypeError, ValueError):
+                    skip_count += 1
+                    continue
+                self.cursor.execute(sql, (
+                    issue,
+                    item.get('numbers', ''),
+                    item.get('wan'), item.get('qian'), item.get('bai'),
+                    item.get('shi'), item.get('ge'),
+                    item.get('hezhi'), item.get('hewei'), item.get('kuadu'),
+                    item.get('avg'), item.get('miss_json'),
+                    item.get('source', 'ydniu_spjzs'),
+                ))
+                success_count += 1
+            self.connection.commit()
+            logger.info(f'升平降走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入升平降走势数据失败: {e}')
+            return 0, len(data)
+
+    def insert_hzzst_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入和值走势数据（智能去重, 幂等）。
+
+        Args:
+            data: 已归一化的和值走势数据列表
+        Returns:
+            (成功条数, 跳过条数)
+        """
+        if not data:
+            return 0, 0
+        success_count = 0
+        skip_count = 0
+        try:
+            self.cursor.execute('SELECT issue FROM p5_hzzst_data')
+            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
+            sql = '''
+            INSERT INTO p5_hzzst_data
+            (issue, numbers, wan, qian, bai, shi, ge, hezhi, kuadu, hewei, miss_json, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                numbers = VALUES(numbers), wan = VALUES(wan), qian = VALUES(qian),
+                bai = VALUES(bai), shi = VALUES(shi), ge = VALUES(ge),
+                hezhi = VALUES(hezhi), kuadu = VALUES(kuadu), hewei = VALUES(hewei),
+                miss_json = VALUES(miss_json), source = VALUES(source)
+            '''
+            for item in data:
+                issue = str(item.get('issue', ''))
+                if not issue:
+                    skip_count += 1
+                    continue
+                try:
+                    wan = int(item.get('wan'))
+                    if not (0 <= wan <= 9):
+                        skip_count += 1
+                        continue
+                except (TypeError, ValueError):
+                    skip_count += 1
+                    continue
+                self.cursor.execute(sql, (
+                    issue,
+                    item.get('numbers', ''),
+                    item.get('wan'), item.get('qian'), item.get('bai'),
+                    item.get('shi'), item.get('ge'),
+                    item.get('hezhi'), item.get('kuadu'), item.get('hewei'),
+                    item.get('miss_json'),
+                    item.get('source', 'ydniu_hzzst'),
+                ))
+                success_count += 1
+            self.connection.commit()
+            logger.info(f'和值走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+            return success_count, skip_count
+        except Exception as e:
+            logger.error(f'插入和值走势数据失败: {e}')
+            return 0, len(data)
+
+    def get_latest_spjzs_issue(self) -> Optional[str]:
+        """获取升平降走势表最新期号"""
+        try:
+            self.cursor.execute('SELECT issue FROM p5_spjzs_data ORDER BY issue DESC LIMIT 1')
+            result = self.cursor.fetchone()
+            return result['issue'] if result else None
+        except Exception as e:
+            logger.error(f'获取升平降走势最新期号失败: {e}')
+            return None
+
+    def get_latest_hzzst_issue(self) -> Optional[str]:
+        """获取和值走势表最新期号"""
+        try:
+            self.cursor.execute('SELECT issue FROM p5_hzzst_data ORDER BY issue DESC LIMIT 1')
+            result = self.cursor.fetchone()
+            return result['issue'] if result else None
+        except Exception as e:
+            logger.error(f'获取和值走势最新期号失败: {e}')
+            return None
+
+    def get_spjzs_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取升平降走势数据(期号倒序)"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_spjzs_data ORDER BY issue DESC LIMIT %s', (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取升平降走势数据失败: {e}')
+            return []
+
+    def get_hzzst_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取和值走势数据(期号倒序)"""
+        try:
+            self.cursor.execute('SELECT * FROM p5_hzzst_data ORDER BY issue DESC LIMIT %s', (limit,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f'获取和值走势数据失败: {e}')
+            return []
+
     def get_ge_number_stats(self) -> Dict[str, Any]:
         """获取个位数字统计信息"""
         try:
@@ -2769,6 +3022,14 @@ class P5Database:
                 })
             return result
         except Exception as e:
+            err_code = getattr(e, 'args', (None, None))[0]
+            if err_code == 1146:  # Table doesn't exist — 兜底自动建表
+                logger.warning('p5_artifact 表不存在, 自动补齐...')
+                try:
+                    self._ensure_artifact_table()
+                except Exception:
+                    pass
+                return []
             logger.error(f'查询产物失败: {e}')
             return []
 
@@ -2777,6 +3038,191 @@ class P5Database:
         """获取指定类型最新一条产物, 无则返回 None。"""
         items = self.get_artifacts(artifact_type=artifact_type, issue=issue, ref_uuid=ref_uuid, limit=1)
         return items[0] if items else None
+
+    # ============================================================
+    # 贝叶斯推断结果持久化 (幂等增量写入, v3.3 新增)
+    # ============================================================
+
+    def save_bayesian_result(self, issue: str, bayesian_data: Dict[str, Any],
+                             target_issue: str = None) -> bool:
+        """
+        幂等保存贝叶斯推断计算结果到 p5_artifact(type='bayesian_result')。
+
+        如果同一期号已存在记录则跳过写入(update_if_newer=False), 避免重复计算产物堆积。
+
+        Args:
+            issue: 关联期号(当前最新期号)
+            bayesian_data: 贝叶斯推断结果(dict), 包含各位置后验概率、先验、似然等
+            target_issue: 预测目标期号(可选)
+
+        Returns:
+            是否保存成功(True/False)
+        """
+        try:
+            # 幂等检查: 同一 issue 已存在则跳过
+            existing = self.get_latest_artifact('bayesian_result', issue=issue)
+            if existing is not None:
+                logger.info(f'期号 {issue} 贝叶斯结果已存在, 跳过幂等写入')
+                return False
+
+            meta = {'target_issue': target_issue} if target_issue else {}
+            ok = self.save_artifact('bayesian_result', bayesian_data, issue=issue, meta=meta)
+            if ok:
+                logger.info(f'贝叶斯推断结果已保存: issue={issue}')
+            return ok
+        except Exception as e:
+            logger.error(f'保存贝叶斯结果失败: {e}')
+            return False
+
+    def get_bayesian_result(self, issue: str = None) -> Optional[Dict[str, Any]]:
+        """
+        获取最近的贝叶斯推断结果(可按 issue 过滤)。
+
+        Args:
+            issue: 指定期号, 若为 None 则返回最新一条
+
+        Returns:
+            贝叶斯推断数据 dict 或 None
+        """
+        artifact = self.get_latest_artifact('bayesian_result', issue=issue)
+        return artifact.get('data') if artifact else None
+
+    def get_bayesian_results(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        获取历史贝叶斯推断结果列表(供趋势分析用)。
+
+        Returns:
+            结果列表 [{issue, data, created_at}, ...]
+        """
+        artifacts = self.get_artifacts(artifact_type='bayesian_result', limit=limit)
+        return [{
+            'id': a.get('id'),
+            'issue': a.get('issue'),
+            'created_at': a.get('created_at'),
+            'data': a.get('data'),
+        } for a in artifacts]
+
+    # ============================================================
+    # 贝叶斯推断结果专用表 p5_bayesian_result (v3.5 新增, 增量复用)
+    # ============================================================
+
+    def insert_bayesian_result(self, issue: str, bayes_list: Any,
+                               target_issue: str = None) -> bool:
+        """
+        幂等保存贝叶斯后验概率到专用表 p5_bayesian_result (按 issue 唯一)。
+
+        同一 issue 已存在则覆盖更新(保证最新计算可见), 不会重复堆积。
+        下次同 issue 的预测可直接读取, 跳过 P5Predictor 重算与 AI 交互。
+
+        Args:
+            issue: 计算所基于的最新开奖期号
+            bayes_list: 后验概率 List[Dict[int,float]] (5个位置, 每位置 {号码:概率})
+            target_issue: 预测目标期号(可选)
+        Returns:
+            是否成功
+        """
+        try:
+            if not bayes_list:
+                return False
+            bayes_json = json.dumps(bayes_list, ensure_ascii=False, default=str)
+            # 各位置概率最高的号码(便于直观查看)
+            top_numbers = []
+            for pos_d in bayes_list:
+                if isinstance(pos_d, dict) and pos_d:
+                    top_numbers.append(int(max(pos_d, key=lambda k: pos_d[k])))
+                else:
+                    top_numbers.append(None)
+            top_json = json.dumps(top_numbers, ensure_ascii=False)
+            sql = (
+                'INSERT INTO p5_bayesian_result (issue, target_issue, bayes_json, top_numbers_json) '
+                'VALUES (%s, %s, %s, %s) '
+                'ON DUPLICATE KEY UPDATE '
+                'target_issue = VALUES(target_issue), '
+                'bayes_json = VALUES(bayes_json), '
+                'top_numbers_json = VALUES(top_numbers_json)'
+            )
+            self.execute_with_reconnect(sql, (str(issue), target_issue, bayes_json, top_json))
+            self.connection.commit()
+            logger.info(f'贝叶斯结果已写入专用表: issue={issue}, top={top_numbers}')
+            return True
+        except Exception as e:
+            logger.error(f'写入 p5_bayesian_result 失败: {e}')
+            return False
+
+    def get_bayesian_result_row(self, issue: str) -> Optional[List[Dict[str, float]]]:
+        """
+        从专用表读取指定 issue 的贝叶斯后验概率(增量复用)。
+        返回 List[Dict[int,float]] 或 None。
+        """
+        try:
+            self.cursor.execute(
+                'SELECT bayes_json FROM p5_bayesian_result WHERE issue = %s', (str(issue),))
+            row = self.cursor.fetchone()
+            if not row:
+                return None
+            return _safe_json_loads(row.get('bayes_json'))
+        except Exception as e:
+            logger.warning(f'读取 p5_bayesian_result 失败: {e}')
+            return None
+
+    def get_bayesian_visual_summary(self, issue: str) -> Optional[Dict]:
+        """
+        获取贝叶斯结果的可展示摘要（用于GUI报表展示）。
+
+        Returns:
+            {
+                'issue': str,
+                'target_issue': str,
+                'top_numbers': List[int],
+                'position_details': List[{number: probability, top3: List}]
+            } or None
+        """
+        try:
+            row = self.get_bayesian_result_row(issue)
+            if not row:
+                return None
+            
+            # 获取完整记录
+            self.cursor.execute(
+                'SELECT issue, target_issue, top_numbers_json FROM p5_bayesian_result WHERE issue = %s',
+                (str(issue),)
+            )
+            full_row = self.cursor.fetchone()
+            if not full_row:
+                return None
+            
+            import json as _json
+            top_numbers = _json.loads(full_row.get('top_numbers_json', '[]'))
+            
+            pos_names = ['万位', '千位', '百位', '十位', '个位']
+            position_details = []
+            
+            for i, pos_dict in enumerate(row):
+                if isinstance(pos_dict, dict):
+                    # 排序取 Top-3
+                    sorted_probs = sorted(pos_dict.items(), key=lambda x: float(x[1]), reverse=True)[:3]
+                    position_details.append({
+                        'position': pos_names[i],
+                        'top_number': top_numbers[i] if i < len(top_numbers) else None,
+                        'top3': [{'number': int(k), 'probability': float(v)} for k, v in sorted_probs]
+                    })
+                else:
+                    position_details.append({
+                        'position': pos_names[i],
+                        'top_number': top_numbers[i] if i < len(top_numbers) else None,
+                        'top3': []
+                    })
+            
+            return {
+                'issue': full_row.get('issue'),
+                'target_issue': full_row.get('target_issue'),
+                'top_numbers': top_numbers,
+                'position_details': position_details
+            }
+        except Exception as e:
+            logger.warning(f'获取贝叶斯可视化摘要失败: {e}')
+            return None
+
 
 
 def test_database():

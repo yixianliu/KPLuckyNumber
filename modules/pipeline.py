@@ -37,7 +37,9 @@
 import logging
 import os
 import json
+import math
 import uuid
+import itertools
 import time
 import random
 from datetime import datetime, timedelta
@@ -516,6 +518,15 @@ class Pipeline:
                         'analyzed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     }
 
+                    # ★ 关键修复(问题3根因): 把AI结构化结果回写到 article 对象,
+                    # 否则下游 _generate_expert_article_report 读取 article['ai_analysis']
+                    # 时始终为空字典 -> 专家文章预测报告的 prediction 全为空。
+                    try:
+                        article['ai_analysis'] = ai_result if isinstance(ai_result, dict) else \
+                            self._parse_ai_json(ai_result) if isinstance(ai_result, str) else {}
+                    except Exception:
+                        article['ai_analysis'] = {}
+
                     redis_key = self.REDIS_ARTICLE_REPORT_KEY.format(article_id=article_id)
                     try:
                         # 确保store_data可被JSON序列化
@@ -636,6 +647,10 @@ class Pipeline:
             result['error'] = str(e)
 
         self.pipeline_state['article_reports'] = result.get('articles', [])
+        # ★ 关键修复(问题5根因): step4 从 self.pipeline_state['expert_article_report']
+        # 读取专家文章预测结果来填充 final_report['article_prediction']; 此前该键从未被设置,
+        # 导致 final_report['article_prediction'] 始终为 {} -> GUI 显示"专家文章预测结果未获取到"。
+        self.pipeline_state['expert_article_report'] = result.get('expert_article_report')
         return result
 
     # ================================================================
@@ -753,12 +768,12 @@ class Pipeline:
 
 【报告要求】
 请以严格的JSON格式输出，不要包含任何额外文字或markdown标记：
-""".format(len(trend_data), target_issue))
+""".format(min(len(trend_data), 30), target_issue))
 
-            # 格式化基础走势数据（缩减到20期，降低提示词长度）
-            prompt_parts.append("\n=== 基础走势图数据（最近{}期） ===\n".format(min(len(trend_data), 20)))
+            # 格式化基础走势数据（缩减到30期，使用历史走势图+基础走势+位置走势三类30期数据）
+            prompt_parts.append("\n=== 基础走势图数据（最近{}期） ===\n".format(min(len(trend_data), 30)))
             prompt_parts.append("期号 | 日期 | 万 | 千 | 百 | 十 | 个 | 和值 | 奇偶比 | 大小比\n")
-            for item in trend_data[:20]:
+            for item in trend_data[:30]:
                 issue = item.get('issue', '')
                 draw_date = item.get('draw_date', '')
                 wan = item.get('wan', 0)
@@ -776,20 +791,20 @@ class Pipeline:
             pos_nums = {'wan_trend': 'wan_number', 'qian_trend': 'qian_number', 'bai_trend': 'bai_number', 'shi_trend': 'shi_number', 'ge_trend': 'ge_number'}
 
             for trend_key, pos_name in pos_names.items():
-                pos_data = trend_data_format.get(trend_key, [])
-                if pos_data:
-                    num_key = pos_nums[trend_key]
-                    prompt_parts.append(f"\n=== {pos_name}走势数据（最近{min(len(pos_data), 20)}期） ===")
-                    prompt_parts.append("期号 | 数字 | 奇偶 | 大小 | 质合 | 遗漏 | 冷热等级\n")
-                    for item in pos_data[:20]:
-                        issue = item.get('issue', '')
-                        num = item.get(num_key, 0)
-                        is_odd = '奇' if item.get('is_odd') else '偶'
-                        is_big = '大' if item.get('is_big') else '小'
-                        is_prime = '质' if item.get('is_prime') else '合'
-                        omission = item.get('omission', 0)
-                        hot_level = item.get('hot_level', '')
-                        prompt_parts.append(f"{issue} | {num} | {is_odd} | {is_big} | {is_prime} | {omission} | {hot_level}")
+                    pos_data = trend_data_format.get(trend_key, [])
+                    if pos_data:
+                        num_key = pos_nums[trend_key]
+                        prompt_parts.append(f"\n=== {pos_name}走势数据（最近{min(len(pos_data), 30)}期） ===")
+                        prompt_parts.append("期号 | 数字 | 奇偶 | 大小 | 质合 | 遗漏 | 冷热等级\n")
+                        for item in pos_data[:30]:
+                            issue = item.get('issue', '')
+                            num = item.get(num_key, 0)
+                            is_odd = '奇' if item.get('is_odd') else '偶'
+                            is_big = '大' if item.get('is_big') else '小'
+                            is_prime = '质' if item.get('is_prime') else '合'
+                            omission = item.get('omission', 0)
+                            hot_level = item.get('hot_level', '')
+                            prompt_parts.append(f"{issue} | {num} | {is_odd} | {is_big} | {is_prime} | {omission} | {hot_level}")
 
                     # 统计摘要
                     num_freq = {}
@@ -950,11 +965,10 @@ class Pipeline:
                 if result.get('ai_fallback'):
                     trend_report.setdefault('note', 'AI分析不可用, 基于统计指标的降级报告')
                 result['trend_chart_report'] = trend_report
-                logger.info(f'走势图数据预测报告已生成(期号:{target_issue})')
-                # 持久化到数据库(v3.3: 仅入库, 不再写本地 JSON 文件)
-                uuid_val = self._save_report_to_db(trend_report, 'trend_chart', target_issue, latest_issue)
-                if uuid_val:
-                    logger.info(f'走势图数据预测报告已入库: {uuid_val}')
+                # 先暂存到 pipeline_state, 待步骤4用多源融合预测填充 prediction 字段后统一入库
+                # (避免在预测为空时提前入库, 导致数据库报告 prediction 为空 —— 问题3/4同类)
+                self.pipeline_state['trend_chart_report'] = trend_report
+                logger.info(f'走势图数据预测报告已生成(期号:{target_issue}), 待步骤4填充预测后入库')
 
             logger.info(f'步骤2完成: 走势分析成功')
 
@@ -1565,6 +1579,425 @@ class Pipeline:
     # 步骤4: 最终预测结果生成与入库
     # ================================================================
 
+    def _predict_trend_multi_source(self, target_issue: str, data_period: int = 30) -> Dict[str, Any]:
+        """
+        多源走势融合预测 (问题2核心实现)
+
+        结合以下四类数据源的「最新 data_period 期」数据, 用加权融合算法输出每个位置 Top-4 推荐号码:
+          1. 历史走势图       —— p5_history_data (万/千/百/十/个 5列)
+          2. 基础走势图       —— p5_trend_data  (和值/跨度/奇偶比/大小比 + 5列号码)
+          3. 万千百十个独立走势表 —— p5_wan/qian/bai/shi/ge_trend_data (含 omission 遗漏/ hot_level 冷热等级/ 奇偶大小质合属性)
+          4. ★ 贝叶斯后验概率 —— p5_bayesian_result (增量复用的贝叶斯推断后验分布)
+
+        融合算法 (每位置 digit d ∈ 0..9):
+          score(d) = 0.35 * 频率归一   + 0.25 * 遗漏归一   + 0.15 * 动量贴近度
+                   + 0.15 * 贝叶斯后验概率(若可用)
+          
+          若无贝叶斯数据，自动降级为:
+          score(d) = 0.45 * 频率归一   + 0.35 * 遗漏归一   + 0.20 * 动量贴近度
+
+        该算法与 P5Predictor 的「频率加权+遗漏回归+趋势动量+贝叶斯」思路一致, 但数据源从单一历史表
+        扩展到四表联动, 更充分利用贝叶斯后验概率(基于历史验证反馈的动态似然调整)。
+
+        Args:
+            target_issue: 目标期号
+            data_period: 回看期数(默认30期)
+
+        Returns:
+            {wan:{numbers,confidence,reason}, qian:..., ...}  为空字典表示失败
+        """
+        from collections import Counter
+
+        if not self.db_client or not getattr(self.db_client, 'connection', None):
+            self._init_db_client()
+        db = self.db_client
+        if not db or not getattr(db, 'connection', None):
+            logger.warning('多源走势预测: 数据库未连接, 返回空结果')
+            return {}
+
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+        pos_names = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+
+        try:
+            # 1. 加载三大类数据源 (DESC -> 翻转成旧->新)
+            db.cursor.execute(
+                'SELECT issue, wan, qian, bai, shi, ge FROM p5_history_data '
+                'ORDER BY issue DESC LIMIT %s', (data_period,))
+            history = db.cursor.fetchall() or []
+
+            db.cursor.execute(
+                'SELECT issue, wan, qian, bai, shi, ge, hezhi, odd_even_ratio, big_small_ratio '
+                'FROM p5_trend_data ORDER BY issue DESC LIMIT %s', (data_period,))
+            basic = db.cursor.fetchall() or []
+
+            pos_trends = {}
+            for p in pos_keys:
+                db.cursor.execute(
+                    f'SELECT issue, {p}_number, omission, hot_level, is_big, is_odd, is_prime '
+                    f'FROM p5_{p}_trend_data ORDER BY issue DESC LIMIT {data_period}')
+                pos_trends[p] = db.cursor.fetchall() or []
+
+            if not history:
+                logger.warning('多源走势预测: 无历史数据, 返回空结果')
+                return {}
+
+            hist_asc = list(reversed(history))
+
+            # 2. 构建每个位置的「近 data_period 期数字序列」(优先用位置走势表, 不足用历史补齐)
+            seq = {}
+            for p in pos_keys:
+                s = [r.get(f'{p}_number') for r in reversed(pos_trends[p])
+                     if r.get(f'{p}_number') is not None]
+                if len(s) < 10:
+                    s = [r.get(p) for r in hist_asc if r.get(p) is not None][-data_period:]
+                seq[p] = s[-data_period:]
+
+            # ★ 升平降走势图数据(p5_spjzs_data): 多期方向偏好(最近10次涨跌多数方向)
+            #   与"升平降走势图"同义, 作为走势惯性信号。
+            spj_pref = self._get_spj_direction_preference() or {}
+
+            # ★ 和值走势图数据(p5_hzzst_data): 近期和值重心, 用于每位置结构偏置
+            _hezhi_recent = []
+            try:
+                db.cursor.execute(
+                    'SELECT hezhi FROM p5_hzzst_data ORDER BY issue DESC LIMIT 10')
+                _hezhi_recent = [int(r['hezhi']) for r in (db.cursor.fetchall() or [])
+                                 if r.get('hezhi') is not None]
+            except Exception:
+                _hezhi_recent = []
+            _hezhi_mean = (sum(_hezhi_recent) / len(_hezhi_recent)) if _hezhi_recent else None
+
+            # ★ 贝叶斯后验概率(增量复用): 从专用表读取已计算的贝叶斯推断结果,
+            #   作为额外加权信号融合到走势预测中(提升命中率)
+            _bayes_posterior = None
+            try:
+                if hasattr(db, 'get_bayesian_result_row'):
+                    _bayes_posterior = db.get_bayesian_result_row(hist_asc[-1].get('issue', '') if hist_asc else '')
+                if not _bayes_posterior:
+                    # 尝试用历史数据最新期号查询
+                    db.cursor.execute('SELECT issue FROM p5_history_data ORDER BY issue DESC LIMIT 1')
+                    _issue_row = db.cursor.fetchone()
+                    if _issue_row:
+                        _bayes_posterior = db.get_bayesian_result_row(_issue_row.get('issue', ''))
+            except Exception:
+                _bayes_posterior = None
+
+
+            out = {}
+            for p in pos_keys:
+                s = seq[p]
+                n = len(s)
+                if n == 0:
+                    continue
+
+                # ★ 指数衰减加权: 越近期出现的数字权重越高(halflife=10期),
+                #   使"走势惯性"更贴合实际近期规律(而非 30 期简单平均)。
+                _decay = self._exp_decay_weights(n, halflife=10)
+                freq = Counter()
+                for i, v in enumerate(s):
+                    if v is not None:
+                        freq[v] += _decay[i]
+
+                # 遗漏: 距上次出现 (reversed 后 index 0 = 最新一期)
+                omission = {}
+                for d in range(10):
+                    last_idx = None
+                    for i, v in enumerate(reversed(s)):
+                        if v == d:
+                            last_idx = i
+                            break
+                    omission[d] = last_idx if last_idx is not None else n
+
+                # 动量: 近期(末5期)均值 vs 整体均值
+                recent = s[-5:] if n >= 5 else s
+                recent_avg = sum(recent) / len(recent)
+                overall_avg = sum(s) / n
+                # 贴近度: 数字越接近近期均值得分越高
+                mom_raw = {d: -abs(d - recent_avg) for d in range(10)}
+                mom_min, mom_max = min(mom_raw.values()), max(mom_raw.values())
+                mom_range = (mom_max - mom_min) or 1.0
+                momentum = {d: (mom_raw[d] - mom_min) / mom_range for d in range(10)}
+
+                total_freq = sum(freq.values()) or 1
+                total_om = sum(omission.values()) or 1
+                
+                # ★ 贝叶斯后验概率融合: 若有可用数据, 将其作为额外信号加入打分
+                # p 是位置键('wan','qian'...)，需要转为索引(0-4)
+                _pos_index = pos_keys.index(p) if p in pos_keys else None
+                _use_bayes = (_bayes_posterior is not None and 
+                              _pos_index is not None and 
+                              _pos_index < len(_bayes_posterior))
+                _bayes_pos = _bayes_posterior[_pos_index] if _use_bayes else None
+                
+                if _use_bayes and isinstance(_bayes_pos, dict) and _bayes_pos:
+                    # 贝叶斯加权模式: 频率0.35 + 遗漏0.25 + 动量0.15 + 贝叶斯0.25
+                    # ★ 注意: _bayes_pos 的 key 是字符串(从JSON反序列化), 需转换为整数
+                    total_bayes = sum(float(v) for v in _bayes_pos.values()) or 1
+                    bayes_norm = {}
+                    for d in range(10):
+                        key_str = str(d)
+                        prob = float(_bayes_pos.get(key_str, 0.1))
+                        bayes_norm[d] = prob / total_bayes
+                    
+                    scores = {}
+                    for d in range(10):
+                        fz = freq.get(d, 0) / total_freq
+                        oz = omission[d] / total_om
+                        scores[d] = (0.35 * fz + 0.25 * oz + 0.15 * momentum[d] + 
+                                     0.25 * bayes_norm.get(d, 0.1))
+                else:
+                    # 标准加权模式(无贝叶斯数据时): 频率0.45 + 遗漏0.35 + 动量0.20
+                    scores = {}
+                    for d in range(10):
+                        fz = freq.get(d, 0) / total_freq
+                        oz = omission[d] / total_om
+                        scores[d] = 0.45 * fz + 0.35 * oz + 0.20 * momentum[d]
+
+                # ★ 基础走势图融合(轻量偏置): 用最新一期奇偶比/大小比微调各数字得分
+                if basic:
+                    _lb = basic[0]
+                    odd_bias = self._ratio_bias(_lb.get('odd_even_ratio', ''))   # >0偏奇, <0偏偶
+                    big_bias = self._ratio_bias(_lb.get('big_small_ratio', ''))  # >0偏大, <0偏小
+                    for d in range(10):
+                        if odd_bias != 0:
+                            _is_odd = (d % 2 == 1)
+                            if (odd_bias > 0 and _is_odd) or (odd_bias < 0 and not _is_odd):
+                                scores[d] += 0.03 * abs(odd_bias)
+                        if big_bias != 0:
+                            _is_big = (d >= 5)
+                            if (big_bias > 0 and _is_big) or (big_bias < 0 and not _is_big):
+                                scores[d] += 0.03 * abs(big_bias)
+
+                # ★ 升平降走势图数据(p5_spjzs_data)多期方向偏置:
+                #   用升平降走势表派生的最近10次涨跌多数方向(pref)作为"走势惯性"信号,
+                #   比单期 history[-1]vs[-2] 更稳定, 直接利用了"升平降走势图"所表达的相邻期涨跌规律。
+                _sp = spj_pref.get(p)
+                if isinstance(_sp, dict):
+                    _spref = _sp.get('pref')
+                    if _spref == 'up':
+                        for d in range(10):
+                            scores[d] += 0.04 * (d / 9.0)
+                    elif _spref == 'down':
+                        for d in range(10):
+                            scores[d] += 0.04 * ((9 - d) / 9.0)
+                    elif _spref == 'flat':
+                        _sld = _sp.get('latest_digit')
+                        if _sld is not None:
+                            for d in range(10):
+                                scores[d] -= 0.05 * abs(d - _sld)
+
+                # ★ 和值走势图数据(p5_hzzst_data)结构偏置:
+                #   近期和值重心 -> 期望每位数字≈ 和值均值/5, 向该期望值轻微偏置,
+                #   使候选数字整体更贴合近期和值结构(与组合级和值约束同源, 但作用于每位置打分)。
+                if _hezhi_mean is not None:
+                    _exp_digit = _hezhi_mean / 5.0
+                    for d in range(10):
+                        scores[d] += 0.03 * (1.0 - min(1.0, abs(d - _exp_digit) / 5.0))
+
+                top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:4]
+                bayes_flag = " +贝叶斯后验" if _use_bayes else ""
+                out[p] = {
+                    'numbers': [int(d) for d, _ in top],
+                    'confidence': [round(float(sc), 4) for _, sc in top],
+                    'reason': (f'全源融合(近{data_period}期: 历史+基础+{pos_names[p]}走势+升平降方向+和值重心{bayes_flag}) '
+                               f'频率/遗漏/动量/方向加权, 近期均值{recent_avg:.1f}')
+                }
+
+            logger.info(f'多源走势融合预测完成: { {k: v["numbers"] for k, v in out.items()} }')
+            return out
+
+        except Exception as e:
+            logger.error(f'多源走势融合预测异常: {e}', exc_info=True)
+            return {}
+
+    @staticmethod
+    def _ratio_bias(ratio_str: str) -> int:
+        """
+        解析 "a:b" 形式的偏置(如奇偶比 "3:2" / 大小比 "2:3")。
+        返回: >0 表示偏向前者(奇/大), <0 表示偏向后者(偶/小), 0 表示中性或无数据。
+        例: "3:2" -> +1 (偏奇/偏大); "1:4" -> -3 (强烈偏偶/偏小)
+        """
+        if not ratio_str or ':' not in str(ratio_str):
+            return 0
+        try:
+            a, b = str(ratio_str).split(':', 1)
+            a, b = int(a.strip()), int(b.strip())
+            diff = a - b
+            if diff == 0:
+                return 0
+            # 归一到 [-3, 3] 区间, 避免极端偏置
+            return max(-3, min(3, diff))
+        except (ValueError, TypeError):
+            return 0
+
+    @staticmethod
+    def _exp_decay_weights(n: int, halflife: float = 10.0) -> List[float]:
+        """
+        生成指数衰减权重序列(长度 n), 越近期(末尾)权重越高。
+        w[i] = 0.5 ** ((n-1-i) / halflife)
+          - i = n-1 (最新一期) -> 权重 1.0
+          - 每经过 halflife 期, 权重衰减一半
+        用于让 30 期走势统计更贴合"近期惯性", 而非等长简单平均。
+        """
+        if n <= 0:
+            return []
+        decay = math.log(2) / max(halflife, 1e-6)
+        return [math.exp(-decay * (n - 1 - i)) for i in range(n)]
+
+    def _get_spj_direction_preference(self, data_period: int = 30, n_dir: int = 10):
+        """
+        从 p5_spjzs_data(升平降走势) 派生每个位置的"涨跌方向偏好":
+          对每个位置, 比较相邻期数字得到 升(up)/平(flat)/降(down) 序列(最近 n_dir 次变迁),
+          取多数方向为 pref(主导方向), 并记录最新一期方向 latest 与最新实际数字 latest_digit。
+        供 _build_constrained_combinations 做组合级方向一致性打分。
+        """
+        db = self.db_client
+        if not db or not getattr(db, 'connection', None):
+            return None
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+        try:
+            db.cursor.execute(
+                'SELECT issue, wan, qian, bai, shi, ge FROM p5_spjzs_data '
+                'ORDER BY issue DESC LIMIT %s', (data_period + 1,))
+            rows = db.cursor.fetchall() or []
+            if len(rows) < 2:
+                return None
+            asc = list(reversed(rows))  # 旧 -> 新
+            latest = asc[-1]
+            # 相邻期变迁: (旧, 新) 配对, 取最近 n_dir 次
+            transitions = list(zip(asc, asc[1:]))
+            last_trans = transitions[-n_dir:] if len(transitions) >= n_dir else transitions
+            states = {p: [] for p in pos_keys}
+            for a, b in last_trans:
+                for p in pos_keys:
+                    va, vb = a.get(p), b.get(p)
+                    if va is None or vb is None:
+                        continue
+                    va, vb = int(va), int(vb)
+                    states[p].append('up' if vb > va else ('down' if vb < va else 'flat'))
+            pref = {}
+            for p in pos_keys:
+                seq = states[p]
+                if not seq:
+                    continue
+                cnt = {'up': seq.count('up'), 'flat': seq.count('flat'), 'down': seq.count('down')}
+                pref[p] = {
+                    'pref': max(cnt, key=cnt.get),
+                    'latest': seq[-1],
+                    'latest_digit': int(latest[p]) if latest.get(p) is not None else None,
+                }
+            return pref
+        except Exception as e:
+            logger.warning(f'读取升平降方向偏好失败: {e}')
+            return None
+
+    def _build_constrained_combinations(self, prediction: Dict[str, Any],
+                                         target_issue: str,
+                                         data_period: int = 30):
+        """
+        用 p5_hzzst_data(和值走势) + p5_spjzs_data(升平降走势) 对多源融合的每位置 Top-4 候选做
+        组合级约束与打分:
+          1. 和值区间(自适应带宽): 以最近10期和值重心为中心, 宽度按最近10期波动率(1.3σ)自适应
+             (波动大->区间宽, 平稳->窄), 保底宽度12防过约束。
+          2. 每位置取多源融合 Top-4 候选(数字+置信度)。
+          3. 笛卡尔积枚举(≤4^5), 仅保留和值落在区间内的组合; 再按"跨位置信度 + 升平降方向一致
+             性"综合打分排序(方向匹配 pref +0.10, 匹配最新方向 +0.04, 背离 -0.06)。
+          4. 约束过严(<5)自动放宽±4再试; 仍无结果返回 None(降级)。
+        Returns:
+            (combinations_list, hezhi_range_str) 或 (None, '') 表示不可用/降级
+        """
+        db = self.db_client
+        if not db or not getattr(db, 'connection', None):
+            return None, ''
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+
+        # 1) 和值区间(自适应带宽)
+        try:
+            db.cursor.execute(
+                'SELECT hezhi FROM p5_hzzst_data ORDER BY issue DESC LIMIT %s', (data_period,))
+            rows = db.cursor.fetchall() or []
+            sums = [int(r['hezhi']) for r in rows if r.get('hezhi') is not None]
+        except Exception as e:
+            logger.warning(f'读取和值走势失败, 跳过和值约束: {e}')
+            return None, ''
+
+        if len(sums) < 5:
+            return None, ''
+
+        # ★ 自适应带宽: 以最近10期(最新在前)的重心为中心, 宽度按最近10期波动率定
+        _recent = sums[:10]
+        _rmean = sum(_recent) / len(_recent)
+        _rvar = sum((x - _rmean) ** 2 for x in _recent) / len(_recent)
+        _rstd = math.sqrt(_rvar) or 1.0
+        lo = max(0, math.floor(_rmean - 1.3 * _rstd))
+        hi = min(45, math.ceil(_rmean + 1.3 * _rstd))
+        if hi - lo < 12:  # 保证不过度约束
+            lo = max(0, lo - 3)
+            hi = min(45, hi + 3)
+
+        # 2) 升平降方向偏好(p5_spjzs_data)
+        spj = self._get_spj_direction_preference(data_period)
+
+        # 3) 每位置候选(必须都有 Top-4, 否则降级)
+        cand = {}
+        for p in pos_keys:
+            pr = prediction.get(p)
+            if not isinstance(pr, dict):
+                return None, ''
+            nums = pr.get('numbers', []) or []
+            conf = pr.get('confidence', []) or []
+            if len(nums) < 4:
+                return None, ''
+            cand[p] = [(int(d), float(conf[i]) if i < len(conf) else 0.0)
+                       for i, d in enumerate(nums)]
+
+        # 4) 枚举约束组合(和值过滤 + 升平降方向一致性打分)
+        def _enumerate(lo_b, hi_b):
+            out = []
+            for combo in itertools.product(*[cand[p] for p in pos_keys]):
+                digits = [c[0] for c in combo]
+                s = sum(digits)
+                if not (lo_b <= s <= hi_b):
+                    continue
+                conf = sum(c[1] for c in combo)
+                spj_bonus = 0.0
+                if spj:
+                    for p, d in zip(pos_keys, digits):
+                        info = spj.get(p)
+                        if not info or info.get('latest_digit') is None:
+                            continue
+                        rel = 'up' if d > info['latest_digit'] else (
+                            'down' if d < info['latest_digit'] else 'flat')
+                        if rel == info['pref']:
+                            spj_bonus += 0.10
+                        elif rel == info['latest']:
+                            spj_bonus += 0.04
+                        else:
+                            spj_bonus -= 0.06
+                out.append((digits, conf + spj_bonus, s))
+            out.sort(key=lambda x: x[1], reverse=True)
+            return out
+
+        best = _enumerate(lo, hi)
+        if len(best) < 5:  # 约束过严, 放宽
+            best = _enumerate(lo - 4, hi + 4)
+        if not best:
+            return None, ''
+
+        out = []
+        for digits, score, s in best[:10]:
+            comb = ''.join(str(d) for d in digits)
+            span = max(digits) - min(digits)
+            out.append({
+                'combination': comb,
+                'confidence': round(float(score) / 5.0, 4),
+                'reason': f"和值{s}(约束区间{lo}-{hi})/跨度{span}"
+                          + ("" if not spj else "/升平降方向约束"),
+                'hezhi': s,
+                'span': span
+            })
+        return out, f"{lo}-{hi}"
+
     def step4_final_prediction(self, target_issue: str) -> Dict[str, Any]:
         """
         步骤4: 从Redis读取走势报告和综合报告，整合后进行最终预测并存入数据库
@@ -1823,6 +2256,7 @@ class Pipeline:
                 result['error'] = '无历史开奖数据，无法进行预测'
                 return result
             latest_issue = _rows[-1].get('issue', '')
+            history_count = len(_rows)
             _history = [{
                 'issue': r.get('issue'), 'draw_date': r.get('draw_date'),
                 'wan': r.get('wan'), 'qian': r.get('qian'), 'bai': r.get('bai'),
@@ -1830,50 +2264,133 @@ class Pipeline:
                 'hezhi': r.get('hezhi'), 'span': r.get('span'),
             } for r in _rows]
 
-            from modules.predictor import P5Predictor
-            _predictor = P5Predictor()
-            _stat = _predictor.predict(_history, current_issue=latest_issue)
-            if _stat.get('error'):
-                result['error'] = f'统计预测失败: {_stat["error"]}'
-                return result
-
-            # 持久化贝叶斯推断结果与完整预测统计到数据库 (v3.3 统一产物存储, 替代本地 JSON)
+            # ★ 贝叶斯/预测统计产物缓存复用(v3.4 修复核心):
+            #   同一最新期号、且历史数据量未变化(未新增开奖)时, 直接复用已落库的
+            #   prediction_stat 产物(内含 bayesian_inference 后验概率等), 不再调用
+            #   P5Predictor -> AI 模型, 彻底消除"每次流水线都频繁与AI交互"的问题。
+            _stat = None
+            _cached = False
             try:
                 self._ensure_db()
                 if self.db_client:
-                    _bayes = _stat.get('bayesian_inference')
-                    if _bayes is not None:
-                        self.db_client.save_artifact(
-                            'bayesian_result', _bayes, issue=latest_issue,
-                            meta={'target_issue': target_issue}
-                        )
-                    self.db_client.save_artifact(
-                        'prediction_stat', _stat, issue=latest_issue,
-                        meta={'target_issue': target_issue, 'model': 'statistical+v3.2'}
-                    )
+                    _cached_art = self.db_client.get_latest_artifact('prediction_stat', issue=latest_issue)
+                    if _cached_art and isinstance(_cached_art.get('data'), dict):
+                        _cmeta = _cached_art.get('meta') or {}
+                        if _cmeta.get('history_count') == history_count:
+                            _stat = _cached_art['data']
+                            _cached = True
+                            logger.info(f'复用已存储预测统计(含贝叶斯推断) issue={latest_issue}, '
+                                         f'跳过AI模型交互与重算')
             except Exception as e:
-                logger.warning(f'贝叶斯/预测统计产物入库失败(非致命): {e}')
+                logger.warning(f'读取预测统计缓存失败(非致命): {e}')
+
+            # ★ 贝叶斯结果增量复用(专用表 p5_bayesian_result):
+            #   先查专用表, 若该 issue 已计算过贝叶斯后验, 则本次直接复用(即便 prediction_stat
+            #   缓存因 history_count 变化而 miss, 贝叶斯部分仍可免去重算), 彻底避免频繁调AI。
+            _bayes_cached_in_db = None
+            try:
+                if self.db_client:
+                    _bayes_cached_in_db = self.db_client.get_bayesian_result_row(latest_issue)
+            except Exception:
+                _bayes_cached_in_db = None
+
+            if not _cached:
+                from modules.predictor import P5Predictor
+                _predictor = P5Predictor()
+                _stat = _predictor.predict(_history, current_issue=latest_issue)
+                if _stat.get('error'):
+                    result['error'] = f'统计预测失败: {_stat["error"]}'
+                    return result
+
+                # 持久化完整预测统计到数据库 (主缓存, 决定是否需要调用AI)
+                try:
+                    if self.db_client:
+                        self.db_client.save_artifact(
+                            'prediction_stat', _stat, issue=latest_issue,
+                            meta={'target_issue': target_issue, 'model': 'statistical+v3.2',
+                                  'history_count': history_count}
+                        )
+                except Exception as e:
+                    logger.warning(f'预测统计产物入库失败(非致命): {e}')
+            else:
+                # 复用 prediction_stat 缓存: 若专用表也有贝叶斯, 以专用表为准确保一致性
+                if _bayes_cached_in_db is not None:
+                    _stat.setdefault('algorithm_probs', {})['bayesian_inference'] = _bayes_cached_in_db
+
+            # 统一同步贝叶斯结果到专用表 p5_bayesian_result (幂等, 按 issue 唯一, 增量复用)
+            try:
+                if self.db_client:
+                    _bayes = _stat.get('algorithm_probs', {}).get('bayesian_inference')
+                    if _bayes is None and _bayes_cached_in_db is not None:
+                        _stat.setdefault('algorithm_probs', {})['bayesian_inference'] = _bayes_cached_in_db
+                        _bayes = _bayes_cached_in_db
+                    if _bayes is not None:
+                        self.db_client.insert_bayesian_result(latest_issue, _bayes, target_issue)
+                        self._bayes_dedicated_used = (_bayes_cached_in_db is not None)
+            except Exception as e:
+                logger.warning(f'贝叶斯专用表同步失败(非致命): {e}')
 
             _fused = _stat['fused_probabilities']
             _top_combos = _stat['top_combinations']
             _trend_fc = _stat.get('trend_forecast', {})
 
             pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
-            prediction = {}
-            for _i, _pk in enumerate(pos_keys):
-                _pp = _fused[_i] if _i < len(_fused) else {}
-                _sn = sorted(_pp.items(), key=lambda x: x[1], reverse=True)[:6]
-                prediction[_pk] = {
-                    'numbers': [int(n) for n, _ in _sn],
-                    'confidence': [round(float(p), 4) for _, p in _sn],
-                    'reason': '统计融合模型(多算法+贝叶斯)Top推荐'
-                }
 
-            recommended_combinations = [{
-                'combination': c.get('combination', ''),
-                'confidence': c.get('confidence', 0),
-                'reason': f"和值{c.get('hezhi')}/跨度{c.get('span')}"
-            } for c in _top_combos[:10]]
+            # ★ 问题2: 多源走势融合预测 —— 结合历史走势图/基础走势图/万千百十个独立走势表
+            #    最近30期数据, 用「频率+遗漏+动量」加权融合算法输出每位置 Top-4 推荐。
+            #    作为"走势图数据预测结果（实时）"的主预测来源(压缩到4位, 满足问题1)。
+            trend_multi = self._predict_trend_multi_source(target_issue, data_period=30)
+
+            # ★ 知识模型增强：利用在线学习的历史知识动态调整走势预测分数
+            if trend_multi and self.online_learner:
+                try:
+                    trend_multi = self.online_learner.apply_knowledge_to_trend_prediction(trend_multi)
+                    logger.info('✓ 知识模型增强已应用到走势预测')
+                except Exception as e:
+                    logger.warning(f'知识模型增强失败(非致命): {e}')
+
+            # 升平降方向偏好(供最终报告展示, 与组合级约束同源)
+            try:
+                spj_pref = self._get_spj_direction_preference() or {}
+            except Exception:
+                spj_pref = {}
+
+            prediction = {}
+            for _pk in pos_keys:
+                if trend_multi.get(_pk):
+                    # 多源融合成功: 直接采用 Top-4
+                    prediction[_pk] = trend_multi[_pk]
+                else:
+                    # 降级: 沿用 P5Predictor 融合概率取 Top-4
+                    _idx = pos_keys.index(_pk)
+                    _pp = _fused[_idx] if _idx < len(_fused) else {}
+                    _sn = sorted(_pp.items(), key=lambda x: x[1], reverse=True)[:4]
+                    prediction[_pk] = {
+                        'numbers': [int(n) for n, _ in _sn],
+                        'confidence': [round(float(p), 4) for _, p in _sn],
+                        'reason': '统计融合模型(多算法+贝叶斯)Top推荐(多源预测降级)'
+                    }
+
+            # ★ 和值走势约束候选组合: 用 p5_hzzst_data 派生和值区间, 对多源 Top-4 候选做和值过滤
+            #    (直接落实新爬取的"排列5和值走势图"数据价值, 提升组合级命中率)
+            recommended_combinations = []
+            hezhi_range_str = ''
+            if trend_multi and any(prediction.get(p) for p in pos_keys):
+                try:
+                    _cc, hezhi_range_str = self._build_constrained_combinations(
+                        prediction, target_issue)
+                    if _cc:
+                        recommended_combinations = _cc
+                except Exception as e:
+                    logger.warning(f'和值约束组合生成失败(降级至统计模型): {e}')
+
+            if not recommended_combinations and _top_combos:
+                # 降级: 沿用 P5Predictor 的 Top 组合
+                recommended_combinations = [{
+                    'combination': c.get('combination', ''),
+                    'confidence': c.get('confidence', 0),
+                    'reason': f"和值{c.get('hezhi')}/跨度{c.get('span')}"
+                } for c in _top_combos[:10]]
 
             trend_analysis = {}
             for _pn, _td in _trend_fc.items():
@@ -1885,8 +2402,16 @@ class Pipeline:
                     }
             key_conclusions = [
                 '各位置推荐关注: ' + '; '.join(f"{_pk}={prediction[_pk]['numbers']}" for _pk in pos_keys),
-                f"共生成 {len(_top_combos)} 个候选组合，取置信度最高的前 {min(10, len(_top_combos))} 个。"
             ]
+            if hezhi_range_str:
+                key_conclusions.append(
+                    f"推荐组合经和值走势约束(区间 {hezhi_range_str})与升平降方向约束, "
+                    f"由多源 Top-4 候选枚举筛选出 {len(recommended_combinations)} 组"
+                    f"最贴合近期和值重心与涨跌惯性的组合。")
+            else:
+                key_conclusions.append(
+                    f"共生成 {len(_top_combos)} 个候选组合，取置信度最高的前 "
+                    f"{min(10, len(_top_combos))} 个。")
             reasoning_process = [
                 '步骤1: 加载历史开奖数据并归一化、按期号排序',
                 '步骤2: 并行执行频率/遗漏/趋势/马尔可夫/形态/贝叶斯/特征 7 类算法',
@@ -1895,18 +2420,76 @@ class Pipeline:
                 '步骤5: 生成 Top 组合并注册预测记录供后续验证'
             ]
             final_report = {
-                'data_source': '统计融合模型(P5Predictor v3.2)+可选AI文本增强',
-                'model_version': 'statistical+v3.2',
+                'data_source': '统计融合模型(P5Predictor v3.2)+多源走势融合+可选AI文本增强',
+                'model_version': 'statistical+v3.3',
                 'current_issue': latest_issue,
                 'next_issue': target_issue,
+                # ★ 拆分为两个独立模块
+                'trend_prediction': prediction,  # 走势图数据预测结果（多源30期融合, Top-4）
+                'article_prediction': {},  # 专家文章预测结果（可由步骤3的结果填充）
+                # ★ 问题4修复: 同时写入 'prediction' 键, 供 _save_final_prediction_to_db /
+                #    _register_prediction_for_verification 读取(此前两处都读 final_report['prediction'],
+                #    而实际数据在 trend_prediction 中 -> 入库 prediction_stats/recommended_numbers 全为空)
                 'prediction': prediction,
                 'recommended_combinations': recommended_combinations,
+                'article_recommendations': [],  # 专家文章推荐组合
                 'trend_analysis': trend_analysis,
                 'key_conclusions': key_conclusions,
                 'reasoning_process': reasoning_process,
                 'risk_warning': _stat.get('risk_warning', '理性购彩，量力而行'),
-                'statistical_summary': _stat.get('summary', '')
+                'statistical_summary': _stat.get('summary', ''),
+                # ★ 新增元数据, 供 GUI 展示本次改进点
+                'hezhi_range': hezhi_range_str,
+                'spj_direction_preference': spj_pref,
+                'bayesian_cache_used': _cached,
+                'bayesian_dedicated_table': getattr(self, '_bayes_dedicated_used', False),
+                'multi_source_method': '30期全源融合(历史+基础+万千百十个走势+升平降方向+和值重心+贝叶斯后验概率, 频率0.35+遗漏0.25+动量0.15+贝叶斯0.25, 指数衰减加权)',
+                # 贝叶斯推断后验概率摘要(若存在), 供 GUI 展示算法透明性
+                'bayesian_inference': _stat.get('algorithm_probs', {}).get('bayesian_inference')
             }
+            
+            # ★ 从 pipeline_state 中获取独立报告并整合到 final_report
+            expert_article_report = self.pipeline_state.get('expert_article_report')
+            if expert_article_report:
+                # 整合专家文章预测结果
+                final_report['article_prediction'] = expert_article_report.get('prediction', {})
+                article_recs = expert_article_report.get('position_recommendations', {})
+                if article_recs:
+                    # 提取专家共识号码
+                    for pos in ['wan', 'qian', 'bai', 'shi', 'ge']:
+                        rec = article_recs.get(pos, {})
+                        if rec.get('top_numbers'):
+                            final_report['article_prediction'][pos] = {
+                                'numbers': rec['top_numbers'],
+                                'consensus': f"专家共识（提及{rec.get('total_mentions', 0)}次）"
+                            }
+                    
+                    # 构建专家推荐组合
+                    article_rec_list = []
+                    for pos_name, pos_key in [('万位', 'wan'), ('千位', 'qian'), ('百位', 'bai'), ('十位', 'shi'), ('个位', 'ge')]:
+                        rec = article_recs.get(pos_key, {})
+                        top_nums = rec.get('top_numbers', [])
+                        if top_nums:
+                            article_rec_list.append({
+                                'position': pos_name,
+                                'top_numbers': top_nums,
+                                'frequency': rec.get('frequency', {}),
+                                'total_mentions': rec.get('total_mentions', 0)
+                            })
+                    final_report['article_recommendations'] = article_rec_list
+                    logger.info(f'已整合专家文章预测结果: {expert_article_report.get("successful_articles", 0)}篇专家文章')
+            
+            trend_chart_report = self.pipeline_state.get('trend_chart_report')
+            if trend_chart_report:
+                # ★ 问题3修复: 把多源融合预测结果填充进走势图报告 prediction 字段后再入库,
+                #   确保数据库中的"走势图数据预测报告"预测数据不再为空。
+                trend_chart_report['prediction'] = prediction
+                trend_chart_report['data_period'] = '最近30期(历史+基础+位置走势表)'
+                uuid_val = self._save_report_to_db(trend_chart_report, 'trend_chart', target_issue, latest_issue)
+                if uuid_val:
+                    logger.info(f'走势图数据预测报告已入库(含多源预测): {uuid_val}')
+                else:
+                    logger.warning('走势图数据预测报告入库失败(非致命)')
 
             # 7. 存入数据库
             logger.info('保存最终预测结果到数据库...')
@@ -1925,6 +2508,30 @@ class Pipeline:
             logger.info('【步骤4】完成：最终预测结果已入库')
             logger.info(f'报告UUID: {report_uuid}')
             logger.info(f'预测期号: {target_issue}')
+            
+            # ★ 贝叶斯专用表写入确认日志（关键，便于排查问题）
+            _bayes_written = getattr(self, '_bayes_dedicated_used', False)
+            _bayes_in_report = final_report.get('bayesian_inference')
+            if _bayes_in_report:
+                logger.info(f'✓ 贝叶斯推断结果已写入专用表 p5_bayesian_result')
+                logger.info(f'  基于历史数据: {latest_issue} ({history_count}条记录)')
+                logger.info(f'  预测目标期号: {target_issue}')
+                if isinstance(_bayes_in_report, list):
+                    pos_names = ['万位', '千位', '百位', '十位', '个位']
+                    top_nums = []
+                    for i, pos_dict in enumerate(_bayes_in_report[:5]):
+                        if isinstance(pos_dict, dict) and pos_dict:
+                            top_num = max(pos_dict, key=pos_dict.get)
+                            top_nums.append(top_num)
+                            top3 = sorted(pos_dict.items(), key=lambda x: x[1], reverse=True)[:3]
+                            logger.info(f'  {pos_names[i]}: top={top_num}, Top-3={top3}')
+                        else:
+                            logger.info(f'  {pos_names[i]}: 非字典格式')
+                    logger.info(f'  综合推荐: {" ".join(str(n) for n in top_nums)}')
+                logger.info(f'  写入状态: {"增量复用(缓存命中)" if _bayes_written else "全新计算并写入"}')
+            else:
+                logger.warning('⚠ 贝叶斯推断结果为空，未写入专用表')
+            
             logger.info('=' * 80)
 
         except Exception as e:

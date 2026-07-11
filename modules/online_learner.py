@@ -21,19 +21,25 @@ logger = logging.getLogger(__name__)
 
 class OnlineLearner:
     """
-    在线学习引擎
+    在线学习引擎 (增强版 v2.0)
     
-    负责任务：
-    - 预测结果自动验证
-    - 模型增量更新
-    - 专家表现追踪
-    - 反例分析与策略调整
+    核心功能：
+    1. 预测结果自动验证
+    2. 模型增量更新
+    3. 专家表现追踪
+    4. 反例分析与策略调整
+    5. ★ 多模块联动：与走势图分析、专家文章分析形成自适应智能体系
+    
+    新增联动能力：
+    - 动态学习实时数据反馈，持续更新分析模型
+    - 利用积累的知识模型辅助走势图趋势预测
+    - 辅助专家文章语义内容解读
     """
     
     def __init__(self, db, redis_client=None):
         self.db = db
         self.redis = redis_client
-        logger.info('在线学习引擎初始化完成')
+        logger.info('在线学习引擎(增强版)初始化完成')
     
     def track_prediction_result(self, prediction_record: Dict[str, Any], 
                                  actual_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -66,10 +72,16 @@ class OnlineLearner:
             # 4. 更新模型权重（增量学习）
             self._incremental_update_weights(hit_tracking, expert_tracking)
             
-            # 5. 更新命中率统计表
+            # 5. ★ 联动：更新走势图知识模型
+            self._update_trend_knowledge_model(target_issue, actual_numbers, hit_tracking)
+            
+            # 6. ★ 联动：更新专家文章语义模型
+            self._update_expert_semantic_model(prediction_record, actual_numbers, expert_tracking)
+            
+            # 7. 更新命中率统计表
             self._update_hit_rate_statistics(hit_tracking, expert_tracking)
             
-            # 6. 存入Redis供实时监控
+            # 8. 存入Redis供实时监控
             if self.redis:
                 self._store_tracking_in_redis(target_issue, hit_tracking, expert_tracking)
             
@@ -188,6 +200,144 @@ class OnlineLearner:
         )
         
         return expert_tracking
+    
+    def _update_trend_knowledge_model(self, target_issue: str, actual_numbers: List[int],
+                                       hit_tracking: Dict):
+        """
+        ★ 联动：更新走势图知识模型
+        
+        利用在线学习的结果，辅助走势图趋势预测分析：
+        1. 记录各位置近期命中模式
+        2. 动态调整趋势预测权重
+        3. 存储知识模型供 `_predict_trend_multi_source` 引用
+        
+        Args:
+            target_issue: 预测期号
+            actual_numbers: 实际开奖号码 [万,千,百,十,个]
+            hit_tracking: 命中追踪结果
+        """
+        try:
+            pos_names = ['wan', 'qian', 'bai', 'shi', 'ge']
+            pos_labels = ['万位', '千位', '百位', '十位', '个位']
+            
+            # 1. 记录最新开奖数据供知识模型使用
+            knowledge_key = f'kpluckynumber:pl5:trend_knowledge'
+            
+            # 2. 计算各位置命中率贡献
+            position_hits = hit_tracking.get('position_hits', {})
+            weighted_scores = {}
+            
+            for i, pos in enumerate(pos_names):
+                hit_info = position_hits.get(pos_labels[i], {})
+                prob = hit_info.get('probability', 0)
+                predicted_rank = hit_info.get('predicted_rank', 10)
+                
+                # 综合评分：概率越高+排名越靠前得分越高
+                score = prob * 0.6 + (1.0 / predicted_rank) * 0.4
+                weighted_scores[pos] = round(score, 4)
+            
+            # 3. 存储知识模型更新
+            knowledge_update = {
+                'issue': target_issue,
+                'actual_numbers': actual_numbers,
+                'weighted_scores': weighted_scores,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            if self.redis:
+                # 存入Redis的知识模型缓存
+                self.redis.safe_hset(
+                    knowledge_key,
+                    'latest_update',
+                    knowledge_update,
+                    ttl_days=30
+                )
+                
+                # 追加到历史轨迹
+                history_key = f'{knowledge_key}:trajectory'
+                self.redis.safe_hset(
+                    history_key,
+                    target_issue,
+                    knowledge_update,
+                    ttl_days=90
+                )
+            
+            logger.info(f'✓ 走势图知识模型已更新: {target_issue}')
+            
+        except Exception as e:
+            logger.warning(f'更新走势图知识模型失败(非致命): {e}')
+    
+    def _update_expert_semantic_model(self, prediction_record: Dict, 
+                                       actual_numbers: List[int],
+                                       expert_tracking: Dict):
+        """
+        ★ 联动：更新专家文章语义模型
+        
+        利用在线学习的结果，辅助专家文章语义内容解读：
+        1. 记录哪些专家推荐的特征/模式被验证为有效
+        2. 动态调整专家信誉权重
+        3. 存储语义关联模型供专家文章分析引用
+        
+        Args:
+            prediction_record: 预测记录(含专家报告)
+            actual_numbers: 实际开奖号码
+            expert_tracking: 专家追踪结果
+        """
+        try:
+            source_tracking = expert_tracking.get('source_tracking', [])
+            best_experts = expert_tracking.get('best_performing_experts', [])
+            
+            if not source_tracking:
+                return
+            
+            # 1. 计算各专家特征的采纳率
+            expert_feature_hits = defaultdict(float)
+            
+            for src in source_tracking:
+                expert_id = src.get('expert_id', 'unknown')
+                hit_positions = src.get('hit_positions', [])
+                hit_rate = src.get('hit_rate', 0)
+                
+                # 记录专家推荐特征的有效性
+                expert_feature_hits[expert_id] += hit_rate
+            
+            # 2. 更新专家信誉排名
+            credibility_key = 'kpluckynumber:pl5:expert_credibility'
+            for expert_id, score in expert_feature_hits.items():
+                if self.redis:
+                    # 增量更新信誉评分
+                    self.redis.safe_hset(
+                        credibility_key,
+                        expert_id,
+                        {
+                            'score': round(score, 4),
+                            'updated_at': datetime.now().isoformat()
+                        },
+                        ttl_days=90
+                    )
+            
+            # 3. 存储最佳专家模式
+            if best_experts:
+                semantic_key = f'kpluckynumber:pl5:expert_semantic_model'
+                model_update = {
+                    'target_issue': prediction_record.get('target_issue'),
+                    'best_patterns': best_experts[:3],  # 保留前3
+                    'source_analysis': source_tracking[:5],
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                if self.redis:
+                    self.redis.safe_hset(
+                        semantic_key,
+                        'latest',
+                        model_update,
+                        ttl_days=30
+                    )
+            
+            logger.info(f'✓ 专家语义模型已更新 (处理{len(source_tracking)}个专家源)')
+            
+        except Exception as e:
+            logger.warning(f'更新专家语义模型失败(非致命): {e}')
     
     def _record_counter_example(self, prediction_record: Dict, 
                                   actual_numbers: List[int]):
@@ -454,6 +604,117 @@ class OnlineLearner:
         except Exception as e:
             logger.error(f'生成学习报告失败: {e}', exc_info=True)
             return {'error': str(e)}
+    
+    def get_trend_knowledge_model(self) -> Dict[str, Any]:
+        """
+        获取走势图知识模型(联动接口)
+        
+        Returns:
+            知识模型数据，包含各位置加权分数和历史轨迹
+        """
+        try:
+            if not self.redis:
+                return {}
+            
+            knowledge_key = 'kpluckynumber:pl5:trend_knowledge'
+            
+            # 获取最新知识模型
+            latest = self.redis.safe_hget(knowledge_key, 'latest_update')
+            if not latest:
+                return {}
+            
+            # 获取历史轨迹(近30期)
+            trajectory_key = f'{knowledge_key}:trajectory'
+            trajectory = {}
+            for key in list(self.redis.client.hkeys(trajectory_key))[:30]:
+                val = self.redis.client.hget(trajectory_key, key)
+                if val:
+                    trajectory[key.decode() if isinstance(key, bytes) else key] = json.loads(val) if isinstance(val, str) else val
+            
+            return {
+                'latest': latest,
+                'trajectory': trajectory,
+                'position_weighted_scores': latest.get('weighted_scores', {}) if isinstance(latest, dict) else {}
+            }
+            
+        except Exception as e:
+            logger.warning(f'获取知识模型失败: {e}')
+            return {}
+    
+    def get_expert_semantic_model(self) -> Dict[str, Any]:
+        """
+        获取专家语义模型(联动接口)
+        
+        Returns:
+            专家语义模型数据
+        """
+        try:
+            if not self.redis:
+                return {}
+            
+            semantic_key = 'kpluckynumber:pl5:expert_semantic_model'
+            latest = self.redis.safe_hget(semantic_key, 'latest')
+            
+            if not latest:
+                return {}
+            
+            return {
+                'latest': latest,
+                'best_patterns': latest.get('best_patterns', []) if isinstance(latest, dict) else []
+            }
+            
+        except Exception as e:
+            logger.warning(f'获取专家语义模型失败: {e}')
+            return {}
+    
+    def apply_knowledge_to_trend_prediction(self, trend_scores: Dict[str, Dict]) -> Dict[str, Dict]:
+        """
+        ★ 联动：将知识模型应用到走势图预测
+        
+        利用在线学习的历史知识，动态调整走势图预测分数。
+        
+        Args:
+            trend_scores: 原始走势图预测结果 {position: {numbers, confidence, reason}}
+            
+        Returns:
+            知识增强后的预测结果
+        """
+        try:
+            knowledge = self.get_trend_knowledge_model()
+            if not knowledge:
+                return trend_scores  # 无知识数据时原样返回
+            
+            weighted_scores = knowledge.get('position_weighted_scores', {})
+            if not weighted_scores:
+                return trend_scores
+            
+            # 对每个位置进行知识增强调整
+            enhanced_scores = {}
+            for pos, data in trend_scores.items():
+                if pos in weighted_scores:
+                    original_confidence = data.get('confidence', [])
+                    weight = weighted_scores[pos]
+                    
+                    # 知识增强：置信度 = 原置信度 * (1 + 知识权重 * 0.1)
+                    enhanced_confidence = [c * (1 + weight * 0.1) for c in original_confidence]
+                    
+                    # 归一化
+                    total = sum(enhanced_confidence) or 1
+                    enhanced_confidence = [c / total for c in enhanced_confidence]
+                    
+                    enhanced_scores[pos] = {
+                        'numbers': data.get('numbers', []),
+                        'confidence': enhanced_confidence,
+                        'reason': f"{data.get('reason', '')} + 知识增强(权重{weight:.4f})"
+                    }
+                else:
+                    enhanced_scores[pos] = data
+            
+            return enhanced_scores
+            
+        except Exception as e:
+            logger.warning(f'知识增强预测失败(非致命): {e}')
+            return trend_scores
     
     def _get_recent_issues(self, days: int) -> List[str]:
         """获取最近N期的目标期号"""

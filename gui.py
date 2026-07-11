@@ -462,6 +462,8 @@ class LotteryGUI:
 
         self._add_action_button(common_card, "数据库检测", COLORS['accent_ai'],
                                 lambda: self._on_button_click("数据库检测", self._check_database))
+        self._add_action_button(common_card, "查看贝叶斯结果", '#8b5cf6',
+                                lambda: self._on_button_click("贝叶斯结果", self._execute_view_bayesian_result))
         self._add_action_button(common_card, "更新快捷统计", '#06b6d4',
                                 lambda: self._on_button_click("更新统计", self._update_quick_stats))
         self._add_action_button(common_card, "清空输出", COLORS['accent_danger'],
@@ -908,56 +910,56 @@ class LotteryGUI:
     def _execute_crawl_incremental(self, task_mgr):
         """增量爬取数据：仅获取数据库中缺失的新期号数据，含历史+走势数据"""
         task_mgr.log("启动增量数据爬取...")
+        task_mgr.log("📊 爬取内容：历史数据 + 走势数据 + 独立走势表(万/千/百/十/个位) + 升平降走势 + 和值走势")
         task_mgr.progress(10, "初始化爬虫")
 
         spider = P5Spider()
-        task_mgr.progress(20, "连接数据库")
+        task_mgr.progress(20, "连接数据库并爬取")
 
+        # ★ 使用data_fetcher的crawl_and_save_incremental()方法
+        # 该方法已内置爬取：
+        #   1. 历史数据（多源备份）- 增量
+        #   2. 通用走势数据（中华彩讯/55128）- 增量
+        #   3. 6个独立走势表（一定牛ydniu.com）：万/千/百/十/个位 + 基础走势 - 增量
+        #   4. 升平降走势图（p5_spjzs_data）- 增量
+        #   5. 和值走势图（p5_hzzst_data）- 增量
+        crawl_res = spider.crawl_and_save_incremental()
+        history_success, history_skip = crawl_res['history']
+        trend_success, trend_skip = crawl_res['trend']
+        spjzs_success, spjzs_skip = crawl_res['spjzs']
+        hzzst_success, hzzst_skip = crawl_res['hzzst']
+        
+        task_mgr.progress(90, "验证爬取结果")
+        
         from modules.database import P5Database
         db = P5Database()
-        if not db.connect():
-            task_mgr.log("✗ 数据库连接失败")
-            return
-
-        db.create_tables()
-        task_mgr.progress(30, "获取已有最新期号")
-
-        latest_issue = db.get_latest_history_issue()
-        task_mgr.log(f"数据库最新期号: {latest_issue or '无数据'}")
-
-        task_mgr.progress(40, "爬取历史数据")
-        history_data = spider.crawl_history_data(max_records=500)
-        task_mgr.log(f"爬取到 {len(history_data)} 条历史数据")
-
-        if latest_issue and history_data:
-            # 过滤已存在的期号
-            new_data = [item for item in history_data if str(item.get('issue', '')) > str(latest_issue)]
-            task_mgr.log(f"新增数据: {len(new_data)} 条")
+        if db.connect():
+            db.create_tables()
+            latest_history = db.get_latest_history_issue()
+            latest_trend = db.get_latest_trend_issue()
+            latest_spjzs = db.get_latest_spjzs_issue()
+            latest_hzzst = db.get_latest_hzzst_issue()
+            task_mgr.progress(100, "完成")
+            task_mgr.log(f"\n✓ 增量爬取完成!")
+            task_mgr.log(f"  📈 数据库最新历史期号: {latest_history}")
+            task_mgr.log(f"  📊 数据库最新走势期号: {latest_trend}")
+            task_mgr.log(f"  📉 升平降走势最新期号: {latest_spjzs}")
+            task_mgr.log(f"  🎯 和值走势最新期号: {latest_hzzst}")
+            task_mgr.log(f"  ──────────────────────")
+            task_mgr.log(f"  历史数据(p5_history_data): 新增{history_success}条, 跳过{history_skip}条")
+            task_mgr.log(f"  走势数据(p5_trend_data): 新增{trend_success}条, 跳过{trend_skip}条")
+            task_mgr.log(f"  ──────────────────────")
+            task_mgr.log(f"  升平降走势(p5_spjzs_data): 新增{spjzs_success}条, 跳过{spjzs_skip}条")
+            task_mgr.log(f"  和值走势(p5_hzzst_data): 新增{hzzst_success}条, 跳过{hzzst_skip}条")
+            task_mgr.log(f"  ──────────────────────")
+            task_mgr.log(f"  独立走势表由crawl_and_save_incremental()自动处理")
+            task_mgr.log(f"  详细日志请查看 logs/ 目录")
+            db.disconnect()
         else:
-            new_data = history_data
-
-        task_mgr.progress(60, "保存历史数据")
-        if new_data:
-            history_success, history_skip = db.insert_history_data(new_data)
-            task_mgr.log(f"历史数据保存: 成功{history_success}条, 跳过{history_skip}条")
-        else:
-            history_success = 0
-            task_mgr.log("无新增历史数据")
-
-        task_mgr.progress(80, "爬取走势数据")
-        trend_data = spider.crawl_trend_data()
-        task_mgr.log(f"爬取到 {len(trend_data)} 条走势数据")
-
-        task_mgr.progress(90, "保存走势数据")
-        if trend_data:
-            trend_success, trend_skip = db.insert_trend_data(trend_data)
-            task_mgr.log(f"走势数据保存: 成功{trend_success}条, 跳过{trend_skip}条")
-        else:
-            task_mgr.log("无新增走势数据")
-
-        db.disconnect()
-        task_mgr.progress(100, "完成")
-        task_mgr.log(f"\n增量爬取完成: 新增历史{history_success}条")
+            task_mgr.progress(100, "完成(数据库未连接)")
+            task_mgr.log(f"\n! 爬取完成但数据库未连接")
+            task_mgr.log(f"  历史数据: {history_success}条新增")
+            task_mgr.log(f"  走势数据: {trend_success}条新增")
 
     def _execute_crawl_full(self, task_mgr):
         """全量爬取数据：重新爬取全部历史数据（最多2000条）和走势数据"""
@@ -1395,7 +1397,12 @@ class LotteryGUI:
                                 task_mgr.log("  各位置推荐:")
                                 pos_names_map = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
                                 for pos_key, pos_name in pos_names_map.items():
-                                    nums = pos_rec.get(pos_key, [])
+                                    _pos = pos_rec.get(pos_key)
+                                    # 兼容两种结构: 直接数字列表 或 {numbers:[...], confidence:[...]}
+                                    if isinstance(_pos, dict):
+                                        nums = _pos.get('numbers', []) or []
+                                    else:
+                                        nums = _pos if isinstance(_pos, list) else []
                                     if nums:
                                         task_mgr.append_info(f"    {pos_name}: {nums[:5]}")
                 else:
@@ -1472,27 +1479,117 @@ class LotteryGUI:
                 if learning and learning.get('success'):
                     task_mgr.append_info("在线学习: 权重已基于验证结果更新")
 
-                # 显示预测结果
+                # 显示预测结果 - 拆分为两个独立模块
                 final_report = result.get('final_report', {})
                 if final_report:
-                    task_mgr.append_section_header("最终预测结果")
-                    prediction = final_report.get('prediction', {})
-                    pos_names = ['万位', '千位', '百位', '十位', '个位']
-                    for pos_key, pos_name in zip(['wan', 'qian', 'bai', 'shi', 'ge'], pos_names):
-                        pos_data = prediction.get(pos_key, {})
-                        nums = pos_data.get('numbers', [])
-                        if nums:
-                            task_mgr.append_info(f"{pos_name}: {nums}")
+                    # 0. 预测算法与数据来源 (新增: 展示本次改进点)
+                    task_mgr.append_section_header("🧮 预测算法与数据来源")
+                    _msm = final_report.get('multi_source_method', '')
+                    if _msm:
+                        task_mgr.append_info(f"  多源融合方法: {_msm}")
+                    _bcu = final_report.get('bayesian_cache_used')
+                    if _bcu:
+                        task_mgr.append_success("  ✓ 贝叶斯/预测统计产物已复用(已落库), 本次未调用AI模型")
+                    else:
+                        task_mgr.append_info("  • 贝叶斯/预测统计产物本次重新计算并已落库(下次同数据将复用, 不再频繁调用AI)")
+                    _bdt = final_report.get('bayesian_dedicated_table')
+                    if _bdt:
+                        task_mgr.append_success("  ✓ 贝叶斯后验概率已写入专用表 p5_bayesian_result 并增量复用(按issue唯一, 不重算)")
+                    else:
+                        task_mgr.append_success("  ✓ 贝叶斯后验概率已计算并写入专用表 p5_bayesian_result (首次计算, 下次同数据将复用)")
+                    _bi = final_report.get('bayesian_inference')
+                    if isinstance(_bi, list) and _bi:
+                        # 贝叶斯结果是 List[Dict] 格式，显示各位置 Top-3
+                        pos_names = ['万位', '千位', '百位', '十位', '个位']
+                        task_mgr.log("")
+                        task_mgr.append_info("  【贝叶斯后验概率 Top-3】")
+                        for i, pos_dict in enumerate(_bi[:5]):
+                            if isinstance(pos_dict, dict) and pos_dict:
+                                top3 = sorted(pos_dict.items(), key=lambda x: float(x[1]), reverse=True)[:3]
+                                top_num = top3[0][0] if top3 else '?'
+                                probs = ", ".join([f"{k}({float(v):.3f})" for k, v in top3])
+                                task_mgr.append_info(f"    {pos_names[i]}(Top={top_num}): {probs}")
+                            else:
+                                task_mgr.append_info(f"    {pos_names[i]}: 数据格式异常")
+                        task_mgr.log("")
+                    if isinstance(_bi, dict):
+                        _bi_top = sorted(_bi.items(), key=lambda x: x[1], reverse=True)[:3]
+                        task_mgr.append_info("  贝叶斯后验概率(各位置最可能数字): " +
+                                             ", ".join(f"{k}→{round(v, 4)}" for k, v in _bi_top))
+                    _hezhi = final_report.get('hezhi_range', '')
+                    if _hezhi:
+                        task_mgr.append_info(f"  和值走势约束区间: {_hezhi}")
+                    _spj = final_report.get('spj_direction_preference', {})
+                    if _spj and isinstance(_spj, dict):
+                        task_mgr.append_info("  升平降方向偏好(近10次涨跌多数方向):")
+                        _pos_map = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+                        for _pk, _pn in _pos_map.items():
+                            _d = _spj.get(_pk)
+                            if isinstance(_d, dict):
+                                task_mgr.append_info(f"    {_pn}: {_d.get('pref', '-')} (最新:{_d.get('latest', '-')})")
 
-                    combos = final_report.get('recommended_combinations', [])
-                    if combos:
-                        task_mgr.log(f"\n  【推荐组合】")
-                        for i, combo in enumerate(combos[:5], 1):
-                            if isinstance(combo, dict):
-                                task_mgr.append_info(f"{i}. {combo.get('combination', '')} (置信度: {combo.get('confidence', 0):.2f})")
-
+                    # 1. 走势图数据预测结果
+                    task_mgr.append_section_header("📈 走势图数据预测结果（实时）")
+                    trend_prediction = final_report.get('trend_prediction', {})
+                    if trend_prediction:
+                        pos_names = ['万位', '千位', '百位', '十位', '个位']
+                        for pos_key, pos_name in zip(['wan', 'qian', 'bai', 'shi', 'ge'], pos_names):
+                            pos_data = trend_prediction.get(pos_key, {})
+                            nums = pos_data.get('numbers', [])
+                            if nums:
+                                confidence = pos_data.get('confidence', [])
+                                task_mgr.append_info(f"{pos_name}: {nums}")
+                                if confidence:
+                                    task_mgr.append_info(f"       置信度: {[round(c, 4) for c in confidence]}")
+                        
+                        trend_combos = final_report.get('recommended_combinations', [])
+                        if trend_combos:
+                            task_mgr.log(f"\n  【推荐组合 (和值/升平降约束筛选)】")
+                            for i, combo in enumerate(trend_combos[:10], 1):
+                                if isinstance(combo, dict):
+                                    _comb = combo.get('combination', '')
+                                    _conf = combo.get('confidence', 0)
+                                    _reason = combo.get('reason', '')
+                                    task_mgr.append_info(f"{i}. {_comb} (置信度: {_conf:.2f})")
+                                    if _reason:
+                                        task_mgr.append_info(f"      ↳ {_reason}")
+                    else:
+                        task_mgr.append_warning("走势图数据预测结果未获取到")
+                    
+                    # 2. 专家文章预测结果
+                    task_mgr.append_section_header("📰 专家文章预测结果（实时）")
+                    article_prediction = final_report.get('article_prediction', {})
+                    if article_prediction:
+                        pos_names = ['万位', '千位', '百位', '十位', '个位']
+                        for pos_key, pos_name in zip(['wan', 'qian', 'bai', 'shi', 'ge'], pos_names):
+                            pos_data = article_prediction.get(pos_key, {})
+                            nums = pos_data.get('numbers', [])
+                            if nums:
+                                consensus = pos_data.get('consensus', '')
+                                task_mgr.append_info(f"{pos_name}: {nums}")
+                                if consensus:
+                                    task_mgr.append_info(f"       专家共识: {consensus}")
+                        
+                        article_combos = final_report.get('article_recommendations', [])
+                        if article_combos:
+                            task_mgr.log(f"\n  【专家推荐组合】")
+                            for i, combo in enumerate(article_combos[:5], 1):
+                                if isinstance(combo, dict):
+                                    task_mgr.append_info(f"{i}. {combo.get('combination', '')} (共识度: {combo.get('consensus_degree', 0):.2f})")
+                    else:
+                        task_mgr.append_warning("专家文章预测结果未获取到")
+                    
+                    # 3. 关键结论
+                    _kc = final_report.get('key_conclusions', [])
+                    if _kc and isinstance(_kc, list):
+                        task_mgr.append_section_header("💡 关键结论")
+                        for _c in _kc:
+                            if _c:
+                                task_mgr.append_info(f"  • {_c}")
+                    
+                    # 4. 风险提示
                     risk = final_report.get('risk_warning', '理性购彩，量力而行')
-                    task_mgr.append_warning(f"风险提示: {risk}")
+                    task_mgr.append_warning(f"\n风险提示: {risk}")
             else:
                 task_mgr.progress(0, "分析失败")
                 task_mgr.log(f"\n✗ 四步流水线分析失败: {result.get('error', '未知错误')}")
@@ -2195,10 +2292,108 @@ class LotteryGUI:
             task_mgr.log(f"\n错误详情:\n{error_detail}")
             task_mgr.progress(0, "异常终止")
 
+    def _execute_view_bayesian_result(self, task_mgr):
+        """
+        查看贝叶斯推断结果
+        
+        从 p5_bayesian_result 专用表中读取最新贝叶斯后验概率数据，
+        并以友好的格式展示给用户。
+        """
+        try:
+            task_mgr.log("正在获取贝叶斯推断结果...")
+            task_mgr.progress(20, "初始化")
+
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+
+            # 获取最新历史期号
+            db.cursor.execute('SELECT issue FROM p5_history_data ORDER BY issue DESC LIMIT 1')
+            row = db.cursor.fetchone()
+            latest_issue = row.get('issue', '') if row else ''
+            
+            if not latest_issue:
+                task_mgr.log("✗ 数据库中无历史数据")
+                task_mgr.progress(0, "无数据")
+                db.disconnect()
+                return
+
+            # 查询贝叶斯结果
+            task_mgr.progress(40, "查询贝叶斯数据")
+            bayes_summary = db.get_bayesian_visual_summary(latest_issue)
+            
+            if not bayes_summary:
+                task_mgr.log(f"✗ 未找到 issue={latest_issue} 的贝叶斯推断结果")
+                task_mgr.log("  请先运行四步流水线分析，系统会自动计算并存储贝叶斯结果")
+                task_mgr.progress(0, "无贝叶斯数据")
+                db.disconnect()
+                return
+
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.log("🔬 贝叶斯推断后验概率结果")
+            task_mgr.log("=" * 70)
+            task_mgr.log(f"\n  基于历史数据: {bayes_summary['issue']}")
+            task_mgr.log(f"  预测目标期号: {bayes_summary['target_issue']}")
+            task_mgr.log(f"  最高概率号码: {''.join(str(n) for n in bayes_summary['top_numbers'])}")
+            
+            task_mgr.log(f"\n  【各位置后验概率 Top-3】")
+            pos_names = ['万位', '千位', '百位', '十位', '个位']
+            for detail in bayes_summary['position_details']:
+                pos_name = detail['position']
+                top_num = detail['top_number']
+                top3 = detail.get('top3', [])
+                
+                # 格式化概率
+                prob_str = ", ".join([f"{t['number']}({t['probability']:.3f})" for t in top3])
+                bar_len = int(top3[0]['probability'] * 20) if top3 else 0
+                bar = '█' * bar_len + '░' * (20 - bar_len)
+                
+                task_mgr.log(f"  {pos_name} (Top={top_num}): [{bar}]")
+                if top3:
+                    task_mgr.log(f"    Top-3: {prob_str}")
+                task_mgr.log("")
+
+            task_mgr.progress(100, "完成")
+            task_mgr.append_success(f"✓ 贝叶斯推断结果已加载 (基于 issue={latest_issue})")
+            
+            db.disconnect()
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 查看贝叶斯结果异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
+
+
+
+def _get_icon_path() -> str:
+    """获取图标文件的绝对路径(兼容打包后的运行环境)。"""
+    icon_name = 'favicon.ico'
+    # PyInstaller 打包后, 资源目录在 sys._MEIPASS
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, icon_name)
+
+
+def _set_window_icon(root):
+    """为 Tk 根窗口设置图标, 如果文件不存在则静默忽略。"""
+    icon_path = _get_icon_path()
+    if os.path.isfile(icon_path):
+        try:
+            root.iconbitmap(icon_path)
+        except tk.TclError:
+            # macOS 不支持 iconbitmap, 静默忽略
+            pass
+
 
 def main():
     """启动排列5 AI智能分析系统GUI应用程序"""
     root = tk.Tk()
+    _set_window_icon(root)
     app = LotteryGUI(root)
 
     def on_closing():
