@@ -1115,54 +1115,6 @@ class P5Features:
 
         return None
 
-    def get_feature_vector(self, features: Dict[str, Any], position: int) -> np.ndarray:
-        """
-        获取指定位置的特征向量（用于机器学习模型输入）
-
-        Args:
-            features: 完整特征字典
-            position: 位置索引（0-4）
-
-        Returns:
-            特征向量
-        """
-        pos_name = self.position_names[position]
-        vector = []
-
-        # 频率特征（10维）
-        freq_features = features.get('frequency', {}).get(pos_name, {})
-        frequencies = freq_features.get('frequencies', {})
-        for num in self.number_range:
-            vector.append(frequencies.get(num, 0))
-
-        # 遗漏特征（10维）
-        omission_features = features.get('omission', {}).get(pos_name, {})
-        omission_probs = omission_features.get('omission_probs', {})
-        for num in self.number_range:
-            vector.append(omission_probs.get(num, 0))
-
-        # 012路特征（3维）
-        road_features = features.get('road_012', {}).get(pos_name, {})
-        road_ratios = road_features.get('road_ratios', {})
-        vector.extend([road_ratios.get(0, 0), road_ratios.get(1, 0), road_ratios.get(2, 0)])
-
-        # 区间特征（3维）
-        interval_features = features.get('interval', {}).get(pos_name, {})
-        interval_ratios = interval_features.get('interval_ratios', {})
-        vector.extend([
-            interval_ratios.get('low', 0),
-            interval_ratios.get('mid', 0),
-            interval_ratios.get('high', 0)
-        ])
-
-        # 趋势特征（2维）
-        trend_features = features.get('trend', {}).get(pos_name, {})
-        vector.append(trend_features.get('slope', 0))
-        vector.append(trend_features.get('momentum', 0))
-
-        return np.array(vector)
-
-
 if __name__ == '__main__':
     # 测试特征工程
     import json

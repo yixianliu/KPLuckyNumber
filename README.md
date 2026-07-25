@@ -26,9 +26,9 @@
 ### 核心特性
 
 - **多源数据采集**：从 55128.cn、china-lottery.cn 等多个权威数据源实时爬取开奖数据与专家文章
-- **混合预测模型**：融合频率加权、遗漏回归、趋势动量、马尔可夫链、形态延续五大统计算法，并与 AI 大模型输出加权融合
-- **四步流水线分析**：★ 推荐架构（v2.0），四步串行分析：文章爬取→走势分析→专家整合→最终预测
-- **混合预测模型**：融合频率加权、遗漏回归、趋势动量、马尔可夫链、形态延续五大统计算法，并与 AI 大模型输出加权融合
+- **混合预测模型**：融合频率加权、遗漏回归、趋势动量、马尔可夫链、形态延续、贝叶斯推断、特征工程七大统计算法，并与 AI 大模型输出加权融合
+- **四步流水线分析**：★ 推荐架构（v3.8 演进中），四步串行分析：文章爬取→走势分析→专家整合→最终预测
+- **混合预测模型**：融合频率加权、遗漏回归、趋势动量、马尔可夫链、形态延续、贝叶斯推断、特征工程七大统计算法，并与 AI 大模型输出加权融合
 - **双阶段 AI 分析**：第一阶段结构化整理文章内容，第二阶段整合文章分析 + 走势数据 + 历史开奖，输出综合预测报告（旧版兼容）
 - **自动化回测验证**：滚动窗口回测框架，量化评估模型 Top-1 / Top-3 命中率与综合得分
 - **丰富特征工程**：提取频率、012路、连号、重隔号、和值跨度等多维度统计特征
@@ -47,19 +47,15 @@ KPLuckyNumber/
 ├── requirements.txt         # Python 依赖清单
 │
 ├── modules/                 # 核心业务模块
-│   ├── four_step_pipeline.py # ★ 四步串行流水线（v2.0推荐）：文章爬取→走势→专家整合→最终预测
-│   ├── database_p5.py       # 数据库层 — MySQL 连接/建表/CRUD
-│   ├── redis_client.py      # 缓存层 — Redis 客户端封装与键名设计
-│   ├── spider_p5.py         # 爬虫层 — 多源历史开奖数据抓取
-│   ├── ydniu_spider.py      # 文章爬虫 — 亿点牛网站专家文章抓取
-│   ├── optimized_p5_predictor.py  # 预测引擎 — 五算法融合 + AI 集成
-│   ├── ernie_ai_analyzer.py # AI 分析器 — AGNES API 封装与 prompt 管理
-│   ├── article_analyzer.py  # 文章工作流 — 6步双阶段 AI 分析流水线（旧版兼容）
-│   ├── article_processor.py # 文章处理器 — 简化4步流程（爬取→AI→Redis，旧版兼容）
+│   ├── pipeline.py # ★ 四步串行流水线（v3.8 演进中）：走势分析→专家整合→最终预测
+│   ├── database.py       # 数据库层 — MySQL 连接/建表/CRUD
+│   ├── cache.py      # 缓存层 — Redis 客户端封装与键名设计
+│   ├── data_fetcher.py         # 爬虫层 — 多源历史开奖数据抓取
+│   ├── predictor.py  # 预测引擎 — 七算法融合 + AI 再包装
+│   ├── ai_analyzer.py # AI 分析器 — AGNES API 封装与 prompt 管理
 │   ├── backtest_engine.py   # 回测引擎 — 滚动回测与可视化报告
-│   ├── feature_engineering.py   # 特征工程 — 频率/012路/连号/重隔号/和值跨度
+│   ├── features.py   # 特征工程 — 频率/012路/连号/重隔号/和值跨度
 │   ├── prediction_validator.py  # 预测验证器 — 验证记录与性能统计（GUI专用）
-│   └── html_cleaner.py      # HTML 清洗器 — 网页内容清理（GUI专用）
 │
 ├── predictions/             # 预测结果输出目录（JSON 格式）
 ├── reports/                 # 分析报告输出目录（JSON/TXT）
@@ -73,14 +69,14 @@ KPLuckyNumber/
     └── memory/
 ```
 
-- **CLI 命令入口**：`main.py`，提供 12 个子命令支持，覆盖数据采集、预测、回测、AI分析全流程
+- **CLI 命令入口**：`main.py`，提供 9 个子命令支持，覆盖数据采集、预测、回测、AI分析全流程
 - **GUI 桌面应用**：`gui.py`，基于 Tkinter，提供暗色主题的图形界面
 
 ---
 
 ## 四步流水线架构（全新）
 
-从 v2.0 起，系统引入全新的**四步串行流水线分析架构**（`modules/four_step_pipeline.py`），取代原有的单阶段分析模式：
+系统引入**四步串行流水线分析架构**（`modules/pipeline.py`），从 v2.0 起引入并演进至 v3.8：
 
 | 步骤 | 名称 | 输入 | 输出 | 存储 |
 |------|------|------|------|------|
@@ -144,7 +140,7 @@ python gui.py
 
 ### 1. 数据采集模块
 
-#### spider_p5.py — 多源历史数据爬虫
+#### data_fetcher.py — 多源历史数据爬虫
 
 从多个权威彩票网站（55128.cn、china-lottery.cn）爬取排列5历史开奖数据与走势图。
 
@@ -169,7 +165,7 @@ python gui.py
 
 ### 2. 数据库与缓存
 
-#### database_p5.py — MySQL 数据持久化
+#### database.py — MySQL 数据持久化
 
 **表结构：**
 
@@ -188,7 +184,7 @@ python gui.py
 - `insert_ai_report(**fields)` — 保存 AI 分析报告
 - `get_latest_ai_report()` — 获取最新 AI 报告
 
-#### redis_client.py — Redis 缓存层
+#### cache.py — Redis 缓存层
 
 **键名设计规范：**
 
@@ -209,21 +205,23 @@ kpluckynumber:pl5:issue_articles:{issue}# 期号文章索引（Set）
 
 ### 3. 预测引擎
 
-#### optimized_p5_predictor.py — 多算法融合预测
+#### predictor.py — 多算法融合预测
 
-**五大统计算法：**
+**七大统计算法：**
 
 | 算法 | 权重 | 原理 |
 |------|------|------|
-| frequency_weighted | 25% | 基于历史出现频率 + 拉普拉斯平滑 |
-| omission_regression | 20% | 指数衰减遗漏回归模型 |
-| trend_momentum | 20% | 线性回归趋势方向 + 高斯衰减 |
-| markov_transition | 20% | 一阶/二阶马尔可夫状态转移 |
-| pattern_continuation | 15% | 奇偶/大小/质合形态延续规律 |
+| frequency_weighted | 35% | 基于历史出现频率 + 拉普拉斯平滑 |
+| omission_regression | 25% | 指数衰减遗漏回归模型 |
+| trend_momentum | 12% | 线性回归趋势方向 + 高斯衰减 |
+| markov_transition | 10% | 一阶/二阶马尔可夫状态转移 |
+| pattern_continuation | 8% | 奇偶/大小/质合形态延续规律 |
+| bayesian_inference | 10% | 贝叶斯推断（v3.0 新增，基于验证反馈动态调整） |
+| feature_engineering | 10% | 特征工程（连号/重号/012路）融合信号 |
 
 **AI 模型集成：**
 - 通过 `AGNES_API_CONFIG` 调用 AGNES AI 模型（默认 agnes-2.0-flash）
-- AI 输出与统计模型加权融合（默认 AI 权重 40%，统计权重 60%）
+- AI 输出与统计模型加权融合（默认 AI 权重 10%，统计权重 90%）
 - 响应解析容错：从第一个 `{` 到最后一个 `}` 提取 JSON 对象
 
 **配置项（OptimizedP5PredictorConfig）：**
@@ -262,36 +260,15 @@ DEFAULT_CONFIG = {
 
 ### 4. AI 分析模块
 
-#### ernie_ai_analyzer.py — AGNES AI 深度分析
+#### ai_analyzer.py — AGNES AI 深度分析
 
 - 封装 AGNES API 调用（POST `/v1/chat/completions`）
 - 支持综合分析师模式：整合历史数据 + 走势图 + 趋势数据
 - 解析 AI 返回的 JSON 格式预测报告并持久化到数据库
 
-#### article_analyzer.py — 文章分析工作流（双阶段 AI）
-
-**6步完整流水线：**
-
-| 步骤 | 操作 | 数据流向 |
-|------|------|----------|
-| 1 | 爬取文章 | YDNiuSpider → 原始文章内容 |
-| 2 | 第一次 AI 分析 | 原始文本 → 结构化 JSON |
-| 3 | Redis 存储 | AI 结果 → Redis（7天过期） |
-| 4 | Redis 加载 | Redis → 内存字典 |
-| 5 | 第二次 AI 分析 | Redis数据 + 历史数据 → 综合预测 |
-| 6 | 数据库存储 | 最终报告 → MySQL |
-
-**3步新版流水线（GUI 中使用）：**
-
-| 步骤 | 操作 | 说明 |
-|------|------|------|
-| 1 | 爬取文章 + 逐篇 AI 分析 | 获取 30 篇专家文章 → 逐篇结构化 → 存入 Redis |
-| 2 | 走势图 AI 分析 | 最近 30 期走势数据 → AI 分析走势规律 → 存入 Redis |
-| 3 | 最终整合分析 | 文章 AI + 走势 AI + 历史数据 → 综合预测报告 → 存 DB + 生成 TXT/JSON |
-
 ### 5. 特征工程
 
-#### feature_engineering.py — 多维统计特征提取
+#### features.py — 多维统计特征提取
 
 | 特征类别 | 提取内容 |
 |----------|----------|
@@ -379,7 +356,7 @@ REPORT_CONFIG = {
 }
 ```
 
-### 预测器配置（可在 optimized_p5_predictor.py 中调整）
+### 预测器配置（可在 predictor.py 中调整）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -410,13 +387,11 @@ python main.py <command> [options]
 | `predict` | 预测下一期号码 | `--model optimized\|old` |
 | `backtest` | 历史回测验证 | `--mode compare\|old\|new`<br>`--start <N>` `--count <M>` |
 | `analyze` | 分析历史数据特征 | 无 |
-| `ernie` | AI 深度分析 | `--limit <N>`（期数） |
-| `comprehensive` | 综合分析（二次深度） | `--limit <N>` |
-| `article` | 文章分析工作流 | `--issue <期号>` `--limit <N>` |
 | `save-articles` | 批量保存文章到 Redis | `--issue` `--max <N>` `--no-extract` |
 | `process-article` | 处理单篇文章 | `--url <URL>` `--title <标题>` |
 | `process-articles` | 批量处理文章 | `--max <N>` |
 | `pipeline` | 四步流水线分析 | `--issue <期号>` `--limit <N>` |
+| `hitrate` | 命中率统计报告 | `--days <N>` `--output <文件>` |
 
 ### 使用示例
 
@@ -430,12 +405,6 @@ python main.py predict --model optimized
 # 执行回测对比
 python main.py backtest --mode compare --start 50 --count 50
 
-# AI 深度分析（最近30期）
-python main.py ernie --limit 30
-
-# 完整文章分析工作流
-python main.py article --issue 2026165 --limit 30
-
 # 批量处理文章（最多10篇）
 python main.py process-articles --max 10
 # 四步流水线分析（默认推算下一期）
@@ -443,6 +412,9 @@ python main.py pipeline
 
 # 指定期数+数据量
 python main.py pipeline --issue 2026166 --limit 50
+
+# 查看命中率统计报告（最近30天，可输出到文件）
+python main.py hitrate --days 30
 ```
 
 ---
@@ -475,7 +447,7 @@ python gui.py
 
 ## 数据流架构
 
-### 四步流水线架构（v2.0 新增）
+### 四步流水线架构（v3.8 演进中）
 
 ```
                     ┌─────────────┐
@@ -529,8 +501,8 @@ python gui.py
               │     │        │        │       │
 ┌─────────────▼─────┐ ┌────▼─────┐ ┌▼──────────────┐
 │  统计分析引擎      │ │ AI 分析  │ │ 文章分析工作流 │
-│ OptimizedP5Predict│ │ Analyzer │ │ ArticleAnalyzer│
-│ 五大算法融合       │ │ AGNES    │ │ 双阶段AI       │
+│ P5Predictor       │ │ Analyzer │ │ ArticleAnalyzer│
+│ 七大算法融合       │ │ AGNES    │ │ 双阶段AI       │
 └─────────┬─────────┘ └────┬─────┘ └───────┬───────┘
           │                │                │
           │     ┌──────────┼────────────────┤
@@ -597,7 +569,6 @@ python gui.py
 | 更新数据 | `python main.py update` |
 | 预测号码 | `python main.py predict --model optimized` |
 | 分析特征 | `python main.py analyze` |
-| AI分析 | `python main.py ernie --limit 30` |
-| 文章分析 | `python main.py article --issue 2026165` |
+| 命中率统计 | `python main.py hitrate --days 30` |
 | 回测验证 | `python main.py backtest --mode compare` |
 | 启动GUI | `python gui.py` |

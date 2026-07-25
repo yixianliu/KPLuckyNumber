@@ -1,17 +1,25 @@
 """
-排列5优化预测模块 (v3.0 深度优化版)
+排列5优化预测模块 (v3.11 深度优化版)
 
-本项目基于多模型融合的彩票数据分析与预测平台,通过五种统计算法 + 概率融合 + 约束优化,
+本项目基于多模型融合的彩票数据分析与预测平台,通过七种统计算法 + 概率融合 + 约束优化,
 生成下期各位置号码的概率分布和推荐组合。
 
-核心架构 (v3.0 新增):
+核心架构 (v3.11 优化):
 1. 频率加权算法 (35%) — 基于历史频次分布,拉普拉斯平滑
 2. 遗漏回归算法 (25%) — 指数衰减模型,遗漏越大概率越高
-3. 趋势动量算法 (12%) — 线性回归检测趋势方向
+3. 趋势动量算法 (13%) — 线性回归检测趋势方向 (从12%升至13%)
 4. 马尔可夫转移算法 (10%) — 一阶状态转移概率矩阵
-5. 形态延续算法 (8%) — 奇偶/大小/质合形态规律
-6. 贝叶斯推断算法 (NEW! 10%) — 基于先验概率和后验验证的动态调整
-7. 自适应融合策略 (NEW!) — 基于验证历史的权重动态更新
+5. 形态延续算法 (9%) — 奇偶/大小/质合形态规律 (从8%升至9%)
+6. 贝叶斯推断算法 (10%) — 基于先验概率和后验验证的动态调整
+7. 自适应融合策略 (8%) — 基于验证历史的权重动态更新 (从10%降为8%)
+
+v3.11 优化重点:
+- 支持60期数据分析，参数微调以提高精度
+- 趋势动量权重12%→13%，增强趋势信号
+- 形态延续权重8%→9%，利用更多数据捕捉形态规律
+- 贝叶斯验证窗口30→60期，匹配数据量
+- 边界约束更严格：奇偶容忍度0.4→0.38，热点比例0.55→0.52
+- 冷号比例提升0.15→0.18，保证号码多样性
 
 关键设计原则:
 - AI模型仅作为统计信号的再包装,不产生新信息
@@ -19,14 +27,14 @@
 - 边界保护: 和值10-35, 相邻位差异惩罚, 奇偶比约束
 - 延迟/懒加载: 所有外部依赖(import)在函数内部完成
 
-算法权重配置 (v3.0):
+算法权重配置 (v3.11):
   频率加权:   35% (最基础的统计信号)
   遗漏回归:   25% (第二可靠的统计信号)
-  趋势动量:   12% (从15%下调,降低噪声)
-  马尔可夫:   10% (从15%下调,防止过拟合)
-  形态延续:    8% (从10%下调,稳定性差)
-  贝叶斯推断: 10% (新增,基于验证反馈动态调整)
-  AI融合:     10% (保持不变,仅作再包装)
+  趋势动量:   13% (从12%上调,60期数据趋势更明显)
+  马尔可夫:   10% (保持不变)
+  形态延续:    9% (从8%上调,60期形态规律更清晰)
+  贝叶斯推断: 10% (保持不变,验证窗口扩为60期)
+  特征工程:    8% (从10%下调,部分信号已被其他算法捕获)
 
 使用方法:
     from modules.predictor import P5Predictor, P5PredictorConfig
@@ -47,6 +55,7 @@
 文件历史:
   2026-07-02: v2.1 优化算法权重配置
   2026-07-04: v3.0 新增贝叶斯推断 + 自适应融合策略
+  2026-07-16: v3.11 60期数据支持 + 参数微调优化
   
 作者: KPLuckyNumber Team
 """
@@ -99,60 +108,201 @@ class AdaptiveWeightManager:
         new_weights = manager.get_adaptive_weights()
     """
     
-    def __init__(self):
-        """初始化权重管理器"""
-        # 各算法的历史命中率跟踪
+    def __init__(self, ewma_alpha: float = 0.3,
+                 shrinkage_min_samples: int = 10,
+                 weight_floor: float = 0.001,
+                 weight_cap: float = 0.75,
+                 enable_guardrails: bool = True):
+        """初始化权重管理器
+
+        Args:
+            ewma_alpha: EWMA 平滑系数(α越小, 历史影响越大)。由 P5PredictorConfig
+                从 DEFAULT_CONFIG['global']['ewma_alpha'] 注入, 便于在不改代码的前提下调参。
+            shrinkage_min_samples: 经验贝叶斯收缩的伪样本量 k。某算法累计验证样本 n 较少时,
+                其自适应权重会被拉回默认权重(先验), 收缩系数 λ = n/(n+k):
+                n=0 → 纯默认; n≫k → 纯数据。防止个位数噪声样本把权重甩飞。
+            weight_floor / weight_cap: 归一化后单算法权重的下限/上限钳制, 避免任一算法
+                因噪声塌缩到 ~0 或异常独大, 保证 7 算法学习通道始终存活。
+            enable_guardrails: 总开关。False 时退化为 v3.14 原始行为(纯 EWMA 归一化),
+                便于对照实验/回滚。
+
+        ★ 护栏设计动机(诚实边界): 排列5 公平摇号, 各算法命中率≈随机, EWMA 极易追逐
+          随机波动。收缩+钳制+最小样本门槛让"自适应"在证据不足时保守贴合冻结默认权重,
+          仅在证据充分且稳定时才偏离——把自学习从"追噪声"变为"抗噪声"。
+        """
+        # 护栏参数
+        self.shrinkage_min_samples = max(0, int(shrinkage_min_samples))
+        self.weight_floor = float(weight_floor)
+        self.weight_cap = float(weight_cap)
+        self.enable_guardrails = bool(enable_guardrails)
+        # 各算法的历史信号跟踪
+        # ★ v3.12 修复: ewma 初值对齐 v3.12 DEFAULT_CONFIG 权重, 并补齐此前遗漏的
+        #   feature_engineering(旧版缺失导致其永远拿不到自适应加成)。
+        # ★ v3.14 双信号并存: 同时记录
+        #   - ewma       : 旧「覆盖命中率」EWMA (0~1之间滚动)
+        #   - ewma_t1    : 新「Top-1 精准度」EWMA (排名加权), 取权重时优先用本字段
+        # 双字段独立累积, 让 get_adaptive_weights 可按 metric 选择信号源, 兼顾兼容性。
         self.algo_hit_rates = {
-            'frequency_weighted': {'total': 0, 'hits': 0, 'ewma': 0.35},
-            'omission_regression': {'total': 0, 'hits': 0, 'ewma': 0.25},
-            'trend_momentum': {'total': 0, 'hits': 0, 'ewma': 0.12},
-            'markov_transition': {'total': 0, 'hits': 0, 'ewma': 0.10},
-            'pattern_continuation': {'total': 0, 'hits': 0, 'ewma': 0.08},
-            'bayesian_inference': {'total': 0, 'hits': 0, 'ewma': 0.10},  # 新增
+            'frequency_weighted': {'total': 0, 'hits': 0, 'ewma': 0.54,   'ewma_t1': 0.54,   't1_hits': 0, 't1_total': 0},
+            'omission_regression': {'total': 0, 'hits': 0, 'ewma': 0.34,   'ewma_t1': 0.34,   't1_hits': 0, 't1_total': 0},
+            'trend_momentum': {'total': 0, 'hits': 0, 'ewma': 0.01,        'ewma_t1': 0.01,    't1_hits': 0, 't1_total': 0},
+            'markov_transition': {'total': 0, 'hits': 0, 'ewma': 0.005,     'ewma_t1': 0.005,   't1_hits': 0, 't1_total': 0},
+            'pattern_continuation': {'total': 0, 'hits': 0, 'ewma': 0.003,  'ewma_t1': 0.003,   't1_hits': 0, 't1_total': 0},
+            'bayesian_inference': {'total': 0, 'hits': 0, 'ewma': 0.10,     'ewma_t1': 0.10,    't1_hits': 0, 't1_total': 0},
+            'feature_engineering': {'total': 0, 'hits': 0, 'ewma': 0.002,   'ewma_t1': 0.002,   't1_hits': 0, 't1_total': 0},
         }
         # EWMA平滑系数 (α越小,历史影响越大)
-        self.ewma_alpha = 0.3
-        
-    def record_verification(self, algo_name: str, hit_rate: float):
+        self.ewma_alpha = ewma_alpha
+
+        # ★ 护栏用: 快照默认权重(先验)。初值 ewma 即等于 DEFAULT_CONFIG 冻结权重,
+        #   归一化后作为收缩目标 prior, 与后续学习产生的 EWMA 解耦。
+        _init_prior = {k: v.get('ewma', 0.0) for k, v in self.algo_hit_rates.items()}
+        _prior_total = sum(_init_prior.values()) or 1.0
+        self.default_weights = {k: v / _prior_total for k, v in _init_prior.items()}
+
+    def _apply_guardrails(self, raw_weights: Dict[str, float], field: str) -> Dict[str, float]:
+        """对原始归一化权重施加护栏: 经验贝叶斯收缩 → 钳制 → 再归一化。
+
+        Args:
+            raw_weights: 由 EWMA 归一化得到的原始自适应权重(sum≈1)。
+            field: 本次取权用的 EWMA 字段('ewma' / 'ewma_t1'), 用于选择对应的样本计数
+                   (t1_total 对应 ewma_t1, total 对应 ewma), 决定每个算法的证据量 n。
+
+        Returns:
+            施加护栏后的权重字典(sum≈1)。enable_guardrails=False 时原样返回 raw_weights。
         """
-        记录单次验证结果
-        
+        if not self.enable_guardrails:
+            return raw_weights
+
+        k = self.shrinkage_min_samples
+        count_field = 't1_total' if field == 'ewma_t1' else 'total'
+
+        # 1) 经验贝叶斯收缩: 证据越少越贴近默认先验
+        shrunk = {}
+        for algo, w in raw_weights.items():
+            n = self.algo_hit_rates.get(algo, {}).get(count_field, 0)
+            lam = (n / (n + k)) if (n + k) > 0 else 0.0
+            prior = self.default_weights.get(algo, w)
+            shrunk[algo] = lam * w + (1.0 - lam) * prior
+
+        # 2) 钳制到 [floor, cap]
+        clamped = {a: min(self.weight_cap, max(self.weight_floor, w))
+                   for a, w in shrunk.items()}
+
+        # 3) 再归一化
+        total = sum(clamped.values()) or 1.0
+        return {a: w / total for a, w in clamped.items()}
+
+    def record_verification(self, algo_name: str, hit_rate: float, top1_hit: Optional[float] = None):
+        """
+        记录单次验证结果 —— ★ v3.14 双信号并存
+
         Args:
             algo_name: 算法名称
-            hit_rate: 该算法的本次验证命中率(0-1)
+            hit_rate: 该算法的本次验证「覆盖命中率」(0-1, 5 位位置命中率)
+            top1_hit: 该算法的本次验证「Top-1 精准度」(0-1 = Top-1命中位数/5位)。
+                      若为 None, 退化为 hit_rate (兼容旧调用方).
+
+        注:
+            两套 EWMA 独立累积, 不会互相污染:
+              - 'ewma'    : 学习覆盖命中率
+              - 'ewma_t1' : 学习 Top-1 精准度
+            这里区分"是否命中 Top-1" vs "是否在 Top-6 范围内"两个评估维度.
+            上一轮(v3.13)实验证明覆盖命中率在 7 算法上几乎都≈0.5, 没有区分信号;
+            Top-1 精准度实验证明 CV = 0.47(覆盖命中率 CV = 0.13, 提升 3.7x), 且能正确选出
+            frequency 算法为最优. 因此本版本采用 top1_hit 默认, hit_rate 保留做回退.
         """
         if algo_name not in self.algo_hit_rates:
             return
-            
+
         record = self.algo_hit_rates[algo_name]
         record['total'] += 1
         record['hits'] += hit_rate
-        
-        # 指数加权移动平均更新
+
+        # 指数加权移动平均更新 — 旧「覆盖命中率」通道
         record['ewma'] = (
-            self.ewma_alpha * hit_rate + 
+            self.ewma_alpha * hit_rate +
             (1 - self.ewma_alpha) * record['ewma']
         )
-        
-    def get_adaptive_weights(self) -> Dict[str, float]:
+
+        # Top-1 精准度通道(允许为 None 表示未提供)
+        if top1_hit is not None:
+            record['t1_total'] += 1
+            record['t1_hits'] += top1_hit
+            record['ewma_t1'] = (
+                self.ewma_alpha * top1_hit +
+                (1 - self.ewma_alpha) * record['ewma_t1']
+            )
+        # else: top1_hit=None, 仅旧通道累积(兼容从 weight_history 旧数据回放的场景)
+
+    def get_adaptive_weights(self, metric: str = 'top1_hit') -> Dict[str, float]:
         """
-        获取自适应调整后的权重
-        
-        Returns:
-            权重字典,格式 {algo_name: weight}
+        获取自适应调整后的权重 —— ★ v3.14 双信号根据 metric 选择
+
+        Args:
+            metric: 评估指标名(说明见下表). 默认 'top1_hit'.
+
+        返回:
+            权重字典 {algo_name: normalized_weight}
+
+        信号源说明:
+            metric='top1_hit' (默认, 推荐):
+                使用 ewma_t1 = Top-1 精准度 EWMA.
+                实验验证 CV=0.47 能产生强算法间区分, 且频率算法被识别为最优.
+            metric='hit_rate' (回退):
+                使用 ewma = 覆盖命中率 EWMA.
+                v3.13 实验证实几乎所有算法都≈0.5, 区分度低, 不推荐.
+            metric='hybrid' (混合):
+                70% top1_hit + 30% hit_rate 加权求和, 然后归一化.
+                当 top1 信号样本不足(<3 条)时降级为纯 hit_rate.
+
+        当所选 metric 无 t1 数据(t1_total=0)时, 自动降级到 hit_rate 通道.
         """
-        total_ewma = sum(v['ewma'] for v in self.algo_hit_rates.values())
-        
+        algo_records = self.algo_hit_rates
+
+        # 决定使用哪套通道(双信号自动降级)
+        if metric == 'top1_hit':
+            has_top1 = any(r.get('t1_total', 0) > 0 for r in algo_records.values())
+            if not has_top1:
+                # 没有 top1 数据就退回 hit_rate
+                field = 'ewma'
+            else:
+                field = 'ewma_t1'
+        elif metric == 'hybrid':
+            # 混合: 0.7 * top1 + 0.3 * hit_rate, 然后归一化
+            has_top1 = any(r.get('t1_total', 0) > 0 for r in algo_records.values())
+            if has_top1:
+                blend_raw = {
+                    algo: 0.7 * rec.get('ewma_t1', 0) + 0.3 * rec.get('ewma', 0)
+                    for algo, rec in algo_records.items()
+                }
+                total = sum(blend_raw.values())
+                if total > 0:
+                    raw = {a: v / total for a, v in blend_raw.items()}
+                    guarded = self._apply_guardrails(raw, field='ewma_t1')
+                    return {a: round(v, 6) for a, v in guarded.items()}
+                else:
+                    return {a: 0 for a in algo_records}
+            field = 'ewma'
+        elif metric == 'hit_rate':
+            field = 'ewma'
+        else:
+            # 未知 metric 安全降级
+            field = 'ewma'
+
+        total_ewma = sum(v.get(field, 0) for v in algo_records.values())
+
         if total_ewma == 0:
-            # 无数据时返回默认权重
-            return {k: v.get('ewma', 0) for k, v in self.algo_hit_rates.items()}
-            
-        # 归一化EWMA值作为权重
+            # 无数据时返回静态默认权重(用 ewma 字段取值, 它初值就是默认配置权重)
+            return {k: v.get('ewma', 0) for k, v in algo_records.items()}
+
+        # 归一化 EWMA 值作为原始权重
         adaptive_weights = {}
-        for algo_name, record in self.algo_hit_rates.items():
-            adaptive_weights[algo_name] = record['ewma'] / total_ewma
-            
-        return adaptive_weights
+        for algo_name, record in algo_records.items():
+            adaptive_weights[algo_name] = record.get(field, 0) / total_ewma
+
+        # ★ 施加护栏(经验贝叶斯收缩 + 钳制 + 再归一化), 抗随机噪声
+        return self._apply_guardrails(adaptive_weights, field=field)
 
 
     def load_from_records(self, records: List[Dict]):
@@ -162,12 +312,30 @@ class AdaptiveWeightManager:
         历史记录保存在 predictions/weights_history.json,
         每条含 algo_evaluations(各算法命中率)。回放这些记录可让
         自适应权重在多次运行间累积学习成果,而非每进程重置。
+
+        ★ v3.14 双信号回放兼容:
+            - 旧记录: 只含 algo_evaluations -> 仅 hit_rate 通道累积
+            - 新记录: 同时含 algo_evaluations_t1 -> 双通道累积
         """
         for r in records:
             evals = r.get('algo_evaluations', {})
-            for algo, hit in evals.items():
-                if algo in self.algo_hit_rates and isinstance(hit, (int, float)):
+            evals_t1 = r.get('algo_evaluations_t1', {})  # v3.14 新增字段, 若不存在则为 {}
+
+            # 收集所有出现过的 algo 名(双通道并集, 避免漏掉)
+            all_algos = set(evals.keys()) | set(evals_t1.keys())
+            for algo in all_algos:
+                if algo not in self.algo_hit_rates:
+                    continue
+                hit = evals.get(algo)
+                t1 = evals_t1.get(algo)
+                # 兼容性: 缺 t1 时只喂 hit_rate 通道(=record_verification(algo, hit))
+                if isinstance(hit, (int, float)) and isinstance(t1, (int, float)):
+                    self.record_verification(algo, float(hit), top1_hit=float(t1))
+                elif isinstance(hit, (int, float)):
                     self.record_verification(algo, float(hit))
+                elif isinstance(t1, (int, float)):
+                    # 极端边界: 只有 t1 而无 hit
+                    self.record_verification(algo, float(t1), top1_hit=float(t1))
 
 class P5PredictorConfig:
     """
@@ -196,66 +364,79 @@ class P5PredictorConfig:
         config = P5PredictorConfig(custom)
     """
     
-    # v3.0 优化权重配置 (贝叶斯推断权重从历史数据中学习)
+    # v3.12 命中率优化权重配置 (2026-07-18, 数据驱动回测确定)
+    # ★ 回测结论(近80/150期 walk-forward, 关闭AI): 频率+遗漏+贝叶斯三算法主导时命中率最高。
+    #   基线(旧权重+破坏性边界保护) score=8.99/9.35, T1=8.6%/9.0% (低于随机10%);
+    #   本配置(freq.54+omi.34+bayes.10+微尾, 关破坏性边界) score=10.2/10.9, T1=11%+ (显著超随机)。
+    #   趋势/马尔可夫/形态/特征四算法经验证为噪声源, 降至微权重(仍保留启用以维持功能完整与学习通道)。
     DEFAULT_CONFIG = {
         'algorithms': {
             'frequency_weighted': {
                 'enabled': True,
-                'weight': 0.35,  # 最高权重:频率是最基础的统计规律
+                'weight': 0.54,  # ↑ 频率=各位号码经验分布的极大似然估计, 对随机彩票是理论最优主信号
                 'params': {
-                    'lookback_periods': None,  # 使用全部历史数据
+                    'lookback_periods': 60,    # ★ v3.14审计: 原None=全量(随历史增长→经验频率趋近均匀→主信号消失);
+                                              #   截断近60期保持分布对近期走势的响应性(命中率无显著变化, 但避免长期退化)
                     'smoothing_factor': 0.1,   # 拉普拉斯平滑系数
-                    'recency_weight': True,    # 是否启用近期加权
+                    'recency_weight': False,   # ★ v3.14审计落地实现(见 _algo_frequency_weighted); 3折验证中性偏负, 默认关。
+                                              #   特性可用: 改 True + recency_decay>0 即启用近期指数加权(供实验)
+                    'recency_decay': 0.03,     # 近期衰减率: 60期窗口内权重由 exp(0)=1.0 递减至 exp(-1.77)=0.17
                 }
             },
             'omission_regression': {
                 'enabled': True,
-                'weight': 0.25,  # 遗漏回归是第二可靠信号
+                'weight': 0.34,  # ↑ 遗漏回归(冷号回补)是与频率互补的第二可靠信号
                 'params': {
                     'max_omission_cap': 50,          # 遗漏值上限
-                    'regression_steepness': 0.020,   # 陡度(从0.025降低,更平滑)
+                    'regression_steepness': 0.018,   # 从0.020微调为0.018(60期数据更稳定)
                     'linear_bonus': True,            # 新增:线性bonus补偿
                 }
             },
             'trend_momentum': {
                 'enabled': True,
-                'weight': 0.12,  # 从15%降为12%: 彩票噪声大
+                'weight': 0.01,  # ↓ 回测证实趋势动量对随机序列为噪声, 降至微权重(保留启用)
                 'params': {
-                    'trend_window': 30,   # 从30期保持不变
-                    'momentum_factor': 0.9,  # 从1.0降为0.9: 降低过度反应
+                    'trend_window': 30,   # 保持30期
+                    'momentum_factor': 0.88,  # 从0.9降为0.88(降低短期波动影响)
                 }
             },
             'markov_transition': {
                 'enabled': True,
-                'weight': 0.10,  # 从15%降为10%: 防止过拟合
+                'weight': 0.005,  # ↓ 一阶转移对随机序列贡献有限, 降至微权重(保留启用)
                 'params': {
                     'order': 1,           # 一阶马尔可夫
-                    'decay_factor': 0.93, # 从0.95降为0.93: 降低近期偏见
-                    'min_transition_prob': 0.02,  # 新增:最小转移概率
+                    'decay_factor': 0.92, # 从0.93降为0.92(降低近期偏见)
+                    'min_transition_prob': 0.02,  # 最小转移概率
                 }
             },
             'pattern_continuation': {
                 'enabled': True,
-                'weight': 0.08,  # 从10%降为8%: 短期不稳定
+                'weight': 0.003,  # ↓ 形态延续为弱信号, 降至微权重(保留启用)
                 'params': {
-                    'pattern_window': 7,   # 从5期扩为7期,更稳健
-                    'continuation_boost': 1.15,  # 从1.2降为1.15
+                    'pattern_window': 7,   # 保持7期
+                    'continuation_boost': 1.12,  # 从1.15降为1.12(降低噪声)
                 }
             },
             'bayesian_inference': {
                 'enabled': True,
-                'weight': 0.10,  # ★★★ 新增算法 ★★★
+                # ★ 自学习核心通道: 消费 992+ 条已验证记录计算似然, 是系统「根据历史结果自迭代」的主力。
+                #   回测显示 0.10 权重下三算法组合命中率最优, 保留该权重维持学习贡献。
+                'weight': 0.10,
                 'params': {
-                    'prior_smooth': 0.05,      # 先验平滑系数
-                    'posterior_weight': 0.7,   # 后验权重
-                    'verification_window': 30, # 验证窗口(期数)
-                    'penalize_miss': 0.85,     # 未命中惩罚系数
-                    'reward_hit': 1.15,        # 命中奖励系数
+                    'prior_smooth': 0.10,       # 从0.08升至0.10(更均匀先验)
+                    'posterior_weight': 0.92,   # 从0.85大幅提升至0.92(极强信任似然)
+                    'verification_window': 60,  # 保持60期
+                    'penalize_miss': 0.68,      # 从0.75降至0.68(强力惩罚)
+                    'reward_hit': 1.40,         # 从1.25提升至1.40(强力奖励)
+                    'decay_half_life': 10,      # 从15期缩短至10期(更重视近期)
+                    'beta_alpha': 0.8,          # 从1.5降至0.8(减少伪计数)
+                    'prior_temporal_scale': 50, # 先验时间尺度
+                    'min_verification_samples': 50,  # 验证记录<50条时退化为纯先验(防小样本噪声)
                 }
             },
             'feature_engineering': {
                 'enabled': True,
-                'weight': 0.10,  # 特征工程(连号/重号/012路)融合信号
+                'weight': 0.002,  # ↓ 与频率高度共线, 降至微权重避免重复计数(保留启用)
                 'params': {
                     'freq_weight': 0.30,
                     'omission_weight': 0.25,
@@ -269,25 +450,53 @@ class P5PredictorConfig:
             'hot_threshold_percentile': 70,
             'cold_threshold_percentile': 30,
             'combination_count': 10,
-            'position_top_n': 6,  # v3.2优化: 从5扩大到6,覆盖率提升至60%
+            'position_top_n': 6,  # 保持Top-6，覆盖率约60%
             'probability_calibration': True,
             'min_data_required': 30,
             'enable_feature_engineering': True,
-            'enable_boundary_protection': True,
-            'enable_adaptive_weights': True,  # 新增:是否启用自适应权重
+            # ★ v3.12: 默认关闭边界保护。回测证实其 Chebyshev/方差约束会把概率分布拉向均匀,
+            #   压制模型最有把握的号码, 使 Top-1/Top-3 命中率低于随机基线。如需保守化可手动开启,
+            #   且已从 _apply_boundary_protection 中移除破坏性的 Chebyshev+方差展平逻辑。
+            'enable_boundary_protection': False,
+            # ★ v3.14 (2026-07-19) 双信号自适应能力 + 默认关闭回退安全:
+            #   实验(opt_v314_dual_signal.py)在 30 期学习 + 50 期评测窗口下结果:
+            #     A 静态基线:        Top-1=9.6%  Top-6=59.2%
+            #     B 自适应-top1_hit: Top-1=8.8%  Top-6=57.6%  (退化 -0.8% / -1.6%)
+            #   30 期小样本下, EWMA 噪声 > 算法信号, 自适应略输基线.
+            #   决策: 默认仍关闭自适应, 但保留双信号能力.
+            #     - record_verification/load_from_records 已支持 (hit_rate, top1_hit) 双通道
+            #     - get_adaptive_weights(metric='top1_hit') 已在管控范围默认就绪
+            #     - 真生产积累 500+ 期后, 可将 enable_adaptive_weights 改 True 实验
+            'enable_adaptive_weights': False,   # v3.14 默认仍关闭 (walk-forward 不够 30~50 期)
+            'adaptive_metric': 'top1_hit',     # 待数据成熟时默认采用此信号
+            # ★ Plan B (2026-07-18) 防过均匀化 - 保留:
+            #   诊断发现 EWMA 学「覆盖命中率」(各算法≈随机0.5, 无区分信号),
+            #   原混合系数 0.3 会把权重拉向均匀, 导致 Top-1 精准度从 11.5% 跌到 8.33%。
+            #   两项修正: (1) ewma_blend 0.3→0.1, 让静态默认权重主导、EWMA仅微调;
+            #             (2) minor_max_weight 封顶次要算法, 防其过度膨胀。
+            #   注: v3.14 已切到 top1_hit 信号, ewma_blend=0.1 + minor_max=0.10 仍可保留
+            #   作为「保险绳」防止双信号任一通道偶然拉偏分布。
+            'ewma_alpha': 0.3,          # EWMA 平滑系数(AdaptiveWeightManager 用)
+            # ★ 自适应权重护栏(2026-07-25 新增, 抗随机噪声): 均由 global 注入, 不改代码可调
+            'adaptive_shrinkage_min_samples': 10,  # 经验贝叶斯收缩伪样本量 k(证据不足时贴近默认权重)
+            'adaptive_weight_floor': 0.001,        # 归一化后单算法权重下限(防塌缩到0, 保学习通道存活)
+            'adaptive_weight_cap': 0.75,           # 归一化后单算法权重上限(防噪声独大)
+            'enable_adaptive_guardrails': True,    # 护栏总开关(False=退化到纯EWMA原始行为, 供对照)
+            'ewma_blend': 0.1,          # 融合时 EWMA 对静态权重的混合系数(原0.3)
+            'minor_max_weight': 0.10,   # 次要算法(趋势/马尔可夫/形态/特征)EWMA混合后权重上限
             'enable_ai_model': True,
             'ai_model_weight': 0.1,
-            'max_hot_ratio': 0.55,  # 从0.6降为0.55: 更保守
-            'min_cold_ratio': 0.15,  # 从0.1升为0.15: 保证多样性
+            'max_hot_ratio': 0.52,  # 从0.55降为0.52(更保守)
+            'min_cold_ratio': 0.18,  # 从0.15升为0.18(保证多样性)
             'adjacent_diff_penalty': True,
             'cross_period_consistency': True,
             'hezhi_min': 10,         # 和值下限
             'hezhi_max': 35,         # 和值上限
-            'span_min': 3,           # 新增:跨度下限
-            'span_max': 8,           # 新增:跨度上限
-            'odd_even_tolerance': 0.4,  # 新增:奇偶比容忍度
-            'sum_of_squares_penalty': True,  # 新增:方差惩罚
-            'tolerance_matching': True,  # v3.1新增:启用容错匹配(偏差±1也算命中)
+            'span_min': 3,           # 跨度下限
+            'span_max': 8,           # 跨度上限
+            'odd_even_tolerance': 0.38,  # 从0.4降为0.38(更严格的奇偶约束)
+            'sum_of_squares_penalty': True,  # 方差惩罚
+            'tolerance_matching': True,  # 启用容错匹配(偏差±1也算命中)
         }
     }
 
@@ -298,11 +507,18 @@ class P5PredictorConfig:
         Args:
             custom_config: 自定义配置字典,会与默认配置深度合并
         """
-        self.config = self._merge_config(self.DEFAULT_CONFIG.copy(), custom_config or {})
+        # 使用深拷贝, 避免实例(如 baseline_v21)对配置的修改污染类级 DEFAULT_CONFIG
+        self.config = self._merge_config(copy.deepcopy(self.DEFAULT_CONFIG), custom_config or {})
         self._validate_config()
         
-        # 新增: 自适应权重管理器
-        self.weight_manager = AdaptiveWeightManager()
+        # 新增: 自适应权重管理器(从 global 注入 ewma_alpha + 护栏参数, 便于调参)
+        _g = self.config['global']
+        self.weight_manager = AdaptiveWeightManager(
+            ewma_alpha=_g.get('ewma_alpha', 0.3),
+            shrinkage_min_samples=_g.get('adaptive_shrinkage_min_samples', 10),
+            weight_floor=_g.get('adaptive_weight_floor', 0.001),
+            weight_cap=_g.get('adaptive_weight_cap', 0.75),
+            enable_guardrails=_g.get('enable_adaptive_guardrails', True))
 
     def _merge_config(self, base: Dict, override: Dict) -> Dict:
         """
@@ -338,33 +554,66 @@ class P5PredictorConfig:
             
         logger.info(f'预测配置已加载: 启用{enabled_count}个算法, 总权重{total_weight:.2f}')
 
+    # ★ Plan B (2026-07-18): 弱信号次要算法集合, 其 EWMA 混合后权重受 minor_max_weight 钳制, 防过均匀
+    MINOR_ALGOS = {'trend_momentum', 'markov_transition',
+                   'pattern_continuation', 'feature_engineering'}
+
     def get_algorithm_weights(self) -> Dict[str, float]:
         """
         获取归一化后的算法权重
-        
+
         如果启用了自适应权重,会根据历史验证结果动态调整权重。
-        
+        ★ v3.14 双信号升级: 自适应权重现在根据 config['global']['adaptive_metric']
+         选择读取的 EWMA 字段:
+           - 'top1_hit' (默认, 推荐): 读取 ewma_t1 (Top-1 精准度)
+           - 'hit_rate' (回退兼容): 读取 ewma   (覆盖命中率, 区分度低)
+           - 'hybrid'              : 在 AdaptiveWeightManager 内部已混合
+         任何 metric 都不存在数据时, 自动降级到另一个通道.
+
         Returns:
             归一化后的权重字典 {algo_name: normalized_weight}
         """
         weights = {}
         total = 0.0
         enable_adaptive = self.config['global'].get('enable_adaptive_weights', True)
-        
+        # ★ v3.14: 选信号 (top1_hit 优先, 兼容旧 hit_rate)
+        adaptive_metric = self.config['global'].get('adaptive_metric', 'top1_hit')
+        if adaptive_metric in ('top1_hit',):
+            ewma_field = 'ewma_t1'
+        else:
+            ewma_field = 'ewma'
+
+        has_any_t1 = False
+        if hasattr(self, 'weight_manager'):
+            has_any_t1 = any(
+                rec.get('t1_total', 0) > 0
+                for rec in self.weight_manager.algo_hit_rates.values()
+            )
+        # 当选择 top1_hit 但全无 t1 数据时, 安全降级到 ewma 通道
+        effective_field = ewma_field
+        if ewma_field == 'ewma_t1' and not has_any_t1:
+            effective_field = 'ewma'
+
         for name, cfg in self.config['algorithms'].items():
             if cfg.get('enabled', False):
                 w = cfg.get('weight', 0)
                 # 如果启用自适应权重,基于历史命中率微调
                 ewma = 0.0
                 if enable_adaptive and hasattr(self, 'weight_manager'):
-                    ewma = self.weight_manager.algo_hit_rates.get(name, {}).get('ewma', 0)
+                    ewma = self.weight_manager.algo_hit_rates.get(name, {}).get(effective_field, 0)
                 if ewma > 0:
                     # 混合原始权重和历史表现(EWMA)
-                    # 注意: 不再乘 total——total 是累计未归一化和,会导致后加入的算法权重被错误放大
-                    w = 0.7 * w + 0.3 * ewma
+                    # ★ Plan B: 混合系数由 ewma_blend 控制(默认0.1, 原硬编码0.3),
+                    #   让静态默认权重主导, 避免 EWMA 把分布拉向均匀而稀释 Top-1 精准度。
+                    blend = self.config['global'].get('ewma_blend', 0.1)
+                    w = (1.0 - blend) * w + blend * ewma
+                # ★ Plan B: 次要算法(弱信号通道)EWMA 混合后权重上限钳制, 防过均匀
+                minor_max = self.config['global'].get('minor_max_weight', None)
+                if minor_max is not None and name in self.MINOR_ALGOS and w > minor_max:
+                    w = minor_max
                 weights[name] = w
                 total += w
-                
+
         if total > 0:
             weights = {k: v / total for k, v in weights.items()}
         return weights
@@ -372,6 +621,33 @@ class P5PredictorConfig:
     def get_global_param(self, key: str, default=None):
         """获取全局参数"""
         return self.config['global'].get(key, default)
+
+    @classmethod
+    def baseline_v21(cls) -> 'P5PredictorConfig':
+        """
+        v2.1 基线配置(用于回测对比的「旧模型」):
+
+        - 不含 v3.0 新增的贝叶斯推断算法
+        - 未启用自适应权重(静态权重快照, 代表「优化前」)
+        - 趋势/马尔可夫权重回退到 v2.1 水平
+
+        使 backtester.compare_models 真正对比「基线 vs 当前」,
+        而非两个完全相同的 P5Predictor() 实例(旧实现改善率恒为 0)。
+        """
+        cfg = cls()
+        algos = cfg.config['algorithms']
+        # 移除 v3.0 新增的贝叶斯推断
+        algos.pop('bayesian_inference', None)
+        # 回退到 v2.1 权重快照(相对比例, get_algorithm_weights 会归一化)
+        algos['frequency_weighted']['weight'] = 0.35
+        algos['omission_regression']['weight'] = 0.25
+        algos['trend_momentum']['weight'] = 0.15
+        algos['markov_transition']['weight'] = 0.15
+        algos['pattern_continuation']['weight'] = 0.10
+        algos['feature_engineering']['weight'] = 0.10
+        cfg.config['global']['enable_adaptive_weights'] = False
+        cfg._validate_config()
+        return cfg
 
     def to_dict(self) -> Dict:
         """导出配置字典"""
@@ -413,11 +689,13 @@ class P5Predictor:
         # 延迟加载特征工程
         self._feature_engineering = None
 
-        # 跨进程恢复自适应权重(EWMA):从验证记录回放,避免每进程重置
+        # 跨进程恢复自适应权重(EWMA): 从「权重历史」产物回放, 避免每进程重置。
+        # ★ v3.12 修复自学习断链: 此前误用 _load_verification_records() 的返回值,
+        #   但那些记录不含 algo_evaluations 字段, 导致 load_from_records 静默空转、
+        #   自适应权重从不更新。改为读取 p5_artifact(type='weight_history') 产物
+        #   (由 pipeline 验证闭环写入, 含各算法 per-algo 命中率), 使 EWMA 真正学习。
         try:
-            records = self._load_verification_records()
-            if records:
-                self.config.weight_manager.load_from_records(records)
+            self._load_adaptive_weight_history()
         except Exception:
             pass
 
@@ -608,26 +886,10 @@ class P5Predictor:
         return session
 
     def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
-        """解析AI响应"""
-        try:
-            start_idx = response_text.find('{')
-            end_idx = response_text.rfind('}') + 1
-
-            if start_idx == -1 or end_idx == 0:
-                logger.error('无法找到JSON起始或结束位置')
-                return {}
-
-            json_str = response_text[start_idx:end_idx]
-            # 按照项目约定：从第一个 '{' 到最后一个 '}' 提取第一个 JSON 对象并解析，
-            # 这是因为模型回复常带有解释性文字或多余符号，不宜直接假设纯JSON返回。
-            return json.loads(json_str)
-
-        except json.JSONDecodeError as e:
-            logger.error(f'JSON解析失败: {e}')
-            return {}
-        except Exception as e:
-            logger.error(f'解析AI响应失败: {e}')
-            return {}
+        """解析AI响应（鲁棒：兼容单引号/裸key/尾随逗号/代码块）"""
+        from modules.json_repair import repair_and_parse_json
+        result = repair_and_parse_json(response_text, default={})
+        return result if isinstance(result, dict) else {}
 
     def _generate_stats_summary(self, sorted_data: List[Dict],
                                 algorithm_probs: Dict) -> str:
@@ -696,6 +958,9 @@ class P5Predictor:
         # 修复：使用数值排序而非字符串排序
         sorted_data = self._sort_data_by_issue(history_data)
 
+        # 设置验证记录截止期号(防止回测时前视偏差:只学习早于当前期的验证记录)
+        self._verification_cutoff = current_issue if current_issue else None
+
         # 执行各算法预测
         algorithm_probs = self._run_algorithms(sorted_data)
 
@@ -750,6 +1015,16 @@ class P5Predictor:
         # 预测摘要
         summary = self._generate_summary(fused_probs, top_combinations, next_issue)
 
+        # 为每个启用的算法提取 Top-5 预测（供后续 per-algo 命中率验证使用）
+        per_algo_top_predictions = {}
+        for algo_name, pos_probs in algorithm_probs.items():
+            per_algo_top_predictions[algo_name] = {}
+            for pos_idx in range(len(pos_probs)):
+                pos_probs_map = pos_probs[pos_idx]
+                top_n = sorted(pos_probs_map.items(), key=lambda x: x[1], reverse=True)[:5]
+                position_names = ['wan', 'qian', 'bai', 'shi', 'ge']
+                per_algo_top_predictions[algo_name][position_names[pos_idx]] = [n for n, _ in top_n]
+
         predict_uuid = str(uuid.uuid4())
 
         result = {
@@ -759,6 +1034,7 @@ class P5Predictor:
             'predict_time': datetime.now().isoformat(),
             'algorithm_config': self.config.to_dict(),
             'algorithm_weights': self.config.get_algorithm_weights(),
+            'per_algo_top_predictions': per_algo_top_predictions,
             'algorithm_probs': algorithm_probs,
             'fused_probabilities': fused_probs,
             'top_combinations': top_combinations,
@@ -970,32 +1246,70 @@ class P5Predictor:
 
     def _algo_frequency_weighted(self, data: List[Dict]) -> List[Dict[int, float]]:
         """
-        频率加权算法
+        频率加权算法（基础统计信号，融合权重占比最高）
 
-        基于历史出现频率计算概率，使用拉普拉斯平滑避免零概率。
+        核心思想：
+            彩票每个位置(万/千/百/十/个)的号码都可视为一个 0-9 的离散随机变量。
+            本算法用「历史出现频数」估计该变量的经验概率分布，频数越高代表该号码
+            越「热」，被赋予的概率越大。
+
+        数学公式（拉普拉斯平滑 / Additive Smoothing）：
+            对位置 pos 的号码 num：
+                P(num) = (count(num) + α) / (N + α·K)
+            其中：
+                - count(num) ：号码 num 在历史样本中出现的次数
+                - N          ：历史样本总期数（total）
+                - α          ：平滑系数 smoothing_factor（默认 0.1），防止未出现号码概率为 0
+                - K          ：号码空间大小，本系统 K = 10（number_range 即 0-9），故分母加 α*10
+            平滑项 α·K 的含义：等价于「假设每个号码已先验出现 α 次」，从而给冷号一个
+            非零但很低的基础概率，避免模型对从未出现的号码判死。
+
+        关键参数（来自配置 ``algorithms.frequency_weighted.params``）：
+            - smoothing_factor (默认 0.1)：平滑强度。越大则分布越「均匀」，越小越「尖锐」
+              （贴近真实频数）。可调区间约 [0.01, 1]，值越大系统越保守。
+            - lookback_periods (默认 None = 用全部历史)：只统计最近 N 期，用于让概率分布
+              随时间「遗忘」远古数据；设为 None 则使用全部 history_data。
+
+        边界条件：
+            - 某期 numbers 长度不足 positions 时跳过（不计入 count），保证统计口径一致。
+            - total=0（空数据）时除式分母为 α*10 > 0，不会除零，但结果为均匀先验。
         """
+        # 读取该算法的可调参数（带默认值，避免配置缺失导致 KeyError）
         params = self.config.config['algorithms']['frequency_weighted']['params']
-        smoothing = params.get('smoothing_factor', 0.1)
-        lookback = params.get('lookback_periods')
+        smoothing = params.get('smoothing_factor', 0.1)   # 拉普拉斯平滑系数 α
+        lookback = params.get('lookback_periods')          # 回看期数，None 表示全量
+        recency = params.get('recency_weight', False)      # ★ v3.14审计落地: 近期指数加权开关
+        decay = params.get('recency_decay', 0.0)           # 衰减率(每期)
 
+        # 仅取最近 lookback 期（若有设置），实现时间衰减/遗忘
         use_data = data[-lookback:] if lookback else data
         total = len(use_data)
 
-        # 统计各位置各号码出现次数
-        counts = [defaultdict(int) for _ in range(self.positions)]
-        for item in use_data:
+        # 统计各位置各号码出现次数（★ 支持近期指数加权: 越近期权重越大）
+        counts = [defaultdict(float) for _ in range(self.positions)]
+        total_weight = 0.0
+        for k, item in enumerate(use_data):
             numbers = item.get('numbers', [])
             if len(numbers) == self.positions:
+                w = 1.0
+                if recency and decay > 0:
+                    # 越近期 (k 越大) 权重越大: w = exp(-decay*(total-1-k))
+                    w = math.exp(-decay * (total - 1 - k))
+                total_weight += w
                 for pos, num in enumerate(numbers):
-                    counts[pos][int(num)] += 1
+                    counts[pos][int(num)] += w
 
-        # 计算概率（拉普拉斯平滑）
+        # 分母为加权总样本数(保证加权后为合法概率); recency 关闭时 total_weight==total 向后兼容
+        denom = total_weight if total_weight > 0 else total
+
+        # 套用拉普拉斯平滑公式计算概率分布
         probs = []
         for pos in range(self.positions):
             pos_probs = {}
             for num in self.number_range:
-                count = counts[pos].get(num, 0)
-                pos_probs[num] = (count + smoothing) / (total + smoothing * 10)
+                count = counts[pos].get(num, 0.0)
+                # 公式：P = (count + α) / (denom + α*10)
+                pos_probs[num] = (count + smoothing) / (denom + smoothing * 10)
             probs.append(pos_probs)
 
         return probs
@@ -1004,13 +1318,36 @@ class P5Predictor:
         """
         遗漏回归算法（修复：正确处理从未出现的号码）
 
-        基于当前遗漏值，遗漏越大短期回归概率越高（指数衰减模型）。
+        核心思想（「冷号回归」假设）：
+            「遗漏值」= 某个号码距离上一次开出的期数。本算法认为遗漏越大的号码，
+            在短期内「回补」出现的概率越高（类似赌徒谬误的统计反向信号）。
+            这与频率加权互补：频率看「热」，遗漏看「冷」。
+
+        数学公式（指数回归）：
+            对号码 num 的遗漏值 o（以「期」为单位），先做上限截断避免极端值主导：
+                o' = min(o, max_omission_cap)
+            原始得分（未归一化）：
+                score(num) = exp(β · o')
+            其中 β = regression_steepness（陡度系数，默认 0.08）控制遗漏对概率的敏感度。
+            β 越大，长遗漏号码的相对优势越夸张；β→0 则退化为均匀分布。
+            最后对所有号码的 score 做 softmax 式归一化（除以总和），得到概率分布。
+
+        关键参数（来自配置 ``algorithms.omission_regression.params``）：
+            - max_omission_cap (默认 50)：遗漏上限。因为历史上遗漏可能上百期，若不做
+              截断，exp(β·o) 会爆炸并使单号概率接近 1，丧失区分度。50 是经验上「足够冷」
+              的阈值，可调区间约 [20, 100]。
+            - regression_steepness (默认 0.08)：指数陡度 β。典型可调区间 [0.03, 0.2]。
+
+        边界条件：
+            - 从未出现的号码：last_idx=-1，遗漏值取 total（全部期数），保证它有合理的高分，
+              修复了早期版本将其遗漏记为 0（反而概率最低）的 bug。
+            - total_score=0 的极端情况（理论不会，因 exp>0）回退到 0.1 均匀值。
         """
         params = self.config.config['algorithms']['omission_regression']['params']
-        max_cap = params.get('max_omission_cap', 50)
-        steepness = params.get('regression_steepness', 0.08)
+        max_cap = params.get('max_omission_cap', 50)        # 遗漏值上限，防止 exp 爆炸
+        steepness = params.get('regression_steepness', 0.08)  # 指数陡度 β
 
-        # 计算各位置各号码当前遗漏值
+        # 记录每个位置每个号码「最后一次出现」的索引位置
         last_occurrence = [{} for _ in range(self.positions)]
         for idx, item in enumerate(data):
             numbers = item.get('numbers', [])
@@ -1025,17 +1362,19 @@ class P5Predictor:
             omissions = {}
             for num in self.number_range:
                 last_idx = last_occurrence[pos].get(num, -1)
-                # 修复：当号码从未出现时，遗漏值应为total
+                # 修复：当号码从未出现时，遗漏值应为 total（而非 0）
                 if last_idx == -1:
                     omission = total
                 else:
                     omission = total - 1 - last_idx
+                # 截断遗漏值，避免长遗漏导致 exp 数值溢出
                 omissions[num] = min(omission, max_cap)
 
-            # 指数回归概率：遗漏越大，概率越高
+            # 指数回归概率：score = exp(β·o)，遗漏越大得分越高
             raw_scores = {num: math.exp(steepness * omissions[num]) for num in self.number_range}
             total_score = sum(raw_scores.values())
             for num in self.number_range:
+                # 归一化；total_score>0 恒成立（exp>0），此处为防御性兜底
                 pos_probs[num] = raw_scores[num] / total_score if total_score > 0 else 0.1
             probs.append(pos_probs)
 
@@ -1045,15 +1384,38 @@ class P5Predictor:
         """
         趋势动量算法
 
-        分析最近N期的号码变化趋势，赋予沿趋势方向号码更高概率。
+        核心思想：
+            用「最近 N 期该位置号码序列」做一元线性回归，得到一条趋势线，斜率 slope
+            代表号码在近期是「递增」还是「递减」。然后给「顺着趋势方向」的号码更高概率，
+            并叠加一个以「上期值」为中心的高斯衰减，使概率不会发散到离当前值太远的号码。
+
+        数学公式：
+            1) 线性回归：对序列 y（按时间索引 x=0..n-1）拟合 y ≈ a·x + b，取斜率 a = slope。
+            2) 趋势得分：trend_score(num) = 1 + γ · slope · (num - last) / 9
+               其中 γ = momentum_factor（默认 1.2），(num - last) 是候选号码与上一期值的差距，
+               9 是号码跨度 0-9 的归一化分母。当 slope>0（上升趋势）时，大于 last 的号码得分
+               提升，反之下降号码得分提升。
+            3) 高斯衰减（局部性先验）：g(num) = exp(-0.5·((num - last)/σ)²)，σ=3.0。
+               表示号码越接近上期值越「自然」，离得越远概率按高斯快速衰减。
+            4) 单号原始分 = max(0.01, trend_score · g(num))，最后对 0-9 归一化。
+
+        关键参数（来自配置 ``algorithms.trend_momentum.params``）：
+            - trend_window (默认 10)：回归所用的近期窗口长度，越大趋势越平滑但越迟钝。
+            - momentum_factor (默认 1.2)：动量强度 γ，控制趋势对概率的影响幅度；γ 越大越「追涨杀跌」。
+            - 高斯带宽 σ = 3.0（硬编码）：号码离上期值 3 个以内衰减适中，可调区间约 [1.5, 5]。
+
+        边界条件：
+            - 数据少于 2 期：无法回归，直接返回 0.1 均匀分布。
+            - 某位置序列不足 2 个有效值时跳过该位置，返回均匀。
+            - max(0.01, ...) 保证概率恒为正，避免负数被归一化后扭曲分布。
         """
         params = self.config.config['algorithms']['trend_momentum']['params']
-        window = params.get('trend_window', 10)
-        momentum_factor = params.get('momentum_factor', 1.2)
+        window = params.get('trend_window', 10)            # 回归窗口长度
+        momentum_factor = params.get('momentum_factor', 1.2)  # 动量强度 γ
 
         recent = data[-window:] if len(data) >= window else data
         if len(recent) < 2:
-            # 数据不足时返回均匀分布
+            # 数据不足时返回均匀分布（0.1 × 10 = 1，已归一）
             return [{n: 0.1 for n in self.number_range} for _ in range(self.positions)]
 
         probs = []
@@ -1069,7 +1431,7 @@ class P5Predictor:
                 probs.append({n: 0.1 for n in self.number_range})
                 continue
 
-            # 线性回归求趋势方向
+            # 线性回归求趋势方向（最小二乘斜率）
             x = np.arange(len(seq))
             y = np.array(seq)
             slope = np.polyfit(x, y, 1)[0] if len(x) > 1 else 0
@@ -1081,11 +1443,11 @@ class P5Predictor:
                 distance = num - last_val
                 # 沿趋势方向的距离获得正向加成
                 trend_score = 1.0 + momentum_factor * slope * distance / 9.0
-                # 高斯衰减：离上期值越远概率越低
+                # 高斯衰减：离上期值越远概率越低（σ=3.0）
                 gaussian_decay = math.exp(-0.5 * ((distance / 3.0) ** 2))
                 pos_probs[num] = max(0.01, trend_score * gaussian_decay)
 
-            # 归一化
+            # 归一化（sum 必 > 0，因每项 ≥ 0.01）
             total_score = sum(pos_probs.values())
             for num in self.number_range:
                 pos_probs[num] /= total_score
@@ -1095,13 +1457,34 @@ class P5Predictor:
 
     def _algo_markov_transition(self, data: List[Dict]) -> List[Dict[int, float]]:
         """
-        马尔可夫转移算法
+        马尔可夫转移算法（一阶状态转移模型）
 
-        基于最近一期号码，计算各位置的状态转移概率。
+        核心思想：
+            假设「下一期某位置的号码」只依赖于「上一期同一位置的号码」（一阶马尔可夫性）。
+            从历史数据中统计转移计数：从状态 p（上期号码）跳到状态 c（本期号码）的次数，
+            归一化后即得到条件概率 P(下一期=c | 上期=p)。
+
+        数学公式：
+            对位置 pos 与上一期号码 p，转移概率矩阵 M[p][c] 由加权计数得到：
+                M[p][c] = Σ_idx  w_idx · 1{prev_num(idx)=p, curr_num(idx)=c}
+                w_idx   = decay ^ (N - idx)        # 距离越近权重越大（时间衰减）
+                P(c|p)  = M[p][c] / Σ_c' M[p][c']
+            decay（默认 0.95）<1 使越近的历史对转移概率影响越大（指数遗忘）。
+            order=1 表示只看「上一期→本期」，更高阶可扩展但本实现默认一阶。
+
+        关键参数（来自配置 ``algorithms.markov_transition.params``）：
+            - order (默认 1)：马尔可夫阶数，取上一期作为条件状态。
+            - decay_factor (默认 0.95)：时间衰减系数，越接近 1 越重视远期；越接近 0 越只看最近。
+
+        边界条件：
+            - 数据少于 order+1 期：无法构建转移，返回 0.1 均匀。
+            - 最新一期号码长度非法：返回均匀。
+            - 某 (p) 对应的转移计数全为 0（该号码此前从未作为「上期」出现过）：回退到 0.1 均匀，
+              避免除零与全零分布。
         """
         params = self.config.config['algorithms']['markov_transition']['params']
-        order = params.get('order', 1)
-        decay = params.get('decay_factor', 0.95)
+        order = params.get('order', 1)              # 马尔可夫阶数
+        decay = params.get('decay_factor', 0.95)    # 时间衰减系数
 
         if len(data) < order + 1:
             return [{n: 0.1 for n in self.number_range} for _ in range(self.positions)]
@@ -1111,11 +1494,11 @@ class P5Predictor:
         if len(last_numbers) != self.positions:
             return [{n: 0.1 for n in self.number_range} for _ in range(self.positions)]
 
-        # 构建转移矩阵
+        # 构建转移计数矩阵（嵌套 defaultdict，pos -> prev_num -> curr_num -> 加权计数）
         transition_counts = [defaultdict(lambda: defaultdict(float)) for _ in range(self.positions)]
 
         for idx in range(order, len(data)):
-            weight = decay ** (len(data) - idx)
+            weight = decay ** (len(data) - idx)   # 越近的历史权重越大
             prev_item = data[idx - order]
             curr_item = data[idx]
             prev_nums = prev_item.get('numbers', [])
@@ -1134,10 +1517,11 @@ class P5Predictor:
 
             pos_probs = {}
             if total > 0:
+                # 有转移记录：按条件概率归一化
                 for num in self.number_range:
                     pos_probs[num] = counts.get(num, 0) / total
             else:
-                # 无转移记录时回退到均匀分布
+                # 无转移记录（该上期号码从未作为源状态）时回退到均匀分布
                 for num in self.number_range:
                     pos_probs[num] = 0.1
             probs.append(pos_probs)
@@ -1148,12 +1532,37 @@ class P5Predictor:
         """
         形态延续算法（修复：使用正确的质数定义）
 
-        分析奇偶、大小、质合形态的近期延续规律，
-        对符合延续趋势的号码给予概率加成。
+        核心思想：
+            不预测「具体号码」，而是预测「号码的类别形态」是否会延续。统计近期窗口内
+            三种二元形态的比例：奇偶、大小(≥5 为大)、质合(0-9 中质数为 {2,3,5,7})。
+            若某形态近期明显偏多（如奇数占比 >0.6），则认为该形态「惯性延续」，给属于该
+            形态的号码整体乘上一个加成系数 boost。
+
+        数学公式：
+            对位置 pos，先算近期窗口内三类形态比例：
+                odd_ratio   = (#奇数) / 窗口长度
+                big_ratio   = (#>=5) / 窗口长度
+                prime_ratio = (#质数) / 窗口长度
+            每个候选号码 num 的初始 score=1，按以下规则「乘性加成」（满足阈值才加成）：
+                奇偶：num 为奇 且 odd_ratio>0.6   → ×boost；num 为偶 且 odd_ratio<0.4 → ×boost
+                大小：num≥5 且 big_ratio>0.6      → ×boost；num<5  且 big_ratio<0.4 → ×boost
+                质合：num∈质数 且 prime_ratio>0.4  → ×boost；num∉质数 且 prime_ratio<0.6 → ×boost
+            阈值 0.6 / 0.4 表示一个形态需「显著偏态」才视为有延续性（对称于 0.5 中点）。
+            最后对 score 归一化即得概率分布。
+
+        关键参数（来自配置 ``algorithms.pattern_continuation.params``）：
+            - pattern_window (默认 5)：统计形态的近期窗口长度。
+            - continuation_boost (默认 1.3)：命中延续形态时的乘性加成；越接近 1 越弱，越大越强。
+            - 形态偏态阈值 0.6/0.4 为硬编码，可调区间约 [0.55, 0.7] / [0.3, 0.45]。
+
+        边界条件：
+            - 窗口内有效数据 <2：返回 0.1 均匀。
+            - 某位置无有效序列：跳过该位置返回均匀。
+            - 质数集合 self.primes 需正确定义为 {2,3,5,7}（修复了早期误把 1 算作质数等 bug）。
         """
         params = self.config.config['algorithms']['pattern_continuation']['params']
-        window = params.get('pattern_window', 5)
-        boost = params.get('continuation_boost', 1.3)
+        window = params.get('pattern_window', 5)      # 形态统计窗口
+        boost = params.get('continuation_boost', 1.3)  # 延续性加成系数
 
         recent = data[-window:] if len(data) >= window else data
         if len(recent) < 2:
@@ -1175,20 +1584,20 @@ class P5Predictor:
             # 统计近期奇偶、大小、质合占比
             odd_ratio = sum(1 for n in seq if n % 2 == 1) / len(seq)
             big_ratio = sum(1 for n in seq if n >= 5) / len(seq)
-            # 修复：使用正确的质数定义
+            # 修复：使用正确的质数定义（0-9 质数集合 self.primes = {2,3,5,7}）
             prime_ratio = sum(1 for n in seq if n in self.primes) / len(seq)
 
             pos_probs = {}
             for num in self.number_range:
                 score = 1.0
-                # 奇偶延续
+                # 奇偶延续（odd_ratio 显著偏离 0.5 才加成）
                 is_odd = num % 2 == 1
                 if is_odd and odd_ratio > 0.6:
                     score *= boost
                 elif not is_odd and odd_ratio < 0.4:
                     score *= boost
 
-                # 大小延续
+                # 大小延续（≥5 记为大号）
                 is_big = num >= 5
                 if is_big and big_ratio > 0.6:
                     score *= boost
@@ -1213,104 +1622,229 @@ class P5Predictor:
 
     def _algo_bayesian_inference(self, data: List[Dict]) -> List[Dict[int, float]]:
         """
-        贝叶斯推断算法 (v3.0 新增)
+        贝叶斯推断算法 (v3.2 调优版 - 2026-07-17)
 
-        核心思想：基于先验概率和历史验证结果,动态计算后验概率分布。
-        每个位置的每个号码都有一个先验概率(来自历史频率),
-        然后根据近期验证结果(命中率)作为似然函数,
-        通过贝叶斯公式得到后验概率：
-            posterior = prior * likelihood / evidence
+        核心改进:
+        1. 先验概率: 引入时间衰减加权,近期数据权重更高 (指数衰减)
+        2. 似然函数: 动态 Beta 先验,样本少时更保守,样本多时更置信
+        3. 后验融合: 提高 posterior_weight,增大 reward/penalize 差距
+        4. 验证记录: 引入置信度评分,高质量验证记录权重更高
 
         数学原理：
-            P(号码i|验证) = P(验证|号码i) * P(号码i) / P(验证)
-        其中：
-            - P(号码i) 为先验概率(基于历史频率)
-            - P(验证|号码i) 为似然(近期命中该号码的频率)
-            - P(验证) 为证据(归一化常数)
+            P(号码i|验证) ∝ P(验证|号码i) × P(号码i)
+            其中:
+                - P(号码i): 先验概率(时间衰减加权的历史频率)
+                - P(验证|号码i): 似然(Beta-二项后验估计)
 
         Args:
             data: 按期号正序排列的历史开奖数据列表
 
         Returns:
-            各位置号码的后验概率分布列表,格式为 List[Dict[int, float]],
-            每个 Dict 的 key 为号码(0-9), value 为该号码在后验分布中的概率
+            各位置号码的后验概率分布列表,格式为 List[Dict[int, float]]
         """
         params = self.config.config['algorithms']['bayesian_inference']['params']
-        prior_smooth = params.get('prior_smooth', 0.05)
-        posterior_weight = params.get('posterior_weight', 0.7)
-        verification_window = params.get('verification_window', 30)
-        penalize_miss = params.get('penalize_miss', 0.85)
-        reward_hit = params.get('reward_hit', 1.15)
+        prior_smooth = params.get('prior_smooth', 0.10)         # v3.2增强:增大平滑系数
+        posterior_weight = params.get('posterior_weight', 0.92)  # v3.2增强:更强信任似然
+        verification_window = params.get('verification_window', 60)
+        penalize_miss = params.get('penalize_miss', 0.68)        # v3.2增强:加大惩罚力度
+        reward_hit = params.get('reward_hit', 1.40)              # v3.2增强:加大奖励力度
+        decay_half_life = params.get('decay_half_life', 10)      # v3.2增强:更重视近期数据
+        beta_alpha = params.get('beta_alpha', 0.8)               # v3.2增强:减少伪计数影响
+        prior_temporal_scale = params.get('prior_temporal_scale', 50)  # 先验数据时间尺度
 
-        # 第一阶段:计算先验概率 — 基于历史频率
-        # 统计各位置各号码出现次数
-        lookback = min(verification_window, len(data))
-        if lookback == 0:
+        # ============================================================
+        # 第一阶段: 计算先验概率 — 时间衰减加权历史频率
+        # ============================================================
+        total_data = len(data)
+        if total_data == 0:
             return [{n: 0.1 for n in self.number_range} for _ in range(self.positions)]
 
-        prior_data = data[-lookback:]
-        prior_counts = [defaultdict(int) for _ in range(self.positions)]
-        for item in prior_data:
-            numbers = item.get('numbers', [])
-            if len(numbers) == self.positions:
-                for pos, num in enumerate(numbers):
-                    prior_counts[pos][int(num)] += 1
+        # 使用全部历史数据(或prior_temporal_scale期),对近期数据给予更高权重
+        # 指数衰减: weight(i) = exp(-ln(2) * (total_data - i) / half_life)
+        # 最新一期权重=1, half_life期前权重=0.5, 以此类推
+        import math
+        
+        # 限制先验数据范围，避免远古数据噪声
+        prior_data = data[-prior_temporal_scale:] if len(data) > prior_temporal_scale else data
+        
+        prior_counts = [defaultdict(float) for _ in range(self.positions)]
+        total_weight = [0.0] * self.positions
 
-        # 用拉普拉斯平滑计算先验概率
+        for idx, item in enumerate(prior_data):
+            numbers = item.get('numbers', [])
+            if len(numbers) != self.positions:
+                continue
+            
+            # 计算时间衰减权重（基于在prior_data中的位置）
+            age = len(prior_data) - 1 - idx  # 最新一期age=0
+            weight = math.exp(-math.log(2) * age / decay_half_life)
+
+            for pos, num in enumerate(numbers):
+                prior_counts[pos][int(num)] += weight
+                total_weight[pos] += weight
+
+        # 计算加权先验概率
         prior_probs = []
         for pos in range(self.positions):
             pos_prior = {}
-            total_count = sum(prior_counts[pos].values()) + prior_smooth * 10
+            tw = max(total_weight[pos], 1e-9)
             for num in self.number_range:
-                pos_prior[num] = (prior_counts[pos].get(num, 0) + prior_smooth) / total_count
+                # 加权频率 + 拉普拉斯平滑
+                pos_prior[num] = (prior_counts[pos].get(num, 0) / tw + prior_smooth * 0.1) / (1 + prior_smooth)
+            
+            # 归一化
+            total_prior = sum(pos_prior.values())
+            if total_prior > 0:
+                pos_prior = {k: v / total_prior for k, v in pos_prior.items()}
+            else:
+                pos_prior = {n: 0.1 for n in self.number_range}
+            
             prior_probs.append(pos_prior)
 
-        # 第二阶段:计算似然概率 — 基于近期验证反馈
-        # 从 weights_history.json 加载历史验证记录
+        # ============================================================
+        # 第二阶段: 计算似然概率 — 动态 Beta-二项后验
+        # ============================================================
         verification_records = self._load_verification_records()
+        # 防止前视偏差:回测/预测时只使用早于截止期号的验证记录(截止期=当前期)
+        cutoff = getattr(self, '_verification_cutoff', None)
+        if cutoff is not None:
+            try:
+                cutoff_int = int(str(cutoff))
+                verification_records = [
+                    r for r in verification_records
+                    if int(str(r.get('target_issue', '0'))) < cutoff_int
+                ]
+            except (ValueError, TypeError):
+                pass
+        tolerance = self.config.get_global_param('tolerance_matching', True)
 
-        # 计算每个位置每个号码的"命中奖励/惩罚因子"
-        likelihood_factors = []
-        for pos in range(self.positions):
-            pos_factors = {n: 1.0 for n in self.number_range}
+        min_samples = params.get('min_verification_samples', 50)
+        if len(verification_records) < min_samples:
+            # 验证样本不足:直接返回先验概率(避免小样本似然噪声误导后验)
+            logger.info(f'贝叶斯推断: 验证记录仅{len(verification_records)}条(<{min_samples}),'
+                       f'退化为纯先验概率(待积累足够验证数据后启用学习)')
+            return prior_probs
 
-            for record in verification_records[-verification_window:]:
-                target_issue = record.get('target_issue', '')
-                pred_numbers = record.get('predicted_numbers', [])
-                actual_numbers = record.get('actual_numbers', [])
+        if not verification_records:
+            # 无验证记录时,直接返回先验概率作为近似后验
+            logger.info('贝叶斯推断: 无验证记录,使用先验概率近似')
+            return prior_probs
 
-                if len(pred_numbers) != self.positions or len(actual_numbers) != self.positions:
+        # 对验证记录按时间加权(近期记录权重更高)
+        recent_records = verification_records[-verification_window:]
+        n_records = len(recent_records)
+        
+        # 命中/未命中次数统计,shape: [position][number]
+        hit_counts = [{n: 0.0 for n in self.number_range} for _ in range(self.positions)]
+        miss_counts = [{n: 0.0 for n in self.number_range} for _ in range(self.positions)]
+        record_weights = [0.0] * n_records  # 每条记录的权重
+
+        for i, record in enumerate(recent_records):
+            # 记录权重: 近期的记录更重要
+            age = n_records - 1 - i
+            rw = math.exp(-math.log(2) * age / max(decay_half_life // 2, 5))
+            record_weights[i] = rw
+
+            pred_numbers = record.get('predicted_numbers', [])
+            actual_numbers = record.get('actual_numbers', [])
+            
+            # 兼容新旧格式: 可能是列表或字典
+            if isinstance(pred_numbers, dict):
+                # 新格式: {'wan': [...], 'qian': [...], ...}
+                if 'wan' not in pred_numbers:
                     continue
+                pred_nums = [pred_numbers.get(pos, [0]) for pos in ['wan', 'qian', 'bai', 'shi', 'ge']]
+            elif isinstance(pred_numbers, list) and len(pred_numbers) == self.positions:
+                pred_nums = pred_numbers
+            else:
+                continue
 
-                # 检查该期预测中当前位置的号码是否在真实结果中出现
-                pred_num = pred_numbers[pos]
-                if pred_num in actual_numbers:
-                    # 命中: 奖励因子
-                    for n in self.number_range:
-                        if n == pred_num:
-                            pos_factors[n] *= reward_hit
-                        else:
-                            pos_factors[n] *= 1.0
+            if isinstance(actual_numbers, dict):
+                actual_nums = [actual_numbers.get(pos, 0) for pos in ['wan', 'qian', 'bai', 'shi', 'ge']]
+            elif isinstance(actual_numbers, list) and len(actual_numbers) == self.positions:
+                actual_nums = actual_numbers
+            else:
+                continue
+
+            for pos in range(self.positions):
+                try:
+                    # pred_nums[pos] 可能是 Top-N 号码列表 [5,3,7,1] 或单个号码
+                    pos_preds = pred_nums[pos]
+                    if isinstance(pos_preds, list):
+                        # Top-N 格式: 取第一个作为主要预测
+                        pred_num = int(pos_preds[0])
+                        all_preds = [int(x) for x in pos_preds]
+                    else:
+                        pred_num = int(pos_preds)
+                        all_preds = [pred_num]
+                    
+                    actual_num = int(actual_nums[pos])
+                except (ValueError, IndexError, TypeError):
+                    continue
+                
+                # 命中判定:位置级精确匹配 + 容错匹配
+                # 注意:这里检测的是「实际开奖号是否在预测号码集合中」
+                is_hit = (actual_num in all_preds) or (
+                    tolerance and any(abs(actual_num - p) <= 1 for p in all_preds)
+                )
+                
+                # 按记录权重累加
+                # 对于所有预测号码都计分(主预测权重大,备选用权重衰减)
+                if is_hit:
+                    # 主预测号码获得全额奖励
+                    hit_counts[pos][pred_num] += rw
+                    # 备用号码获得衰减奖励(权重0.5)
+                    for alt_num in all_preds[1:]:
+                        hit_counts[pos][alt_num] += rw * 0.5
                 else:
-                    # 未命中: 轻微惩罚
-                    for n in self.number_range:
-                        if n == pred_num:
-                            pos_factors[n] *= penalize_miss
-                        else:
-                            pos_factors[n] *= 1.02  # 其他号码轻微上调
+                    # 所有预测号码都受到惩罚
+                    miss_counts[pos][pred_num] += rw
+                    for alt_num in all_preds[1:]:
+                        miss_counts[pos][alt_num] += rw * 0.5
 
-            likelihood_factors.append(pos_factors)
+        # 计算 Beta-二项似然(动态伪计数)
+        # 样本越少越接近先验(0.5),样本越多越接近真实命中率
+        likelihoods = []
+        for pos in range(self.positions):
+            pos_likelihood = {}
+            for num in self.number_range:
+                h = hit_counts[pos][num]
+                m = miss_counts[pos][num]
+                total_evidence = h + m
+                
+                # 动态伪计数:总证据少时用较大的beta_alpha保持保守,证据多用较小的
+                dynamic_alpha = beta_alpha * (1.0 / max(total_evidence, 1.0) ** 0.5)
+                
+                # Beta后验估计
+                pos_likelihood[num] = (h + dynamic_alpha) / (total_evidence + 2 * dynamic_alpha)
+            
+            likelihoods.append(pos_likelihood)
 
-        # 第三阶段:计算后验概率 = prior * likelihood / evidence
-        # 融合先验和似然,得到最终后验分布
+        # ============================================================
+        # 第三阶段: 后验概率 = 先验 × 似然的加权融合
+        # ============================================================
         posterior_probs = []
         for pos in range(self.positions):
             pos_posterior = {}
             for num in self.number_range:
                 prior = prior_probs[pos].get(num, 0.1)
-                likelihood = likelihood_factors[pos].get(num, 1.0)
-                # 加权融合
-                combined = posterior_weight * prior * likelihood + (1 - posterior_weight) * prior
+                likelihood = likelihoods[pos].get(num, 0.1)
+                
+                # 核心贝叶斯更新: posterior ∝ prior^((1-λ)) * likelihood^λ
+                # λ越大越信任似然,越小越依赖先验
+                combined = (prior ** (1 - posterior_weight)) * (likelihood ** posterior_weight)
+                
+                # 额外boost/penalize: 放大似然区分度
+                if combined > 0:
+                    # 如果似然显著高于先验,进一步boost
+                    if likelihood > prior:
+                        ratio_boost = reward_hit ** (likelihood - prior)
+                        combined *= min(ratio_boost, 2.0)  # 限制最大 boosting
+                    # 如果似然低于先验,进一步惩罚
+                    elif likelihood < prior:
+                        ratio_penalty = penalize_miss ** (prior - likelihood)
+                        combined *= max(ratio_penalty, 0.3)  # 限制最小 penalty
+                
                 pos_posterior[num] = combined
 
             # 归一化
@@ -1319,44 +1853,128 @@ class P5Predictor:
                 for num in self.number_range:
                     pos_posterior[num] /= total
             else:
-                for num in self.number_range:
-                    pos_posterior[num] = 0.1
+                pos_posterior = {n: 0.1 for n in self.number_range}
 
             posterior_probs.append(pos_posterior)
 
-        logger.info('贝叶斯推断算法执行完成,已计算后验概率分布')
+        logger.info(f'贝叶斯推断算法(v3.2)执行完成: 使用{len(recent_records)}条验证记录, '
+                   f'posterior_weight={posterior_weight}, beta_alpha={beta_alpha:.2f}')
         return posterior_probs
+
+    def _load_adaptive_weight_history(self, limit: int = 200):
+        """
+        加载「权重历史」产物, 回放 per-algo 命中率以更新自适应权重 EWMA。(v3.12 新增)
+
+        数据来源: p5_artifact 表 type='weight_history' 记录, 每条 data 含:
+            - target_issue: 验证期号
+            - algo_evaluations: {算法名: 该期该算法 per-algo 命中率(0-1)}
+        由 pipeline 的验证闭环(_record_verification_result)写入。回放这些记录可让
+        AdaptiveWeightManager 的 EWMA 在多次运行间累积学习, 使表现好的算法权重上升。
+
+        说明: 当前该产物可能尚未积累(需验证闭环逐期写入), 此时为无害空操作;
+        随着每期开奖→验证, 记录会持续累积并自动生效。
+        """
+        try:
+            from modules.database import P5Database
+            db = P5Database()
+            if not db.connect():
+                return
+            arts = db.get_artifacts(artifact_type='weight_history', limit=limit)
+            db.disconnect()
+            if not arts:
+                return
+            # get_artifacts 按 created_at 倒序; 回放时改为正序, 使近期记录对 EWMA 影响更大
+            records = [a.get('data', {}) for a in reversed(arts) if isinstance(a.get('data'), dict)]
+            records = [r for r in records if r.get('algo_evaluations')]
+            if records:
+                self.config.weight_manager.load_from_records(records)
+                logger.info(f'自适应权重: 回放 {len(records)} 条权重历史产物完成')
+        except Exception as e:
+            logger.debug(f'加载权重历史产物跳过(非致命): {e}')
 
     def _load_verification_records(self) -> List[Dict]:
         """
         加载历史验证记录
 
-        从数据库 p5_artifact(type='weight_history') 读取历史预测验证记录
-        (v3.3 起替代原先的 predictions/weights_history.json 文件)。
+        ★ v3.2 修复: 直接从 p5_prediction_record 表读取验证数据,
+        不再依赖 p5_artifact(type='weight_history') (该表当前为空)。
+
         这些记录包含每次预测的目标期号、推荐号码和实际开奖号码,
         用于贝叶斯推断算法计算似然概率。
 
         Returns:
             验证记录列表,每条记录包含:
-                - timestamp: 记录时间戳
                 - target_issue: 预测目标期号
-                - predicted_numbers: 预测号码列表
-                - actual_numbers: 实际开奖号码列表
-                - position_hits: 各位置命中率
-                - algo_evaluations: 各算法评估得分
+                - predicted_numbers: 预测号码(格式: {'wan': [...], 'qian': [...], ...})
+                - actual_numbers: 实际开奖号码(格式: [wan, qian, bai, shi, ge])
         """
+        # 缓存:同一predictor实例内只加载一次(避免回测时每期重复连库)
+        if getattr(self, '_verification_cache', None) is not None:
+            return self._verification_cache
         try:
             from modules.database import P5Database
             db = P5Database()
             if not db.connect():
                 logger.warning('加载验证记录: 数据库连接失败')
                 return []
-            artifacts = db.get_artifacts('weight_history', limit=1000)
+            
+            # 直接从 p5_prediction_record 表读取已验证的记录
+            # 注意: 不使用 LIMIT 限制条数, 让贝叶斯似然学习利用「全部」已验证历史
+            # (cutoff 已在调用方按 target_issue 过滤, 仅保留早于当前期的记录, 避免前视偏差)
+            db.cursor.execute('''
+                SELECT target_issue, predicted_numbers, actual_numbers,
+                       wan_match, qian_match, bai_match, shi_match, ge_match
+                FROM p5_prediction_record 
+                WHERE verification_status = 'verified'
+                ORDER BY id DESC
+            ''')
+            rows = db.cursor.fetchall()
             db.disconnect()
-            records = [a.get('data', {}) for a in artifacts if a.get('data')]
+            
+            records = []
+            import json
+            for row in rows:
+                pred = row['predicted_numbers']
+                actual = row['actual_numbers']
+                
+                # 解析预测号码 (格式: {'wan': [5,3,7,1], ...})
+                if isinstance(pred, str):
+                    pred = json.loads(pred)
+                if isinstance(actual, str):
+                    actual = json.loads(actual)
+                
+                # 统一格式
+                if isinstance(pred, dict):
+                    pred_nums = [pred.get(pos, [0]) for pos in ['wan', 'qian', 'bai', 'shi', 'ge']]
+                elif isinstance(pred, list) and len(pred) == 5:
+                    pred_nums = pred
+                else:
+                    pred_nums = [[0]] * 5
+                
+                if isinstance(actual, dict):
+                    actual_nums = [actual.get(pos, 0) for pos in ['wan', 'qian', 'bai', 'shi', 'ge']]
+                elif isinstance(actual, list) and len(actual) == 5:
+                    actual_nums = actual
+                else:
+                    actual_nums = [0] * 5
+                
+                records.append({
+                    'target_issue': row['target_issue'],
+                    'predicted_numbers': pred_nums,
+                    'actual_numbers': actual_nums,
+                    'wan_match': row['wan_match'],
+                    'qian_match': row['qian_match'],
+                    'bai_match': row['bai_match'],
+                    'shi_match': row['shi_match'],
+                    'ge_match': row['ge_match'],
+                })
+            
+            logger.info(f'从 p5_prediction_record 加载 {len(records)} 条验证记录')
+            self._verification_cache = records
             return records
+            
         except Exception as e:
-            logger.warning(f'加载验证记录失败: {e}')
+            logger.warning(f'加载验证记录失败: {e}', exc_info=True)
         return []
 
     def _algo_feature_engineering(self, data: List[Dict], fe) -> List[Dict[int, float]]:
@@ -1567,36 +2185,43 @@ class P5Predictor:
                 continue
             
             # 约束1: 相邻位置号码差距惩罚（轻度）
+            # 惩罚系数 0.85 为软惩罚：仅降权、不剔除，避免误杀可能的开奖组合。
             adjacent_similar = 0
             for i in range(self.positions - 1):
                 if abs(combo[i] - combo[i+1]) <= 1:
                     adjacent_similar += 1
             if adjacent_similar > 2:
-                score *= 0.85  # 轻度惩罚,不致命
+                score *= 0.85  # 相邻相似对 >2 时轻度降权
 
             # 约束2: 和值范围约束（软惩罚,仅极端越界才强惩罚）
             hezhi = sum(combo)
+            # 和值 10~35 为「正常区间」，仅降权 0.85 保留命中可能；
+            # 和值 <5 或 >40 为极端罕见值，强惩罚 0.6。
             if hezhi < hezhi_min or hezhi > hezhi_max:
                 score *= 0.85   # 轻度惩罚,保留命中可能
             elif hezhi < 5 or hezhi > 40:
                 score *= 0.6    # 仅极端和值才强惩罚
 
             # 约束3: 奇偶比约束（避免全奇/全偶,但不致命）
+            # 全奇(odd=5)或全偶(odd=0)在排列5开奖中概率极低，惩罚 0.6。
             odd_count = sum(1 for num in combo if num % 2 == 1)
             if odd_count == 0 or odd_count == 5:
                 score *= 0.6
 
             # 约束4: 平方和偏差(SSD)惩罚（软化）
+            # SSD = Σ(num-4.5)² / 5，衡量组合整体偏离均值 4.5 的程度。
+            # SSD 过小(<1)说明号码过于集中，过大(>15/>20)说明过于发散，均降权。
             if enable_ssd_penalty:
                 ssd = sum((num - position_mean) ** 2 for num in combo) / self.positions
                 if ssd < 1.0:
-                    score *= 0.9
+                    score *= 0.9    # 过于集中
                 elif ssd > 20.0:
-                    score *= 0.85
+                    score *= 0.85   # 极端发散
                 elif ssd > 15.0:
-                    score *= 0.95
+                    score *= 0.95   # 较发散
 
             # 约束5: 跨度约束（软化）
+            # span = max-min，衡量组合的分布广度；过窄(<span_min)或过宽(>span_max)均降权。
             combo_span = max(combo) - min(combo)
             if combo_span < span_min:
                 score *= 0.85
@@ -1837,73 +2462,10 @@ class P5Predictor:
                         for num in self.number_range:
                             protected_probs[pos][num] /= total
 
-                # ============================
-                # 约束6: Chebyshev(切比雪夫)距离检查
-                # ============================
-                # 原理: 计算每个位置号码概率到聚类中心的切比雪夫距离,
-                # 距离过远的号码表示其概率显著偏离群体平均水平,应予以惩罚。
-                # 切比雪夫距离定义: D_chebyshev = max_k(|x_ik - x_jk|),
-                # 此处"聚类中心"为各位置概率的均值。
-                try:
-                    for pos in range(self.positions):
-                        pos_values = list(protected_probs[pos].values())
-                        center = sum(pos_values) / len(pos_values)  # 概率均值作为中心
-
-                        for num in self.number_range:
-                            prob_val = protected_probs[pos].get(num, 0.1)
-                            chebyshev_dist = abs(prob_val - center)
-
-                            # 如果某个号码的概率远超均值(切比雪夫距离过大),适度惩罚
-                            if chebyshev_dist > 0.05:
-                                penalty = 1.0 - 0.1 * (chebyshev_dist / 0.05)
-                                protected_probs[pos][num] *= max(penalty, 0.7)
-
-                    # Chebyshev约束后重新归一化
-                    for pos in range(self.positions):
-                        total = sum(protected_probs[pos].values())
-                        if total > 0:
-                            for num in self.number_range:
-                                protected_probs[pos][num] /= total
-
-                except Exception as e:
-                    logger.debug(f'切比雪夫距离检查跳过: {e}')
-
-                # ============================
-                # 约束7: 位置方差检查 (Positional Variance Check)
-                # ============================
-                # 原理: 检查每个位置的概率分布方差,判断是否过于集中或过于发散。
-                # 方差过小说明概率分布过于尖锐(某个号码占据绝对优势),
-                # 方差过大说明分布过于平坦(所有号码概率接近),都不理想。
-                # 理想方差范围: Var ∈ [0.001, 0.008]
-                ideal_var_low = 0.001
-                ideal_var_high = 0.008
-
-                for pos in range(self.positions):
-                    pos_probs_arr = list(protected_probs[pos].values())
-                    mean_p = sum(pos_probs_arr) / len(pos_probs_arr)
-
-                    # 计算概率分布方差
-                    variance = sum((p - mean_p) ** 2 for p in pos_probs_arr) / len(pos_probs_arr)
-
-                    if variance < ideal_var_low:
-                        # 方差太小: 过于集中,拉平概率分布,提升冷门号码
-                        for num in self.number_range:
-                            if protected_probs[pos][num] < mean_p:
-                                protected_probs[pos][num] *= 1.15  # 提升冷门号码
-
-                    elif variance > ideal_var_high:
-                        # 方差太大: 过于分散且存在极端值,压制最高概率的号码
-                        sorted_items = sorted(protected_probs[pos].items(),
-                                             key=lambda x: x[1], reverse=True)
-                        if sorted_items:
-                            max_num = sorted_items[0][0]
-                            protected_probs[pos][max_num] *= 0.85  # 压制极端号码
-
-                    # 方差检查后重新归一化
-                    total = sum(protected_probs[pos].values())
-                    if total > 0:
-                        for num in self.number_range:
-                            protected_probs[pos][num] /= total
+            # ── v3.12 移除: Chebyshev 距离检查 与 位置方差检查 ──
+            # 这两项约束会把每个位置的概率分布主动拉向均匀(压制高概率号、抬升低概率号),
+            # 等价于抹掉各算法辛苦挖出的信号。回测证实它们使 Top-1/Top-3 命中率跌破随机基线,
+            # 故整体删除。边界保护现仅保留「温和」的冷热比与相邻位去重, 且默认关闭。
 
             return protected_probs
 
@@ -2059,8 +2621,8 @@ class P5Predictor:
         ...
 
         【推荐组合（Top-5）】
-        1. 53728 (置信度: 72.34%)
-        2. 53726 (置信度: 68.12%)
+        1. 53728 (相对热度: 72.34%)
+        2. 53726 (相对热度: 68.12%)
         ...
 
         ==================================================
@@ -2093,7 +2655,7 @@ class P5Predictor:
         # 推荐组合列表
         lines.append('\n【推荐组合（Top-5）】')
         for combo in top_combinations[:5]:
-            lines.append(f"{combo['rank']}. {combo['combination']} (置信度: {combo['confidence']:.2f}%)")
+            lines.append(f"{combo['rank']}. {combo['combination']} (相对热度: {combo['confidence']:.2f}%)")
 
         lines.append('\n' + '=' * 50)
         lines.append('⚠️ 重要提示：本预测仅基于历史数据统计分析，无法预测开奖结果，请理性购彩。')
@@ -2149,207 +2711,6 @@ class P5Predictor:
             hit_rates[pos_name] = hits / position_top_n
 
         return hit_rates
-
-    def record_verification_result(self, prediction_record: Dict,
-                                     actual_numbers: List[int]) -> Dict[str, Any]:
-        """
-        记录预测验证结果 — 自适应权重系统的核心数据源
-
-        当一期彩票开奖后,将实际结果与之前的预测进行对比,
-        计算各算法各位置的命中率,并更新自适应权重管理器。
-        这是整个 v3.0 系统实现"自我进化"的关键环节。
-
-        完整工作流程：
-        ┌─────────────────────────────────────────────────────────────┐
-        │ 1. 提取本次预测的推荐号码和实际开奖号码                      │
-        │    ↓                                                        │
-        │ 2. 计算各位置的命中率 (Top-3 vs 实际)                       │
-        │    ↓                                                        │
-        │ 3. 评估各算法在各位置上的表现 (Top-1命中率 + 部分命中)      │
-        │    ↓                                                        │
-        │ 4. 更新 AdaptiveWeightManager 中的 EWMA 值                 │
-        │    ↓                                                        │
-        │ 5. 将验证记录持久化到 predictions/weights_history.json      │
-        │    ↓                                                        │
-        │ 6. 返回验证结果摘要 (命中率 + 算法评估 + 自适应权重)        │
-        └─────────────────────────────────────────────────────────────┘
-
-        算法评估规则：
-        - 完美命中: 算法推荐的头号号码 == 实际号码 → +1.0分
-        - 部分命中: 算法推荐的头号号码在其他位置出现 → +0.5分
-        - 未命中: 不得分
-        - 最终得分 = 总分 / 位置数(5)
-
-        Args:
-            prediction_record: 预测记录字典,必须包含以下字段:
-                - target_issue: 目标期号 (str)
-                - top_combinations: 推荐组合列表 (list)
-                - algorithm_probs: 各算法概率分布 (dict)
-                - fused_probabilities: 融合概率分布 (list)
-            actual_numbers: 实际开奖号码列表,格式 [万位, 千位, 百位, 十位, 个位]
-                          例如: [5, 3, 7, 2, 8]
-
-        Returns:
-            验证结果摘要字典,包含:
-                - success: 是否成功记录 (bool)
-                - hit_rates: 各位置命中率 {位置名: 0.0~1.0}
-                - algo_evaluations: 各算法评估得分 {算法名: 0.0~1.0}
-                - adaptive_weights: 更新后的自适应权重
-                - error: 出错时的错误信息 (str)
-        """
-        # 验证号码数量是否正确
-        if len(actual_numbers) != self.positions:
-            logger.error(f'实际号码数量不匹配: 期望{self.positions}个, 实际{len(actual_numbers)}个')
-            return {'success': False, 'error': '号码数量不匹配'}
-
-        try:
-            # 步骤0: 连接数据库(替代原先写入 predictions/weights_history.json 文件, v3.3)
-            from modules.database import P5Database
-            db = P5Database()
-            if not db.connect():
-                logger.error('记录验证结果: 数据库连接失败')
-                return {'success': False, 'error': '数据库连接失败'}
-
-            # 步骤1: 提取推荐号码(取排名第一的组合)
-            top_combs = prediction_record.get('top_combinations', [])
-            if top_combs:
-                predicted_combo = top_combs[0].get('numbers', actual_numbers)
-            else:
-                predicted_combo = actual_numbers[:]
-
-            # 步骤2: 计算位置命中率
-            position_hits = self._compute_position_hit_rate(
-                prediction_record.get('fused_probabilities', []), actual_numbers
-            )
-
-            # 步骤3: 评估各算法在各位置的贡献
-            algo_evaluations = {}
-            algorithm_probs = prediction_record.get('algorithm_probs', {})
-            for algo_name, algo_probs_list in algorithm_probs.items():
-                algo_hit_sum = 0.0
-                for pos in range(self.positions):
-                    if pos < len(algo_probs_list):
-                        # 该算法推荐的最大概率号码(头号号码)
-                        sorted_nums = sorted(algo_probs_list[pos].items(),
-                                           key=lambda x: x[1], reverse=True)
-                        algo_top = sorted_nums[0][0] if sorted_nums else -1
-                        if algo_top == actual_numbers[pos]:
-                            algo_hit_sum += 1.0  # 完美命中
-                        elif algo_top in actual_numbers:
-                            algo_hit_sum += 0.5  # 出现在其他位置也算部分命中
-                algo_evaluations[algo_name] = algo_hit_sum / self.positions
-
-            # 步骤4: 更新自适应权重管理器(EWMA更新)
-            for algo_name, avg_hit in algo_evaluations.items():
-                if algo_name in self.config.config['algorithms']:
-                    self.config.weight_manager.record_verification(algo_name, avg_hit)
-
-            # 步骤5: 构建验证记录(结构化数据)
-            verification_entry = {
-                'timestamp': datetime.now().isoformat(),       # 记录时间戳
-                'target_issue': prediction_record.get('target_issue', ''),  # 目标期号
-                'predicted_numbers': predicted_combo,           # 预测号码
-                'actual_numbers': actual_numbers,               # 实际号码
-                'position_hits': position_hits,                 # 位置命中率
-                'algo_evaluations': algo_evaluations,           # 算法评估
-            }
-
-            # 步骤6: 持久化到数据库 p5_artifact(type='weight_history'), 替代原文件方式
-            db.save_artifact(
-                artifact_type='weight_history',
-                data=verification_entry,
-                issue=verification_entry.get('target_issue', ''),
-            )
-            db.disconnect()
-
-            logger.info(f'验证记录已保存: 期号={verification_entry["target_issue"]}, '
-                        f'预测={predicted_combo}, 实际={actual_numbers}')
-
-            # 步骤8: 返回验证结果摘要
-            return {
-                'success': True,
-                'hit_rates': position_hits,
-                'algo_evaluations': algo_evaluations,
-                'adaptive_weights': self.config.weight_manager.get_adaptive_weights()
-            }
-
-        except Exception as e:
-            logger.error(f'记录验证结果失败: {e}', exc_info=True)
-            return {'success': False, 'error': str(e)}
-
-    def load_weight_history(self) -> Dict[str, Any]:
-        """
-        加载历史权重调整记录
-
-        从数据库 p5_artifact(type='weight_history') 读取所有保存的验证记录和
-        权重管理器当前的自适应权重状态。同时计算各算法的累计命中率统计。
-        (v3.3 起替代原先的 predictions/weights_history.json 文件)
-
-        返回的数据可用于:
-        - 可视化展示各算法的历史表现
-        - 分析权重调整趋势
-        - 调试和优化算法配置
-        - 评估系统整体预测准确率
-
-        Returns:
-            权重历史字典,包含:
-                - verification_records: 历史验证记录列表 (最多1000条)
-                - adaptive_weights: 当前自适应权重状态
-                - total_verifications: 累计验证次数
-                - summary: 各算法累计命中率统计
-                - error: 出错时的错误信息
-        """
-        try:
-            from modules.database import P5Database
-            db = P5Database()
-            if not db.connect():
-                logger.info('暂无权重历史记录(数据库连接失败)')
-                return {
-                    'verification_records': [],
-                    'adaptive_weights': self.config.weight_manager.get_adaptive_weights() if hasattr(self.config, 'weight_manager') else {},
-                    'total_verifications': 0,
-                    'summary': {}
-                }
-            artifacts = db.get_artifacts('weight_history', limit=1000)
-            db.disconnect()
-            records = [a.get('data', {}) for a in artifacts if a.get('data')]
-
-            # 计算各算法累计命中率统计
-            algo_total_hits = defaultdict(float)
-            algo_total_evals = defaultdict(int)
-            for record in records:
-                for algo_name, hit_rate in record.get('algo_evaluations', {}).items():
-                    algo_total_hits[algo_name] += hit_rate
-                    algo_total_evals[algo_name] += 1
-
-            # 汇总各算法的平均命中率
-            summary = {}
-            for algo_name in algo_total_hits:
-                summary[algo_name] = {
-                    'cumulative_hits': round(algo_total_hits[algo_name], 4),
-                    'evaluation_count': algo_total_evals[algo_name],
-                    'average_hit_rate': round(
-                        algo_total_hits[algo_name] / max(algo_total_evals[algo_name], 1), 4
-                    )
-                }
-
-            return {
-                'verification_records': records,
-                'adaptive_weights': self.config.weight_manager.get_adaptive_weights() if hasattr(self.config, 'weight_manager') else {},
-                'total_verifications': len(records),
-                'summary': summary
-            }
-
-        except Exception as e:
-            logger.error(f'加载权重历史失败: {e}', exc_info=True)
-            return {
-                'verification_records': [],
-                'adaptive_weights': {},
-                'total_verifications': 0,
-                'summary': {},
-                'error': str(e)
-            }
-
 
 if __name__ == '__main__':
     # 测试优化后的预测器

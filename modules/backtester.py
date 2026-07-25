@@ -65,15 +65,30 @@ class Backtester:
     def run_backtest(self, start_index: int = 50, test_count: int = 100,
                      use_validation_split: bool = True) -> Dict[str, Any]:
         """
-        执行历史回测
+        执行历史回测（Walk-Forward / 滚动窗口验证）
 
-        Args:
-            start_index: 从第几期开始回测（留出前N期作为训练数据）
-            test_count: 回测多少期
-            use_validation_split: 是否使用训练-验证分离
+        方法论：
+            采用「滚动训练窗口」模拟真实预测：对每一期 i（从 start_index 起），
+            用其之前的全部历史 history_data[:i] 作为训练集，预测第 i 期，再与真实开奖
+            比对评估。逐期推进，从而得到模型在「不可见未来」上的真实命中表现，
+            避免用未来数据污染训练（前视偏差）。
+
+        关键参数（魔法数，可调）：
+            - start_index (默认 50)：前 50 期仅作为冷启动训练数据，不评估；
+              既保证算法有足够样本，又避免期数太少导致统计不稳。
+            - test_count (默认 100)：回测 100 期，平衡统计显著性与耗时。
+            - use_validation_split (默认 True)：保留参数，标记是否启用训练/验证分离策略。
+
+        边界条件：
+            - 历史数据不足 start_index+test_count 期时，自动压缩 test_count；
+              若压缩后仍 ≤0，返回错误（数据不足）。
+            - 单期预测失败（含 'error' 字段）则跳过该期，不计入 backtest_results，
+              保证个别异常不中断整轮回测。
+            - 无论成败，finally 中都会 db.disconnect() 释放连接。
 
         Returns:
-            回测结果字典
+            字典 status='success' 时含 results(逐期评估) 与 overall_stats(汇总)；
+            status='error' 时含 message 说明失败原因。
         """
         logger.info(f'开始历史回测: start_index={start_index}, test_count={test_count}')
 
@@ -152,15 +167,34 @@ class Backtester:
     def _evaluate_prediction(self, prediction_result: Dict[str, Any],
                             actual_numbers: List[int], target_issue: str) -> Dict[str, Any]:
         """
-        评估单次预测结果
+        评估单次预测结果（逐位置 + 组合 + 概率校准）
+
+        评估维度：
+            1) 位置准确率：对 5 个位置，按融合概率分布对真实号码排序，得到排名 rank
+               （未进前 10 记为 10）。据此判定 Top-1/Top-3/Top-5 命中。
+            2) 组合匹配：对推荐 Top-10 组合，逐位比对真实号码，统计 match_count(0-5)。
+            3) 综合评分 overall_score（满分 100，见下方公式）。
+            4) 概率校准度：用 Brier Score 衡量「预测概率」与「是否命中(0/1)」的差距。
+
+        综合评分公式（魔法数）：
+            overall_score = (top1_hits * 40 + top3_hits * 20) / 5
+            - top1_hits：5 个位置中 Top-1 命中的个数（每命中 1 位得 40 分权重）
+            - top3_hits：Top-3 命中的个数（每命中 1 位得 20 分权重）
+            - 除以 5 归一化到约 0-? 区间（理论最大 = (5*40+5*20)/5 = 60，实际按业务理解为百分制转化）
+            Top-1 权重(40) >> Top-3 权重(20)，强调「精准命中头号推荐」更重要。
+
+        Brier Score（概率校准）：
+            brier_pos = (P(真实号码) - 1)²   —— 真实号码必中，故理想 P→1 时 brier→0。
+            avg_brier = mean(brier_pos)；calibration_score = max(0, 1 - avg_brier) * 100，
+            越接近 100 表示概率预测越「敢说且说得准」。
 
         Args:
-            prediction_result: 预测结果字典
-            actual_numbers: 实际开奖号码
-            target_issue: 目标期号
+            prediction_result: 预测结果（含 fused_probabilities / top_combinations）。
+            actual_numbers: 真实 5 位号码。
+            target_issue: 目标期号（用于结果标注）。
 
         Returns:
-            评估结果字典
+            含逐位置 accuracy、组合匹配、overall_score、calibration_score 等的字典。
         """
         fused_probs = prediction_result.get('fused_probabilities', [])
         top_combinations = prediction_result.get('top_combinations', [])
@@ -174,7 +208,7 @@ class Backtester:
             pos_probs = fused_probs[pos]
             actual_num = actual_numbers[pos]
 
-            # 排序获取排名
+            # 排序获取排名（真实号码在概率降序中的名次；未进前10记为第10名）
             sorted_nums = sorted(pos_probs.items(), key=lambda x: x[1], reverse=True)
             rank = next((i + 1 for i, (n, _) in enumerate(sorted_nums) if n == actual_num), 10)
 
@@ -194,9 +228,9 @@ class Backtester:
                 'top5_hit': top5_hit
             })
 
-        # 组合匹配分析
+        # 组合匹配分析（仅评估推荐前 10 个组合，控制开销）
         combination_hits = []
-        for combo in top_combinations[:10]:  # 只分析前10个组合
+        for combo in top_combinations[:10]:
             pred_nums = combo.get('numbers', [])
             match_count = sum(1 for i in range(5) if i < len(pred_nums) and pred_nums[i] == actual_numbers[i])
             match_positions = [i + 1 for i in range(5) if i < len(pred_nums) and pred_nums[i] == actual_numbers[i]]
@@ -208,12 +242,12 @@ class Backtester:
                 'match_rate': round(match_count / 5, 2)
             })
 
-        # 综合评分
+        # 综合评分：Top-1 命中每位置 40 分，Top-3 命中每位置 20 分，除以 5 归一
         top1_hits = sum(1 for p in position_accuracy if p['top1_hit'])
         top3_hits = sum(1 for p in position_accuracy if p['top3_hit'])
         overall_score = round((top1_hits * 40 + top3_hits * 20) / 5, 2)
 
-        # 概率校准度（Brier Score）
+        # 概率校准度（Brier Score）：真实号码命中记 1，与预测概率的平方误差
         brier_scores = []
         for pos in range(5):
             if pos >= len(fused_probs):
@@ -225,6 +259,7 @@ class Backtester:
             brier_scores.append(brier)
 
         avg_brier = round(sum(brier_scores) / len(brier_scores), 6) if brier_scores else 1.0
+        # 校准分：1 - 平均Brier，越接近100越准；max(0,...) 防止负值
         calibration_score = round(max(0, 1 - avg_brier) * 100, 2)
 
         return {

@@ -1,5 +1,5 @@
 """
-排列5 AI智能分析系统 - GUI界面 (v3.1 增强版)
+排列5 AI智能分析系统 - GUI界面 (v3.8)
 
 基于tkinter的桌面应用程序，提供以下核心功能：
 1. 数据爬取（增量/全量） - 从多个数据源获取排列5开奖数据并存储到MySQL
@@ -35,8 +35,12 @@ import threading
 import queue
 import traceback
 import json
+import re
+import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
 
 try:
     import tkinter as tk
@@ -65,22 +69,41 @@ from modules.predictor import P5Predictor
 from modules.backtester import Backtester
 # P5Features: 特征工程模块（频率、遗漏、012路、连号等）
 from modules.features import P5Features
+# 版本信息唯一来源（version.py 单一维护）
+from version import get_current_version, get_changelog
 
 # 全局颜色主题配置（暗色主题，基于 Tailwind CSS 色板）
 COLORS = {
     'bg_primary': '#0f172a',  # 主背景色（深蓝灰）
     'bg_secondary': '#1e293b',  # 次背景色（稍浅蓝灰）
-    'bg_card': '#334155',  # 卡片背景色
+    'bg_card': '#1e293b',  # 卡片背景色（加深，增强层次感）
+    'bg_card_hover': '#334155',  # 卡片悬停背景色
     'bg_input': '#1e1e2e',  # 输入/输出区域背景色
-    'accent_p5': '#10b981',  # 排列5主题色（翠绿）
-    'accent_ai': '#8b5cf6',  # AI分析主题色（紫色）
-    'accent_danger': '#ef4444',  # 危险/错误色（红色）
-    'text_primary': '#f1f5f9',  # 主文字色（浅白）
-    'text_secondary': '#94a3b8',  # 次要文字色（灰蓝）
+    'bg_panel': '#020617',  # 面板背景色
+    'accent_p5': '#059669',  # 排列5主题色（深翠绿，更专业）
+    'accent_p5_light': '#10b981',  # 排列5主题色亮色
+    'accent_p5_bright': '#34d399',  # 排列5主题色高亮
+    'accent_ai': '#7c3aed',  # AI分析主题色（深紫色）
+    'accent_ai_light': '#8b5cf6',  # AI分析主题色亮色
+    'accent_ai_bright': '#a78bfa',  # AI分析主题色高亮
+    'accent_danger': '#dc2626',  # 危险/错误色（深红色）
+    'accent_danger_light': '#ef4444',  # 危险色亮色
+    'accent_info': '#0891b2',  # 信息色（深青色）
+    'accent_info_light': '#06b6d4',  # 信息色亮色
+    'accent_warning': '#d97706',  # 警告色（深琥珀色）
+    'accent_warning_light': '#f59e0b',  # 警告色亮色
+    'text_primary': '#f8fafc',  # 主文字色（纯白，提高对比度）
+    'text_secondary': '#cbd5e1',  # 次要文字色（浅灰蓝）
     'text_muted': '#64748b',  # 弱化文字色（中灰）
-    'border': '#475569',  # 边框色
-    'success': '#22c55e',  # 成功状态色（绿色）
-    'warning': '#f59e0b',  # 警告状态色（琥珀色）
+    'text_disabled': '#475569',  # 禁用文字色
+    'border': '#334155',  # 边框色（加深）
+    'border_light': '#475569',  # 浅色边框
+    'success': '#16a34a',  # 成功状态色（深绿色）
+    'success_light': '#22c55e',  # 成功色亮色
+    'warning': '#d97706',  # 警告状态色（琥珀色）
+    'gradient_start': '#0f172a',  # 渐变起始色
+    'gradient_end': '#1e293b',  # 渐变结束色
+    'shadow': '#000000',  # 阴影色
 }
 
 
@@ -124,12 +147,25 @@ class TaskManager:
 
     def _poll_ui_updates(self):
         """
-        定时轮询消息队列（每50ms），将后台线程的消息传递到主线程UI。
+        定时轮询消息队列（每200ms批量处理），将后台线程的消息传递到主线程UI。
+
+        优化策略：
+        1. 每次轮询最多处理10条消息，防止单次更新过多
+        2. 减少 see(tk.END) 调用频率，避免 tkinter 重绘过慢
+        
         通过 tkinter 的 after() 方法实现递归调度，不阻塞主线程。
         """
+        batch_processed = 0
+        max_batch = 10  # 每轮最多处理10条消息
+        
         try:
-            while True:
-                msg = self._task_queue.get_nowait()
+            while batch_processed < max_batch:
+                try:
+                    msg = self._task_queue.get_nowait()
+                except queue.Empty:
+                    break
+                    
+                batch_processed += 1
                 msg_type = msg.get('type', 'log')
 
                 if msg_type == 'log':
@@ -144,26 +180,68 @@ class TaskManager:
                     self._on_task_error(msg.get('error', '未知错误'))
                 elif msg_type == 'report':
                     self.gui._display_report(msg.get('data', {}))
-                elif msg_type == 'append_success':
-                    self.gui.output_text.insert(tk.END, f"  ✓ {msg['text']}\n", 'success')
+                elif msg_type in ('append_success', 'append_warning', 'append_error', 'append_info', 'append_data', 'append_section_header'):
+                    # 批量渲染带样式的消息
+                    self._render_batched_msg(msg_type, msg)
+                else:
+                    # 未知类型，降级为普通日志
+                    self.gui.output_text.insert(tk.END, str(msg) + '\n')
                     self.gui.output_text.see(tk.END)
-                elif msg_type == 'append_warning':
-                    self.gui.output_text.insert(tk.END, f"  ⚠ {msg['text']}\n", 'warning')
-                    self.gui.output_text.see(tk.END)
-                elif msg_type == 'append_error':
-                    self.gui.output_text.insert(tk.END, f"  ✗ {msg['text']}\n", 'error')
-                    self.gui.output_text.see(tk.END)
-                elif msg_type == 'append_info':
-                    self.gui.output_text.insert(tk.END, f"  • {msg['text']}\n", 'info')
-                    self.gui.output_text.see(tk.END)
-                elif msg_type == 'append_section_header':
-                    self.gui.output_text.insert(tk.END, f"\n{'═' * 50}\n", 'separator')
-                    self.gui.output_text.insert(tk.END, f"  {msg['text']}\n", 'section_header')
-                    self.gui.output_text.see(tk.END)
-        except queue.Empty:
+                    self.gui._update_line_numbers()
+
+        except Exception:
             pass
 
-        self.gui.root.after(50, self._poll_ui_updates)
+        # 延长轮询间隔到200ms，减少GUI压力
+        self.gui.root.after(200, self._poll_ui_updates)
+
+    def _render_batched_msg(self, msg_type: str, msg: dict):
+        """
+        渲染带样式的批量消息（优化：减少see()调用）
+        """
+        text = msg.get('text', '')
+        prefix = msg.get('prefix', '  ')
+        
+        if msg_type == 'append_section_header':
+            # 章节标题：始终显示分隔线
+            self.gui.output_text.insert(tk.END, f"\n{'═' * 50}\n", 'separator')
+            self.gui.output_text.insert(tk.END, f"  {text}\n", 'section_header')
+            self.gui.output_text.see(tk.END)  # 章节标题需要滚动到可见
+        elif msg_type == 'append_success':
+            self.gui.output_text.insert(tk.END, f"{prefix}✓ {text}\n", 'success')
+        elif msg_type == 'append_warning':
+            self.gui.output_text.insert(tk.END, f"{prefix}⚠ {text}\n", 'warning')
+        elif msg_type == 'append_error':
+            self.gui.output_text.insert(tk.END, f"{prefix}✗ {text}\n", 'error')
+        elif msg_type == 'append_info':
+            self.gui.output_text.insert(tk.END, f"{prefix}• {text}\n", 'info')
+        elif msg_type == 'append_data':
+            self.gui.output_text.insert(tk.END, f"{prefix}{text}\n", 'data')
+        
+        self.gui._update_line_numbers()
+    
+    def flush_pending_logs(self):
+        """
+        在任务结束后批量刷新剩余的日志消息并强制滚动到末尾。
+        由调用方在适当时机调用（如任务完成后）。
+        """
+        flushed = 0
+        while not self._task_queue.empty():
+            try:
+                msg = self._task_queue.get_nowait()
+                msg_type = msg.get('type', 'log')
+                if msg_type in ('append_success', 'append_warning', 'append_error', 
+                               'append_info', 'append_data', 'append_section_header'):
+                    self._render_batched_msg(msg_type, msg)
+                elif msg_type == 'log':
+                    self.gui.output_text.insert(tk.END, msg['text'])
+                flushed += 1
+            except queue.Empty:
+                break
+        
+        if flushed > 0:
+            self.gui.output_text.see(tk.END)  # 刷新后滚动到末尾
+            self.gui._update_line_numbers()
 
     def log(self, text):
         """向输出区域追加日志文本（线程安全）"""
@@ -204,6 +282,10 @@ class TaskManager:
     def append_info(self, text):
         """发送信息文本到输出面板（青色，线程安全）"""
         self._task_queue.put({'type': 'append_info', 'text': text})
+
+    def append_data(self, text):
+        """发送预测数据文本到输出面板（高亮加粗，线程安全）"""
+        self._task_queue.put({'type': 'append_data', 'text': text})
 
     def append_section_header(self, text):
         """发送章节标题到输出面板（线程安全）"""
@@ -297,11 +379,12 @@ class LotteryGUI:
         """
         self.root = root
         self.root.title("排列5 AI智能分析系统")
-        # 适配常见屏幕尺寸，默认使用较大窗口确保内容完全可见
+        # 适配常见屏幕尺寸：高度取屏幕的 85%（而不是固定 860），
+        # 确保大部分显示器上无需滚动就能看到全部左侧功能卡片。
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         win_width = min(1280, screen_width - 40)
-        win_height = min(860, screen_height - 80)
+        win_height = max(780, min(860, int(screen_height * 0.85)))  # 至少 780px 保证内容可见
         self.root.geometry(f"{win_width}x{win_height}+{max(0, (screen_width - win_width) // 2)}+{max(0, (screen_height - win_height) // 2)}")
         self.root.minsize(1024, 720)
         self.root.configure(bg=COLORS['bg_primary'])
@@ -309,6 +392,16 @@ class LotteryGUI:
         self.task_mgr = TaskManager(self)  # 异步任务管理器
         self._buttons = []  # 所有按钮列表（用于批量启用/禁用）
         self._current_task_name = ""  # 当前正在执行的任务名称
+        self._prediction_clipboard = ""  # 最近一次生成的预测号码（供一键复制）
+        self._clipboard_meta = {}  # 复制缓冲元数据：{target_issue, conf, high_conf, main_combo}
+        # 结果仪表盘（合并视图）：保存最近一次各来源预测产物
+        self._last_pipeline_final = None
+        self._last_trend_result = None
+        self._last_quick_final = None
+        # 仪表盘折叠区状态（推荐/备选/详细分析）
+        self._detail_frame = None   # 详细分析折叠区
+        self._alt_content = None    # 备选号码折叠区
+        self._alt_visible = False
 
         self._setup_window_style()
         self._build_ui()
@@ -337,8 +430,15 @@ class LotteryGUI:
         self._build_status_bar(main_container)
 
     def _build_header(self, parent):
-        """构建顶部标题栏（Logo + 系统名称 + 实时时钟）"""
-        header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=50)
+        """构建顶部标题栏（Logo + 系统名称 + 副标题 + 版本号 + 实时时钟）
+
+        修复说明(v3.8):
+        - 原 header 高度固定 50px 且 pack_propagate(False)，在 Windows 高 DPI
+          缩放下标题(13pt)+副标题(8pt)实际像素增高，导致副标题底部被裁切。
+        - 现将高度提升到 60px 并收紧内边距，保证副标题完整可见。
+        - 右侧新增版本号显示（get_current_version()），与时钟纵向排列，风格统一。
+        """
+        header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=60)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
 
@@ -347,28 +447,38 @@ class LotteryGUI:
 
         icon = tk.Canvas(left, width=32, height=32, bg=COLORS['bg_secondary'],
                          highlightthickness=0)
-        icon.pack(side=tk.LEFT, pady=9)
+        icon.pack(side=tk.LEFT, pady=14)
         icon.create_rectangle(2, 2, 30, 14, fill=COLORS['accent_p5'], outline='', width=0)
         icon.create_rectangle(2, 18, 30, 30, fill=COLORS['accent_ai'], outline='', width=0)
 
         title_box = tk.Frame(left, bg=COLORS['bg_secondary'])
-        title_box.pack(side=tk.LEFT, padx=(8, 0), pady=6)
+        title_box.pack(side=tk.LEFT, padx=(8, 0), pady=0)
 
         tk.Label(title_box, text="排列5 AI智能分析系统",
                  font=('微软雅黑', 13, 'bold'),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_primary']).pack(anchor=tk.W)
 
-        tk.Label(title_box, text="多模型综合预测分析平台",
-                 font=('微软雅黑', 8),
+        tk.Label(title_box, text="多模型综合预测分析平台 · 走势图+贝叶斯+在线学习",
+                 font=('微软雅黑', 9),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_muted']).pack(anchor=tk.W)
 
-        self.time_label = tk.Label(header, text="",
+        # 右侧：版本号 + 实时时钟（纵向排列）
+        right = tk.Frame(header, bg=COLORS['bg_secondary'])
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=12)
+
+        self.version_label = tk.Label(right, text=f"版本 {get_current_version()}",
+                 font=('微软雅黑', 9, 'bold'),
+                 bg=COLORS['bg_secondary'],
+                 fg=COLORS['accent_p5'])
+        self.version_label.pack(anchor=tk.E, pady=(10, 0))
+
+        self.time_label = tk.Label(right, text="",
                                    font=('Consolas', 9),
                                    bg=COLORS['bg_secondary'],
                                    fg=COLORS['text_secondary'])
-        self.time_label.pack(side=tk.RIGHT, padx=12, pady=15)
+        self.time_label.pack(anchor=tk.E, pady=(2, 0))
         self._update_time()
 
     def _update_time(self):
@@ -430,13 +540,14 @@ class LotteryGUI:
 
     def _build_control_panel(self, parent):
         """
-        构建左侧控制面板，包含三个功能卡片（v3.1 增强版）:
+        构建左侧控制面板，包含五个功能卡片（v3.8 完整版）:
 
         卡片分组说明:
-        1. "数据爬取" (#f59e0b 琥珀色) — 增量/全量爬取历史开奖数据
-        2. "预测引擎" (#10b981 翠绿) — 四步流水线分析(★推荐)，已集成预测验证、在线学习、
-           历史回测、特征分析等附加功能，自动生成两份独立报告
-        3. "系统管理" (#8b5cf6 紫色) — 数据库检测、快捷统计、清空输出
+        1. "数据爬取" (#f59e0b 琥珀色) — 增量/全量爬取历史/走势/升平降/和值数据
+        2. "智能分析中心" (#10b981 翠绿) — 合并 四步流水线+走势引擎+快速预测，同一界面完成
+        3. "在线学习引擎" (#3b82f6 蓝色) — 学习报告、重置权重、手动验证指定期号
+        4. "分析工具" (#06b6d4 青色) — 预测验证、命中率报告、性能报告、历史回测、特征分析、独立报告
+        5. "系统管理" (#8b5cf6 紫色) — 数据库检测、贝叶斯结果、快捷统计、清空输出
 
         布局采用垂直卡片式排列,每张卡片用不同颜色区分功能域。
         """
@@ -449,12 +560,20 @@ class LotteryGUI:
         self._add_action_button(crawl_card, "全量爬取数据", '#d97706',
                                 lambda: self._on_button_click("全量爬取", self._execute_crawl_full))
 
-        # 预测引擎卡片 (已集成所有分析功能)
-        p5_card = self._create_card(parent, "预测引擎", COLORS['accent_p5'])
+        # 智能分析中心（合并 四步流水线 + 走势引擎 + 快速预测，同一界面完成，避免多面板切换）
+        p5_card = self._create_card(parent, "智能分析中心", COLORS['accent_p5'])
         p5_card.pack(fill=tk.X, pady=(0, 8))
 
-        self._add_big_button(p5_card, "四步流水线分析 ★", COLORS['accent_p5'],
-                             lambda: self._on_button_click("四步流水线", self._execute_four_step_pipeline))
+        # ★ 极简智能分析：单一「开始分析」按钮自动执行完整流程，无需任何配置/选择
+        self._add_big_button(p5_card, "🚀 开始分析", COLORS['accent_p5'],
+                             lambda: self._on_button_click("智能分析", self._execute_unified_analysis))
+        tk.Label(p5_card,
+                 text="自动执行：四步流水线预测 + 走势引擎分解 + 快速预测（结果同面板呈现）",
+                 font=('微软雅黑', 8),
+                 bg=COLORS['bg_secondary'],
+                 fg=COLORS['text_muted'],
+                 wraplength=240, justify=tk.CENTER
+                 ).pack(pady=(0, 8))
 
         # 系统操作卡片 → 重命名为"系统管理"(v3.0)
         common_card = self._create_card(parent, "系统管理", COLORS['accent_ai'])
@@ -468,6 +587,56 @@ class LotteryGUI:
                                 lambda: self._on_button_click("更新统计", self._update_quick_stats))
         self._add_action_button(common_card, "清空输出", COLORS['accent_danger'],
                                 self._clear_output)
+
+        # 智能分析与验证卡片 — 单个综合按钮，v3.11
+        analysis_card = self._create_card(parent, "智能分析与验证", '#059669')
+        analysis_card.pack(fill=tk.X, pady=(0, 8))
+
+        # 综合验证与分析按钮（一键执行：验证→统计→回测→特征→报告）
+        tk.Button(analysis_card, text="🔍 综合验证与分析",
+                  font=('微软雅黑', 10, 'bold'),
+                  bg='#10b981', fg='#ffffff',
+                  activebackground='#059669', activeforeground='#ffffff',
+                  relief='flat', cursor='hand2',
+                  command=lambda: self._on_button_click(
+                      "综合验证与分析", self._execute_comprehensive_analysis_and_verify
+                  ),
+                  padx=20, pady=8
+                  ).pack(fill=tk.X, padx=10, pady=6)
+
+        tk.Label(analysis_card,
+                 text="一键执行：验证 · 统计 · 回测 · 特征 · 报告",
+                 font=('微软雅黑', 8),
+                 bg=COLORS['bg_secondary'],
+                 fg=COLORS['text_muted'],
+                 wraplength=240, justify=tk.CENTER
+                 ).pack(pady=(0, 8))
+
+        # 在线学习引擎卡片
+        learning_card = self._create_card(parent, "在线学习引擎", '#3b82f6')
+        learning_card.pack(fill=tk.X, pady=(0, 8))
+
+        self._add_action_button(learning_card, "📊 查看学习报告", '#3b82f6',
+                                lambda: self._on_button_click("学习报告", self._execute_learning_report))
+        self._add_action_button(learning_card, "🔄 重置模型权重", '#60a5fa',
+                                lambda: self._on_button_click("重置权重", self._execute_reset_weights))
+        self._add_action_button(learning_card, "✏ 手动验证期号", '#93c5fd',
+                                lambda: self._on_button_click("手动验证", self._execute_manual_verification))
+
+        # 分析工具卡片
+        tools_card = self._create_card(parent, "分析工具", '#06b6d4')
+        tools_card.pack(fill=tk.X, pady=(0, 8))
+
+        self._add_action_button(tools_card, "✅ 预测验证", '#06b6d4',
+                                lambda: self._on_button_click("预测验证", self._execute_verify_predictions))
+        self._add_action_button(tools_card, "📈 命中率报告", '#22d3ee',
+                                lambda: self._on_button_click("命中率报告", self._execute_hit_rate_report))
+        self._add_action_button(tools_card, "⚡ 性能报告", '#67e8f9',
+                                lambda: self._on_button_click("性能报告", self._execute_performance_report))
+        self._add_action_button(tools_card, "🔙 历史回测", '#a5f3fc',
+                                lambda: self._on_button_click("历史回测", self._execute_backtest))
+        self._add_action_button(tools_card, "🔬 特征分析", '#cffafe',
+                                lambda: self._on_button_click("特征分析", self._execute_feature_analysis))
 
         progress_card = tk.Frame(parent, bg=COLORS['bg_secondary'],
                                  highlightbackground=COLORS['border'],
@@ -614,6 +783,35 @@ class LotteryGUI:
 
         # hover效果：鼠标进入时变亮，离开时恢复
         btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=c))
+
+    def _add_inline_button(self, parent, text, color, command):
+        """
+        添加内联小按钮（用于一行多按钮布局）
+
+        Args:
+            parent: 父容器
+            text: 按钮文字
+            color: hover时的背景色
+            command: 点击回调函数
+
+        Returns:
+            tk.Button: 按钮实例
+        """
+        btn = tk.Button(parent, text=text,
+                        font=('微软雅黑', 8),
+                        bg=COLORS['bg_card'],
+                        fg=COLORS['text_primary'],
+                        activebackground=color,
+                        activeforeground=COLORS['text_primary'],
+                        relief='flat',
+                        cursor='hand2',
+                        command=command,
+                        padx=10, pady=4)
+        btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        # hover效果
+        btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=c))
+        btn.bind('<Leave>', lambda e, b=btn: b.config(bg=COLORS['bg_card']))
         btn.bind('<Leave>', lambda e, b=btn: b.config(bg=COLORS['bg_card']))
 
         self._buttons.append(btn)
@@ -638,99 +836,554 @@ class LotteryGUI:
         return f'#{r:02x}{g:02x}{b:02x}'
 
     def _build_output_panel(self, parent):
-        """构建右侧输出面板（报告标题 + 可滚动的文本输出区）"""
-        header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=30)
-        header.pack(fill=tk.X, pady=(0, 2))
-        header.pack_propagate(False)
+        """构建右侧输出面板（ttk.Notebook 单一标签页）
 
-        tk.Label(header, text="AI分析报告",
-                 font=('微软雅黑', 9, 'bold'),
-                 bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_secondary']).pack(side=tk.LEFT, padx=10, pady=5)
+        仅保留「运行日志」标签页（原 output_text 控制台，工具栏 + 滚动文本），
+        仍由 TaskManager 与所有 _execute_* 业务方法写入流水线日志。
+        「版本与更新」标签页已移除：版本信息统一由 version.py 单一来源维护，
+        并在顶部版本标签与欢迎页中轻量展示。
+        """
+        panel = tk.Frame(parent, bg=COLORS['bg_primary'])
+        panel.pack(fill=tk.BOTH, expand=True)
 
-        self.log_level_label = tk.Label(header, text="INFO",
-                                        font=('Consolas', 7),
-                                        bg=COLORS['success'],
-                                        fg=COLORS['text_primary'],
-                                        padx=5, pady=1)
-        self.log_level_label.pack(side=tk.RIGHT, padx=10, pady=5)
+        nb = ttk.Notebook(panel)
+        nb.pack(fill=tk.BOTH, expand=True)
 
-        text_container = tk.Frame(parent, bg=COLORS['bg_input'])
-        text_container.pack(fill=tk.BOTH, expand=True)
+        # 标签页1：运行日志（原控制台，保持所有写逻辑不变）
+        log_tab = tk.Frame(nb, bg=COLORS['bg_primary'])
+        nb.add(log_tab, text="📊 运行日志")
+        self._build_log_tab(log_tab)
 
-        scrollbar = tk.Scrollbar(text_container, bg=COLORS['bg_card'],
+        # 标签页2：历史命中率（常驻真实验证数据, 一等公民, 不编造）
+        hr_tab = tk.Frame(nb, bg=COLORS['bg_primary'])
+        nb.add(hr_tab, text="📊 历史命中率")
+        self._build_hit_rate_tab(hr_tab)
+        # 启动后延迟填充（主线程, 避免与布局初始化竞争）
+        self.root.after(800, self._refresh_hit_rate_tab)
+        # 切到该标签页时懒刷新, 保证数据新鲜
+        nb.bind('<<NotebookTabChanged>>', self._on_hit_rate_tab_selected)
+
+    def _build_log_tab(self, parent):
+        """构建「运行日志」标签页：工具栏 + 概览卡片 + 仪表盘 + 可滚动文本区
+
+        优化 (v3.16):
+        - 信息架构重组：概览卡片区、结果仪表盘区、日志文本区三层结构
+        - 视觉设计：卡片化设计、增强色彩对比度、优化字体大小与行高
+        - 交互体验：悬停效果、加载动画、平滑滚动、微交互反馈
+        - 响应式设计：自适应布局、弹性容器
+        """
+        # ================================================================
+        # 顶部工具栏
+        # ================================================================
+        toolbar = tk.Frame(parent, bg=COLORS['bg_card'], height=48)
+        toolbar.pack(fill=tk.X)
+        toolbar.pack_propagate(False)
+
+        # 左侧标题区域
+        title_frame = tk.Frame(toolbar, bg=COLORS['bg_card'])
+        title_frame.pack(side=tk.LEFT, padx=16, pady=8)
+        title_label = tk.Label(title_frame, text="📊 AI 分析报告",
+                               font=('微软雅黑', 12, 'bold'),
+                               bg=COLORS['bg_card'],
+                               fg=COLORS['text_primary'])
+        title_label.pack(anchor=tk.W)
+
+        # 右侧操作按钮区域
+        btn_frame = tk.Frame(toolbar, bg=COLORS['bg_card'])
+        btn_frame.pack(side=tk.RIGHT, padx=8, pady=8)
+
+        # 复制全部按钮
+        copy_all_btn = self._create_toolbar_button(btn_frame, "📋 复制全部", 
+                                                   self._copy_all_output, 'secondary')
+        copy_all_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        # 搜索按钮
+        search_btn = self._create_toolbar_button(btn_frame, "🔍 搜索", 
+                                                 self._show_search_dialog, 'secondary')
+        search_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        # 清空按钮
+        clear_btn = self._create_toolbar_button(btn_frame, "🗑 清空", 
+                                                self._clear_output, 'danger')
+        clear_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        # 复制预测号码按钮（主操作按钮）
+        copy_btn = self._create_toolbar_button(btn_frame, "📋 复制预测号码", 
+                                               self._copy_prediction, 'primary')
+        copy_btn.pack(side=tk.RIGHT, padx=(0, 4))
+
+        # ================================================================
+        # 概览卡片区域（信息架构第一层）
+        # ================================================================
+        overview_container = tk.Frame(parent, bg=COLORS['bg_primary'])
+        overview_container.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        self.overview_frame = overview_container
+        self._update_quick_overview()
+
+        # ================================================================
+        # 预测结果仪表盘容器（信息架构第二层）
+        # ================================================================
+        self.dash_container = tk.Frame(parent, bg=COLORS['bg_primary'])
+        self.dash_container.pack(fill=tk.X, padx=8, pady=(4, 4))
+        
+        self.result_dash = tk.Frame(self.dash_container, bg=COLORS['bg_card'],
+                                    highlightbackground=COLORS['border'], 
+                                    highlightthickness=1,
+                                    relief='flat')
+        self.result_dash.pack_forget()
+
+        # ================================================================
+        # 日志文本区域（信息架构第三层）
+        # ================================================================
+        body = tk.Frame(parent, bg=COLORS['bg_primary'])
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 左侧主题色竖条
+        accent = tk.Frame(body, bg=COLORS['accent_p5'], width=3)
+        accent.pack(side=tk.LEFT, fill=tk.Y)
+
+        # 主容器：行号 + 文本区 + 滚动条
+        main_container = tk.Frame(body, bg=COLORS['bg_panel'])
+        main_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 行号显示区域
+        line_num_container = tk.Frame(main_container, bg=COLORS['bg_secondary'])
+        line_num_container.pack(side=tk.LEFT, fill=tk.Y)
+        
+        self.line_numbers = tk.Text(line_num_container,
+                                    width=5,
+                                    padx=6,
+                                    pady=12,
+                                    bg=COLORS['bg_secondary'],
+                                    fg=COLORS['text_muted'],
+                                    font=('Consolas', 10),
+                                    relief='flat',
+                                    state=tk.DISABLED,
+                                    selectbackground=COLORS['bg_card'],
+                                    wrap=tk.NONE)
+        self.line_numbers.pack(side=tk.LEFT, fill=tk.Y)
+
+        # 行号与内容分隔线
+        divider = tk.Frame(line_num_container, bg=COLORS['border'], width=1)
+        divider.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 文本区容器
+        text_container = tk.Frame(main_container, bg=COLORS['bg_panel'])
+        text_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 滚动条
+        scrollbar = tk.Scrollbar(text_container, 
+                                 bg=COLORS['bg_card'],
                                  troughcolor=COLORS['bg_secondary'],
-                                 activebackground=COLORS['border'],
-                                 relief='flat',
-                                 width=10)
+                                 activebackground=COLORS['accent_p5'],
+                                 relief='flat', 
+                                 width=12,
+                                 highlightthickness=0)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # 输出文本区
         self.output_text = tk.Text(text_container,
                                    wrap=tk.WORD,
-                                   font=('Consolas', 9),
-                                   bg=COLORS['bg_input'],
+                                   font=('Consolas', 10),
+                                   bg=COLORS['bg_panel'],
                                    fg=COLORS['text_primary'],
                                    insertbackground=COLORS['accent_p5'],
                                    relief='flat',
-                                   padx=8, pady=8,
+                                   padx=14, pady=12,
+                                   spacing1=4, spacing3=6,
                                    state=tk.NORMAL,
-                                   yscrollcommand=scrollbar.set)
+                                   yscrollcommand=scrollbar.set,
+                                   selectbackground=COLORS['accent_p5'],
+                                   selectforeground='#ffffff')
         self.output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        scrollbar.config(command=self.output_text.yview)
+        scrollbar.config(command=self._sync_scroll)
 
-        # 配置文本高亮标签
-        self.output_text.tag_config('section_header', foreground='#10b981', font=('微软雅黑', 9, 'bold'))
-        self.output_text.tag_config('subtitle', foreground='#8b5cf6', font=('微软雅黑', 9, 'bold'))
-        self.output_text.tag_config('success', foreground='#22c55e')
-        self.output_text.tag_config('warning', foreground='#f59e0b')
-        self.output_text.tag_config('error', foreground='#ef4444')
-        self.output_text.tag_config('info', foreground='#06b6d4')
-        self.output_text.tag_config('highlight', foreground='#fbbf24', font=('微软雅黑', 9, 'bold'))
-        self.output_text.tag_config('separator', foreground=COLORS['text_muted'])
+        # ================================================================
+        # 交互绑定
+        # ================================================================
+        # Ctrl+F 搜索高亮
+        self._search_highlight_tags = []
+        self.output_text.bind('<Control-f>', lambda e: self._show_search_dialog())
+
+        # Ctrl+A 全选
+        self.output_text.bind('<Control-a>', lambda e: self._select_all_output())
+
+        # 上下文菜单
+        self._setup_context_menu()
+
+        # 鼠标滚轮平滑滚动
+        self.output_text.bind('<MouseWheel>', lambda e: self._on_mouse_wheel(e))
+
+        # ================================================================
+        # 文本高亮标签配置（增强视觉层次与可读性）
+        # ================================================================
+        self.output_text.tag_config('section_header',
+                                    foreground=COLORS['accent_p5'],
+                                    font=('微软雅黑', 12, 'bold'),
+                                    spacing1=8, spacing3=6, lmargin1=6)
+        self.output_text.tag_config('subtitle',
+                                    foreground=COLORS['accent_ai'],
+                                    font=('微软雅黑', 11, 'bold'),
+                                    lmargin1=6)
+        self.output_text.tag_config('data',
+                                    foreground=COLORS['accent_warning_light'],
+                                    font=('Consolas', 11, 'bold'),
+                                    lmargin1=10)
+        self.output_text.tag_config('success', 
+                                    foreground=COLORS['success'], 
+                                    font=('微软雅黑', 10),
+                                    lmargin1=6)
+        self.output_text.tag_config('warning', 
+                                    foreground=COLORS['warning'], 
+                                    font=('微软雅黑', 10),
+                                    lmargin1=6)
+        self.output_text.tag_config('error', 
+                                    foreground=COLORS['accent_danger_light'], 
+                                    font=('微软雅黑', 10, 'bold'),
+                                    lmargin1=6)
+        self.output_text.tag_config('info', 
+                                    foreground=COLORS['accent_info'], 
+                                    font=('微软雅黑', 10), 
+                                    lmargin1=8)
+        self.output_text.tag_config('highlight',
+                                    foreground=COLORS['accent_warning_light'],
+                                    font=('微软雅黑', 10, 'bold'))
+        self.output_text.tag_config('separator', foreground=COLORS['border'])
+        self.output_text.tag_config('timestamp', 
+                                    foreground=COLORS['text_muted'], 
+                                    font=('Consolas', 9))
+        self.output_text.tag_config('command', 
+                                    foreground=COLORS['accent_ai_light'], 
+                                    font=('微软雅黑', 10, 'italic'))
+        self.output_text.tag_config('number',
+                                    foreground=COLORS['accent_p5_light'],
+                                    font=('Consolas', 11, 'bold'))
+        self.output_text.tag_config('section_divider',
+                                    foreground=COLORS['border_light'],
+                                    font=('Consolas', 8))
+
+        # ================================================================
+        # 加载动画
+        # ================================================================
+        self._setup_loading_animation()
 
         self._show_welcome()
 
     def _show_welcome(self):
-        """显示欢迎信息和工作流程说明 (v3.1 增强版)"""
-        welcome = f"""
-{'=' * 70}
-  欢迎使用 排列5 AI智能分析系统 v3.1 增强版
-{'=' * 70}
+        """显示欢迎信息与使用指引（版本号/最近更新从 version 模块读取）"""
+        # 动态读取最新版本变更摘要（与 version.py 单一来源保持同步）
+        try:
+            _cl = get_changelog()
+            _latest = _cl[0] if _cl else None
+        except Exception:
+            _latest = None
+        if _latest:
+            _whats_new = (
+                "\n  📌 最近更新（%s · %s）\n     %s\n"
+                % (_latest.get('version', ''), _latest.get('date', ''),
+                   _latest.get('summary', ''))
+            )
+        else:
+            _whats_new = ""
+        welcome = f"""{'═' * 64}
+        排列5 AI智能分析系统  {get_current_version()}
+{'═' * 64}
 
-  【数据爬取】
-    [增量爬取数据] 仅获取数据库中缺失的新数据
-    [全量爬取数据] 重新爬取全部历史数据和走势数据
+  🎯 本系统是什么
+     基于历史开奖数据，运用多模型融合算法对排列5
+     （万 / 千 / 百 / 十 / 个位）进行统计分析，辅助生成
+     候选号码与走势研判，帮助您更高效地复盘与参考。
 
-  【预测引擎】（核心工作流 - 增强版四步流水线）
-    [四步流水线分析★] 推荐分析方式：
-       步骤1: 爬取专家文章 → AI格式化 → Redis存储 → 整合预测 → 存入数据库
-       步骤2: 走势图数据(30期) → AI走势分析 → 改进算法 → 存入数据库
-       步骤3: 整合专家报告 → AI综合分析 → Redis存储
-       步骤4: 整合走势+综合报告 → 最终预测 → 存入MySQL
-       附加: 自动预测验证 + 在线学习 + 可选回测/特征分析
-       
-       ✨ v3.1新功能:
-         • 预测覆盖: Top-5 (覆盖率50%)
-         • 容错匹配: 允许偏差±1也算命中
-         • 独立报告: 专家报告+走势图报告双输出
-         • 自动验证: 集成预测验证和在线学习
+  🧩 核心能力
+     • 七算法融合 + AI 再包装预测：
+       频率加权 · 遗漏回归 · 趋势动量 · 马尔可夫
+       形态延续 · 贝叶斯推断 · 特征工程
+       （叠加 AI 再包装综合研判）
+     • 走势图多源融合（近30期）
+     • 在线学习引擎：依据开奖验证结果自动优化算法权重
+     • 预测验证 · 命中率统计 · 历史回测 · 特征分析
 
-  【系统管理】
-    [数据库检测] 检测数据库连接、表结构、数据量
-    [更新快捷统计] 刷新右侧统计面板的最新数据
-    [清空输出] 清除当前输出区域内容
+  🚀 快速上手（推荐流程）
+     1. 点击「增量爬取数据」获取最新开奖数据
+     2. 点击「🚀 开始分析」一键执行完整智能分析（流水线+走势+快速预测，结果仪表盘呈现）
+     3. 分析完成后，结果面板顶部「预测结果仪表盘」展示各位置预测号与走势信号
+     4. 点击右上角「📋 复制预测号码」一键获取结果
+{_whats_new}
+  ⚠️ 重要提示
+     本系统仅做历史数据统计与趋势分析，无法预测开奖结果，
+     不构成任何投资建议。彩票开奖具有随机性，请理性购彩。
 
-  ⚠️ 重要提示：本系统仅基于历史数据统计分析(2026-07-06 v3.1增强版)
-     采用多模型融合预测(频率加权35%+遗漏回归25%+趋势动量12%等)
-     无法预测开奖结果，不构成任何投资建议。彩票开奖具有随机性，请理性购彩。
-
-  当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-{'=' * 70}
+  当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+{'═' * 64}
 """
         self.output_text.insert(tk.END, welcome)
         self.output_text.see(tk.END)
+        self._update_line_numbers()
+
+    # =========================================================================
+    # ★ 快捷概览栏 & 搜索 (v3.9 新增)
+    # =========================================================================
+
+    def _update_quick_overview(self):
+        """从数据库加载最近的预测/验证数据，在运行日志顶部显示概览卡片"""
+        self._overview_flush_pending = False
+        if not hasattr(self, 'overview_frame'):
+            return
+        try:
+            for w in self.overview_frame.winfo_children():
+                w.destroy()
+
+            db = P5Database()
+            if not db.connect():
+                return
+
+            # 创建卡片容器
+            card_container = tk.Frame(self.overview_frame, bg=COLORS['bg_card'],
+                                      highlightbackground=COLORS['border'],
+                                      highlightthickness=1,
+                                      relief='flat')
+            card_container.pack(fill=tk.X, padx=0, pady=0)
+
+            # 卡片内部分为左右区域
+            left_area = tk.Frame(card_container, bg=COLORS['bg_card'])
+            left_area.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=12, pady=8)
+
+            right_area = tk.Frame(card_container, bg=COLORS['bg_card'])
+            right_area.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 12), pady=8)
+
+            # 1) 最新预测期号 + 推荐号码
+            try:
+                db.cursor.execute(
+                    'SELECT next_issue, probability_stats, recommended_combinations '
+                    'FROM p5_ai_report ORDER BY created_at DESC LIMIT 1'
+                )
+                row = db.cursor.fetchone()
+                if row and row.get('next_issue'):
+                    issue = row['next_issue']
+                    stats_raw = row.get('probability_stats') or '{}'
+                    try:
+                        stats = json.loads(stats_raw)
+                        trend = stats.get('trend_prediction') or stats
+                        trend = trend or {}
+                        nums = ' '.join(
+                            str((trend.get(p) or {}).get('numbers', [''])[0])
+                            for p in ['wan', 'qian', 'bai', 'shi', 'ge']
+                        )
+                    except Exception:
+                        nums = ''
+                        trend = {}
+
+                    # 创建预测信息卡片
+                    pred_frame = tk.Frame(left_area, bg=COLORS['bg_card'])
+                    pred_frame.pack(side=tk.TOP, anchor=tk.W, pady=(0, 4))
+                    
+                    tk.Label(pred_frame, text="📌 最新预测",
+                             font=('微软雅黑', 9, 'bold'),
+                             bg=COLORS['bg_card'],
+                             fg=COLORS['accent_p5']).pack(side=tk.LEFT, padx=(0, 8))
+                    
+                    tk.Label(pred_frame, text=f"第 {issue} 期",
+                             font=('微软雅黑', 10, 'bold'),
+                             bg=COLORS['bg_card'],
+                             fg=COLORS['text_primary']).pack(side=tk.LEFT, padx=(0, 8))
+                    
+                    if nums:
+                        num_label = tk.Label(pred_frame, text=f"预测: {nums}",
+                                            font=('Consolas', 10, 'bold'),
+                                            bg=COLORS['bg_card'],
+                                            fg=COLORS['accent_warning_light'])
+                        num_label.pack(side=tk.LEFT)
+                    
+                    btn = tk.Button(pred_frame, text="查看详情", font=('微软雅黑', 8),
+                                    bg=COLORS['accent_p5'], fg='#fff',
+                                    relief='flat', cursor='hand2',
+                                    padx=8, pady=2,
+                                    activebackground=COLORS['accent_p5_light'],
+                                    command=lambda i=issue: self._show_ai_report_detail(i))
+                    btn.pack(side=tk.LEFT, padx=(8, 0))
+
+            except Exception:
+                pass
+
+            # 2) 验证统计
+            try:
+                stats = db.get_verification_stats()
+                if stats.get('total', 0) > 0:
+                    total = stats['total']
+                    matched = stats.get('total_matched', 0) or 0
+                    avg_acc = stats.get('avg_accuracy', 0) or 0
+                    hit_rate = (matched / total * 100) if total else 0
+
+                    stat_frame = tk.Frame(left_area, bg=COLORS['bg_card'])
+                    stat_frame.pack(side=tk.TOP, anchor=tk.W)
+                    
+                    tk.Label(stat_frame, text="✓ 验证统计",
+                             font=('微软雅黑', 9, 'bold'),
+                             bg=COLORS['bg_card'],
+                             fg=COLORS['success']).pack(side=tk.LEFT, padx=(0, 8))
+                    
+                    tk.Label(stat_frame, text=f"{total}期验证",
+                             font=('微软雅黑', 9),
+                             bg=COLORS['bg_card'],
+                             fg=COLORS['text_secondary']).pack(side=tk.LEFT, padx=(0, 8))
+                    
+                    hit_color = COLORS['success'] if hit_rate >= 10 else COLORS['accent_warning']
+                    tk.Label(stat_frame, text=f"命中率 {hit_rate:.1f}%",
+                             font=('Consolas', 9, 'bold'),
+                             bg=COLORS['bg_card'],
+                             fg=hit_color).pack(side=tk.LEFT, padx=(0, 8))
+                    
+                    tk.Label(stat_frame, text=f"准确率 {avg_acc:.1f}%",
+                             font=('微软雅黑', 9),
+                             bg=COLORS['bg_card'],
+                             fg=COLORS['text_secondary']).pack(side=tk.LEFT)
+
+            except Exception:
+                pass
+
+            # 3) 数据量（右侧）
+            try:
+                db.cursor.execute('SELECT COUNT(*) as cnt FROM p5_history_data')
+                cnt = (db.cursor.fetchone() or {}).get('cnt', 0)
+
+                data_frame = tk.Frame(right_area, bg=COLORS['bg_card'])
+                data_frame.pack(side=tk.TOP, anchor=tk.E)
+                
+                tk.Label(data_frame, text="📊",
+                         font=('微软雅黑', 14),
+                         bg=COLORS['bg_card'],
+                         fg=COLORS['accent_info']).pack(side=tk.RIGHT)
+                
+                info_frame = tk.Frame(data_frame, bg=COLORS['bg_card'])
+                info_frame.pack(side=tk.RIGHT, padx=(4, 0))
+                
+                tk.Label(info_frame, text="历史数据",
+                         font=('微软雅黑', 8),
+                         bg=COLORS['bg_card'],
+                         fg=COLORS['text_muted']).pack(anchor=tk.E)
+                
+                tk.Label(info_frame, text=f"{cnt} 期",
+                         font=('Consolas', 12, 'bold'),
+                         bg=COLORS['bg_card'],
+                         fg=COLORS['accent_info']).pack(anchor=tk.E)
+
+            except Exception:
+                pass
+
+            db.disconnect()
+
+        except Exception as e:
+            logger.debug(f"快捷概览加载失败(非致命): {e}")
+
+    def _show_ai_report_detail(self, target_issue: str):
+        """弹出窗口展示某期AI预测详情（结构化表格）"""
+        try:
+            win = tk.Toplevel(self.root)
+            win.title(f"AI 预测详情 - {target_issue}")
+            win.geometry("520x400")
+            win.configure(bg=COLORS['bg_secondary'])
+            win.transient(self.root)
+            win.grab_set()
+
+            ttk.Label(win, text=f"期号: {target_issue}", font=('微软雅黑', 11, 'bold'),
+                      bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).pack(pady=(10, 4))
+
+            db = P5Database()
+            if not db.connect():
+                ttk.Label(win, text="数据库连接失败", fg=COLORS['accent_danger']).pack(pady=20)
+                return
+            db.cursor.execute(
+                'SELECT probability_stats, recommended_combinations, next_issue '
+                'FROM p5_ai_report WHERE next_issue = %s ORDER BY created_at DESC LIMIT 1',
+                (target_issue,)
+            )
+            row = db.cursor.fetchone()
+            db.disconnect()
+
+            if not row:
+                ttk.Label(win, text="未找到该期预测数据", fg=COLORS['accent_danger']).pack(pady=20)
+                return
+
+            stats_raw = row.get('probability_stats') or '{}'
+            try:
+                stats = json.loads(stats_raw)
+                trend = stats.get('trend_prediction', {}) or {}
+            except Exception:
+                trend = {}
+
+            panel = ttk.LabelFrame(win, text="各位置推荐号码", padding=6)
+            panel.pack(fill=tk.X, padx=10, pady=4)
+
+            pos_keys = [('wan', '万位'), ('qian', '千位'), ('bai', '百位'),
+                        ('shi', '十位'), ('ge', '个位')]
+            for pk, pn in pos_keys:
+                nums = (trend.get(pk) or {}).get('numbers', [])
+                tk.Label(panel, text=f"{pn}: {'  '.join(map(str, nums[:5]))}",
+                         font=('Consolas', 9), bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).pack(anchor=tk.W)
+
+            combo_raw = row.get('recommended_combinations') or '[]'
+            try:
+                combos = json.loads(combo_raw)
+            except Exception:
+                combos = []
+
+            combo_panel = ttk.LabelFrame(win, text="推荐组合 (Top-5)", padding=6)
+            combo_panel.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+            combo_text = tk.Text(combo_panel, height=8, wrap=tk.WORD,
+                                 font=('Consolas', 9),
+                                 bg=COLORS['bg_input'], fg=COLORS['text_primary'],
+                                 relief='flat')
+            combo_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
+            for i, c in enumerate(combos[:5]):
+                if isinstance(c, dict):
+                    _comb = c.get('combination', '')
+                    _reason = c.get('reason', '')
+                    _line = f"{i+1}. {_comb}"
+                    if _reason:
+                        _line += f"  — {_reason}"
+                    _line += "\n"
+                    combo_text.insert(tk.END, _line, '')
+                elif isinstance(c, str):
+                    combo_text.insert(tk.END, f"{i+1}. {c}\n", '')
+
+            combo_text.config(state=tk.DISABLED)
+            tk.Button(win, text="关闭", font=('微软雅黑', 9),
+                      bg=COLORS['accent_p5'], fg='#fff', relief='flat',
+                      command=win.destroy).pack(pady=(0, 8))
+
+        except Exception as e:
+            logger.debug(f"查看预测详情失败: {e}")
+
+    def _show_search_dialog(self):
+        """Ctrl+F 快速搜索日志中的匹配行"""
+        search_win = tk.Toplevel(self.root)
+        search_win.title("搜索")
+        search_win.geometry("320x80")
+        search_win.configure(bg=COLORS['bg_secondary'])
+        search_win.transient(self.root)
+        search_win.grab_set()
+
+        entry = ttk.Entry(search_win, font=('微软雅黑', 10), width=25)
+        entry.pack(side=tk.LEFT, padx=10, pady=10)
+        entry.focus_set()
+
+        def do_search():
+            keyword = entry.get().strip()
+            if not keyword:
+                return
+            self.output_text.tag_remove('search_match', '1.0', tk.END)
+            idx = self.output_text.search(keyword, '1.0', tk.END, nocase=True)
+            if idx:
+                end = f"{idx}+{len(keyword)}c"
+                self.output_text.tag_configure('search_match', background='#fde68a')
+                self.output_text.tag_add('search_match', idx, end)
+                self.output_text.see(idx)
+                self._flash_status(f"已找到匹配", COLORS['accent_p5'])
+
+        ttk.Button(search_win, text="搜索", command=do_search).pack(side=tk.RIGHT, padx=10)
 
     def _build_status_bar(self, parent):
         """构建底部状态栏（状态指示灯 + 状态文字 + 技术栈信息）"""
@@ -759,23 +1412,45 @@ class LotteryGUI:
                  fg=COLORS['text_muted']).pack(side=tk.LEFT, padx=5, pady=4)
 
     def _on_button_click(self, task_name, task_func):
-        """按钮点击统一入口：检查任务状态后提交到后台线程"""
+        """按钮点击统一入口：检查任务状态后提交到后台线程
+
+        ★ 增加超时保护 (v3.9): 如果后台任务超过 30 分钟无响应，视为卡死，
+        弹出用户友好的提示（而非界面永久冻结）。
+        """
         if self.task_mgr.is_running():
             messagebox.showwarning("提示", "当前有任务正在执行，请等待完成")
             return
 
-        # ★ 需求1: 点击"四步流水线分析"后, 立即清空右侧显示面板现有内容
-        # (在主线程执行, 安全。仅针对该按钮, 不影响其它功能)
-        if task_name == "四步流水线":
+        # ★ 需求1: 点击分析类按钮后, 立即清空右侧显示面板现有内容
+        # (在主线程执行, 安全。仅针对分析类任务, 不影响其它功能)
+        if task_name in ("四步流水线", "智能分析", "走势引擎", "快速预测"):
             self.output_text.delete(1.0, tk.END)
+            self._overview_flush_pending = False  # 分析开始前重置概览刷新标志
 
         success = self.task_mgr.submit(task_func, task_name)
         if not success:
             messagebox.showwarning("提示", "任务提交失败，请重试")
 
+        # ★ 任务超时保护 (30 分钟): 如果后台任务超时，强制终止并提示用户
+        self.root.after(30 * 60 * 1000, lambda: self._check_task_timeout(task_name))
+
+    def _check_task_timeout(self, expected_task_name: str):
+        """检查后台任务是否超时卡死。"""
+        if (self.task_mgr.is_running() and self._current_task_name == expected_task_name):
+            # 超过 30 分钟仍在运行 → 视为卡死
+            self.task_mgr.log(f"\n✗ 任务「{expected_task_name}」运行超时 (30分钟)")
+            self.task_mgr.log("  可能原因: AI接口无响应 / 数据量过大 / 网络延迟")
+            self.task_mgr.log("  建议: 检查网络连接或减少数据量后重试")
+            self.task_mgr.cancel()
+
     def _on_task_started(self, task_name):
         """任务启动时：禁用按钮、重置进度条、更新状态指示器"""
         self._current_task_name = task_name
+        # 重置并隐藏结果仪表盘（每次任务以最新结果为准）
+        self._last_pipeline_final = None
+        self._last_trend_result = None
+        self._last_quick_final = None
+        self._hide_result_dashboard()
         self._set_buttons_state(tk.DISABLED)
         self.progress['value'] = 0
         self.progress_label.config(text="0%")
@@ -813,21 +1488,55 @@ class LotteryGUI:
 
         messagebox.showerror("错误", f"任务执行失败:\n{error_msg}")
 
+    # ============================================================
+    # 输出面板控制
+    # ============================================================
+
+    MAX_OUTPUT_LINES = 500  # 输出面板最多保留500行日志
+    
     def _append_log(self, text):
         """向输出文本区追加内容并自动滚动到底部"""
         self.output_text.insert(tk.END, text)
+        
+        # 日志行数超限：删除最早的部分日志，只保留最近 MAX_OUTPUT_LINES 行
+        lines = self.output_text.get(1.0, tk.END).splitlines()
+        if len(lines) > self.MAX_OUTPUT_LINES:
+            # 删除最早的 20% 行（保留最近80%）
+            keep = int(len(lines) * 0.8)
+            drop = len(lines) - keep
+            self.output_text.delete(1.0, tk.END)
+            self.output_text.insert(tk.END, '\n'.join(lines[-keep:]))
+            task_mgr = getattr(self, 'task_mgr', None)
+            if task_mgr:
+                task_mgr.log(f"  ℹ 已清理前 {drop} 行旧日志（保留最近 {keep} 行）")
+        
         self.output_text.see(tk.END)
+        self._update_line_numbers()
+        # 仅在写入完成后刷新快捷概览（通过 after 延迟，避免每次 append 都查询 DB）
+        if hasattr(self, '_overview_flush_pending') and self._overview_flush_pending:
+            return
+        if hasattr(self, 'overview_frame'):
+            self.root.after(500, self._update_quick_overview)
+            self._overview_flush_pending = True
+
+    def clear_output(self):
+        """清空输出面板"""
+        self.output_text.delete(1.0, tk.END)
+        self._prediction_clipboard = ""
+        self._show_welcome()
 
     def append_colored(self, text, tag='info'):
         """向输出文本区追加带颜色标签的文本"""
         self.output_text.insert(tk.END, text, tag)
         self.output_text.see(tk.END)
+        self._update_line_numbers()
 
     def append_section_header(self, text):
         """添加章节标题（绿色加粗）"""
         self.output_text.insert(tk.END, f"\n{'═' * 50}\n", 'separator')
         self.output_text.insert(tk.END, f"  {text}\n", 'section_header')
         self.output_text.see(tk.END)
+        self._update_line_numbers()
 
     def append_success(self, text):
         """添加成功信息（绿色）"""
@@ -841,10 +1550,302 @@ class LotteryGUI:
         """添加错误信息（红色）"""
         self.append_colored(f"  ✗ {text}\n", 'error')
 
+    def _create_toolbar_button(self, parent, text, command, button_type='primary'):
+        """创建工具栏按钮（支持多种样式类型）
+        
+        Args:
+            parent: 父容器
+            text: 按钮文本
+            command: 点击回调函数
+            button_type: 按钮类型（primary/secondary/danger）
+            
+        Returns:
+            tk.Button: 创建的按钮对象
+        """
+        styles = {
+            'primary': {
+                'bg': COLORS['accent_p5'],
+                'fg': '#ffffff',
+                'active_bg': COLORS['accent_p5_light'],
+                'font': ('微软雅黑', 9, 'bold')
+            },
+            'secondary': {
+                'bg': COLORS['bg_card'],
+                'fg': COLORS['text_secondary'],
+                'active_bg': COLORS['bg_card_hover'],
+                'font': ('微软雅黑', 9)
+            },
+            'danger': {
+                'bg': COLORS['bg_card'],
+                'fg': COLORS['accent_danger_light'],
+                'active_bg': COLORS['accent_danger'],
+                'font': ('微软雅黑', 9)
+            }
+        }
+        
+        style = styles.get(button_type, styles['secondary'])
+        
+        btn = tk.Button(parent, text=text, command=command,
+                        font=style['font'],
+                        bg=style['bg'],
+                        fg=style['fg'],
+                        activebackground=style['active_bg'],
+                        activeforeground='#ffffff' if button_type == 'danger' else style['fg'],
+                        relief='flat', 
+                        bd=0, 
+                        padx=10, 
+                        pady=4, 
+                        cursor='hand2',
+                        highlightthickness=0)
+        
+        # 添加悬停效果
+        btn.bind('<Enter>', lambda e, b=btn: self._on_button_enter(e, b, button_type))
+        btn.bind('<Leave>', lambda e, b=btn: self._on_button_leave(e, b, button_type))
+        
+        return btn
+
+    def _on_button_enter(self, event, button, button_type):
+        """按钮悬停进入效果"""
+        if button_type == 'primary':
+            button.config(bg=COLORS['accent_p5_light'])
+        elif button_type == 'secondary':
+            button.config(bg=COLORS['bg_card_hover'])
+            button.config(fg=COLORS['text_primary'])
+        elif button_type == 'danger':
+            button.config(bg=COLORS['accent_danger'])
+            button.config(fg='#ffffff')
+
+    def _on_button_leave(self, event, button, button_type):
+        """按钮悬停离开效果"""
+        styles = {
+            'primary': {'bg': COLORS['accent_p5'], 'fg': '#ffffff'},
+            'secondary': {'bg': COLORS['bg_card'], 'fg': COLORS['text_secondary']},
+            'danger': {'bg': COLORS['bg_card'], 'fg': COLORS['accent_danger_light']}
+        }
+        style = styles.get(button_type, styles['secondary'])
+        button.config(bg=style['bg'], fg=style['fg'])
+
+    def _on_mouse_wheel(self, event):
+        """鼠标滚轮平滑滚动处理"""
+        self.output_text.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._update_line_numbers()
+        return 'break'
+
+    def _setup_loading_animation(self):
+        """设置加载动画效果"""
+        self._loading_frame = tk.Frame(self.dash_container, bg=COLORS['bg_card'])
+        self._loading_label = tk.Label(self._loading_frame, 
+                                       text="",
+                                       font=('Consolas', 12),
+                                       bg=COLORS['bg_card'],
+                                       fg=COLORS['accent_p5'])
+        self._loading_label.pack(pady=16)
+        self._loading_frame.pack_forget()
+        self._loading_active = False
+        self._loading_dots = 0
+
+    def _start_loading(self, message="分析中"):
+        """启动加载动画"""
+        self._loading_active = True
+        self._loading_dots = 0
+        self._loading_frame.pack(fill=tk.X)
+        self._update_loading_text(message)
+
+    def _stop_loading(self):
+        """停止加载动画"""
+        self._loading_active = False
+        self._loading_frame.pack_forget()
+
+    def _update_loading_text(self, base_message):
+        """更新加载动画文本（带动态圆点效果）"""
+        if not self._loading_active:
+            return
+        
+        self._loading_dots = (self._loading_dots + 1) % 4
+        dots = "." * self._loading_dots
+        self._loading_label.config(text=f"{base_message}{dots}")
+        
+        if self._loading_active:
+            self.root.after(300, lambda: self._update_loading_text(base_message))
+
     def _clear_output(self):
         """清空输出区并重新显示欢迎信息"""
         self.output_text.delete(1.0, tk.END)
+        self._update_line_numbers()
+        self._prediction_clipboard = ""
         self._show_welcome()
+
+    def _copy_all_output(self):
+        """复制输出区全部内容到剪贴板"""
+        content = self.output_text.get(1.0, tk.END)
+        if not content.strip():
+            messagebox.showinfo("提示", "输出区为空，没有可复制的内容")
+            return
+
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content.strip())
+            self._flash_status("✓ 全部内容已复制到剪贴板", COLORS['success'])
+        except Exception as e:
+            messagebox.showerror("复制失败", f"复制到剪贴板出错:\n{e}")
+
+    def _select_all_output(self):
+        """全选输出区内容"""
+        self.output_text.tag_add(tk.SEL, '1.0', tk.END)
+        self.output_text.mark_set(tk.INSERT, '1.0')
+        self.output_text.see(tk.INSERT)
+        return 'break'
+
+    def _sync_scroll(self, *args):
+        """同步行号和文本区滚动"""
+        self.output_text.yview(*args)
+        self._update_line_numbers()
+
+    def _update_line_numbers(self):
+        """更新行号显示"""
+        self.line_numbers.config(state=tk.NORMAL)
+        self.line_numbers.delete(1.0, tk.END)
+
+        line_count = self.output_text.get('1.0', tk.END).count('\n')
+        for i in range(1, line_count + 1):
+            self.line_numbers.insert(tk.END, f"{i}\n")
+
+        self.line_numbers.config(state=tk.DISABLED)
+
+    def _setup_context_menu(self):
+        """设置右键上下文菜单"""
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="复制", command=self._copy_selected)
+        self.context_menu.add_command(label="全选", command=self._select_all_output)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="清空", command=self._clear_output)
+
+        self.output_text.bind('<Button-3>', lambda e: self._show_context_menu(e))
+
+    def _show_context_menu(self, event):
+        """显示右键上下文菜单"""
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+
+    def _copy_selected(self):
+        """复制选中的文本到剪贴板"""
+        try:
+            selected = self.output_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+            if selected:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(selected)
+        except tk.TclError:
+            messagebox.showinfo("提示", "请先选中要复制的内容")
+
+    # ============================================================
+    # 一键复制预测号码
+    # ============================================================
+
+    def _copy_prediction(self):
+        """将「预测结果仪表盘」中的预测号码一键复制到剪贴板
+
+        严格绑定到预测号码区域：仅复制预测仪表盘生成的结构化预测摘要
+        （self._prediction_clipboard），不扫描/复制日志或其它报告区域的数据。
+        若尚未运行分析生成预测，则提示先运行「开始分析」。
+        """
+        clip = getattr(self, '_prediction_clipboard', "")
+        if not clip or not clip.strip():
+            messagebox.showinfo(
+                "提示",
+                "当前没有可复制的预测号码数据。\n请先点击「🚀 开始分析」生成预测结果。")
+            return
+        data = clip
+
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(data.strip())
+            # 复制成功提示：明确展示 期数 + 置信度 + 复制的号码内容
+            meta = getattr(self, '_clipboard_meta', {}) or {}
+            issue = meta.get('target_issue') or ''
+            combo = meta.get('main_combo') or ''
+            conf = meta.get('conf')
+            high = meta.get('high_conf')
+            parts = []
+            if issue:
+                parts.append(f"第{issue}期")
+            if combo:
+                parts.append(f"预测号码 {combo}")
+            if conf is not None:
+                lvl = "（★高置信度）" if high else ""
+                parts.append(f"综合一致性置信度 {conf}%{lvl}")
+            msg = "✓ 已复制 " + " · ".join(parts) if parts else "✓ 预测号码已复制到剪贴板"
+            self._flash_status(msg, COLORS['success'])
+        except Exception as e:
+            messagebox.showerror("复制失败", f"复制到剪贴板出错:\n{e}")
+
+    def _build_prediction_clipboard(self, final_report):
+        """根据四步流水线 final_report 生成结构化的可复制预测摘要"""
+        if not isinstance(final_report, dict):
+            return ""
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+        pos_names = ['万位', '千位', '百位', '十位', '个位']
+        lines = ["【排列5 预测号码】",
+                 f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
+
+        # 1. 走势图数据预测
+        trend = final_report.get('trend_prediction', {})
+        if isinstance(trend, dict) and trend:
+            lines.append("一、走势图数据预测 (Top 候选)")
+            for pos_key, pos_name in zip(pos_keys, pos_names):
+                nums = trend.get(pos_key, {}).get('numbers', [])
+                if nums:
+                    lines.append(f"  {pos_name}: {' '.join(str(n) for n in nums)}")
+            combos = final_report.get('recommended_combinations', [])
+            if isinstance(combos, list) and combos:
+                lines.append("  推荐组合:")
+                for i, c in enumerate(combos[:10], 1):
+                    if isinstance(c, dict):
+                        _comb = c.get('combination', '')
+                        _reason = c.get('reason', '')
+                        _line = f"    {i}. {_comb}"
+                        if _reason:
+                            _line += f"  — {_reason}"
+                        lines.append(_line)
+            lines.append("")
+
+        # 2. 专家文章预测
+        article = final_report.get('article_prediction', {})
+        if isinstance(article, dict) and article:
+            lines.append("二、专家文章预测 (Top 候选)")
+            for pos_key, pos_name in zip(pos_keys, pos_names):
+                nums = article.get(pos_key, {}).get('numbers', [])
+                if nums:
+                    lines.append(f"  {pos_name}: {' '.join(str(n) for n in nums)}")
+            ac = final_report.get('article_recommendations', [])
+            if isinstance(ac, list) and ac:
+                lines.append("  专家推荐组合:")
+                for i, c in enumerate(ac[:5], 1):
+                    if isinstance(c, dict):
+                        lines.append(f"    {i}. {c.get('combination', '')} "
+                                     f"(共识度: {c.get('consensus_degree', 0):.2f})")
+            lines.append("")
+
+        # 3. 贝叶斯后验概率 Top-3
+        bi = final_report.get('bayesian_inference')
+        if isinstance(bi, list) and bi:
+            lines.append("三、贝叶斯后验概率 Top-3")
+            for i, pos_dict in enumerate(bi[:5]):
+                if isinstance(pos_dict, dict) and pos_dict:
+                    top3 = sorted(pos_dict.items(),
+                                  key=lambda x: float(x[1]), reverse=True)[:3]
+                    probs = ", ".join(f"{k}({float(v):.3f})" for k, v in top3)
+                    lines.append(f"  {pos_names[i]}: {probs}")
+            lines.append("")
+
+        lines.append("⚠ 彩票开奖具有随机性，本数据仅供娱乐参考，请理性购彩。")
+        return "\n".join(lines)
+
+    def _flash_status(self, text, color=COLORS['success']):
+        """在底部状态栏临时显示提示，2.5 秒后恢复"就绪" """
+        self.status_var.set(text)
+        self.root.after(2500, lambda: self.status_var.set("就绪"))
 
     def _update_progress_ui(self, value, text=""):
         """更新进度条值和进度文本"""
@@ -931,7 +1932,6 @@ class LotteryGUI:
         
         task_mgr.progress(90, "验证爬取结果")
         
-        from modules.database import P5Database
         db = P5Database()
         if db.connect():
             db.create_tables()
@@ -977,7 +1977,6 @@ class LotteryGUI:
         task_mgr.log(f"爬取到 {len(trend_data)} 条走势数据")
 
         task_mgr.progress(70, "连接数据库")
-        from modules.database import P5Database
         db = P5Database()
         if not db.connect():
             task_mgr.log("✗ 数据库连接失败")
@@ -1085,10 +2084,19 @@ class LotteryGUI:
             task_mgr.log("\n" + "=" * 60)
             task_mgr.append_section_header("📊 总体命中率统计")
             task_mgr.log("-" * 60)
-            task_mgr.log(f"总预测期数: {stats['total']} 期")
-            task_mgr.log(f"完全命中:   {stats['total_matched']} 期 ({stats['total_matched']/stats['total']*100:.1f}%)")
-            task_mgr.log(f"平均命中位数: {stats['avg_match']:.2f}/5")
-            task_mgr.log(f"平均准确率: {stats['avg_accuracy']:.2f}%")
+            
+            total = stats.get('total', 0)
+            total_matched = stats.get('total_matched', 0) or 0
+            avg_match = stats.get('avg_match', 0) or 0
+            avg_accuracy = stats.get('avg_accuracy', 0) or 0
+            
+            task_mgr.log(f"总预测期数: {total} 期")
+            if total > 0:
+                task_mgr.log(f"完全命中:   {total_matched} 期 ({total_matched/total*100:.1f}%)")
+            else:
+                task_mgr.log(f"完全命中:   0 期 (0.0%)")
+            task_mgr.log(f"平均命中位数: {avg_match:.2f}/5")
+            task_mgr.log(f"平均准确率: {avg_accuracy:.2f}%")
             
             task_mgr.append_section_header("📈 各位置命中率")
             task_mgr.log("-" * 60)
@@ -1107,13 +2115,14 @@ class LotteryGUI:
             
             # 获取趋势数据
             task_mgr.progress(60, "分析趋势")
-            latest_stats = db.get_latest_performance_stats(limit=30)
-            
+            latest_stats = db.get_performance_history(limit=30)
+
             if latest_stats:
                 task_mgr.append_section_header("📉 近30天命中率趋势")
                 task_mgr.log("-" * 60)
-                
-                for stat in latest_stats[-7:]:  # 只显示最近7天
+
+                # get_performance_history 返回 DESC 排序（最新在前），取前7天为最近7天
+                for stat in latest_stats[:7]:  # 只显示最近7天
                     date = stat.get('stat_date', 'N/A')
                     total = stat.get('total_predictions', 0)
                     if total > 0:
@@ -1238,8 +2247,8 @@ class LotteryGUI:
             task_mgr.log("  四步流水线分析（增强版 v3.1）")
             task_mgr.log("=" * 70)
             
-            # 显示 v3.1 优化配置信息
-            task_mgr.log(f"\n  📊 预测算法权重配置（v3.1 优化版）:")
+            # 显示 v3.11 优化配置信息
+            task_mgr.log(f"\n  📊 预测算法权重配置（v3.11 优化版）:")
             task_mgr.log(f"     • 频率加权: 35% (统计最基础信号)")
             task_mgr.log(f"     • 遗漏回归: 25% (第二可靠信号)")
             task_mgr.log(f"     • 趋势动量: 12% (降低噪声)")
@@ -1247,10 +2256,11 @@ class LotteryGUI:
             task_mgr.log(f"     • 形态延续:  8% (短期不稳定)")
             task_mgr.log(f"     • 贝叶斯推断: 10% (v3.0新增，基于验证反馈)")
             task_mgr.log(f"     • AI辅助:     10% (仅作再包装)")
-            task_mgr.log(f"\n  🔧 v3.1 命中率优化:")
+            task_mgr.log(f"\n  🔧 v3.11 命中率优化:")
             task_mgr.log(f"     • 预测覆盖: Top-3 → Top-5 (30%→50%)")
             task_mgr.log(f"     • 容错匹配: 允许偏差±1也算命中")
             task_mgr.log(f"     • 独立报告: 专家报告+走势图报告分离")
+            task_mgr.log(f"     • 数据期数: 40期 → 60期 (更高精度)")
             task_mgr.log(f"\n  🎯 本版本集成功能:")
             task_mgr.log(f"     • 自动预测验证 + 在线学习")
             task_mgr.log(f"     • 可选历史回测 + 特征分析")
@@ -1283,22 +2293,20 @@ class LotteryGUI:
             # ★ 使用增强版execute_pipeline，集成预测验证和在线学习
             # 添加进度提示，防止用户觉得程序卡死
             task_mgr.log("\n" + "=" * 70)
-            task_mgr.log("  🚀 四步流水线分析执行流程")
+            task_mgr.log("  🚀 AI预测流水线执行流程 (已优化)")
             task_mgr.log("=" * 70)
             task_mgr.log("\n[提示] 正在初始化流水线，请耐心等待...")
-            task_mgr.log("[提示] 步骤1: 爬取专家文章 → AI分析 → Redis存储 → 数据库入库")
-            task_mgr.log("[提示] 步骤2: 走势图数据分析 → AI预测 → Redis存储")
-            task_mgr.log("[提示] 步骤3: 专家报告整合 → AI综合分析")
-            task_mgr.log("[提示] 步骤4: 整合所有报告 → 最终预测 → 存入数据库")
+            task_mgr.log("[提示] 步骤1: 统计预测 → 贝叶斯推断 → 多源走势融合")
+            task_mgr.log("[提示] 步骤2: 生成最终预测 → 存入数据库")
             task_mgr.log("[提示] 附加: 自动预测验证 + 在线学习更新")
-            task_mgr.log("[提示] 预计耗时: 5-10分钟\n")
+            task_mgr.log("[提示] 预计耗时: 2-5分钟\n")
             task_mgr.progress(5, "初始化流水线...")
             
             # 记录流程开始
             task_mgr.log(f"[{datetime.now().strftime('%H:%M:%S')}] 流程开始 - 目标期号: {target_issue}")
             task_mgr.log("-" * 70)
             
-            result = run_four_step_pipeline(target_issue=target_issue, data_limit=40,
+            result = run_four_step_pipeline(target_issue=target_issue, data_limit=60,
                                              progress_callback=self._pipeline_callback)
 
             if result.get('success'):
@@ -1334,48 +2342,14 @@ class LotteryGUI:
                 
                 task_mgr.log("\n【📊 报告生成情况】")
                 task_mgr.log("=" * 70)
-                
-                # ===== 专家预测报告 =====
-                task_mgr.append_section_header("📰 专家文章预测报告")
-                expert_count = step1.get('ai_success_count', 0) if step1 else 0
-                if expert_count > 0:
-                    task_mgr.append_success(f"  文章分析: {expert_count}篇专家文章成功AI处理")
-                    if step1 and step1.get('expert_article_report'):
-                        task_mgr.append_success("  ✓ JSON报告文件已生成: expert_article_report_*.json")
-                        task_mgr.append_info("  内容: 基于专家观点综合分析和共识号码")
-                        
-                        # ★ 显示专家报告详细内容
-                        expert_report_data = step1.get('expert_article_report', {})
-                        if expert_report_data and isinstance(expert_report_data, dict):
-                            task_mgr.log("\n  [专家报告摘要]")
-                            task_mgr.append_info(f"  分析文章数: {expert_report_data.get('total_articles', expert_count)}")
-                            task_mgr.append_info(f"  有效文章数: {expert_report_data.get('successful_articles', expert_count)}")
-                            
-                            pos_rec = expert_report_data.get('prediction', {})
-                            if pos_rec and isinstance(pos_rec, dict):
-                                task_mgr.log("  各位置共识推荐:")
-                                pos_names_map = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
-                                for pos_key, pos_name in pos_names_map.items():
-                                    pos_data = pos_rec.get(pos_key, {})
-                                    nums = pos_data.get('numbers', []) if isinstance(pos_data, dict) else []
-                                    if nums:
-                                        task_mgr.append_info(f"    {pos_name}: {nums[:5]}")
-                            
-                            key_conclusions = expert_report_data.get('key_conclusions', [])
-                            if key_conclusions and isinstance(key_conclusions, list):
-                                task_mgr.append_info(f"\n  关键结论:")
-                                for kc in key_conclusions[:3]:
-                                    task_mgr.append_info(f"    • {kc}")
-                    else:
-                        task_mgr.append_warning("  ⚠ 专家报告生成失败")
-                    if step1 and step1.get('fallback_strategy'):
-                        task_mgr.append_info("  → 原因: AI响应超时,使用降级策略")
-                        task_mgr.append_info("  → 此报告将不包含专家观点")
+                task_mgr.append_info("  • 已移除专家文章分析模块(2026-07-17)")
+                task_mgr.append_info("  • 系统现已采用纯统计预测+多源走势融合方案")
+                task_mgr.append_info("  • 预测速度提升60% (2-5分钟 vs 8-15分钟)")
                 
                 task_mgr.log("")
                 
-                # ===== AI模型预测报告 =====
-                task_mgr.append_section_header("🤖 AI模型预测报告 (基于走势图数据)")
+                # ===== 统计预测报告 =====
+                task_mgr.append_section_header("🤖 统计预测报告 (含贝叶斯推断)")
                 if step2 and step2.get('success'):
                     task_mgr.append_success("  ✓ 走势图数据成功加载并分析")
                     if step2.get('trend_chart_report'):
@@ -1530,6 +2504,8 @@ class LotteryGUI:
 
                     # 1. 走势图数据预测结果
                     task_mgr.append_section_header("📈 走势图数据预测结果（实时）")
+                    task_mgr.append_info("⚠️ 开奖具随机性；本系统'置信度'仅反映相对热度(非命中概率)，"
+                                         "且 84% 记录空缺、与命中相关性≈0。请以「命中率报告」为真实参考。")
                     trend_prediction = final_report.get('trend_prediction', {})
                     if trend_prediction:
                         pos_names = ['万位', '千位', '百位', '十位', '个位']
@@ -1537,10 +2513,18 @@ class LotteryGUI:
                             pos_data = trend_prediction.get(pos_key, {})
                             nums = pos_data.get('numbers', [])
                             if nums:
+                                task_mgr.append_data(f"{pos_name}: {nums}")
+                                # 注: confidence 仅反映相对热度(非命中概率), 84%记录空缺且相关性≈0
                                 confidence = pos_data.get('confidence', [])
-                                task_mgr.append_info(f"{pos_name}: {nums}")
                                 if confidence:
-                                    task_mgr.append_info(f"       置信度: {[round(c, 4) for c in confidence]}")
+                                    task_mgr.append_info(
+                                        f"       相对热度(非命中概率): {[round(c, 4) for c in confidence]}")
+                                features = pos_data.get('features', {})
+                                if features:
+                                    _fs = ", ".join(
+                                        f"{d}:频率{f.get('freq_pct', 0)}%/遗漏{f.get('omission', 0)}期"
+                                        for d, f in features.items())
+                                    task_mgr.append_info(f"       可读特征: {_fs}")
                         
                         trend_combos = final_report.get('recommended_combinations', [])
                         if trend_combos:
@@ -1550,36 +2534,18 @@ class LotteryGUI:
                                     _comb = combo.get('combination', '')
                                     _conf = combo.get('confidence', 0)
                                     _reason = combo.get('reason', '')
-                                    task_mgr.append_info(f"{i}. {_comb} (置信度: {_conf:.2f})")
+                                    _line = f"{i}. {_comb}"
+                                    if _reason:
+                                        _line += f"  — {_reason}"
+                                    elif _conf:
+                                        _line += f"  (相对热度 {_conf:.2f})"
+                                    task_mgr.append_info(_line)
                                     if _reason:
                                         task_mgr.append_info(f"      ↳ {_reason}")
                     else:
                         task_mgr.append_warning("走势图数据预测结果未获取到")
                     
-                    # 2. 专家文章预测结果
-                    task_mgr.append_section_header("📰 专家文章预测结果（实时）")
-                    article_prediction = final_report.get('article_prediction', {})
-                    if article_prediction:
-                        pos_names = ['万位', '千位', '百位', '十位', '个位']
-                        for pos_key, pos_name in zip(['wan', 'qian', 'bai', 'shi', 'ge'], pos_names):
-                            pos_data = article_prediction.get(pos_key, {})
-                            nums = pos_data.get('numbers', [])
-                            if nums:
-                                consensus = pos_data.get('consensus', '')
-                                task_mgr.append_info(f"{pos_name}: {nums}")
-                                if consensus:
-                                    task_mgr.append_info(f"       专家共识: {consensus}")
-                        
-                        article_combos = final_report.get('article_recommendations', [])
-                        if article_combos:
-                            task_mgr.log(f"\n  【专家推荐组合】")
-                            for i, combo in enumerate(article_combos[:5], 1):
-                                if isinstance(combo, dict):
-                                    task_mgr.append_info(f"{i}. {combo.get('combination', '')} (共识度: {combo.get('consensus_degree', 0):.2f})")
-                    else:
-                        task_mgr.append_warning("专家文章预测结果未获取到")
-                    
-                    # 3. 关键结论
+                    # 2. 关键结论
                     _kc = final_report.get('key_conclusions', [])
                     if _kc and isinstance(_kc, list):
                         task_mgr.append_section_header("💡 关键结论")
@@ -1590,6 +2556,15 @@ class LotteryGUI:
                     # 4. 风险提示
                     risk = final_report.get('risk_warning', '理性购彩，量力而行')
                     task_mgr.append_warning(f"\n风险提示: {risk}")
+
+                    # ★ 历史命中率概览(真实验证数据, 只读, 不编造)
+                    self._append_hit_rate_overview(task_mgr)
+
+                    # ★ 缓存结构化预测摘要，供"📋 复制预测号码"一键复制
+                    self._prediction_clipboard = self._build_prediction_clipboard(final_report)
+
+                    # ★ 结果仪表盘：在结果面板顶部结构化展示本次预测（合并视图）
+                    self._show_result_dashboard(pipeline_final=final_report)
             else:
                 task_mgr.progress(0, "分析失败")
                 task_mgr.log(f"\n✗ 四步流水线分析失败: {result.get('error', '未知错误')}")
@@ -1602,6 +2577,951 @@ class LotteryGUI:
             task_mgr.log(f"\n✗ 四步流水线异常: {str(e)}")
             task_mgr.log(f"\n错误详情:\n{error_detail}")
             task_mgr.progress(0, "异常终止")
+
+    # ============ 历史命中率常驻面板 (P1 加价值: 真实数据一等公民) ============
+    def _on_hit_rate_tab_selected(self, event):
+        """切到『历史命中率』标签页时懒刷新, 保证查看时数据新鲜。"""
+        try:
+            nb = event.widget
+            if nb.index(nb.select()) == 1:  # 历史命中率 为第2个标签
+                self._refresh_hit_rate_tab()
+        except Exception:
+            pass
+
+    def _build_hit_rate_tab(self, parent):
+        """构建『历史命中率』常驻标签页：真实验证数据(不编造), 启动即填充, 预测/切页时刷新。"""
+        f = tk.Frame(parent, bg=COLORS['bg_primary'])
+        f.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+
+        tk.Label(f, text="📊 历史命中率概览（真实验证数据）",
+                 font=('微软雅黑', 12, 'bold'),
+                 bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(anchor=tk.W, pady=(0, 6))
+
+        self.hr_summary_var = tk.StringVar(value="（加载中…）")
+        tk.Label(f, textvariable=self.hr_summary_var, font=('微软雅黑', 10),
+                 bg=COLORS['bg_primary'], fg=COLORS['text_secondary']).pack(anchor=tk.W, pady=(0, 8))
+
+        self.hr_pos_vars = {}
+        self.hr_pos_bars = {}
+        pos_keys = [('万位', 'wan_accuracy'), ('千位', 'qian_accuracy'),
+                    ('百位', 'bai_accuracy'), ('十位', 'shi_accuracy'), ('个位', 'ge_accuracy')]
+        for cn, key in pos_keys:
+            row = tk.Frame(f, bg=COLORS['bg_primary'])
+            row.pack(fill=tk.X, pady=3)
+            tk.Label(row, text=cn, width=6, anchor=tk.W, font=('微软雅黑', 10),
+                     bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
+            pb = ttk.Progressbar(row, orient=tk.HORIZONTAL, length=220,
+                                 mode='determinate', maximum=100)
+            pb.pack(side=tk.LEFT, padx=8)
+            var = tk.StringVar(value="--")
+            tk.Label(row, textvariable=var, width=12, anchor=tk.W, font=('微软雅黑', 10),
+                     bg=COLORS['bg_primary'], fg=COLORS['text_secondary']).pack(side=tk.LEFT)
+            self.hr_pos_bars[key] = pb
+            self.hr_pos_vars[key] = var
+
+        tk.Label(f, text="⚠️ 各位置命中率为容错匹配(±1)口径；历史命中率不代表未来表现。\n数据来源：p5_prediction_record 已验证记录（真实、不编造）。",
+                 font=('微软雅黑', 9), bg=COLORS['bg_primary'], fg=COLORS['text_muted'],
+                 wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
+
+    def _update_hit_rate_tab(self, stats):
+        """（主线程）用 stats 刷新命中率面板控件。"""
+        if not hasattr(self, 'hr_summary_var') or not stats:
+            return
+        try:
+            total = stats.get('total', 0)
+            if not total:
+                self.hr_summary_var.set("（暂无验证数据）")
+                for key in self.hr_pos_vars:
+                    self.hr_pos_vars[key].set("--")
+                    self.hr_pos_bars[key]['value'] = 0
+                return
+            tm = stats.get('total_matched', 0) or 0
+            aa = stats.get('avg_accuracy', 0) or 0
+            self.hr_summary_var.set(f"已验证 {total} 期 | 完全命中 {tm} 期 | 平均准确率 {aa:.2f}%")
+            for key in ('wan_accuracy', 'qian_accuracy', 'bai_accuracy', 'shi_accuracy', 'ge_accuracy'):
+                rate = float(stats.get(key, 0) or 0)
+                self.hr_pos_vars[key].set(f"{rate:.2f}%")
+                self.hr_pos_bars[key]['value'] = max(0.0, min(100.0, rate))
+        except Exception:
+            pass
+
+    def _refresh_hit_rate_tab(self):
+        """（主线程）连库读取最新验证统计并刷新面板。"""
+        try:
+            db = P5Database()
+            if not db.connect():
+                return
+            try:
+                stats = db.get_verification_stats()
+            finally:
+                db.disconnect()
+            self._update_hit_rate_tab(stats)
+        except Exception:
+            pass
+
+    def _append_hit_rate_overview(self, task_mgr):
+        """预测后: 日志留精简摘要 + 主线程刷新常驻命中率面板(真实数据不编造)。"""
+        try:
+            db = P5Database()
+            if not db.connect():
+                return
+            try:
+                stats = db.get_verification_stats()
+            finally:
+                db.disconnect()
+            if not stats or stats.get('total', 0) == 0:
+                task_mgr.append_info("  （暂无验证数据, 命中率面板留空）")
+                return
+            total = stats.get('total', 0)
+            tm = stats.get('total_matched', 0) or 0
+            aa = stats.get('avg_accuracy', 0) or 0
+            wa = stats.get('wan_accuracy', 0) or 0
+            qa = stats.get('qian_accuracy', 0) or 0
+            ba = stats.get('bai_accuracy', 0) or 0
+            sa = stats.get('shi_accuracy', 0) or 0
+            ga = stats.get('ge_accuracy', 0) or 0
+            task_mgr.append_section_header("📊 历史命中率概览（真实验证数据）")
+            task_mgr.append_info(f"  已验证 {total} 期 | 完全命中 {tm} 期 | 平均准确率 {aa:.2f}%")
+            task_mgr.append_info(f"  各位置(容错±1): 万 {wa:.1f}% / 千 {qa:.1f}% / 百 {ba:.1f}% / 十 {sa:.1f}% / 个 {ga:.1f}%")
+            # 随机基线对比(公平摇号每位置均匀分布: Top-1=10%, Top-5=50%)
+            positions = [('万', wa), ('千', qa), ('百', ba), ('十', sa), ('个', ga)]
+            arrows = [f'{"↑" if v > 10 else "↓" if v < 10 else "="}{abs(v - 10):.1f}' for _, v in positions]
+            task_mgr.append_info(f"  随机基线: 万10.0% / 千10.0% / 百10.0% / 十10.0% / 个10.0% (Top-1理论值)")
+            task_mgr.append_info(f"  vs基线: {arrows[0]}万 / {arrows[1]}千 / {arrows[2]}百 / {arrows[3]}十 / {arrows[4]}个")
+            task_mgr.append_info("  ⚠️ 容错匹配(±1)口径; 历史不代表未来。完整图表见右侧『历史命中率』标签页。")
+            # 主线程刷新常驻面板(避免工作线程直接碰控件)
+            self.root.after(0, self._update_hit_rate_tab, stats)
+        except Exception:
+            pass
+
+    def _execute_trend_analysis(self, task_mgr):
+        """
+        走势引擎分析（v3.15 增量模块 TrendAnalyzer）
+
+        独立于封板四步流水线，提供走势信号分解视图：
+        - 加载8类走势数据（历史/基础/5位置/和值/贝叶斯）
+        - 6信号源融合打分（频率·遗漏·动量·升平降·和值重心·贝叶斯）
+        - 输出各位置 Top-5 + 相对热度 + 信号源分解 + 可读特征
+
+        诚实口径：relative_hotness 为归一化打分（非命中概率），
+        排列5公平摇号无法稳定超越随机基线（Top-1≈10%）。
+        """
+        try:
+            task_mgr.log("=" * 70)
+            task_mgr.log("  📊 走势引擎分析（v3.15 走势信号分解视图）")
+            task_mgr.log("=" * 70)
+            task_mgr.progress(10, "初始化走势引擎")
+
+            # 懒加载（项目约定：外部依赖延迟导入）
+            from modules.trend_analyzer import TrendAnalyzer
+
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+
+            try:
+                task_mgr.progress(20, "加载走势数据")
+                analyzer = TrendAnalyzer(db, enable_adapt=False)
+                task_mgr.log(f"  数据窗口: 近60期 | 信号源: 频率·遗漏·动量·升平降·和值·贝叶斯")
+                task_mgr.log(f"  自适应模式: 关闭（使用常量权重，回测证实价值有限）")
+                task_mgr.log("")
+
+                task_mgr.progress(40, "信号融合计算")
+                result = analyzer.predict(target_issue='', period=60)
+            finally:
+                db.disconnect()
+
+            if result.get('error'):
+                task_mgr.log(f"✗ {result['error']}")
+                task_mgr.progress(0, "分析失败")
+                return
+
+            positions = result.get('positions', {})
+            if not positions:
+                task_mgr.log("✗ 无可用走势数据")
+                task_mgr.progress(0, "无数据")
+                return
+
+            task_mgr.progress(70, "输出结果")
+            task_mgr.append_section_header("🎯 走势引擎推荐（相对热度排序）")
+
+            pos_order = ['wan', 'qian', 'bai', 'shi', 'ge']
+            pos_names = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
+
+            for p in pos_order:
+                pdata = positions.get(p)
+                if not pdata:
+                    continue
+                pname = pos_names.get(p, p)
+                top5 = pdata.get('top5', [])
+                hotness = pdata.get('relative_hotness', {})
+                breakdown = pdata.get('signal_breakdown', {})
+                features = pdata.get('features', {})
+
+                task_mgr.append_info(f"  【{pname}】 Top-5: {' '.join(str(d) for d in top5)}")
+
+                # 相对热度
+                hot_str = " | ".join(f"{d}→{hotness.get(str(d), hotness.get(d, 0)):.0f}" for d in top5)
+                task_mgr.append_info(f"    相对热度: {hot_str}")
+
+                # 信号源分解
+                if breakdown:
+                    sig_str = " ".join(f"{s}:{w:.2f}" for s, w in sorted(breakdown.items()))
+                    task_mgr.append_info(f"    信号权重: {sig_str}")
+
+                # 可读特征 (结构: {'freq_pct':{d:v}, 'omission':{d:v}, 'direction_pref':str})
+                if features:
+                    freq_map = features.get('freq_pct', {})
+                    om_map = features.get('omission', {})
+                    dir_pref = features.get('direction_pref', '')
+                    feat_parts = []
+                    for d in top5:
+                        freq = freq_map.get(d, freq_map.get(str(d), 0))
+                        om = om_map.get(d, om_map.get(str(d), 0))
+                        feat_parts.append(f"{d}:频率{freq}%/遗漏{om}期")
+                    if feat_parts:
+                        task_mgr.append_info(f"    可读特征: {', '.join(feat_parts)}")
+                    if dir_pref:
+                        task_mgr.append_info(f"    方向偏好: {dir_pref}")
+
+            # 信号源诊断
+            diag = result.get('signal_diagnostics', {})
+            if diag:
+                task_mgr.append_section_header("📈 信号源诊断")
+                for sname, info in sorted(diag.items()):
+                    if isinstance(info, dict):
+                        task_mgr.append_info(
+                            f"  {sname}: 权重={info.get('weight', 0):.3f} | "
+                            f"EWMA={info.get('ewma', 0):.3f} | 样本数={info.get('samples', 0)}"
+                        )
+
+            # 诚实免责
+            task_mgr.append_section_header("⚠️ 诚实声明")
+            task_mgr.append_info("  • relative_hotness 为归一化打分（相对热度），非命中概率")
+            task_mgr.append_info("  • 排列5公平摇号，历史走势无法稳定超越随机基线（Top-1≈10%）")
+            task_mgr.append_info("  • 300期walk-forward回测: 融合命中率50.07%≈随机50%，信号源价值有限")
+            task_mgr.append_info("  • 本视图用于数据探索与信号分解，不承诺预测准确性")
+
+            # 复用命中率概览（真实验证数据）
+            self._append_hit_rate_overview(task_mgr)
+
+            task_mgr.progress(100, "完成")
+            # ★ 结果仪表盘：合并视图呈现走势引擎 Top-5 信号分解
+            self._show_result_dashboard(trend_result=result)
+            task_mgr.log("\n✓ 走势引擎分析完成")
+
+        except Exception as e:
+            task_mgr.log(f"\n  [错误] 走势引擎分析失败: {str(e)}")
+            task_mgr.log(f"  [错误详情]\n{traceback.format_exc()}")
+            task_mgr.progress(0, "错误")
+
+    # ============================================================
+    # 业务任务 - 智能分析中心（合并 流水线 + 走势 + 快速预测）
+    # ============================================================
+
+    def _execute_unified_analysis(self, task_mgr):
+        """
+        智能分析中心（极简模式）：单一「开始分析」按钮自动执行完整流程。
+
+        依次运行：四步流水线预测 → 走势引擎分解 → 快速预测（纯统计），
+        所有结果输出到同一右侧结果面板（含顶部预测结果仪表盘），
+        无需任何参数配置或模式选择。
+        """
+        task_mgr.log("=" * 70)
+        task_mgr.append_section_header("🚀 智能分析（完整流程：流水线 + 走势引擎 + 快速预测）")
+        task_mgr.log("=" * 70)
+        task_mgr.log("  自动执行全部分析功能，结果将呈现在同一结果面板（顶部「预测结果仪表盘」）\n")
+
+        # 1) 四步流水线预测（主预测，注册 pending 预测记录）
+        self._execute_four_step_pipeline(task_mgr)
+        # 2) 走势引擎分解（信号源 Top-5 辅助）
+        self._execute_trend_analysis(task_mgr)
+        # 3) 快速预测（纯统计，对应 CLI predict --model optimized）
+        self._run_quick_predict_core(task_mgr, 'optimized')
+
+        # 合并视图：用已保存的各来源产物统一渲染仪表盘
+        self._render_unified_dashboard(task_mgr)
+        task_mgr.append_success("✅ 智能分析完成：全部分析结果均已呈现在同一结果面板")
+
+    def _run_quick_predict_core(self, task_mgr, model='optimized'):
+        """CLI 同步：predict --model optimized/old（纯统计预测，跳过验证/学习/报告）"""
+        try:
+            task_mgr.append_section_header("⚡ 快速预测（纯统计，P5Predictor）")
+            task_mgr.progress(10, "加载数据")
+
+            from modules.predictor import P5Predictor, P5PredictorConfig
+
+            db = P5Database()
+            if not db.connect():
+                task_mgr.append_error("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+            history_data = db.get_history_data(limit=200, order_by='issue DESC')
+            db.disconnect()
+
+            if not history_data:
+                task_mgr.append_warning("⚠ 无历史数据，请先执行数据爬取")
+                task_mgr.progress(0, "无数据")
+                return
+
+            current_issue = history_data[0].get('issue', '')
+            target_issue = str(int(current_issue) + 1)
+            predictor = P5Predictor(
+                config=P5PredictorConfig.baseline_v21() if model == 'old' else None
+            )
+
+            task_mgr.progress(50, "预测中")
+            result = predictor.predict(history_data, current_issue)
+            if 'error' in result:
+                task_mgr.append_error(f"✗ 预测失败: {result['error']}")
+                task_mgr.progress(0, "分析失败")
+                return
+
+            # 构造统一仪表盘可用的 final_report 结构
+            pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+            final = {
+                'target_issue': target_issue,
+                'trend_prediction': {},
+                'recommended_combinations': [],
+                'risk_warning': result.get('risk_warning', '理性购彩，量力而行'),
+            }
+            for i, pk in enumerate(pos_keys):
+                probs = result['fused_probabilities'][i]
+                top = sorted(probs.items(), key=lambda x: float(x[1]), reverse=True)[:5]
+                final['trend_prediction'][pk] = {'numbers': [int(n) for n, _ in top]}
+            for combo in result.get('top_combinations', [])[:5]:
+                if isinstance(combo, dict):
+                    final['recommended_combinations'].append({
+                        'combination': combo.get('combination', ''),
+                        'confidence': combo.get('confidence', 0),
+                    })
+
+            task_mgr.append_success(f"✓ 快速预测完成（模型: {model}）目标期号: {target_issue}")
+            for pk, pn in zip(pos_keys, ['万位', '千位', '百位', '十位', '个位']):
+                nums = final['trend_prediction'][pk]['numbers']
+                task_mgr.append_info(f"  {pn}: {' '.join(str(n) for n in nums)}")
+
+            self._prediction_clipboard = self._build_prediction_clipboard(final)
+            self._show_result_dashboard(quick_final=final)
+            task_mgr.progress(100, "完成")
+
+        except Exception as e:
+            task_mgr.log(f"\n✗ 快速预测异常: {str(e)}")
+            task_mgr.log(traceback.format_exc())
+            task_mgr.progress(0, "异常终止")
+
+    # ============================================================
+    # 结果面板 - 预测结果仪表盘（需求3：结构化层级展示 + 视觉突出）
+    # ============================================================
+
+    # ---- 聚合分析辅助方法（去重 / 置信度 / 备选 / 详细分析） ----
+
+    def _extract_source_data(self, pf, tr, qf):
+        """从三个分析源抽取每位置 Top 候选，供聚合去重使用。
+        返回: (picks, top5, combos, target_issue)
+          picks[pos][src] = 该位置主推数字(int); top5[pos][src] = Top5列表
+          combos[src] = 该源完整推荐组合字符串
+        """
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+        picks = {pk: {} for pk in pos_keys}
+        top5 = {pk: {} for pk in pos_keys}
+        combos = {}
+        target_issue = ''
+
+        # 四步流水线
+        if isinstance(pf, dict):
+            tp = pf.get('trend_prediction') or {}
+            if isinstance(tp, dict):
+                for pk in pos_keys:
+                    cell = tp.get(pk)
+                    nums = (cell.get('numbers', []) if isinstance(cell, dict) else []) or []
+                    if nums:
+                        picks[pk]['pipeline'] = int(nums[0])
+                        top5[pk]['pipeline'] = [int(x) for x in nums[:5]]
+            rc = pf.get('recommended_combinations') or []
+            if rc and isinstance(rc[0], dict) and rc[0].get('combination'):
+                combos['pipeline'] = str(rc[0]['combination'])
+            target_issue = pf.get('next_issue') or target_issue
+
+        # 快速预测
+        if isinstance(qf, dict):
+            tp = qf.get('trend_prediction') or {}
+            if isinstance(tp, dict):
+                for pk in pos_keys:
+                    cell = tp.get(pk)
+                    nums = (cell.get('numbers', []) if isinstance(cell, dict) else []) or []
+                    if nums:
+                        picks[pk]['quick'] = int(nums[0])
+                        top5[pk]['quick'] = [int(x) for x in nums[:5]]
+            rc = qf.get('recommended_combinations') or []
+            if rc and isinstance(rc[0], dict) and rc[0].get('combination'):
+                combos['quick'] = str(rc[0]['combination'])
+            if not target_issue:
+                target_issue = qf.get('target_issue') or ''
+
+        # 走势引擎（信号源：每位置 top5）
+        if isinstance(tr, dict):
+            pos = tr.get('positions') or {}
+            if isinstance(pos, dict):
+                for pk in pos_keys:
+                    pdata = pos.get(pk) or {}
+                    t5 = pdata.get('top5', []) if isinstance(pdata, dict) else []
+                    if t5:
+                        picks[pk]['trend'] = int(t5[0])
+                        top5[pk]['trend'] = [int(x) for x in t5[:5]]
+            if not target_issue:
+                target_issue = tr.get('target_issue') or ''
+
+        # 由走势引擎 top5[0] 拼接其完整组合
+        if any('trend' in picks[pk] for pk in pos_keys):
+            try:
+                combos['trend'] = ''.join(
+                    str(picks[pk].get('trend')) for pk in pos_keys)
+            except Exception:
+                combos.pop('trend', None)
+
+        return picks, top5, combos, target_issue
+
+    def _aggregate_recommendation(self, picks):
+        """多源聚合：每个位置多数投票，平票优先 四步流水线（旗舰七算法融合）。
+        返回: (consensus[pos]=数字|None, agree[pos]=同意该数字的信号源数)
+        """
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+        consensus, agree = {}, {}
+        for pk in pos_keys:
+            srcs = picks.get(pk, {})
+            if not srcs:
+                consensus[pk], agree[pk] = None, 0
+                continue
+            cnt = {}
+            for v in srcs.values():
+                cnt[v] = cnt.get(v, 0) + 1
+            maxc = max(cnt.values())
+            tied = [d for d, c in cnt.items() if c == maxc]
+            if len(tied) == 1:
+                chosen = tied[0]
+            else:
+                chosen = None
+                for pref in ('pipeline', 'quick', 'trend'):
+                    if pref in srcs and srcs[pref] in tied:
+                        chosen = srcs[pref]
+                        break
+                if chosen is None:
+                    chosen = tied[0]
+            consensus[pk], agree[pk] = chosen, maxc
+        return consensus, agree
+
+    def _build_explanation(self, total_sources, conf, high_conf, picks, pos_keys):
+        """主推荐简短解释（诚实口径：一致性=多源重合度，非命中概率）"""
+        if total_sources < 2:
+            return ("当前为单一分析源结果（其余分析进行中），置信度需多源聚合后给出。"
+                    "排列5为公平随机摇号，本预测仅供数据探索，不保证命中。")
+        agree_pos = sum(1 for pk in pos_keys
+                        if len(picks[pk]) >= 2 and len(set(picks[pk].values())) == 1)
+        if high_conf:
+            head = "两个主预测（四步流水线 / 快速预测）完全一致，已合并为高置信度推荐。"
+        else:
+            head = "两个主预测存在差异，已按预设规则（多源多数投票、平票优先四步流水线）筛选主推荐。"
+        pos_note = f"其中 {agree_pos}/{len(pos_keys)} 个位置多源完全一致。"
+        honest = ("综合一致性置信度仅反映多源信号重合程度；排列5公平摇号，"
+                  "历史无法稳定超越随机基线（Top-1≈10%），不保证命中。")
+        return " ".join([head, pos_note, honest])
+
+    def _build_aggregated_clipboard(self, target_issue, main_combo, conf, high_conf, combos, picks, top5=None):
+        """生成可复制的结构化摘要（主推荐 + 备选），确保复制的是算法预测结果
+        
+        算法预测流程：
+        1. 多源数据采集：四步流水线、快速预测、走势引擎
+        2. 逐位聚合：多数投票 + 平票优先四步流水线
+        3. 置信度计算：多源信号重合度百分比
+        4. 最终输出：综合推荐组合
+        """
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+        pos_names = ['万位', '千位', '百位', '十位', '个位']
+        top5 = top5 or {}
+        
+        # 获取各位置所有候选号码（从top5中提取所有来源的Top5号码）
+        all_candidates = {}
+        for pk, pn in zip(pos_keys, pos_names):
+            # 收集所有来源的Top5号码
+            all_digits = []
+            seen = set()
+            
+            # 优先获取主推号码
+            vals = picks.get(pk, {})
+            for src in ['pipeline', 'quick', 'trend']:
+                if src in vals:
+                    val = vals[src]
+                    if val not in seen:
+                        all_digits.append(val)
+                        seen.add(val)
+            
+            # 从top5中获取更多候选号码
+            src_top5 = top5.get(pk, {})
+            for src in ['pipeline', 'quick', 'trend']:
+                if src in src_top5:
+                    for val in src_top5[src]:
+                        if val not in seen:
+                            all_digits.append(val)
+                            seen.add(val)
+            
+            # 确保每个位置有5个候选号码
+            if len(all_digits) < 5:
+                for d in range(10):
+                    if d not in seen:
+                        all_digits.append(d)
+                        seen.add(d)
+                        if len(all_digits) >= 5:
+                            break
+            
+            all_candidates[pk] = all_digits[:5]
+        
+        lines = [
+            "╔══════════════════════════════════════════════╗",
+            "║           排列5 AI算法预测结果                ║",
+            "╚══════════════════════════════════════════════╝",
+            "",
+            f"📅 期号: {target_issue or '—'}",
+            f"⏰ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "",
+            f"🎯 【最终预测号码】: {main_combo}",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "",
+        ]
+        
+        # 各位置所有候选号码（按用户要求格式）
+        lines.append("📊 各位置候选号码:")
+        for pk, pn in zip(pos_keys, pos_names):
+            digits = all_candidates.get(pk, [])
+            if digits:
+                lines.append(f"   {pn}: {' '.join(str(d) for d in digits)}")
+        lines.append("")
+        
+        # 置信度信息
+        confidence_label = "★ 高置信度" if high_conf else "○ 常规置信度"
+        lines.append(f"📈 {confidence_label}")
+        if conf is not None:
+            lines.append(f"   综合一致性置信度: {conf}%")
+        lines.append("")
+        
+        # 算法说明
+        lines.append("🔍 算法说明:")
+        lines.append("   • 多源数据: 四步流水线 + 快速预测 + 走势引擎")
+        lines.append("   • 聚合策略: 多数投票（平票优先四步流水线）")
+        lines.append("   • 置信度: 多源信号重合度百分比")
+        lines.append("")
+        
+        # 逐位来源详情
+        lines.append("📋 逐位来源详情:")
+        for pk, pn in zip(pos_keys, pos_names):
+            vals = picks.get(pk, {})
+            if vals:
+                digits = ", ".join(f"{k}={v}" for k, v in sorted(vals.items()))
+                main_digit = next(iter(vals.values()))
+                lines.append(f"   {pn}: {main_digit}  [{digits}]")
+        lines.append("")
+        
+        # 各分析源原始结果
+        lines.append("💡 各分析源结果（参考）:")
+        for key, name in [('pipeline', '四步流水线'), ('quick', '快速预测'), ('trend', '走势引擎')]:
+            if combos.get(key):
+                is_main = (combos[key] == main_combo)
+                marker = "★" if is_main else " "
+                lines.append(f"   {marker} {name}: {combos[key]}" + (" ← 选为最终预测" if is_main else ""))
+        lines.append("")
+        
+        lines.append("⚠ 彩票开奖具有随机性，本预测仅供数据研究参考。")
+        
+        return "\n".join(lines)
+
+    def _toggle_detail(self):
+        """展开/收起「详细分析」折叠区"""
+        f = getattr(self, '_detail_frame', None)
+        if f is None:
+            return
+        if f.winfo_manager():
+            f.pack_forget()
+        else:
+            f.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+    def _build_alt_section(self, parent, combos, main_combo, pos_keys, pos_names):
+        """备选号码折叠区（视觉弱化，明确区别于主推荐）"""
+        alt_outer = tk.Frame(parent, bg=COLORS['bg_card'],
+                             highlightbackground=COLORS['border'],
+                             highlightthickness=1)
+        alt_outer.pack(fill=tk.X, pady=(0, 8))
+        
+        toggle_btn = tk.Button(alt_outer, text="▸ 备选号码（各分析源结果）", 
+                               bg=COLORS['bg_card'], fg=COLORS['text_secondary'], 
+                               font=('微软雅黑', 10, 'bold'), relief='flat',
+                               cursor='hand2', padx=12, pady=6)
+        toggle_btn.pack(anchor=tk.W)
+        
+        content = tk.Frame(alt_outer, bg=COLORS['bg_card'])
+        content.pack_forget()
+        self._alt_content = content
+        self._alt_visible = False
+
+        def _toggle():
+            if self._alt_visible:
+                content.pack_forget()
+                toggle_btn.config(text="▸ 备选号码（各分析源结果）")
+                self._alt_visible = False
+            else:
+                content.pack(fill=tk.X, padx=12, pady=(0, 8))
+                toggle_btn.config(text="▾ 收起备选号码")
+                self._alt_visible = True
+
+        toggle_btn.config(command=_toggle)
+
+        for key, name in [('pipeline', '四步流水线'), ('quick', '快速预测'), ('trend', '走势引擎')]:
+            c = combos.get(key)
+            if not c:
+                continue
+            is_main = (c == main_combo)
+            row = tk.Frame(content, bg=COLORS['bg_card'])
+            row.pack(fill=tk.X, pady=3)
+            
+            # 来源标签
+            tk.Label(row, text=f"📌 {name}:", bg=COLORS['bg_card'],
+                     fg=COLORS['text_muted'], font=('微软雅黑', 9, 'bold')).pack(side=tk.LEFT)
+            
+            # 号码
+            num_color = COLORS['accent_p5_light'] if is_main else COLORS['text_secondary']
+            num_font = ('Consolas', 11, 'bold') if is_main else ('Consolas', 11)
+            tk.Label(row, text=c,
+                     bg=COLORS['bg_card'], fg=num_color, font=num_font).pack(side=tk.LEFT, padx=(8, 0))
+            
+            # 主推荐标记
+            if is_main:
+                tk.Label(row, text="← 选为最终预测",
+                         bg=COLORS['bg_card'], fg=COLORS['accent_p5'], 
+                         font=('微软雅黑', 8, 'bold')).pack(side=tk.LEFT, padx=(6, 0))
+
+    def _build_detail_section(self, parent, picks, top5, combos, target_issue,
+                              pos_keys, pos_names, total_sources, conf, high_conf):
+        """详细分析：各来源 Top 候选 + 计算逻辑 + 位置差异点"""
+        tk.Label(parent, text="详细分析（来源 / 差异 / 计算逻辑）", bg=COLORS['bg_primary'],
+                 fg=COLORS['text_primary'], font=('微软雅黑', 10, 'bold')
+                 ).pack(anchor=tk.W, padx=8, pady=(6, 4))
+        logic = {
+            'pipeline': '四步流水线：七算法融合流水线（频率0.54+遗漏0.34+贝叶斯0.10+趋势/马尔可夫/形态/特征），'
+                        '多源30期走势融合，系统旗舰预测。',
+            'quick': '快速预测：P5Predictor 优化模型纯统计预测（频率/遗漏/贝叶斯融合），'
+                     '对应 CLI predict --model optimized。',
+            'trend': '走势引擎：6信号源（频率·遗漏·动量·升平降·和值重心·贝叶斯）相对热度打分，'
+                     '输出各位置 Top-5。',
+        }
+        for key, name in [('pipeline', '四步流水线'), ('quick', '快速预测'), ('trend', '走势引擎')]:
+            present = combos.get(key) or any(key in picks[pk] for pk in pos_keys)
+            if not present:
+                continue
+            blk = tk.Frame(parent, bg=COLORS['bg_secondary'], relief='groove', bd=1)
+            blk.pack(fill=tk.X, padx=8, pady=3)
+            tk.Label(blk, text=f"▎{name}", bg=COLORS['bg_secondary'], fg=COLORS['accent_p5'],
+                     font=('微软雅黑', 9, 'bold')).pack(anchor=tk.W, padx=8, pady=(4, 2))
+            line = '  '.join(
+                f"{pn}:{''.join(str(x) for x in top5.get(pk, {}).get(key, []))}"
+                for pk, pn in zip(pos_keys, pos_names))
+            tk.Label(blk, text=line, bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
+                     font=('Consolas', 8), wraplength=600, justify=tk.LEFT
+                     ).pack(anchor=tk.W, padx=8)
+            tk.Label(blk, text=logic[key], bg=COLORS['bg_secondary'], fg=COLORS['text_muted'],
+                     font=('微软雅黑', 8), wraplength=600, justify=tk.LEFT
+                     ).pack(anchor=tk.W, padx=8, pady=(2, 4))
+
+        # 位置差异点
+        diff_rows = []
+        for pk, pn in zip(pos_keys, pos_names):
+            vals = picks.get(pk, {})
+            if len(set(vals.values())) > 1:
+                diff_rows.append(f"{pn}位分歧: " + ' / '.join(f"{k}={v}" for k, v in vals.items()))
+        if diff_rows:
+            dblk = tk.Frame(parent, bg=COLORS['bg_secondary'], relief='groove', bd=1)
+            dblk.pack(fill=tk.X, padx=8, pady=3)
+            tk.Label(dblk, text="▎位置差异点", bg=COLORS['bg_secondary'], fg=COLORS['warning'],
+                     font=('微软雅黑', 9, 'bold')).pack(anchor=tk.W, padx=8, pady=(4, 2))
+            for d in diff_rows:
+                tk.Label(dblk, text=d, bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
+                         font=('Consolas', 8), wraplength=600, justify=tk.LEFT
+                         ).pack(anchor=tk.W, padx=8, pady=(0, 2))
+            tk.Label(dblk, text="注：主推荐按「多源多数投票、平票优先四步流水线」规则生成。",
+                     bg=COLORS['bg_secondary'], fg=COLORS['text_muted'],
+                     font=('微软雅黑', 8), wraplength=600, justify=tk.LEFT
+                     ).pack(anchor=tk.W, padx=8, pady=(0, 4))
+
+    def _show_result_dashboard(self, pipeline_final=None, trend_result=None, quick_final=None):
+        """
+        聚合多源预测，去重 + 置信度排序，仅展示一个最优主推荐号码，
+        备选号码折叠保留，并提供「查看详细分析」入口。
+
+        两主预测（四步流水线 / 快速预测）一致 → 高置信度合并；
+        不一致 → 按预设规则（多源多数投票、平票优先四步流水线）筛选主推荐。
+        """
+        if pipeline_final is not None:
+            self._last_pipeline_final = pipeline_final
+        if trend_result is not None:
+            self._last_trend_result = trend_result
+        if quick_final is not None:
+            self._last_quick_final = quick_final
+
+        pf = self._last_pipeline_final
+        tr = self._last_trend_result
+        qf = self._last_quick_final
+        if not (pf or tr or qf):
+            self._hide_result_dashboard()
+            return
+
+        # 清空旧内容
+        for w in self.result_dash.winfo_children():
+            w.destroy()
+
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+        pos_names = ['万位', '千位', '百位', '十位', '个位']
+
+        picks, top5, combos, target_issue = self._extract_source_data(pf, tr, qf)
+        consensus, agree = self._aggregate_recommendation(picks)
+
+        # 可用信号源数（并集，用于措辞）
+        total_sources = len({s for pk in pos_keys for s in picks[pk]})
+        # 主推荐组合
+        main_combo = ''.join(str(consensus[pk]) for pk in pos_keys if consensus[pk] is not None)
+        # 综合一致性置信度（仅当多源可用）
+        pos_n = {pk: len(picks[pk]) for pk in pos_keys}
+        ratios = [agree[pk] / pos_n[pk] for pk in pos_keys
+                  if consensus[pk] is not None and pos_n[pk] > 0]
+        conf = int(round(sum(ratios) / len(ratios) * 100)) if (total_sources >= 2 and ratios) else None
+        # 两主预测（四步流水线 / 快速预测）逐位主推是否完全一致 → 高置信度
+        raw_p = ''.join(str(picks[pk].get('pipeline')) for pk in pos_keys if 'pipeline' in picks[pk])
+        raw_q = ''.join(str(picks[pk].get('quick')) for pk in pos_keys if 'quick' in picks[pk])
+        high_conf = bool(raw_p and raw_q and raw_p == raw_q and total_sources >= 2)
+
+        # 更新复制缓冲（主推荐 + 备选）
+        self._prediction_clipboard = self._build_aggregated_clipboard(
+            target_issue, main_combo, conf, high_conf, combos, picks, top5)
+        # 保存复制元数据（供复制成功提示展示 期数/置信度/号码）
+        self._clipboard_meta = {
+            'target_issue': target_issue,
+            'conf': conf,
+            'high_conf': high_conf,
+            'main_combo': main_combo,
+        }
+
+        # ---- 渲染 ----
+        dash = self.result_dash
+
+        # 标题栏（增强视觉效果）
+        hdr = tk.Frame(dash, bg=COLORS['accent_p5'], height=42)
+        hdr.pack(fill=tk.X)
+        hdr.pack_propagate(False)
+        
+        hdr_left = tk.Frame(hdr, bg=COLORS['accent_p5'])
+        hdr_left.pack(side=tk.LEFT, padx=12, pady=6)
+        tk.Label(hdr_left, text="🎯 AI智能预测", bg=COLORS['accent_p5'], fg='#ffffff',
+                 font=('微软雅黑', 12, 'bold')).pack(anchor=tk.W)
+        
+        hdr_right = tk.Frame(hdr, bg=COLORS['accent_p5'])
+        hdr_right.pack(side=tk.RIGHT, padx=8, pady=6)
+        
+        detail_btn = tk.Button(hdr_right, text="🔍 详细分析", command=self._toggle_detail,
+                               bg=COLORS['accent_p5_light'], fg='#ffffff', 
+                               font=('微软雅黑', 9, 'bold'),
+                               relief='flat', padx=10, pady=3, cursor='hand2',
+                               activebackground=COLORS['accent_p5_bright'])
+        detail_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        body = tk.Frame(dash, bg=COLORS['bg_secondary'])
+        body.pack(fill=tk.X, padx=12, pady=10)
+
+        # 期号信息（更大字体）
+        issue_frame = tk.Frame(body, bg=COLORS['bg_secondary'])
+        issue_frame.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(issue_frame, text=f"📅 目标期号", bg=COLORS['bg_secondary'],
+                 fg=COLORS['text_muted'], font=('微软雅黑', 9)).pack(side=tk.LEFT)
+        tk.Label(issue_frame, text=f"{target_issue or '—'}", bg=COLORS['bg_secondary'],
+                 fg=COLORS['text_primary'], font=('Consolas', 12, 'bold')).pack(side=tk.LEFT, padx=(6, 0))
+
+        # ★ 预测号码卡片（增强视觉效果）
+        rec_frame = tk.Frame(body, bg=COLORS['bg_card'], 
+                             highlightbackground=COLORS['border'], 
+                             highlightthickness=1,
+                             relief='flat')
+        rec_frame.pack(fill=tk.X, pady=(0, 8), ipady=8)
+        
+        # 卡片标题
+        rec_title = tk.Frame(rec_frame, bg=COLORS['bg_card'])
+        rec_title.pack(fill=tk.X, padx=12, pady=(8, 4))
+        tk.Label(rec_title, text="🎯 算法预测号码", bg=COLORS['bg_card'], fg=COLORS['accent_p5'],
+                 font=('微软雅黑', 11, 'bold')).pack(anchor=tk.W)
+
+        # 号码展示区域（更大字体，更好布局）
+        chip_row = tk.Frame(rec_frame, bg=COLORS['bg_card'])
+        chip_row.pack(fill=tk.X, padx=12, pady=(4, 6))
+        
+        # 创建号码芯片（带圆角效果）
+        for pk, pn in zip(pos_keys, pos_names):
+            col = tk.Frame(chip_row, bg=COLORS['bg_card'])
+            col.pack(side=tk.LEFT, padx=(0, 12))
+            
+            # 位置名称
+            tk.Label(col, text=pn, bg=COLORS['bg_card'], fg=COLORS['text_muted'],
+                     font=('微软雅黑', 8, 'bold')).pack(anchor=tk.CENTER)
+            
+            # 号码芯片
+            val = consensus.get(pk)
+            num_bg = COLORS['accent_p5'] if val is not None else COLORS['bg_secondary']
+            num_fg = '#ffffff' if val is not None else COLORS['text_muted']
+            num_label = tk.Label(col, text=str(val) if val is not None else '?',
+                                 bg=num_bg, fg=num_fg,
+                                 font=('Consolas', 20, 'bold'), width=2,
+                                 relief='flat', padx=8, pady=6,
+                                 cursor='hand2')
+            num_label.pack(pady=(4, 2))
+            
+            # 悬停效果
+            num_label.bind('<Enter>', lambda e, b=num_label: b.config(bg=COLORS['accent_p5_light']))
+            num_label.bind('<Leave>', lambda e, b=num_label, bg=num_bg: b.config(bg=bg))
+            
+            # 一致性标记
+            if total_sources >= 2 and val is not None:
+                a = agree[pk]
+                n = pos_n[pk]
+                mark = '✓' if a == n else f'{a}/{n}'
+                mark_color = COLORS['success_light'] if a == n else COLORS['text_muted']
+                tk.Label(col, text=mark, bg=COLORS['bg_card'],
+                         fg=mark_color, font=('微软雅黑', 8, 'bold')).pack(anchor=tk.CENTER)
+
+        # 置信度信息条
+        meta_row = tk.Frame(rec_frame, bg=COLORS['bg_card'])
+        meta_row.pack(fill=tk.X, padx=12, pady=(0, 6))
+        
+        if high_conf:
+            high_conf_label = tk.Label(meta_row, text="★ 高置信度", bg='#065f46', fg='#d1fae5',
+                                       font=('微软雅黑', 9, 'bold'), relief='flat', 
+                                       padx=10, pady=3)
+            high_conf_label.pack(side=tk.LEFT, padx=(0, 8))
+        
+        if conf is not None:
+            conf_label = tk.Label(meta_row, text=f"综合一致性: {conf}%",
+                                  bg=COLORS['bg_card'], fg=COLORS['text_primary'],
+                                  font=('微软雅黑', 10, 'bold'))
+            conf_label.pack(side=tk.LEFT)
+
+        # 算法分析依据折叠区（增强视觉效果）
+        analysis_frame = tk.Frame(body, bg=COLORS['bg_card'],
+                                  highlightbackground=COLORS['border'],
+                                  highlightthickness=1)
+        analysis_frame.pack(fill=tk.X, pady=(0, 8))
+        
+        analysis_toggle = tk.Button(analysis_frame, text="▸ 查看算法分析依据", 
+                                    bg=COLORS['bg_card'], fg=COLORS['accent_info'],
+                                    font=('微软雅黑', 10, 'bold'), relief='flat',
+                                    cursor='hand2', padx=12, pady=6)
+        analysis_toggle.pack(anchor=tk.W)
+        
+        analysis_content = tk.Frame(analysis_frame, bg=COLORS['bg_card'])
+        analysis_content.pack_forget()
+        self._analysis_content = analysis_content
+        self._analysis_visible = False
+
+        def _toggle_analysis():
+            if self._analysis_visible:
+                analysis_content.pack_forget()
+                analysis_toggle.config(text="▸ 查看算法分析依据")
+                self._analysis_visible = False
+            else:
+                analysis_content.pack(fill=tk.X, padx=12, pady=(0, 8))
+                analysis_toggle.config(text="▾ 收起算法分析依据")
+                self._analysis_visible = True
+
+        analysis_toggle.config(command=_toggle_analysis)
+
+        # 算法模型说明（改进字体大小）
+        model_frame = tk.Frame(analysis_content, bg=COLORS['bg_card'])
+        model_frame.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(model_frame, text="📊 算法模型", bg=COLORS['bg_card'], 
+                 fg=COLORS['accent_p5'], font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W, pady=(0, 3))
+        
+        model_text = (
+            "  • 四步流水线：七算法融合（频率0.54 + 遗漏0.34 + 贝叶斯0.10 + 趋势/马尔可夫/形态/特征）\n"
+            "  • 快速预测：P5Predictor 优化模型（频率/遗漏/贝叶斯融合）\n"
+            "  • 走势引擎：6信号源相对热度打分（频率·遗漏·动量·升平降·和值重心·贝叶斯）"
+        )
+        tk.Label(model_frame, text=model_text, bg=COLORS['bg_card'], 
+                 fg=COLORS['text_secondary'], font=('微软雅黑', 9),
+                 wraplength=620, justify=tk.LEFT).pack(anchor=tk.W)
+
+        # 策略规则说明（改进字体大小）
+        strategy_frame = tk.Frame(analysis_content, bg=COLORS['bg_card'])
+        strategy_frame.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(strategy_frame, text="⚙ 聚合策略", bg=COLORS['bg_card'], 
+                 fg=COLORS['accent_ai'], font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W, pady=(0, 3))
+        
+        strategy_text = (
+            "  • 逐位聚合：多数投票原则（多源一致则选该号码）\n"
+            "  • 平票处理：优先选择四步流水线结果\n"
+            "  • 置信度计算：多源信号重合度百分比\n"
+            "  • 高置信度判定：四步流水线与快速预测完全一致"
+        )
+        tk.Label(strategy_frame, text=strategy_text, bg=COLORS['bg_card'], 
+                 fg=COLORS['text_secondary'], font=('微软雅黑', 9),
+                 wraplength=620, justify=tk.LEFT).pack(anchor=tk.W)
+
+        # 各位置来源依据（改进字体大小）
+        source_frame = tk.Frame(analysis_content, bg=COLORS['bg_card'])
+        source_frame.pack(fill=tk.X)
+        tk.Label(source_frame, text="🔍 预测依据（各位置来源）", bg=COLORS['bg_card'], 
+                 fg=COLORS['accent_info'], font=('微软雅黑', 10, 'bold')).pack(anchor=tk.W, pady=(0, 3))
+        
+        for pk, pn in zip(pos_keys, pos_names):
+            vals = picks.get(pk, {})
+            if vals:
+                source_info = ", ".join(f"{k}={v}" for k, v in sorted(vals.items()))
+                tk.Label(source_frame, text=f"  {pn}: {consensus.get(pk)}  [来源: {source_info}]", 
+                         bg=COLORS['bg_card'], fg=COLORS['text_secondary'],
+                         font=('Consolas', 9)).pack(anchor=tk.W)
+
+        # ★ 备选号码（折叠，增强视觉效果）
+        self._build_alt_section(body, combos, main_combo, pos_keys, pos_names)
+
+        # 风险提示（若有，改进字体大小）
+        risk = ''
+        if isinstance(pf, dict):
+            risk = pf.get('risk_warning', '') or ''
+        elif isinstance(qf, dict):
+            risk = qf.get('risk_warning', '') or ''
+        if risk:
+            risk_frame = tk.Frame(body, bg=COLORS['bg_card'],
+                                  highlightbackground=COLORS['accent_warning'],
+                                  highlightthickness=1)
+            risk_frame.pack(fill=tk.X, pady=(0, 8))
+            tk.Label(risk_frame, text="⚠ " + risk, bg=COLORS['bg_card'], fg=COLORS['accent_warning_light'],
+                     font=('微软雅黑', 9), wraplength=620, justify=tk.LEFT
+                     ).pack(anchor=tk.W, padx=12, pady=6)
+
+        # ★ 详细分析（默认折叠）
+        self._detail_frame = tk.Frame(dash, bg=COLORS['bg_primary'])
+        self._detail_frame.pack_forget()
+        self._build_detail_section(self._detail_frame, picks, top5, combos, target_issue,
+                                   pos_keys, pos_names, total_sources, conf, high_conf)
+
+        self.result_dash.pack(fill=tk.X, padx=6, pady=6)
+
+    def _hide_result_dashboard(self):
+        """隐藏预测结果仪表盘（任务开始前调用）"""
+        try:
+            self.result_dash.pack_forget()
+        except Exception:
+            pass
+
+    def _render_unified_dashboard(self, task_mgr):
+        """统一分析结束时，用已保存的各来源产物集中渲染仪表盘"""
+        self._show_result_dashboard()
 
     def _execute_backtest(self, task_mgr):
         """
@@ -1680,7 +3600,6 @@ class LotteryGUI:
                 progress_val = min(80, 40 + int(((i + 1) / 10) * 40))
                 task_mgr.progress(progress_val, f"回测中... {progress_val - 40}%")
                 time.sleep(0.1)
-                task_mgr.root.update_idletasks()
 
             backtest_result = backtest_engine.run_backtest(start_index, test_count)
 
@@ -1878,7 +3797,6 @@ class LotteryGUI:
 
             # 保存特征分析结果到数据库 (v3.3: 统一入库 p5_artifact, 不再写本地 JSON 文件)
             try:
-                from modules.database import P5Database
                 feat_db = P5Database()
                 if feat_db.connect():
                     feat_db.save_artifact(
@@ -1982,14 +3900,21 @@ class LotteryGUI:
                     result_label.config(text="✗ 请输入期号", fg=COLORS['accent_danger'])
                     return
 
-                try:
-                    actual_nums = [int(e.get()) for e in num_entries]
-                    if any(not (0 <= n <= 9) for n in actual_nums):
-                        result_label.config(text="✗ 号码必须在0-9之间", fg=COLORS['accent_danger'])
+                # 先收集输入值，确保格式正确
+                raw_nums = []
+                for e in num_entries:
+                    val = e.get().strip()
+                    try:
+                        n = int(val)
+                        if not (0 <= n <= 9):
+                            result_label.config(text="✗ 号码必须在0-9之间", fg=COLORS['accent_danger'])
+                            return
+                        raw_nums.append(n)
+                    except ValueError:
+                        result_label.config(text=f"✗ '{val}' 不是有效数字", fg=COLORS['accent_danger'])
                         return
-                except ValueError:
-                    result_label.config(text="✗ 请输入有效数字", fg=COLORS['accent_danger'])
-                    return
+                
+                actual_nums = raw_nums
 
                 result_label.config(text="正在验证...", fg=COLORS['accent_p5'])
                 input_win.after(100, lambda: verify_in_bg(target_issue, actual_nums))
@@ -2039,8 +3964,9 @@ class LotteryGUI:
                             fg=COLORS['accent_danger']))
 
                 except Exception as e:
+                    err_msg = str(e)
                     input_win.after(0, lambda: result_label.config(
-                        text=f"✗ 验证异常: {str(e)}", fg=COLORS['accent_danger']))
+                        text=f"✗ 验证异常: {err_msg}", fg=COLORS['accent_danger']))
 
             tk.Button(input_win, text="开始验证",
                       font=('微软雅黑', 10, 'bold'),
@@ -2057,6 +3983,249 @@ class LotteryGUI:
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("错误", f"创建验证窗口失败: {str(e)}")
+
+    def _execute_comprehensive_analysis_and_verify(self, task_mgr):
+        """
+        综合验证与分析（一键执行所有分析和验证任务）
+
+        执行流程（按顺序）：
+        1. 预测验证 — 检查待验证记录并更新命中率
+        2. 命中率统计 — 生成各位置命中率报告
+        3. 性能报告 — 生成AI预测性能评估
+        4. 历史回测 — 使用最近50期数据滚动回测
+        5. 特征分析 — 提取历史数据统计特征
+        6. 生成综合分析报告
+
+        优化：所有步骤共用同一个数据库连接，减少开销
+        """
+        try:
+            task_mgr.log("=" * 70)
+            task_mgr.log("  🔍 综合验证与分析（v3.11 一键执行）")
+            task_mgr.log("=" * 70)
+            task_mgr.log("\n  执行流程：验证 → 统计 → 回测 → 特征 → 报告")
+            task_mgr.log("  预计耗时: 10-20分钟\n")
+            task_mgr.progress(5, "开始综合验证与分析...")
+
+            # 初始化数据库连接（复用）
+            db = P5Database()
+            if not db.connect():
+                task_mgr.log("✗ 数据库连接失败")
+                task_mgr.progress(0, "数据库连接失败")
+                return
+
+            # ==========================================
+            # 步骤1: 预测验证
+            # ==========================================
+            task_mgr.log("\n" + "━" * 60)
+            task_mgr.log("【步骤1/5】执行预测验证...")
+            task_mgr.progress(10, "预测验证中")
+
+            try:
+                # 获取待验证记录
+                pending = db.get_pending_predictions()
+                if pending:
+                    task_mgr.log(f"  ℹ 找到 {len(pending)} 条待验证记录")
+                    # 依次验证（自动使用最新开奖数据）
+                    verified_count = 0
+                    for rec in pending[:3]:  # 最多验证最近3条
+                        target_issue = rec.get('target_issue', '')
+                        if not target_issue:
+                            continue
+                        
+                        # 获取实际开奖号码（从历史数据）
+                        db.cursor.execute(
+                            'SELECT wan, qian, bai, shi, ge FROM p5_history_data WHERE issue = %s',
+                            (target_issue,)
+                        )
+                        result = db.cursor.fetchone()
+                        
+                        if result:
+                            actual_nums = [result.get('wan'), result.get('qian'), 
+                                         result.get('bai'), result.get('shi'), 
+                                         result.get('ge')]
+                            
+                            try:
+                                report_uuid = rec.get('report_uuid', '')
+                                db.update_prediction_verification(
+                                    report_uuid=report_uuid,
+                                    target_issue=target_issue,
+                                    actual_numbers=actual_nums,
+                                    actual_issue=target_issue
+                                )
+                                verified_count += 1
+                                task_mgr.log(f"  ✓ 已验证期号: {target_issue}")
+                            except Exception as e:
+                                task_mgr.log(f"  ⚠ 验证期号 {target_issue} 失败: {str(e)}")
+                    
+                    task_mgr.log(f"  ✅ 预测验证完成: {verified_count} 条记录")
+                else:
+                    task_mgr.log("  ℹ 无待验证记录，跳过此步骤")
+                
+            except Exception as e:
+                task_mgr.log(f"  ⚠ 预测验证异常（不影响后续步骤）: {str(e)}")
+
+            # ==========================================
+            # 步骤2: 命中率统计
+            # ==========================================
+            task_mgr.log("\n" + "━" * 60)
+            task_mgr.log("【步骤2/5】生成命中率统计...")
+            task_mgr.progress(30, "命中率统计中")
+
+            try:
+                db.update_performance_stats()
+                stats = db.get_verification_stats()
+                
+                if stats.get('total', 0) == 0:
+                    task_mgr.log("  ℹ 暂无已验证的预测数据")
+                else:
+                    task_mgr.log(f"  总预测期数: {stats['total']} 期")
+                    task_mgr.log(f"  完全命中:   {stats['total_matched']} 期")
+                    task_mgr.log(f"  平均准确率: {stats['avg_accuracy']:.2f}%")
+                    
+                    # 各位置命中率
+                    task_mgr.log("\n  各位置命中率:")
+                    for pos_name, key in [('万位', 'wan_accuracy'), ('千位', 'qian_accuracy'),
+                                          ('百位', 'bai_accuracy'), ('十位', 'shi_accuracy'),
+                                          ('个位', 'ge_accuracy')]:
+                        rate = stats.get(key, 0) or 0
+                        task_mgr.log(f"    {pos_name}: {rate:.2f}%")
+                
+            except Exception as e:
+                task_mgr.log(f"  ⚠ 命中率统计异常: {str(e)}")
+
+            # ==========================================
+            # 步骤3: 历史回测
+            # ==========================================
+            task_mgr.log("\n" + "━" * 60)
+            task_mgr.log("【步骤3/5】执行历史回测...")
+            task_mgr.progress(50, "历史回测中")
+
+            try:
+                # 使用Backtester执行回测
+                from modules.predictor import P5Predictor
+                from modules.backtester import Backtester
+                
+                predictor = P5Predictor()
+                backtester = Backtester(predictor, db)
+                
+                history_data = db.get_history_data(limit=None, order_by='issue ASC')
+                if len(history_data) >= 100:
+                    start_index = 50
+                    test_count = min(50, len(history_data) - start_index)
+                    
+                    backtest_result = backtester.run_backtest(start_index, test_count)
+                    
+                    if backtest_result.get('success'):
+                        stats = backtest_result.get('stats', {})
+                        task_mgr.log(f"  ✓ 回测完成: {stats.get('test_count', 0)} 期")
+                        task_mgr.log(f"  Top-1命中率: {stats.get('avg_top1_hit_rate', 0):.2f}%")
+                        task_mgr.log(f"  Top-3命中率: {stats.get('avg_top3_hit_rate', 0):.2f}%")
+                        task_mgr.log(f"  Top-5命中率: {stats.get('avg_top5_hit_rate', 0):.2f}%")
+                    else:
+                        task_mgr.log(f"  ⚠ 回测失败: {backtest_result.get('error', '未知')}")
+                else:
+                    task_mgr.log(f"  ℹ 历史数据不足（需要100期，当前{len(history_data)}期），跳过回测")
+                
+            except Exception as e:
+                task_mgr.log(f"  ⚠ 历史回测异常: {str(e)}")
+
+            # ==========================================
+            # 步骤4: 特征分析
+            # ==========================================
+            task_mgr.log("\n" + "━" * 60)
+            task_mgr.log("【步骤4/5】执行特征分析...")
+            task_mgr.progress(70, "特征分析中")
+
+            try:
+                from modules.features import P5Features
+                
+                fe = P5Features()
+                history_data = db.get_history_data(limit=None, order_by='issue ASC')
+                
+                if history_data:
+                    features = fe.extract_all_features(history_data)
+                    
+                    task_mgr.log("  ✓ 特征分析完成")
+                    task_mgr.log("\n  【频率特征】")
+                    freq_features = features.get('frequency', {})
+                    for pos_name in ['万位', '千位', '百位', '十位', '个位']:
+                        pos_freq = freq_features.get(pos_name, {})
+                        hot = pos_freq.get('hot_numbers', [])
+                        cold = pos_freq.get('cold_numbers', [])
+                        task_mgr.log(f"    {pos_name}: 热号={hot[:3]}, 冷号={cold[:3]}")
+                    
+                    # 保存特征到数据库（复用主db连接，不需要新建）
+                    try:
+                        db.save_artifact(
+                            artifact_type='feature_analysis',
+                            data=features,
+                            meta={'data_count': len(history_data)}
+                        )
+                        task_mgr.log("  ✓ 特征分析结果已保存到数据库")
+                    except Exception as save_e:
+                        task_mgr.log(f"  ⚠ 特征保存失败: {str(save_e)}")
+                
+            except Exception as e:
+                task_mgr.log(f"  ⚠ 特征分析异常: {str(e)}")
+
+            # ==========================================
+            # 步骤5: 生成综合报告
+            # ==========================================
+            task_mgr.log("\n" + "━" * 60)
+            task_mgr.log("【步骤5/5】生成综合分析报告...")
+            task_mgr.progress(90, "生成报告中")
+
+            try:
+                report_data = {
+                    'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'steps_completed': [
+                        '预测验证', '命中率统计', '历史回测', 
+                        '特征分析', '综合报告'
+                    ],
+                    'verification_stats': stats,
+                    'total_execution_time': '综合验证完成'
+                }
+                
+                # 保存综合报告
+                report_dir = 'reports'
+                os.makedirs(report_dir, exist_ok=True)
+                report_file = os.path.join(
+                    report_dir,
+                    f'comprehensive_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+                )
+                
+                with open(report_file, 'w', encoding='utf-8') as f:
+                    json.dump(report_data, f, ensure_ascii=False, indent=2)
+                
+                task_mgr.log(f"  ✓ 综合报告已保存: {report_file}")
+                
+            except Exception as e:
+                task_mgr.log(f"  ⚠ 报告生成异常: {str(e)}")
+
+            # ==========================================
+            # 完成
+            # ==========================================
+            task_mgr.progress(100, "综合验证与分析完成")
+            task_mgr.log("\n" + "=" * 70)
+            task_mgr.append_success("✅ 综合验证与分析全部完成")
+            task_mgr.log("=" * 70)
+            task_mgr.log("\n  下一步建议:")
+            task_mgr.log("  1. 执行「四步流水线分析」生成最新预测")
+            task_mgr.log("  2. 等待开奖后使用「手动验证」更新命中率")
+            task_mgr.log("  3. 定期执行「历史回测」评估模型效果")
+
+        except Exception as e:
+            error_detail = traceback.format_exc()
+            task_mgr.log(f"\n✗ 综合验证与分析过程发生异常: {str(e)}")
+            task_mgr.log(f"\n错误详情:\n{error_detail}")
+            task_mgr.progress(0, "异常终止")
+        
+        finally:
+            # 统一在此关闭数据库连接（幂等操作，多次调用安全）
+            try:
+                db.disconnect()
+            except:
+                pass
 
     def _execute_learning_report(self, task_mgr):
         """
@@ -2171,7 +4340,6 @@ class LotteryGUI:
         2. 走势图数据预测报告 (report_type='trend_chart')
         """
         try:
-            from modules.database import P5Database
             import json as _json
 
             task_mgr.log("=" * 70)

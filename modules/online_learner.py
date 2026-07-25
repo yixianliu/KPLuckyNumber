@@ -39,19 +39,55 @@ class OnlineLearner:
     def __init__(self, db, redis_client=None):
         self.db = db
         self.redis = redis_client
+        # 内置自适应权重管理器：支持 _update_weight_manager 在会话期内直接调用
+        from modules.predictor import AdaptiveWeightManager
+        self.weight_manager = AdaptiveWeightManager()
         logger.info('在线学习引擎(增强版)初始化完成')
     
-    def track_prediction_result(self, prediction_record: Dict[str, Any], 
+    def record_algo_hit(self, algo_name: str, hit_rate: float, top1_hit: Optional[float] = None):
+        """
+        记录某算法的单次验证命中结果
+
+        该方法被 pipeline 的 _update_weight_manager() 调用，
+        使在会话期内也能累积算法命中率用于自适应权重调整。
+
+        ★ v3.14 双信号并存:
+            - hit_rate: 5 位位置覆盖率(保留旧通道)
+            - top1_hit: 5 位最高概率位命中数/5, 即 Top-1 精准度(新通道, 推荐)
+
+        Args:
+            algo_name: 算法名称，如 'frequency_weighted'
+            hit_rate: 本次验证的覆盖率 (0.0-1.0)
+            top1_hit: 本次验证的 Top-1 精准度 (0.0-1.0), 可选; 缺省时仅累积旧通道
+        """
+        # 入参类型纠正: numpy / pandas / Python int 都被允许，统一 float
+        hr = float(hit_rate) if hit_rate is not None else 0.0
+        t1 = float(top1_hit) if top1_hit is not None else None
+        self.weight_manager.record_verification(algo_name, hr, top1_hit=t1)
+    
+    def track_prediction_result(self, prediction_record: Dict[str, Any],
                                  actual_result: Dict[str, Any]) -> Dict[str, Any]:
         """
-        追踪预测结果 - 每次开奖后自动调用
-        
+        追踪预测结果 — 每期开奖后自动调用的「在线学习主入口」
+
+        职责：
+            把一次预测记录与真实开奖结果做全面比对，并触发一整套「自我进化」流程：
+            基础命中统计 → 专家推荐追踪 → 反例记录 → 模型权重增量更新 →
+            走势知识模型更新 → 专家语义模型更新 → 命中率统计表更新 → Redis 实时缓存。
+            整套流程任一子步骤异常都不会中断主流程（各步骤内部已 try/except）。
+
         Args:
-            prediction_record: 预测记录
-            actual_result: 实际开奖结果
-            
+            prediction_record: 预测记录字典，需包含 target_issue（目标期号）及
+                top_combinations / algorithm_probs / fused_probabilities 等字段。
+            actual_result: 实际开奖结果字典，需包含 numbers（5 位真实号码列表）。
+
         Returns:
-            命中追踪结果
+            字典 {'status': 'success'|'error', 'hit_tracking': ..., 'expert_tracking': ...}；
+            异常时 status='error' 并携带 error 信息，不影响调用方继续运行。
+
+        边界条件：
+            - target_issue / numbers 缺失时，下游方法会做兜底处理（如 exact_match=0 触发反例记录）。
+            - redis 为 None 时跳过 Redis 缓存步骤（第 8 步），不影响本地学习。
         """
         try:
             target_issue = prediction_record.get('target_issue')
@@ -70,7 +106,8 @@ class OnlineLearner:
                 self._record_counter_example(prediction_record, actual_numbers)
             
             # 4. 更新模型权重（增量学习）
-            self._incremental_update_weights(hit_tracking, expert_tracking)
+            self._incremental_update_weights(hit_tracking, expert_tracking,
+                                             prediction_record, actual_numbers)
             
             # 5. ★ 联动：更新走势图知识模型
             self._update_trend_knowledge_model(target_issue, actual_numbers, hit_tracking)
@@ -411,60 +448,124 @@ class OnlineLearner:
         
         return patterns
     
-    def _incremental_update_weights(self, hit_tracking: Dict, 
-                                     expert_tracking: Dict):
-        """增量更新模型权重"""
+    def _incremental_update_weights(self, hit_tracking: Dict,
+                                     expert_tracking: Dict,
+                                     prediction_record: Optional[Dict] = None,
+                                     actual_numbers: Optional[List[int]] = None):
+        """增量更新模型权重 —— ★ 2026-07-25 修复(B1): 从"算完即弃"改为真实生效。
+
+        历史缺陷: 旧实现调用 _calculate_weight_adjustment 得到一组基于全局 partial_hits
+        的魔法数调整量, 却只 logger.info 打印、从不写回任何存储 —— 是彻底的死代码;
+        且 partial_hits 是组合级信号, 无法归因到单个算法, 据此全局微调只会追逐噪声。
+
+        新实现(诚实归因):
+          1) 从 prediction_record 提取每个算法各自的命中评估(per-algo attribution),
+             逐算法喂给 self.weight_manager(AdaptiveWeightManager, 带经验贝叶斯收缩+钳制护栏),
+             使自适应权重真正累积、且抗噪声。
+          2) 无 per-algo 数据时不再伪造调整, 只记 debug 并说明: 跨会话持久化的权重学习
+             由 pipeline._update_weight_manager -> weight_history 制品通道负责。
+          3) 保留专家信誉分更新(该部分本就有效)。
+        """
         try:
-            # 基于命中率调整算法权重
-            partial_hits = hit_tracking.get('partial_hits', 0)
-            weight_adjustment = self._calculate_weight_adjustment(partial_hits)
-            
-            # 更新配置中的算法权重
-            from config import PREDICTOR_CONFIG
-            if hasattr(weight_adjustment, 'get'):
-                for algo_name, weight_change in weight_adjustment.items():
-                    logger.info(f'调整算法权重: {algo_name} {weight_change:+.2f}')
-            
-            # 更新专家信誉分数
+            # --- 1) 真实的 per-algo 权重学习(替代死代码) ---
+            evals = self._extract_algo_evaluations(prediction_record, actual_numbers)
+            if evals:
+                updated = 0
+                for algo_name, ev in evals.items():
+                    hr = ev.get('hit_rate')
+                    t1 = ev.get('top1_hit')
+                    if hr is None and t1 is None:
+                        continue
+                    self.weight_manager.record_verification(
+                        algo_name,
+                        float(hr) if hr is not None else (float(t1) if t1 is not None else 0.0),
+                        top1_hit=float(t1) if t1 is not None else None,
+                    )
+                    updated += 1
+                if updated:
+                    new_w = self.weight_manager.get_adaptive_weights(metric='top1_hit')
+                    logger.info(f'在线学习: 已按 per-algo 命中更新 {updated} 个算法权重(护栏生效); '
+                                f'当前自适应权重={ {k: round(v, 3) for k, v in new_w.items()} }')
+            else:
+                logger.debug('在线学习: 本记录无 per-algo 命中评估, 跳过权重学习; '
+                             '跨会话权重学习由 pipeline._update_weight_manager 通道负责')
+
+            # --- 2) 专家信誉分更新(原有有效逻辑, 保留) ---
             expert_scores = {}
             for source in expert_tracking.get('source_tracking', []):
                 expert_scores[source['expert_id']] = source.get('impact_on_final', 0)
-            
+
             if expert_scores and self.redis:
-                # 保存专家信誉（使用兼容接口）
                 self.redis.safe_hset_existed(
                     'kpluckynumber:pl5:expert_credibility',
                     'experts',
                     expert_scores,
                     ttl_days=90
                 )
-            
+
         except Exception as e:
             logger.error(f'增量更新权重失败: {e}', exc_info=True)
-    
-    def _calculate_weight_adjustment(self, partial_hits: int) -> Dict[str, float]:
-        """根据命中情况计算权重调整"""
-        adjustments = {
-            'frequency_weighted': 0,
-            'omission_regression': 0,
-            'trend_momentum': 0,
-            'markov_transition': 0,
-            'pattern_continuation': 0
-        }
-        
-        # 基于经验规则的权重调整
-        if partial_hits >= 4:
-            # 高命中，增强当前策略
-            adjustments['frequency_weighted'] += 0.05
-            adjustments['omission_regression'] += 0.05
-        elif partial_hits <= 2:
-            # 低命中，尝试调整
-            adjustments['trend_momentum'] -= 0.03
-            adjustments['pattern_continuation'] += 0.03
-            adjustments['markov_transition'] -= 0.02
-            adjustments['trend_momentum'] += 0.02
-        
-        return adjustments
+
+    def _extract_algo_evaluations(self, prediction_record: Optional[Dict],
+                                   actual_numbers: Optional[List[int]]) -> Dict[str, Dict[str, float]]:
+        """从预测记录中提取每个算法的命中评估(per-algo attribution)。
+
+        兼容三种数据形态(按优先级):
+          A. record['algo_evaluations'](+可选 'algo_evaluations_t1'): 已算好的 per-algo
+             覆盖命中率 / Top-1 精准度, 直接采用。
+          B. record['per_algo_top_predictions']: {algo: {pos: [top_nums...]}} 结构,
+             对照 actual_numbers 现算 hit_rate(实际号在该算法 Top-N 内的位置比) 与
+             top1_hit(实际号=该算法各位 Top-1 的位置比)。
+          C. 都没有 -> 返回空 dict, 调用方据此跳过(不伪造)。
+
+        Returns:
+            {algo_name: {'hit_rate': float|None, 'top1_hit': float|None}}
+        """
+        if not prediction_record:
+            return {}
+
+        # A. 直接携带评估结果
+        evals = prediction_record.get('algo_evaluations')
+        evals_t1 = prediction_record.get('algo_evaluations_t1', {}) or {}
+        if isinstance(evals, dict) and evals:
+            out = {}
+            for algo, hr in evals.items():
+                out[algo] = {
+                    'hit_rate': float(hr) if isinstance(hr, (int, float)) else None,
+                    'top1_hit': float(evals_t1[algo]) if isinstance(evals_t1.get(algo), (int, float)) else None,
+                }
+            return out
+
+        # B. 由 per_algo_top_predictions 现场归因
+        per_algo = prediction_record.get('per_algo_top_predictions')
+        if isinstance(per_algo, dict) and per_algo and actual_numbers and len(actual_numbers) >= 5:
+            pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+            out = {}
+            for algo, pos_preds in per_algo.items():
+                if not isinstance(pos_preds, dict):
+                    continue
+                cover_hits = 0
+                top1_hits = 0
+                counted = 0
+                for i, pk in enumerate(pos_keys):
+                    preds = pos_preds.get(pk) or pos_preds.get(i) or pos_preds.get(str(i))
+                    if not isinstance(preds, (list, tuple)) or not preds:
+                        continue
+                    counted += 1
+                    actual = actual_numbers[i]
+                    if actual in preds:
+                        cover_hits += 1
+                    if preds[0] == actual:
+                        top1_hits += 1
+                if counted:
+                    out[algo] = {
+                        'hit_rate': cover_hits / counted,
+                        'top1_hit': top1_hits / counted,
+                    }
+            return out
+
+        # C. 无可用数据
+        return {}
     
     def _update_hit_rate_statistics(self, hit_tracking: Dict, 
                                      expert_tracking: Dict):

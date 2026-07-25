@@ -19,6 +19,7 @@ import os
 import logging
 import argparse
 from datetime import datetime
+from typing import Optional
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -88,7 +89,7 @@ def update_data():
         return False
 
 
-def predict_next_issue(use_optimized=True):
+def predict_next_issue(model='optimized'):
     """
     预测下一期排列5开奖号码
 
@@ -97,7 +98,7 @@ def predict_next_issue(use_optimized=True):
     2. 初始化P5Predictor（统计模型+AI融合）
     3. 调用predict()方法执行预测
     4. 输出各位置推荐号码（Top-3）和推荐组合（Top-5）
-    5. 保存预测结果JSON到 predictions/ 目录
+    5. 保存预测结果到数据库
 
     预测器返回结构（必须包含的字段）:
     - fused_probabilities: 融合后的各位置概率分布
@@ -107,19 +108,18 @@ def predict_next_issue(use_optimized=True):
     - risk_warning: 风险提示
 
     Args:
-        use_optimized: 始终使用优化后的模型（旧版P5Predictor已删除）
+        model: 'optimized'(默认, 当前 v3.x 配置) 或 'old'(v2.1 基线配置, 不含贝叶斯推断)
 
     Returns:
         bool: 是否预测成功
     """
     logger.info('=' * 80)
-    logger.info(f'开始预测下一期（{"优化后" if use_optimized else "原始"}模型）')
+    logger.info(f'开始预测下一期（{model} 模型）')
     logger.info('=' * 80)
 
     try:
         # 导入模块
-        # 始终使用优化后的预测器（旧版 p5_predictor.py 已删除，功能已整合到优化版）
-        from modules.predictor import P5Predictor as Predictor
+        from modules.predictor import P5Predictor as Predictor, P5PredictorConfig
 
         from modules.database import P5Database
 
@@ -130,7 +130,7 @@ def predict_next_issue(use_optimized=True):
             logger.error('数据库连接失败')
             return False
 
-        # 获取历史数据
+        # 获取历史数据（取最近 200 期：足够覆盖各算法的统计窗口/回看期，又不至于过慢；魔法数，可调）
         logger.info('加载历史数据...')
         history_data = db.get_history_data(limit=200, order_by='issue DESC')
 
@@ -145,9 +145,11 @@ def predict_next_issue(use_optimized=True):
 
         db.disconnect()
 
-        # 初始化预测器
+        # 初始化预测器（'old' 使用 v2.1 基线配置, 使 --model 真正生效）
         logger.info('初始化预测器...')
-        predictor = Predictor()
+        predictor = Predictor(
+            config=P5PredictorConfig.baseline_v21() if model == 'old' else None
+        )
 
         # 执行预测
         logger.info('开始预测...')
@@ -197,7 +199,7 @@ def predict_next_issue(use_optimized=True):
                 artifact_type='prediction',
                 data=result,
                 issue=result.get('target_issue', ''),
-                meta={'model': 'optimized', 'data_samples': result.get('data_samples')}
+                meta={'model': model, 'data_samples': result.get('data_samples')}
             )
             save_db.disconnect()
             logger.info(f'预测结果已保存(数据库): 期号={result.get("target_issue", "")}')
@@ -264,9 +266,9 @@ def run_backtest(mode='compare', start=50, count=50):
 
         # 初始化预测器
         logger.info('初始化预测器...')
-        # 回测对比模式下，使用两个独立实例模拟"优化前"和"优化后"对比
-        # 两者均为优化后的预测器，但可通过配置区分行为
-        old_predictor = P5Predictor()
+        # 回测对比模式下，old=基线(v2.1, 不含贝叶斯/自适应), new=当前配置, 使对比真正有意义
+        from modules.predictor import P5PredictorConfig
+        old_predictor = P5Predictor(config=P5PredictorConfig.baseline_v21())
         new_predictor = P5Predictor()
 
         # 初始化回测引擎
@@ -462,168 +464,10 @@ def analyze_features():
 
 
 
-def run_save_articles_to_redis(target_issue=None, max_articles=100, extract_predictions=True):
-    """
-    执行批量保存文章到Redis，并可选提取预测数据
-
-    流程:
-    1. 爬取最多max_articles篇文章
-    2. 可选提取每篇文章中的预测数据（号码推荐等）
-    3. 按质量分数（≥0.7为高质量）分类
-    4. 将所有文章和预测数据保存到Redis
-
-    Args:
-        target_issue: 目标期号（如"2026165"），None则爬取全部文章
-        max_articles: 最大处理文章数（默认100）
-        extract_predictions: 是否提取预测数据（默认True）
-
-    Returns:
-        bool: 是否保存成功
-    """
-    logger.info('=' * 80)
-    logger.info('开始执行批量保存文章到Redis')
-    if extract_predictions:
-        logger.info('【启用预测数据自动提取】')
-    logger.info('=' * 80)
-
-    try:
-        from modules.article_handler import ArticleAnalyzer
-
-        logger.info(f'配置参数：目标期号={target_issue or "全部"}, 最大文章数={max_articles}, 预测提取={extract_predictions}')
-
-        analyzer = ArticleAnalyzer()
-        # call the bulk-save variant (renamed to avoid method name collision)
-        result = analyzer.save_all_articles_bulk_to_redis(
-            target_issue=target_issue, 
-            max_articles=max_articles,
-            extract_predictions=extract_predictions
-        )
-
-        if result['success']:
-            logger.info('=' * 80)
-            logger.info('批量处理文章完成')
-            logger.info('=' * 80)
-            logger.info(f'总文章数：{result["total_articles"]}')
-            logger.info(f'成功保存：{result["saved_articles"]}')
-            logger.info(f'失败保存：{result["failed_articles"]}')
-            
-            if extract_predictions:
-                logger.info('')
-                logger.info('【预测数据提取统计】')
-                logger.info('-' * 50)
-                logger.info(f'预测提取成功：{result["extracted_predictions"]}')
-                logger.info(f'高质量预测（≥0.7）：{result["high_quality_predictions"]}')
-                
-                if result['predictions']:
-                    logger.info('')
-                    logger.info('【高质量预测数据列表】')
-                    logger.info('-' * 50)
-                    high_quality = [p for p in result['predictions'] if p['quality_score'] >= 0.7]
-                    for i, pred in enumerate(high_quality[:10], 1):
-                        logger.info(f'{i}. {pred["article_id"]} - 期号:{pred["issue"]} - 质量:{pred["quality_score"]} - {pred["prediction_summary"]}')
-                    if len(high_quality) > 10:
-                        logger.info(f'... 还有 {len(high_quality) - 10} 条高质量预测')
-            
-            logger.info('')
-            logger.info('【已保存文章列表】')
-            logger.info('-' * 50)
-            for i, article in enumerate(result['articles'][:10], 1):
-                pred_flag = '✓预测' if article.get('has_prediction') else '无预测'
-                quality = f'质量:{article.get("quality_score", 0):.2f}' if article.get('has_prediction') else ''
-                logger.info(f'{i}. {article["article_id"]} - 期号:{article["issue"]} - {pred_flag} {quality} - {article["title"]}')
-            if len(result['articles']) > 10:
-                logger.info(f'... 还有 {len(result["articles"]) - 10} 篇文章')
-            
-            logger.info('=' * 80)
-
-            return True
-        else:
-            logger.error(f'批量保存文章失败：{result["error"]}')
-            return False
-
-    except Exception as e:
-        logger.error(f'批量保存文章执行失败：{e}', exc_info=True)
-        return False
 
 
-def run_process_article(url: str, title: str = '') -> bool:
-    """
-    处理单篇文章：爬取→AI分析→预处理→Redis存储
 
-    完整流程:
-    1. 爬取文章内容（从给定URL）
-    2. AI分析（调用Qianfan API进行内容结构化）
-    3. 预处理（HTML清洗、格式规范化）
-    4. Redis存储（key格式: kpluckynumber:pl5:article:{issue}，7天过期）
-
-    Args:
-        url: 文章URL
-        title: 文章标题（可选，不提供则从页面提取）
-
-    Returns:
-        bool: 是否处理成功
-    """
-    logger.info('=' * 80)
-    logger.info('开始处理单篇文章')
-    logger.info('=' * 80)
-
-    try:
-        from modules.article_handler import ArticleProcessor
-
-        logger.info(f'文章URL: {url}')
-        if title:
-            logger.info(f'文章标题: {title}')
-
-        processor = ArticleProcessor()
-        result = processor.process_article(url, title)
-
-        if result['success']:
-            logger.info('=' * 80)
-            logger.info('文章处理完成')
-            logger.info('=' * 80)
-            
-            logger.info('【处理步骤】')
-            logger.info('-' * 50)
-            for step in result['steps']:
-                status_icon = '✓' if step['status'] == '成功' else '✗'
-                logger.info(f'  {status_icon} {step["step"]}: {step["status"]}')
-                if 'content_length' in step:
-                    logger.info(f'      内容长度: {step["content_length"]}')
-                if 'report_length' in step:
-                    logger.info(f'      报告长度: {step["report_length"]}')
-                if 'processed_length' in step:
-                    logger.info(f'      处理后长度: {step["processed_length"]}')
-                if 'key' in step:
-                    logger.info(f'      Redis键: {step["key"]}')
-            
-            logger.info('')
-            logger.info('【报告预览】')
-            logger.info('-' * 50)
-            if result['report']:
-                preview = result['report'][:300] + '...' if len(result['report']) > 300 else result['report']
-                logger.info(f'{preview}')
-            
-            logger.info('')
-            logger.info(f'Redis键名: {result["redis_key"]}')
-            logger.info(f'过期时间: 7天')
-            logger.info('=' * 80)
-
-            return True
-        else:
-            logger.error(f'文章处理失败：{result["error"]}')
-            if result['steps']:
-                logger.info('【失败步骤】')
-                for step in result['steps']:
-                    if step['status'] == '失败':
-                        logger.info(f'  {step["step"]}: {step.get("error", "未知错误")}')
-            return False
-
-    except Exception as e:
-        logger.error(f'文章处理执行失败：{e}', exc_info=True)
-        return False
-
-
-def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int = 40) -> bool:
+def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int = 60) -> bool:
     """
     执行全新的四步流水线分析
 
@@ -708,6 +552,48 @@ def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int =
 # 命中率统计
 # ================================================================
 
+def run_verify_pending() -> bool:
+    """
+    闭合「预测→开奖」验证闭环：对全部已开奖但仍 pending 的预测记录执行验证。
+
+    这是 v3.16 新增的自动化关键能力——让真实预测获得开奖反馈，
+    持续喂养贝叶斯验证学习。可独立运行，也被每日定时任务调用。
+
+    Returns:
+        bool: 是否执行成功（即使无 pending 记录也返回 True）
+    """
+    logger.info('=' * 80)
+    logger.info('开始闭合验证闭环（verify pending predictions）')
+    logger.info('=' * 80)
+
+    try:
+        from modules.pipeline import Pipeline
+
+        pipeline = Pipeline()
+        result = pipeline.verify_pending_predictions()
+
+        if not result.get('success'):
+            logger.error(f'验证闭环失败: {result.get("error")}')
+            return False
+
+        logger.info('=' * 80)
+        logger.info('验证闭环完成')
+        logger.info('=' * 80)
+        logger.info(f'  扫描待验证记录: {result.get("total_scanned", 0)} 条')
+        logger.info(f'  已验证: {result.get("verified_count", 0)} 条')
+        logger.info(f'  跳过: {result.get("skipped", 0)} 条')
+        for d in result.get('details', [])[:20]:
+            logger.info(
+                f'    - 期号 {d.get("issue")}: 命中 {d.get("match_count")}/5 '
+                f'(准确率 {d.get("accuracy_rate")}%)'
+            )
+        return True
+
+    except Exception as e:
+        logger.error(f'验证闭环执行异常: {e}', exc_info=True)
+        return False
+
+
 def run_hit_rate_report(days: int = 30, output_file: Optional[str] = None) -> bool:
     """
     运行命中率统计报告
@@ -753,87 +639,6 @@ def run_hit_rate_report(days: int = 30, output_file: Optional[str] = None) -> bo
         return False
 
 
-def run_process_multiple_articles(max_count: int = 10) -> bool:
-    """
-    批量处理文章：爬取→AI分析→预处理→Redis存储
-
-    流程:
-    1. 通过爬虫获取文章URL列表（最多max_count篇）
-    2. 逐篇执行爬取→AI分析→预处理→Redis存储
-    3. 汇总统计成功/失败数量
-
-    Args:
-        max_count: 最大处理文章数（默认10）
-
-    Returns:
-        bool: 至少有一篇处理成功则返回True
-    """
-    logger.info('=' * 80)
-    logger.info(f'开始批量处理 {max_count} 篇文章')
-    logger.info('=' * 80)
-
-    try:
-        from modules.article_handler import ArticleProcessor
-
-        processor = ArticleProcessor()
-
-        # 获取文章URL列表（从爬虫获取）
-        logger.info('获取文章列表...')
-        # B1 修复：ArticleProcessor 默认 lazy=True，spider 初始为 None，
-        # 必须先初始化爬虫再访问，否则 process-articles 命令 100% 走 else 报错
-        if not processor.spider:
-            processor._init_spider()
-        if processor.spider:
-            crawl_result = processor.spider.crawl_all_articles()
-            articles = crawl_result.get('articles', [])[:max_count]
-            urls = [article.get('url', article.get('link_url', '')) for article in articles if article.get('url') or article.get('link_url')]
-            
-            if not urls:
-                logger.error('未获取到文章列表')
-                return False
-            
-            logger.info(f'获取到 {len(urls)} 篇文章')
-        else:
-            logger.error('爬虫模块不可用')
-            return False
-
-        # 批量处理
-        summary = processor.process_multiple_articles(urls)
-
-        logger.info('=' * 80)
-        logger.info('批量处理完成')
-        logger.info('=' * 80)
-        logger.info(f'总文章数：{summary["total"]}')
-        logger.info(f'成功：{summary["success"]}')
-        logger.info(f'失败：{summary["failed"]}')
-
-        if summary['reports']:
-            logger.info('')
-            logger.info('【成功处理的报告】')
-            logger.info('-' * 50)
-            for i, report in enumerate(summary['reports'], 1):
-                logger.info(f'{i}. {report["url"][:60]}...')
-                logger.info(f'   Redis键: {report["redis_key"]}')
-                logger.info(f'   期号: {report["issue"]}')
-                logger.info(f'   报告长度: {report["report_length"]}')
-
-        if summary['errors']:
-            logger.info('')
-            logger.info('【处理失败的文章】')
-            logger.info('-' * 50)
-            for i, error in enumerate(summary['errors'], 1):
-                logger.info(f'{i}. {error["url"][:60]}...')
-                logger.info(f'   错误: {error["error"]}')
-
-        logger.info('=' * 80)
-
-        return summary['success'] > 0
-
-    except Exception as e:
-        logger.error(f'批量处理执行失败：{e}', exc_info=True)
-        return False
-
-
 def main():
     """
     主函数：解析命令行参数并分发到对应的功能函数
@@ -844,9 +649,6 @@ def main():
     - backtest: 历史回测（--mode compare/old/new, --start, --count）
     - analyze: 分析历史数据特征
     - pipeline: 四步流水线分析（--issue, --limit）
-    - save-articles: 批量爬取文章并保存到Redis（--issue, --max, --no-extract）
-    - process-article: 处理单篇文章（--url, --title）
-    - process-articles: 批量处理文章（--max）
     """
     parser = argparse.ArgumentParser(description='排列五AI预测系统')
     subparsers = parser.add_subparsers(dest='command', help='可用命令')
@@ -877,39 +679,21 @@ def main():
 
 
     # 四步流水线分析命令（推荐）
-    pipeline_parser = subparsers.add_parser('pipeline', help='执行四步流水线分析：文章爬取→走势分析→专家整合→最终预测')
+    pipeline_parser = subparsers.add_parser('pipeline', help='执行四步流水线分析：走势分析→专家整合→最终预测')
     pipeline_parser.add_argument('--issue', type=str, default=None,
                                  help='目标期号（如2026165），不指定则自动推算下一期')
     pipeline_parser.add_argument('--limit', type=int, default=40,
                                  help='历史数据期数限制（默认40期）')
 
-    # 批量保存文章命令
-    save_articles_parser = subparsers.add_parser('save-articles', help='批量爬取文章并保存到Redis，自动提取预测数据')
-    save_articles_parser.add_argument('--issue', type=str, default=None,
-                                       help='目标期号（如2026165），不指定则爬取所有文章')
-    save_articles_parser.add_argument('--max', type=int, default=100,
-                                       help='最大处理文章数（默认100）')
-    save_articles_parser.add_argument('--no-extract', action='store_true',
-                                       help='不提取预测数据，仅保存原始文章')
-
-    # 文章处理命令（爬取→AI→预处理→Redis存储）
-    process_article_parser = subparsers.add_parser('process-article', help='处理单篇文章：爬取→AI分析→预处理→Redis存储')
-    process_article_parser.add_argument('--url', type=str, required=True,
-                                        help='文章URL')
-    process_article_parser.add_argument('--title', type=str, default='',
-                                        help='文章标题（可选）')
-
-    # 批量文章处理命令
-    process_articles_parser = subparsers.add_parser('process-articles', help='批量处理文章：爬取→AI分析→预处理→Redis存储')
-    process_articles_parser.add_argument('--max', type=int, default=10,
-                                         help='最大处理文章数（默认10）')
-    
     # 命中率统计命令
     hitrate_parser = subparsers.add_parser('hitrate', help='查看历史预测命中率统计报告')
     hitrate_parser.add_argument('--days', type=int, default=30, dest='days',
                                 help='最近N天数据（默认30天）')
     hitrate_parser.add_argument('--output', type=str, default=None, dest='output',
                                 help='输出到文件（可选，默认仅打印到控制台）')
+
+    # 验证闭环命令（闭合「预测→开奖」验证，喂养贝叶斯学习）
+    verify_parser = subparsers.add_parser('verify', help='闭合验证闭环：对全部已开奖但未验证的预测记录执行验证')
 
     args = parser.parse_args()
 
@@ -921,23 +705,17 @@ def main():
     if args.command == 'update':
         success = update_data()
     elif args.command == 'predict':
-        use_optimized = args.model == 'optimized'
-        success = predict_next_issue(use_optimized)
+        success = predict_next_issue(args.model)
     elif args.command == 'backtest':
         success = run_backtest(args.mode, args.start, args.count)
     elif args.command == 'analyze':
         success = analyze_features()
     elif args.command == 'pipeline':
         success = run_four_step_pipeline(target_issue=args.issue, data_limit=args.limit)
-    elif args.command == 'save-articles':
-        extract_predictions = not args.no_extract
-        success = run_save_articles_to_redis(target_issue=args.issue, max_articles=args.max, extract_predictions=extract_predictions)
-    elif args.command == 'process-article':
-        success = run_process_article(url=args.url, title=args.title)
-    elif args.command == 'process-articles':
-        success = run_process_multiple_articles(max_count=args.max)
     elif args.command == 'hitrate':
         success = run_hit_rate_report(args.days, args.output)
+    elif args.command == 'verify':
+        success = run_verify_pending()
     else:
         logger.error(f'未知命令：{args.command}')
         success = False

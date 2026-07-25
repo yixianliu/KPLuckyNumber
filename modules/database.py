@@ -1,8 +1,31 @@
 """
 排列5数据库操作模块（完整版）
 
-负责排列5数据的数据库连接、表结构管理、数据存储与查询
-包含：历史数据表、走势数据表、AI分析报告表、预测验证记录表
+职责：
+    封装排列5系统对 MySQL 的全部访问：连接/断开、事务、建表（向后兼容）、
+    历史数据读写、各位置走势数据读写、AI 分析报告与预测验证记录入库等。
+    所有外部模块（predictor / pipeline / backtester / main / online_learner 等）
+    都通过本模块的 ``P5Database`` 类统一访问持久化层，避免在业务代码中散落 SQL。
+
+主要负责的表（建表逻辑见 create_tables，修改 schema 务必保持向后兼容）：
+    - 历史开奖表        ：存储每期开奖号码，供预测/回测读取（get_history_data 等）。
+    - 各位置走势表      ：万位/千位/百位/十位/个位（wan/qian/bai/shi/ge）的走势数据。
+    - 特殊走势表        ：spjzs（双排列）、hzzst（和值走势）、sum_end（和尾）、back_three（后三）等。
+    - AI 分析报告表     ：insert_ai_report，存储每期 AI 生成的综合分析报告。
+    - 预测验证记录表    ：insert_prediction_record / update_prediction_verification，
+                          用于开奖后核对命中、计算命中率。
+    - 专家推荐表        ：insert_expert_recommendation，存储大神专家的荐号。
+    - 权重历史表        ：insert_weight_history，支撑自适应权重（EWMA）的持久化与回放。
+
+与其它模块的关系：
+    - config.DB_CONFIG 提供连接参数（host/port/user/password/database）。
+    - predictor / pipeline 调用 save_artifact / get_artifacts 存取 JSON 化产物。
+    - online_learner 调用权重相关方法实现「自我进化」的持久化。
+
+设计约定：
+    - 采用延迟导入（函数内部 ``from config import DB_CONFIG``），避免模块导入期失败。
+    - 网络/数据库异常统一走 execute_with_reconnect 的重连机制，提升健壮性。
+    - JSON 字段统一用 _safe_json_loads 解析，防止脏数据导致崩溃。
 """
 
 import pymysql
@@ -88,12 +111,12 @@ class P5Database:
                     database=db_name,
                     charset='utf8mb4',
                     cursorclass=pymysql.cursors.DictCursor,
-                    connect_timeout=10,
-                    read_timeout=30,
-                    write_timeout=30
+                    connect_timeout=10,   # 建立连接超时 10s，避免网络异常时无限等待
+                    read_timeout=30,      # 查询读超时 30s
+                    write_timeout=30      # 写入超时 30s
                 )
                 self.cursor = self.connection.cursor()
-                logger.info('MySQL数据库连接成功（排列5）')
+                logger.debug('MySQL数据库连接成功（排列5）')
                 return True
             except pymysql.err.OperationalError as e:
                 error_code = e.args[0] if e.args else 0
@@ -157,10 +180,15 @@ class P5Database:
             return False
     
     def disconnect(self):
-        """断开数据库连接"""
-        if self.connection:
-            self.connection.close()
-            logger.info('MySQL数据库连接已关闭')
+        """断开数据库连接（幂等操作：多次调用安全）"""
+        # PyMySQL Connection 对象的 _closed 属性（不是 closed）
+        if self.connection and not getattr(self.connection, '_closed', False):
+            try:
+                self.connection.close()
+                logger.debug('MySQL数据库连接已关闭')
+            except Exception as e:
+                logger.debug(f'关闭数据库连接时异常: {e}')
+        self.connection = None  # 置空防止重复关闭
 
     def execute_with_reconnect(self, query, params=None):
         """
@@ -299,6 +327,21 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5AI分析报告表';
             '''
             self.cursor.execute(sql_ai_report)
+
+            # 安全扩展: 为 p5_ai_report 增加 per_algo_predictions 列(存储各算法 Top-5 预测 JSON, 供 per-algo 命中率验证)。
+            try:
+                self.cursor.execute(
+                    "ALTER TABLE p5_ai_report "
+                    "ADD COLUMN per_algo_predictions TEXT NULL DEFAULT NULL "
+                    "COMMENT '各算法Top-5预测JSON(per-algo predictions)'"
+                )
+                logger.info('p5_ai_report.per_algo_predictions 列已添加')
+            except Exception as e:
+                err_code = getattr(e, 'args', (None,))[0]
+                if err_code == 1060:  # Duplicate column name
+                    pass
+                else:
+                    logger.warning(f'添加 per_algo_predictions 列跳过(非致命): {e}')
 
             # 安全扩展: 为 p5_ai_report 增加 report_type 列(区分 expert_article/trend_chart/final)。
             # 由于 CREATE TABLE IF NOT EXISTS 不会给已存在的表加列, 这里用 ALTER 补齐,
@@ -875,12 +918,21 @@ class P5Database:
     def get_history_data(self, limit: int = 500, order_by: str = 'issue DESC',
                          order: str = None) -> List[Dict[str, Any]]:
         """
-        获取历史开奖数据
+        获取历史开奖数据（predictor / backtester / pipeline 的核心读取入口）
 
         Args:
-            limit: 返回数量限制; 为 None 时返回全部
-            order_by: 排序方式(内部固定列, 非用户输入)
-            order: 兼容旧调用, 'ASC'/'DESC' 简写, 会被转换为 order_by
+            limit: 返回数量上限；默认 500 期（足够覆盖算法窗口又不过载）。
+                   传 None 则返回全部有效历史（回测全量遍历时用到）。
+            order_by: 排序表达式（内部固定列 issue，非用户输入，防注入）。
+            order: 兼容旧调用，'ASC'/'DESC' 简写，会转换为 order_by。
+
+        Returns:
+            历史数据列表，每项含 issue 与 numbers 等字段；异常时返回空列表。
+
+        边界条件：
+            - 仅返回 is_valid = 1 的有效记录，自动过滤被标记为无效（如试机号/脏数据）的行。
+            - 任意数据库异常都会被捕获并返回 []，调用方需判空（如 predictor 会因空数据退化为均匀）。
+            - 通过 execute_with_reconnect 执行，规避长连接 "MySQL server has gone away"。
         """
         try:
             # 兼容旧调用: order='ASC' -> 'issue ASC'
@@ -889,6 +941,7 @@ class P5Database:
                 direction = 'ASC' if str(order).upper() == 'ASC' else 'DESC'
                 ob = f'issue {direction}'
 
+            # 只取有效数据；is_valid=1 表示正式开奖（过滤脏数据/试机号）
             sql = 'SELECT * FROM p5_history_data WHERE is_valid = 1'
             params = []
             if limit is not None:
@@ -1025,12 +1078,13 @@ class P5Database:
                          recommended_numbers=None, recommended_combinations=None,
                          confidence_scores=None, recommendation_reasons=None,
                          key_conclusions=None, risk_warning=None, report_format='TEXT',
-                         report_type='final'):
+                         report_type='final', per_algo_predictions=None):
         """插入排列5AI分析报告
 
         Args:
             report_type: 报告类型, 用于区分 'expert_article'(专家文章预测报告) /
                          'trend_chart'(走势图数据预测报告) / 'final'(最终预测, 默认)
+            per_algo_predictions: 各算法 Top-5 预测 JSON, 供 per-algo 命中率验证
         """
         try:
             report_uuid = str(uuid.uuid4())
@@ -1041,9 +1095,11 @@ class P5Database:
                 report_date, report_uuid, data_count, latest_issue, next_issue,
                 trend_analysis, probability_stats, recommended_numbers,
                 recommended_combinations, confidence_scores, recommendation_reasons,
-                key_conclusions, risk_warning, report_content, report_format, report_type
+                key_conclusions, risk_warning, report_content, report_format, report_type,
+                per_algo_predictions
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s
             )
             '''
 
@@ -1051,7 +1107,8 @@ class P5Database:
                 report_date, report_uuid, data_count, latest_issue, next_issue,
                 trend_analysis, probability_stats, recommended_numbers,
                 recommended_combinations, confidence_scores, recommendation_reasons,
-                key_conclusions, risk_warning, report_content, report_format, report_type
+                key_conclusions, risk_warning, report_content, report_format, report_type,
+                json.dumps(per_algo_predictions, ensure_ascii=False) if per_algo_predictions else None
             )
 
             try:
@@ -1059,9 +1116,10 @@ class P5Database:
                 self.connection.commit()
             except Exception as e:
                 err_code = getattr(e, 'args', (None, None))[0]
-                # 1054 = Unknown column 'report_type' —— 老表尚未加该列, 运行时动态补齐
+                # 1054 = Unknown column 'report_type'/'per_algo_predictions' —— 运行时动态补齐
                 if err_code == 1054:
                     self._ensure_report_type_column()
+                    self._ensure_per_algo_column()
                     self.execute_with_reconnect(sql, params)
                     self.connection.commit()
                 else:
@@ -1092,7 +1150,23 @@ class P5Database:
                 pass
             else:
                 logger.warning(f'动态补齐 report_type 列跳过(非致命): {e}')
-    
+
+    def _ensure_per_algo_column(self):
+        """运行时安全补齐 p5_ai_report.per_algo_predictions 列(兼容老表, 幂等)。"""
+        try:
+            self.execute_with_reconnect(
+                "ALTER TABLE p5_ai_report "
+                "ADD COLUMN per_algo_predictions TEXT NULL DEFAULT NULL "
+                "COMMENT '各算法Top-5预测JSON(per-algo predictions)'"
+            )
+            logger.info('p5_ai_report.per_algo_predictions 列已动态补齐')
+        except Exception as e:
+            err_code = getattr(e, 'args', (None, None))[0]
+            if err_code == 1060:  # Duplicate column name, 已存在则忽略
+                pass
+            else:
+                logger.warning(f'动态补齐 per_algo_predictions 列跳过(非致命): {e}')
+
     def get_latest_ai_report(self):
         """获取最新的AI分析报告"""
         try:
@@ -1177,7 +1251,24 @@ class P5Database:
                 return {'status': 'error', 'message': '预测记录不存在'}
             
             # 解析预测号码
-            predicted = json.loads(record['predicted_numbers'])
+            predicted_raw = json.loads(record['predicted_numbers'])
+            
+            # ★ 兼容处理: 新旧两种 predicted_numbers 格式
+            # 新格式: {'wan': [4, 5, 6], 'qian': [...], ...}  (扁平化)
+            # 旧格式: {'wan': {'numbers': [4, 5, 6], 'confidence': [...]}, ...} (非扁平化)
+            predicted = {}
+            for _pos in ['wan', 'qian', 'bai', 'shi', 'ge']:
+                _pdata = predicted_raw.get(_pos, [])
+                if isinstance(_pdata, dict):
+                    # 旧格式: 提取 numbers 列表
+                    _nums = _pdata.get('numbers', [])
+                elif isinstance(_pdata, list):
+                    # 新格式: 已经是数字列表
+                    _nums = _pdata
+                else:
+                    _nums = []
+                # 确保所有元素都是整数
+                predicted[_pos] = [int(n) for n in _nums] if _nums else []
             
             # 启用容错匹配机制(v3.1优化)
             tolerance_enabled = True  # 允许号码偏差±1也算命中
