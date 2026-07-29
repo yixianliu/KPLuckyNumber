@@ -40,8 +40,21 @@ class OnlineLearner:
         self.db = db
         self.redis = redis_client
         # 内置自适应权重管理器：支持 _update_weight_manager 在会话期内直接调用
-        from modules.predictor import AdaptiveWeightManager
-        self.weight_manager = AdaptiveWeightManager()
+        # ★ v3.17: 从 predictor.DEFAULT_CONFIG['global'] 注入学习率调度参数(衰减/下限/预热/收敛),
+        #   使引擎的"学习率/迭代/收敛策略"可配置、可监控, 而非写死。
+        from modules.predictor import AdaptiveWeightManager, P5PredictorConfig
+        _g = getattr(P5PredictorConfig, 'DEFAULT_CONFIG', {}).get('global', {})
+        self.weight_manager = AdaptiveWeightManager(
+            ewma_alpha=_g.get('ewma_alpha', 0.3),
+            shrinkage_min_samples=_g.get('adaptive_shrinkage_min_samples', 10),
+            weight_floor=_g.get('adaptive_weight_floor', 0.001),
+            weight_cap=_g.get('adaptive_weight_cap', 0.75),
+            enable_guardrails=_g.get('enable_adaptive_guardrails', True),
+            learning_rate_decay=_g.get('learning_rate_decay', 0.995),
+            min_learning_rate=_g.get('min_learning_rate', 0.05),
+            warmup_iterations=_g.get('warmup_iterations', 5),
+            convergence_tol=_g.get('convergence_tol', 0.01),
+        )
         logger.info('在线学习引擎(增强版)初始化完成')
     
     def record_algo_hit(self, algo_name: str, hit_rate: float, top1_hit: Optional[float] = None):
@@ -132,7 +145,114 @@ class OnlineLearner:
         except Exception as e:
             logger.error(f'追踪预测结果失败: {e}', exc_info=True)
             return {'status': 'error', 'error': str(e)}
-    
+
+    def learn_from_verification(self, db, target_issue: str,
+                                actual_numbers: List[int]) -> Dict[str, Any]:
+        """
+        验证后触发的「验证→学习」闭环（v3.17 新增）。
+
+        从已存储的预测记录 + AI 报告中取出该期号的 per_algo_top_predictions,
+        对照真实开奖号码做 per-algo 归因, 喂入 track_prediction_result,
+        使在线学习引擎真正从「已验证结果」中学习(闭合结果验证流程)。
+
+        防御式设计: 任意环节缺失/异常均安全降级为 {'learned': False},
+        绝不因学习侧异常影响主验证流程。
+
+        Returns:
+            {'learned': bool, 'algos': int, 'reason': str}
+        """
+        try:
+            if not db or not hasattr(db, 'cursor'):
+                return {'learned': False, 'algos': 0, 'reason': 'no_db'}
+            # 1) 取该期号的预测记录(含 report_uuid)
+            db.cursor.execute(
+                "SELECT report_uuid, target_issue FROM p5_prediction_record "
+                "WHERE target_issue=%s ORDER BY id DESC LIMIT 1",
+                (target_issue,))
+            rec = db.cursor.fetchone()
+            if not rec:
+                return {'learned': False, 'algos': 0, 'reason': 'no_prediction_record'}
+            report_uuid = rec.get('report_uuid')
+            if not report_uuid:
+                return {'learned': False, 'algos': 0, 'reason': 'no_report_uuid'}
+
+            # 2) 取 AI 报告内容(含 per_algo_top_predictions)
+            db.cursor.execute(
+                "SELECT report_content FROM p5_ai_report WHERE report_uuid=%s LIMIT 1",
+                (report_uuid,))
+            row = db.cursor.fetchone()
+            if not row or not row.get('report_content'):
+                return {'learned': False, 'algos': 0, 'reason': 'no_report_content'}
+            import json as _json
+            content = row['report_content']
+            if isinstance(content, str):
+                try:
+                    content = _json.loads(content)
+                except Exception:
+                    return {'learned': False, 'algos': 0, 'reason': 'report_parse_fail'}
+            per_algo = content.get('per_algo_top_predictions') if isinstance(content, dict) else None
+            if not per_algo:
+                return {'learned': False, 'algos': 0, 'reason': 'no_per_algo_data'}
+
+            # 3) 构造预测记录并触发学习
+            prediction_record = {
+                'target_issue': target_issue,
+                'per_algo_top_predictions': per_algo,
+                'top_combinations': content.get('top_combinations', []),
+                'fused_probabilities': content.get('fused_probabilities', []),
+            }
+            res = self.track_prediction_result(prediction_record, {'numbers': actual_numbers})
+            algos = len(per_algo) if isinstance(per_algo, dict) else 0
+            ok = bool(res.get('status') == 'success')
+            return {'learned': ok, 'algos': algos,
+                    'reason': 'ok' if ok else str(res.get('error', 'track_failed'))}
+        except Exception as e:
+            logger.warning(f'learn_from_verification 异常(安全降级): {e}')
+            return {'learned': False, 'algos': 0, 'reason': f'error:{e}'}
+
+    def estimate_attribution_coverage(self, db, days: int = 30,
+                                      limit: int = 20) -> Dict[str, Any]:
+        """
+        估算「验证→学习」闭环的 per-algo 归因覆盖率(诚实报告用, v3.17)。
+
+        扫描最近已验证预测, 统计其中能取到 per_algo_top_predictions 的比例,
+        让用户看到在线学习是否真的在「按算法归因」学习, 还是因数据缺失而空转。
+
+        Returns:
+            {'coverage': float|None, 'sampled': int, 'with_attribution': int}
+        """
+        try:
+            if not db or not hasattr(db, 'cursor'):
+                return {'coverage': None, 'sampled': 0, 'with_attribution': 0}
+            verified = db.get_verified_predictions(days=days, limit=limit)
+            if not verified:
+                return {'coverage': None, 'sampled': 0, 'with_attribution': 0}
+            with_attr = 0
+            for v in verified:
+                ru = v.get('report_uuid')
+                if not ru:
+                    continue
+                try:
+                    db.cursor.execute(
+                        "SELECT report_content FROM p5_ai_report WHERE report_uuid=%s LIMIT 1",
+                        (ru,))
+                    r = db.cursor.fetchone()
+                    if r and r.get('report_content'):
+                        import json as _json
+                        c = r['report_content']
+                        if isinstance(c, str):
+                            c = _json.loads(c)
+                        if isinstance(c, dict) and c.get('per_algo_top_predictions'):
+                            with_attr += 1
+                except Exception:
+                    continue
+            cov = round(with_attr / len(verified), 3)
+            return {'coverage': cov, 'sampled': len(verified),
+                    'with_attribution': with_attr}
+        except Exception as e:
+            logger.warning(f'estimate_attribution_coverage 异常: {e}')
+            return {'coverage': None, 'sampled': 0, 'with_attribution': 0}
+
     def _calculate_hits(self, prediction_record: Dict, actual_numbers: List[int]) -> Dict[str, Any]:
         """计算基础命中统计"""
         result = {

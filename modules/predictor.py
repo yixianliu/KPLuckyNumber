@@ -112,12 +112,16 @@ class AdaptiveWeightManager:
                  shrinkage_min_samples: int = 10,
                  weight_floor: float = 0.001,
                  weight_cap: float = 0.75,
-                 enable_guardrails: bool = True):
+                 enable_guardrails: bool = True,
+                 learning_rate_decay: float = 0.995,
+                 min_learning_rate: float = 0.05,
+                 warmup_iterations: int = 5,
+                 convergence_tol: float = 0.01):
         """初始化权重管理器
 
         Args:
-            ewma_alpha: EWMA 平滑系数(α越小, 历史影响越大)。由 P5PredictorConfig
-                从 DEFAULT_CONFIG['global']['ewma_alpha'] 注入, 便于在不改代码的前提下调参。
+            ewma_alpha: 基础学习率(α)。由 P5PredictorConfig 从 DEFAULT_CONFIG['global']
+                ['ewma_alpha'] 注入, 便于在不改代码的前提下调参。
             shrinkage_min_samples: 经验贝叶斯收缩的伪样本量 k。某算法累计验证样本 n 较少时,
                 其自适应权重会被拉回默认权重(先验), 收缩系数 λ = n/(n+k):
                 n=0 → 纯默认; n≫k → 纯数据。防止个位数噪声样本把权重甩飞。
@@ -125,10 +129,19 @@ class AdaptiveWeightManager:
                 因噪声塌缩到 ~0 或异常独大, 保证 7 算法学习通道始终存活。
             enable_guardrails: 总开关。False 时退化为 v3.14 原始行为(纯 EWMA 归一化),
                 便于对照实验/回滚。
+            learning_rate_decay: 学习率衰减系数(每次有效迭代后 α ← α·decay)。配合
+                warmup_iterations 与 min_learning_rate, 构成"学习率调度"——前期快速适应,
+                后期逐步收敛、停止被单期随机波动甩动。
+            min_learning_rate: 学习率下限(衰减地板), 保证长期仍有微幅适应能力。
+            warmup_iterations: 预热迭代次数; 期间使用基础 α 不衰减, 让初期少量样本先形成
+                稳定基线, 避免冷启动阶段的过度反应。
+            convergence_tol: 收敛判据。当连续两次权重向量的最大分量变化 < tol 时判定为收敛,
+                标记 self._converged=True, 后续仅做微量调整, 进入"稳定监控"态。
 
-        ★ 护栏设计动机(诚实边界): 排列5 公平摇号, 各算法命中率≈随机, EWMA 极易追逐
-          随机波动。收缩+钳制+最小样本门槛让"自适应"在证据不足时保守贴合冻结默认权重,
-          仅在证据充分且稳定时才偏离——把自学习从"追噪声"变为"抗噪声"。
+        ★ 设计动机(诚实边界): 排列5 公平摇号, 各算法命中率≈随机, 单期验证本质是噪声。
+          本套"学习率调度 + 预热 + 收敛检测 + 经验贝叶斯收缩 + 钳制"的组合, 目标是把自适应
+          学习从"追逐随机噪声"改造为"在证据充分且稳定时才缓慢偏离默认权重"——
+          提升的是稳定性/可监控性/抗噪性, 而非突破随机天花板。
         """
         # 护栏参数
         self.shrinkage_min_samples = max(0, int(shrinkage_min_samples))
@@ -153,6 +166,18 @@ class AdaptiveWeightManager:
         }
         # EWMA平滑系数 (α越小,历史影响越大)
         self.ewma_alpha = ewma_alpha
+
+        # ★ 学习率调度参数(v3.17 新增: 让自适应学习"收敛"而非震荡)
+        self.learning_rate_decay = max(0.0, min(1.0, float(learning_rate_decay)))
+        self.min_learning_rate = max(0.0, float(min_learning_rate))
+        self.warmup_iterations = max(0, int(warmup_iterations))
+        self.convergence_tol = max(0.0, float(convergence_tol))
+
+        # 学习调度运行状态
+        self.iteration = 0                                   # 累计有效迭代次数
+        self.effective_learning_rate = float(ewma_alpha)     # 当前实际生效学习率
+        self._converged = False                              # 是否已收敛
+        self._prev_weights = None                            # 上一轮权重(用于收敛检测)
 
         # ★ 护栏用: 快照默认权重(先验)。初值 ewma 即等于 DEFAULT_CONFIG 冻结权重,
         #   归一化后作为收缩目标 prior, 与后续学习产生的 EWMA 解耦。
@@ -215,14 +240,25 @@ class AdaptiveWeightManager:
         if algo_name not in self.algo_hit_rates:
             return
 
+        # ★ v3.17 学习率调度: 每次有效迭代推进一次学习率(预热期用基础率, 之后衰减至下限),
+        #   使自适应权重"先快速适应、后稳定收敛", 避免被单期随机波动长期甩动。
+        self.iteration += 1
+        if self.iteration <= self.warmup_iterations:
+            lr = self.ewma_alpha
+        else:
+            _steps = self.iteration - self.warmup_iterations
+            lr = max(self.min_learning_rate,
+                     self.ewma_alpha * (self.learning_rate_decay ** _steps))
+        self.effective_learning_rate = lr
+
         record = self.algo_hit_rates[algo_name]
         record['total'] += 1
         record['hits'] += hit_rate
 
-        # 指数加权移动平均更新 — 旧「覆盖命中率」通道
+        # 指数加权移动平均更新 — 旧「覆盖命中率」通道(使用调度后的有效学习率)
         record['ewma'] = (
-            self.ewma_alpha * hit_rate +
-            (1 - self.ewma_alpha) * record['ewma']
+            lr * hit_rate +
+            (1 - lr) * record['ewma']
         )
 
         # Top-1 精准度通道(允许为 None 表示未提供)
@@ -230,10 +266,52 @@ class AdaptiveWeightManager:
             record['t1_total'] += 1
             record['t1_hits'] += top1_hit
             record['ewma_t1'] = (
-                self.ewma_alpha * top1_hit +
-                (1 - self.ewma_alpha) * record['ewma_t1']
+                lr * top1_hit +
+                (1 - lr) * record['ewma_t1']
             )
         # else: top1_hit=None, 仅旧通道累积(兼容从 weight_history 旧数据回放的场景)
+
+        # ★ v3.17 收敛检测: 累积足够样本后, 比较相邻两次权重向量的最大分量位移,
+        #   小于收敛阈值则标记已收敛(进入"稳定监控"态, 仅做微量调整)。
+        if self.iteration > self.warmup_iterations:
+            try:
+                _cur = self.get_adaptive_weights(metric='top1_hit')
+                if self._prev_weights is not None:
+                    _max_delta = max(
+                        abs(_cur.get(a, 0.0) - self._prev_weights.get(a, 0.0))
+                        for a in _cur
+                    )
+                    self._converged = bool(_max_delta < self.convergence_tol)
+                self._prev_weights = _cur
+            except Exception:
+                pass
+
+    def is_converged(self) -> bool:
+        """返回当前是否已收敛(权重向量位移低于阈值)。"""
+        return self._converged
+
+    def get_learning_state(self) -> Dict[str, Any]:
+        """返回学习调度与收敛状态快照(供学习报告/调试展示)。"""
+        return {
+            'iteration': self.iteration,
+            'effective_learning_rate': round(self.effective_learning_rate, 6),
+            'base_learning_rate': self.ewma_alpha,
+            'converged': self._converged,
+            'warmup_iterations': self.warmup_iterations,
+            'learning_rate_decay': self.learning_rate_decay,
+            'min_learning_rate': self.min_learning_rate,
+            'convergence_tol': self.convergence_tol,
+            'effective_sample_size': sum(
+                r.get('t1_total', 0) for r in self.algo_hit_rates.values()
+            ),
+        }
+
+    def reset_state(self):
+        """重置迭代/收敛运行状态(权重 EWMA 由外部 load_from_records 或实例重建恢复)。"""
+        self.iteration = 0
+        self.effective_learning_rate = float(self.ewma_alpha)
+        self._converged = False
+        self._prev_weights = None
 
     def get_adaptive_weights(self, metric: str = 'top1_hit') -> Dict[str, float]:
         """
@@ -482,6 +560,11 @@ class P5PredictorConfig:
             'adaptive_weight_floor': 0.001,        # 归一化后单算法权重下限(防塌缩到0, 保学习通道存活)
             'adaptive_weight_cap': 0.75,           # 归一化后单算法权重上限(防噪声独大)
             'enable_adaptive_guardrails': True,    # 护栏总开关(False=退化到纯EWMA原始行为, 供对照)
+            # ★ 学习率调度(2026-07-25 v3.17 新增, 让自适应"收敛"而非震荡, 均由 global 注入可调):
+            'learning_rate_decay': 0.995,   # 每次有效迭代后 α←α·decay(学习率衰减系数)
+            'min_learning_rate': 0.05,      # 学习率下限(衰减地板, 保证长期仍有微幅适应)
+            'warmup_iterations': 5,          # 预热迭代次数(期间用基础 α 不衰减, 稳定冷启动)
+            'convergence_tol': 0.01,        # 收敛判据(相邻权重向量最大分量位移 < 此值即判收敛)
             'ewma_blend': 0.1,          # 融合时 EWMA 对静态权重的混合系数(原0.3)
             'minor_max_weight': 0.10,   # 次要算法(趋势/马尔可夫/形态/特征)EWMA混合后权重上限
             'enable_ai_model': True,
@@ -518,7 +601,11 @@ class P5PredictorConfig:
             shrinkage_min_samples=_g.get('adaptive_shrinkage_min_samples', 10),
             weight_floor=_g.get('adaptive_weight_floor', 0.001),
             weight_cap=_g.get('adaptive_weight_cap', 0.75),
-            enable_guardrails=_g.get('enable_adaptive_guardrails', True))
+            enable_guardrails=_g.get('enable_adaptive_guardrails', True),
+            learning_rate_decay=_g.get('learning_rate_decay', 0.995),
+            min_learning_rate=_g.get('min_learning_rate', 0.05),
+            warmup_iterations=_g.get('warmup_iterations', 5),
+            convergence_tol=_g.get('convergence_tol', 0.01))
 
     def _merge_config(self, base: Dict, override: Dict) -> Dict:
         """
