@@ -1,5 +1,5 @@
 """
-走势图分析预测引擎 (v3.15 增量, 封板后新迭代)
+走势图分析预测引擎
 
 对应需求4功能:
   1) load_trend_data()      — 导入解析各类历史走势图数据(8张走势表)
@@ -54,6 +54,15 @@ class TrendSignalWeightManager:
     """
 
     def __init__(self, enable_adapt: bool = False, ewma_alpha: float = 0.3):
+        """初始化走势信号源权重管理器。
+
+        参数:
+            enable_adapt: 是否启用信号源自适应调权（实验性，默认关闭）
+            ewma_alpha: EWMA 平滑系数，越大越看重近期表现
+
+        说明:
+            每个信号源的表现以 EWMA 追踪，初值 0.5 表示中性、无先验偏好。
+        """
         self.enable_adapt = bool(enable_adapt)
         self.ewma_alpha = float(ewma_alpha)
         # 各信号源的 EWMA 表现追踪 (0~1, 初值0.5中性)
@@ -94,11 +103,18 @@ class TrendAnalyzer:
     POS_NAMES = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
 
     def __init__(self, db, enable_adapt: bool = False, ewma_alpha: float = 0.3):
+        """初始化走势图分析预测引擎。
+
+        参数:
+            db: 已连接的 P5Database 实例，用于读取各位置走势数据
+            enable_adapt: 是否启用信号源自适应调权（实验性，默认关闭）
+            ewma_alpha: 传递给权重管理器的 EWMA 平滑系数
+        """
         self.db = db
         self.weight_mgr = TrendSignalWeightManager(enable_adapt, ewma_alpha)
 
     # ---------------- 功能1: 导入解析各类历史走势图数据 ----------------
-    def load_trend_data(self, period: int = 60) -> Dict[str, Any]:
+    def load_trend_data(self, period: int = 40) -> Dict[str, Any]:
         """加载8类走势数据: 历史走势 / 基础走势 / 5位置走势 / 和值 / 贝叶斯(可选)"""
         if not self.db or not getattr(self.db, 'connection', None):
             logger.warning('TrendAnalyzer: 数据库未连接, 返回空')
@@ -124,10 +140,10 @@ class TrendAnalyzer:
                 pos_trends[p] = m(limit=period) if m else []
             except Exception:
                 pos_trends[p] = []
-        # 和值重心 (p5_hzzst_data 近15期)
+        # 和值重心 (p5_hzzst_data 近 period 期, 与整体走势窗口一致)
         hezhi_recent: List[int] = []
         try:
-            db.cursor.execute('SELECT hezhi FROM p5_hzzst_data ORDER BY issue DESC LIMIT 15')
+            db.cursor.execute('SELECT hezhi FROM p5_hzzst_data ORDER BY issue DESC LIMIT %s', (period,))
             hezhi_recent = [int(r['hezhi']) for r in (db.cursor.fetchall() or [])
                             if r.get('hezhi') is not None]
         except Exception:
@@ -294,8 +310,8 @@ class TrendAnalyzer:
             mn = min(fused.values()) if fused else 0.0
             rng = (mx - mn) or 1.0
             hotness = {d: round((fused[d] - mn) / rng * 100, 2) for d in range(10)}
-            # Top-5
-            top = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:5]
+            # Top-3 (用户要求浓缩到3个数字)
+            top = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:3]
             positions[p] = {
                 'position_name': self.POS_NAMES[p],
                 'top5': [int(d) for d, _ in top],
@@ -316,8 +332,8 @@ class TrendAnalyzer:
             'honest_disclaimer': HONEST_DISCLAIMER,
         }
 
-    def predict(self, target_issue: str = '', period: int = 60) -> Dict[str, Any]:
-        """输出各位置 Top-5 + 相对热度 + 信号源分解 + 诊断 + 诚实免责
+    def predict(self, target_issue: str = '', period: int = 40) -> Dict[str, Any]:
+        """输出各位置 Top-3 + 相对热度 + 信号源分解 + 诊断 + 诚实免责
 
         内部 = load_trend_data + predict_with_data; 回测场景请直接调
         predict_with_data 注入截止期数据切片。
@@ -328,13 +344,21 @@ class TrendAnalyzer:
 
 # ---------------- CLI 入口 (独立可验证) ----------------
 def _cli():
+    """命令行调试入口：加载走势数据并输出一次预测结果（JSON）。
+
+    说明:
+        仅供开发调试，正式运行请使用 GUI；
+        支持 --issue（目标期号，仅标注）、--period（历史期数，默认 40）、
+        --adapt（启用信号源自适应，实验性）三个参数；
+        无论预测是否成功都会断开数据库连接。
+    """
     import argparse
     import json
     from modules.database import P5Database
 
     parser = argparse.ArgumentParser(description='走势图分析预测引擎 (v3.15 增量, 诚实口径)')
     parser.add_argument('--issue', default='', help='目标期号(仅标注, 不影响数据加载)')
-    parser.add_argument('--period', type=int, default=60, help='使用历史期数 (默认60)')
+    parser.add_argument('--period', type=int, default=40, help='使用历史期数 (默认40)')
     parser.add_argument('--adapt', action='store_true', help='启用信号源自适应(实验性, 默认关闭)')
     args = parser.parse_args()
 

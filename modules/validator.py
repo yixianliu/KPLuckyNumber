@@ -1,14 +1,14 @@
 """
-排列5预测验证系统模块
+排列5 预测验证系统模块
 
 功能：
-1. 跟踪每一期AI预测结果（从数据库读取待验证预测记录）
+1. 跟踪每一期预测结果（从数据库读取待验证预测记录）
 2. 在实际开奖结果公布后，自动比对预测与实际结果
 3. 计算命中率、偏差分析、准确率指标（按位置统计）
-4. 建立完整的AI预测性能评估档案（含历史趋势）
+4. 建立预测性能评估档案（含历史趋势）
 
 调用路径：
-    gui.py → Validator → P5Database（读写预测验证数据）
+    main.py → Validator → P5Database（读写预测验证数据）
 
 数据库依赖表：
     - ai_predictions: 预测记录源（含待验证状态）
@@ -23,13 +23,15 @@ import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-os.makedirs('logs', exist_ok=True)
+from paths import LOGS_DIR
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('logs/prediction_validator.log', encoding='utf-8')
+    file_handler = logging.FileHandler(LOGS_DIR + '/prediction_validator.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -321,7 +323,7 @@ class Validator:
         
         report += """
 ========================================
-📊 说明：
+说明：
 - 完全猜中：5个位置全部命中
 - 命中率：命中位数 / 5 * 100%
 - 数据基于历史预测验证结果统计

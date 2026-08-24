@@ -675,11 +675,11 @@ class P5Features:
 
         # 计算和值特征
         sum_stats = {
-            'mean': np.mean(sums),
-            'std': np.std(sums),
-            'min': min(sums),
-            'max': max(sums),
-            'median': np.median(sums)
+            'mean': float(np.mean(sums)),
+            'std': float(np.std(sums)),
+            'min': int(min(sums)),
+            'max': int(max(sums)),
+            'median': float(np.median(sums))
         }
 
         # 统计和值区间分布

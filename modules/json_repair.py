@@ -88,8 +88,19 @@ def _repair_json_string(s: str) -> str:
     仅在「结构位置」上处理单引号，避免误伤双引号字符串内的撇号。
     """
     # a. 结构位置上的单引号字符串 -> 双引号字符串
-    #    要求单引号前是 { [ , : 或其后空白（即键/值位置），避免触碰 "it's" 这类内部撇号
+    # 要求单引号前是 { [ , : 或其后空白（即键/值位置），避免触碰 "it's" 这类内部撇号
     def _single_to_double(m):
+        """正则替换回调：把单引号包裹的 JSON 字符串改写为双引号形式。
+
+        参数:
+            m: 正则匹配对象，组 1 为前缀（键名与冒号等），组 2 为单引号内的原始内容
+
+        返回:
+            str —— 改写为双引号后的片段
+
+        说明:
+            内部已有的双引号会被转义，避免改写后破坏 JSON 结构。
+        """
         prefix = m.group(1)
         inner = m.group(2).replace('\\"', '\\\\"').replace('"', '\\"')
         return prefix + '"' + inner + '"'
@@ -97,7 +108,7 @@ def _repair_json_string(s: str) -> str:
     s = re.sub(r"([{\[,:]\s*)'([^']*)'", _single_to_double, s)
 
     # b. 未加引号的裸 key -> 加双引号
-    #    形如 { wan: 或 , qian:  （key 为合法标识符，前面是 { 或 ,）
+    # 形如 { wan: 或 , qian: （key 为合法标识符，前面是 { 或 ,）
     s = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', s)
 
     # c. Python 常量 -> JSON 常量（词边界）
@@ -105,7 +116,7 @@ def _repair_json_string(s: str) -> str:
     s = re.sub(r'\bFalse\b', 'false', s)
     s = re.sub(r'\bNone\b', 'null', s)
 
-    # d. 尾随逗号:  ,} 或 ,]  ->  } 或 ]
+    # d. 尾随逗号: ,} 或 ,] -> } 或 ]
     s = re.sub(r',(\s*[}\]])', r'\1', s)
 
     return s

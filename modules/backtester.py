@@ -14,6 +14,7 @@
 import logging
 import os
 import json
+import hashlib
 import numpy as np
 from collections import defaultdict
 from datetime import datetime
@@ -27,10 +28,16 @@ import matplotlib.font_manager as fm
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
-os.makedirs('logs', exist_ok=True)
-os.makedirs('reports/backtest', exist_ok=True)
+from paths import LOGS_DIR, REPORTS_BACKTEST_DIR
 
-# 说明：回测结果与报告写入 projects/reports/backtest 下；日志写入 logs/。
+os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(REPORTS_BACKTEST_DIR, exist_ok=True)
+
+# 回测断点续跑缓存版本号。预测语义发生变化时(如贝叶斯/融合逻辑调整)应递增，
+# 使旧缓存自动失效、避免用过期预测污染续跑结果。
+BACKTEST_RESUME_VERSION = "2026-07-31-v1"
+
+# 说明：回测结果与报告写入 reports/backtest 下；日志写入 logs/。
 # 本模块可能生成大量文件，请确保磁盘空间充足并使用配置好的日志路径进行集中管理。
 
 logger = logging.getLogger(__name__)
@@ -62,62 +69,257 @@ class Backtester:
             self.db = P5Database()
         return self.db
 
+    # ------------------------------------------------------------------
+    # 回测断点续跑：将逐期评估结果落盘，中断后再次运行可从断点继续，
+    # 既避免 API 限流/网络抖动导致前功尽弃，也省去对已完成期的重复 AI 调用。
+    # ------------------------------------------------------------------
+    def _backtest_signature(self, eval_mode: str, eval_start: int, test_count: int,
+                            enable_ai: bool, max_bayes_aux_calls: int) -> str:
+        """生成回测运行签名：唯一定位一组「绝对期号窗口 + 配置」，作为缓存键。
+
+        历史数据为按期号正序、仅追加的序列，故 index 映射到固定期号；
+        eval_start/test_count 确定窗口，配合 enable_ai/max_bayes_aux_calls/版本号
+        可区分不同配置（如改 cap 即视为不同运行，避免续跑时辅助决策不一致）。
+        """
+        raw = f"{BACKTEST_RESUME_VERSION}|{eval_mode}|{eval_start}|{test_count}" \
+              f"|ai={enable_ai}|auxcap={max_bayes_aux_calls}"
+        return hashlib.md5(raw.encode('utf-8')).hexdigest()[:12]
+
+    def _backtest_resume_path(self, signature: str) -> str:
+        """拼接回测断点续跑文件的完整路径。
+
+        参数:
+            signature: 回测参数指纹，用于区分不同配置的断点文件
+
+        返回:
+            str —— reports/backtest/resume_{signature}.json 的绝对路径
+
+        说明:
+            调用时确保目标目录存在，首次回测无需手动建目录。
+        """
+        os.makedirs(REPORTS_BACKTEST_DIR, exist_ok=True)
+        return os.path.join(REPORTS_BACKTEST_DIR, f"resume_{signature}.json")
+
+    def _load_backtest_resume(self, path: str) -> Dict[str, Any]:
+        """读取断点缓存：{issue: {'eval': eval_result, 'aux': bool}}。损坏则返回空。"""
+        try:
+            if not os.path.exists(path):
+                return {}
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or 'version' not in data or data.get('version') != BACKTEST_RESUME_VERSION:
+                return {}  # 版本不符，视为无效缓存
+            return data.get('issues', {})
+        except Exception:
+            return {}
+
+    def _save_backtest_resume(self, path: str, issues: Dict[str, Any]):
+        """增量落盘断点缓存（每期预测成功后调用）。"""
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({'version': BACKTEST_RESUME_VERSION, 'issues': issues}, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f'回测断点缓存写入失败（不影响本次结果）: {e}')
+
+    @classmethod
+    def clear_backtest_resume_cache(cls):
+        """清除全部回测断点缓存文件（reports/backtest/resume_*.json）。"""
+        try:
+            if not os.path.isdir(REPORTS_BACKTEST_DIR):
+                return 0
+            _n = 0
+            for _fn in os.listdir(REPORTS_BACKTEST_DIR):
+                if _fn.startswith('resume_') and _fn.endswith('.json'):
+                    os.remove(os.path.join(REPORTS_BACKTEST_DIR, _fn))
+                    _n += 1
+            return _n
+        except Exception as e:
+            logger.warning(f'清除回测断点缓存失败: {e}')
+            return 0
+
+    def _blog(self, msg: str):
+        """进度日志——写日志文件/控制台，若提供 log_callback 则同步转发（如 GUI 面板）。"""
+        logger.info(msg)
+        if self._log_cb:
+            try:
+                self._log_cb(msg)
+            except Exception:
+                pass
+
     def run_backtest(self, start_index: int = 50, test_count: int = 100,
-                     use_validation_split: bool = True) -> Dict[str, Any]:
+                     use_validation_split: bool = True,
+                     eval_mode: str = 'recent',
+                     enable_ai: bool = False,
+                     max_bayes_aux_calls: int = 10,
+                     resume: bool = True,
+                     log_callback: Optional[callable] = None) -> Dict[str, Any]:
         """
         执行历史回测（Walk-Forward / 滚动窗口验证）
 
         方法论：
-            采用「滚动训练窗口」模拟真实预测：对每一期 i（从 start_index 起），
-            用其之前的全部历史 history_data[:i] 作为训练集，预测第 i 期，再与真实开奖
-            比对评估。逐期推进，从而得到模型在「不可见未来」上的真实命中表现，
+            采用「滚动训练窗口」模拟真实预测：对每一期 i，用其之前的全部历史
+            history_data[:i] 作为训练集，预测第 i 期，再与真实开奖比对评估。
+            逐期推进，从而得到模型在「不可见未来」上的真实命中表现，
             避免用未来数据污染训练（前视偏差）。
 
-        关键参数（魔法数，可调）：
-            - start_index (默认 50)：前 50 期仅作为冷启动训练数据，不评估；
-              既保证算法有足够样本，又避免期数太少导致统计不稳。
-            - test_count (默认 100)：回测 100 期，平衡统计显著性与耗时。
-            - use_validation_split (默认 True)：保留参数，标记是否启用训练/验证分离策略。
+        评估窗口（v3.25 修复）：
+            - eval_mode='recent'（默认，推荐）：评估「最近 test_count 期」，
+              即 start = max(start_index, len(history) - test_count)。
+              与 scripts/production/opt_freeze_baseline.py 的基线口径完全一致。
+              修复前的行为是从最老的第 start_index 期开始评估，
+              在当前 1000+ 期库存下相当于只回测 2023 年的老数据，
+              既不代表当下表现，训练集也仅有 50 期（严重欠拟合）。
+            - eval_mode='legacy'：保留旧行为（自 start_index 向后评估），
+              仅供复现历史结果时使用。
+
+        AI 开关（v3.25 修复 / v3.27 调整）：
+            - enable_ai=False（默认）：回测期间关闭「完整AI复包装」
+              (predict() 的 ai_result)，原因有三：① 每期一次 HTTP 调用，50 期即 50 次，
+              产生费用与耗时；② AI 输出不可复现，回测结论无法字节级复算；
+              ③ 大模型对历史开奖结果可能「已知答案」，虚高回测命中率。
+              回测的意义是评估统计模型本身，故完整AI复包装默认关闭。
+            - 但「贝叶斯AI辅助」(_ai_augment_bayesian) 受独立开关
+              enable_bayes_aux_in_backtest(默认 True) 控制，回测期间仍会触发：
+              它仅对贝叶斯后验分布作自然语言解读与重点关注号码提示，
+              不读取未来开奖、不改变 fused_probabilities / top_combinations，
+              因此既不引入前视泄漏、也不影响命中率指标，却让用户能在回测日志中
+              看到"AI分析:启用（含贝叶斯辅助洞察）"。用户需求：回测长期显示
+              "AI分析:未启用"，希望贝叶斯推断真的用AI辅助。
+            - enable_ai=True：显式要求时完整AI复包装也在回测中调用。
+
+        关键参数：
+            - start_index (默认 50)：最小冷启动训练期数（训练集下限）。
+            - test_count (默认 100)：评估期数，平衡统计显著性与耗时。
+            - use_validation_split (默认 True)：保留参数，标记训练/验证分离策略。
+            - max_bayes_aux_calls (默认 10)：v3.27 新增。回测逐期调用会触发API限流
+              (实测逐期 ~40-70s)，全量50期将卡住GUI数十分钟。故贝叶斯辅助AI最多触发
+              该次数(仅对最近若干期——后验路径必达、最贴近当期——生效)，其余期保持关闭。
+              设为 0 可完全关闭回测中的贝叶斯辅助AI。
+            - log_callback (默认 None)：v3.31 新增。若提供（如 GUI 的 task_mgr.log），
+              关键进度日志（断点恢复、逐期AI启用、每10期汇总、完成统计）将同步送至该回调，
+              使回测过程在 GUI 输出面板中逐期可见；不提供时仅写日志文件/控制台。
 
         边界条件：
-            - 历史数据不足 start_index+test_count 期时，自动压缩 test_count；
-              若压缩后仍 ≤0，返回错误（数据不足）。
-            - 单期预测失败（含 'error' 字段）则跳过该期，不计入 backtest_results，
-              保证个别异常不中断整轮回测。
+            - 历史数据不足时自动压缩 test_count；压缩后仍 ≤0 则返回错误。
+            - 单期预测失败（含 'error' 字段）则跳过该期，不中断整轮回测。
             - 无论成败，finally 中都会 db.disconnect() 释放连接。
+            - resume=True（默认）：将逐期结果落盘（reports/backtest/resume_<签名>.json），
+              中断后再次运行可从断点继续，已完成期不重预测、不重调AI；
+              运行签名含 eval_mode/eval_start/test_count/enable_ai/max_bayes_aux_calls/版本号，
+              配置变更即视为不同运行、互不串扰。失败期不缓存，下次重试。
+              resume=False 或 Backtester.clear_backtest_resume_cache() 可强制全新回测。
 
         Returns:
             字典 status='success' 时含 results(逐期评估) 与 overall_stats(汇总)；
             status='error' 时含 message 说明失败原因。
         """
-        logger.info(f'开始历史回测: start_index={start_index}, test_count={test_count}')
+        self._log_cb = log_callback  # GUI 面板可见性回调（None 则不转发）
+
+        logger.info(f'开始历史回测: start_index={start_index}, test_count={test_count}, '
+                    f'eval_mode={eval_mode}, enable_ai={enable_ai}')
 
         # 加载历史数据
         db = self._get_db()
         if not db.connect():
             return {'status': 'error', 'message': '数据库连接失败'}
 
+        # 回测期间的 AI 开关（默认关闭，见 docstring）
+        ai_restore = self._set_ai_enabled(enable_ai)
+
+        # 贝叶斯AI辅助调用上限。回测逐期调用会触发API限流(实测逐期 ~40-70s),
+        # 全量50期将卡住GUI数十分钟。故仅对「最近若干期」(后验路径必达、最贴近当期)
+        # 触发辅助AI, 其余期保持关闭。aux_allowed 受 config.enable_bayes_aux_in_backtest 控制。
+        _cfg = getattr(self.predictor, 'config', None)
+        _aux_allowed = bool(_cfg.get_global_param('enable_bayes_aux_in_backtest', True)) if _cfg else True
+        _bayes_aux_n = max_bayes_aux_calls if _aux_allowed else 0
+        if _bayes_aux_n > 0:
+            self._blog(f'回测贝叶斯AI辅助: 仅对最后 {_bayes_aux_n} 期(最近、最贴近当期)触发, 控费且避免API限流卡顿')
+
         try:
             # 获取历史数据（按期号正序排列）
             history_data = db.get_history_data(limit=None, order='ASC')
+            total_hist = len(history_data)
 
-            if len(history_data) < start_index + test_count:
-                logger.warning(f'历史数据不足: 需要{start_index + test_count}期，实际{len(history_data)}期')
-                test_count = len(history_data) - start_index
-                if test_count <= 0:
-                    return {'status': 'error', 'message': '历史数据不足，无法回测'}
+            if total_hist <= start_index:
+                return {'status': 'error', 'message': '历史数据不足，无法回测'}
+
+            # 确定评估起点
+            if eval_mode == 'recent':
+                eval_start = max(start_index, total_hist - test_count)
+            else:
+                eval_start = start_index
+
+            effective_count = min(test_count, total_hist - eval_start)
+            if effective_count <= 0:
+                return {'status': 'error', 'message': '历史数据不足，无法回测'}
+            if effective_count < test_count:
+                logger.warning(f'历史数据不足: 期望{test_count}期，实际可评估{effective_count}期')
+            test_count = effective_count
+
+            eval_range = (history_data[eval_start]['issue'],
+                          history_data[eval_start + test_count - 1]['issue'])
+            self._blog(f'回测评估区间: {eval_range[0]} ~ {eval_range[1]} '
+                       f'(共{test_count}期, 训练集起始规模{eval_start}期)')
+
+            # 断点续跑——按运行签名加载已完成的逐期结果，避免重复预测/重复调AI。
+            _signature = self._backtest_signature(eval_mode, eval_start, test_count, enable_ai, max_bayes_aux_calls)
+            _cache_path = self._backtest_resume_path(_signature)
+            _cache = self._load_backtest_resume(_cache_path) if resume else {}
+            _resume_total = len(_cache)
+            if _resume_total > 0:
+                self._blog(f'检测到回测断点缓存（签名 {_signature}）：已恢复 {_resume_total}/{test_count} 期，'
+                           f'将从第 {_resume_total + 1} 期继续（已完成期不重预测、不重调AI）')
 
             # 执行回测
             backtest_results = []
+            _aux_fired = 0
+            _resumed = 0
 
-            for i in range(start_index, min(start_index + test_count, len(history_data))):
-                # 使用前i期数据预测第i+1期
-                train_data = history_data[:i]
+            for _idx, i in enumerate(range(eval_start, eval_start + test_count)):
                 target_issue = history_data[i]['issue']
-                actual_numbers = history_data[i]['numbers']
 
-                # 执行预测
-                prediction_result = self.predictor.predict(train_data, target_issue)
+                # —— 断点恢复：已完成期直接复用缓存，跳过预测与AI调用 ——
+                if resume and target_issue in _cache:
+                    _wrap = _cache[target_issue]
+                    backtest_results.append(_wrap['eval'])
+                    if _wrap.get('aux'):
+                        _aux_fired += 1
+                    _resumed += 1
+                    self._blog(f'  期号{target_issue}: (断点恢复) 跳过预测，复用缓存结果')
+                    if (_idx + 1) % 10 == 0:
+                        self._blog(f'已回测 {_idx + 1}/{test_count} 期'
+                                   f'（含断点恢复 {_resumed} 期，辅助已触发 {_aux_fired} 期）')
+                    continue
+
+                # 用第 i 期之前的全部历史，预测第 i 期
+                train_data = history_data[:i]
+                actual_numbers = history_data[i]['numbers']
+                # 训练集最后一期 = 预测时「已知」的最新期号
+                base_issue = history_data[i - 1]['issue'] if i > 0 else None
+
+                # 仅对「最后 _bayes_aux_n 期」开启贝叶斯辅助AI(最近、最贴近当期、
+                # 后验路径必达), 既让用户看到"AI分析:启用", 又控费并避免API限流卡顿GUI。
+                _aux_on = _aux_allowed and (_idx >= test_count - _bayes_aux_n)
+                self.predictor._bayes_aux_override = _aux_on
+                # 清晰的上下文标注: 被 cap 掉的非辅助期, 明确说明原因,
+                # 避免"未启用"被误判为配置错误(用户曾多次因此困惑)。
+                if _aux_on:
+                    if hasattr(self.predictor, '_ai_disabled_context'):
+                        delattr(self.predictor, '_ai_disabled_context')
+                else:
+                    self.predictor._ai_disabled_context = (
+                        f'回测/批量评估模式（贝叶斯辅助AI仅对最近{_bayes_aux_n}期开启，控费避免API限流卡顿）'
+                    )
+
+                # 执行预测（显式传入 target_issue，避免预测器按 +1 推导导致期号错位）
+                prediction_result = self.predictor.predict(
+                    train_data, base_issue, target_issue=target_issue
+                )
+
+                # 捕获本期的辅助AI触发标志，既用于计数也写入断点缓存
+                _aux_hit = bool(getattr(self.predictor, '_bayesian_ai_auxiliary', {}))
+                if _aux_hit:
+                    _aux_fired += 1
 
                 if 'error' in prediction_result:
                     logger.warning(f'期号{target_issue}预测失败: {prediction_result["error"]}')
@@ -132,8 +334,20 @@ class Backtester:
 
                 backtest_results.append(eval_result)
 
-                if (i - start_index + 1) % 10 == 0:
-                    logger.info(f'已回测 {i - start_index + 1}/{test_count} 期')
+                # 增量落盘断点（仅成功预测才缓存，失败期留待下次重试）
+                if resume:
+                    _cache[target_issue] = {'eval': eval_result, 'aux': _aux_hit}
+                    self._save_backtest_resume(_cache_path, _cache)
+
+                if _aux_on:
+                    # 辅助AI逐期流式日志——让"全部50期"用户实时看到每期
+                    # "AI分析:启用"，同时保证 liveness 信号充足（单期AI调用远<30min）。
+                    self._blog(f' 期号{target_issue}: 贝叶斯AI辅助=启用 '
+                               f'(第 {_idx + 1}/{test_count} 期)')
+
+                if (_idx + 1) % 10 == 0:
+                    self._blog(f'已回测 {_idx + 1}/{test_count} 期'
+                               f'（贝叶斯AI辅助已触发 {_aux_fired} 期）')
 
             # 计算总体统计
             overall_stats = self._calculate_overall_stats(backtest_results)
@@ -143,18 +357,31 @@ class Backtester:
                 'backtest_time': datetime.now().isoformat(),
                 'config': {
                     'start_index': start_index,
+                    'eval_start_index': eval_start,
+                    'eval_mode': eval_mode,
+                    'eval_issue_range': list(eval_range),
+                    'train_size_at_start': eval_start,
+                    'ai_enabled': bool(enable_ai),
                     'test_count': test_count,
                     'use_validation_split': use_validation_split
                 },
                 'results': backtest_results,
                 'overall_stats': overall_stats,
-                'total_tested': len(backtest_results)
+                'total_tested': len(backtest_results),
+                'ai_aux_enabled_count': _aux_fired,
+                'ai_aux_cap': _bayes_aux_n,
+                'resumed_count': _resumed,
+                'resume_signature': _signature
             }
 
-            logger.info(f'回测完成: 共测试{len(backtest_results)}期')
-            logger.info(f'Top-1平均命中率: {overall_stats["avg_top1_hit_rate"]:.2%}')
-            logger.info(f'Top-3平均命中率: {overall_stats["avg_top3_hit_rate"]:.2%}')
-            logger.info(f'平均综合得分: {overall_stats["avg_overall_score"]:.2f}/100')
+            self._blog(f'回测完成: 共测试{len(backtest_results)}期'
+                       f'{f" (其中断点恢复 {_resumed} 期)" if _resumed else ""}')
+            if _aux_allowed and _bayes_aux_n > 0:
+                self._blog(f'贝叶斯AI辅助: {_aux_fired}/{len(backtest_results)} 期已触发辅助洞察'
+                           f'（最近 {_bayes_aux_n} 期；其余期按设计关闭以控费/避免API限流卡顿）')
+            self._blog(f'Top-1平均命中率: {overall_stats["avg_top1_hit_rate"]:.2%}')
+            self._blog(f'Top-3平均命中率: {overall_stats["avg_top3_hit_rate"]:.2%}')
+            self._blog(f'平均综合得分: {overall_stats["avg_overall_score"]:.2f}/100')
 
             return backtest_summary
 
@@ -162,7 +389,70 @@ class Backtester:
             logger.error(f'回测执行失败: {e}', exc_info=True)
             return {'status': 'error', 'message': str(e)}
         finally:
+            self._restore_ai_enabled(ai_restore)
             db.disconnect()
+
+    # ------------------------------------------------------------------
+    # AI 开关（回测期间默认关闭，防止耗时/费用/不可复现/前视泄漏）
+    # ------------------------------------------------------------------
+    def _set_ai_enabled(self, enabled: bool) -> Dict[str, Any]:
+        """临时设置预测器 AI 开关，返回用于恢复的原始状态。
+
+        完整AI复包装由 enabled 控制(回测默认False→关闭，控费+保可复现)；
+        但「贝叶斯AI辅助」受独立开关 enable_bayes_aux_in_backtest 控制，默认开启，
+        故回测期间贝叶斯推断仍会调用AI作辅助解读(用户明确诉求)，且不改变命中率指标。
+        """
+        restore = {'touched': False}
+        try:
+            predictor = self.predictor
+            cfg = getattr(predictor, 'config', None)
+            restore['ai_available'] = getattr(predictor, 'ai_available', None)
+            if cfg is not None and hasattr(cfg, 'config'):
+                g = cfg.config.setdefault('global', {})
+                restore['enable_ai_model'] = g.get('enable_ai_model')
+                g['enable_ai_model'] = bool(enabled)
+            if hasattr(predictor, 'ai_available'):
+                # 关闭时直接置为 False；开启时保持预测器自身的可用性判定
+                predictor.ai_available = bool(enabled) and bool(restore['ai_available'])
+            # 贝叶斯AI辅助独立开关：回测期间默认仍开启(用户诉求)，完整AI复包装保持关闭
+            _allow_aux = True
+            if cfg is not None and hasattr(cfg, 'config'):
+                _allow_aux = bool(cfg.get_global_param('enable_bayes_aux_in_backtest', True))
+            predictor._bayes_aux_override = _allow_aux
+            # 标注「完整AI复包装被关闭」的上下文，使 predict() 日志不再被误读为配置错误
+            if hasattr(predictor, '_ai_disabled_context'):
+                delattr(predictor, '_ai_disabled_context')
+            if not enabled:
+                predictor._ai_disabled_context = '回测/批量评估模式（完整AI复包装关闭，仅贝叶斯辅助AI开启）'
+                logger.info('回测关闭完整AI复包装(可复现/控费)；贝叶斯AI辅助按 enable_bayes_aux_in_backtest 仍开启')
+            restore['touched'] = True
+        except Exception as e:
+            logger.warning(f'设置回测 AI 开关失败(忽略): {e}')
+        return restore
+
+    def _restore_ai_enabled(self, restore: Dict[str, Any]) -> None:
+        """恢复预测器 AI 开关到回测前状态。"""
+        if not restore or not restore.get('touched'):
+            return
+        try:
+            predictor = self.predictor
+            cfg = getattr(predictor, 'config', None)
+            if cfg is not None and hasattr(cfg, 'config') and 'enable_ai_model' in restore:
+                g = cfg.config.setdefault('global', {})
+                if restore['enable_ai_model'] is None:
+                    g.pop('enable_ai_model', None)
+                else:
+                    g['enable_ai_model'] = restore['enable_ai_model']
+            if restore.get('ai_available') is not None and hasattr(predictor, 'ai_available'):
+                predictor.ai_available = restore['ai_available']
+            # 清除贝叶斯辅助覆盖层，恢复为「跟随 enable_ai_model」的常态行为
+            if hasattr(predictor, '_bayes_aux_override'):
+                delattr(predictor, '_bayes_aux_override')
+            # 清除「按设计关闭」上下文标注，避免泄漏到随后的真实预测日志
+            if hasattr(predictor, '_ai_disabled_context'):
+                delattr(predictor, '_ai_disabled_context')
+        except Exception as e:
+            logger.warning(f'恢复回测 AI 开关失败(忽略): {e}')
 
     def _evaluate_prediction(self, prediction_result: Dict[str, Any],
                             actual_numbers: List[int], target_issue: str) -> Dict[str, Any]:
@@ -242,10 +532,12 @@ class Backtester:
                 'match_rate': round(match_count / 5, 2)
             })
 
-        # 综合评分：Top-1 命中每位置 40 分，Top-3 命中每位置 20 分，除以 5 归一
+        # 综合评分：Top-1 命中每位置 40 分，Top-3 命中每位置 20 分。
+        # 满分场景（5 位全 Top-1）= 200 分；除以 3 归一到百分制（600/3=200，仍合理上限）。
+        # 历史版本除以 5 导致数值上限仅 60，显示"8.80/100"实为小数点后方失真，此处纠正归一分母。
         top1_hits = sum(1 for p in position_accuracy if p['top1_hit'])
         top3_hits = sum(1 for p in position_accuracy if p['top3_hit'])
-        overall_score = round((top1_hits * 40 + top3_hits * 20) / 5, 2)
+        overall_score = round((top1_hits * 40 + top3_hits * 20) / 3, 2)
 
         # 概率校准度（Brier Score）：真实号码命中记 1，与预测概率的平方误差
         brier_scores = []
@@ -427,7 +719,7 @@ class Backtester:
         """
         if output_path is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_path = f'reports/backtest/backtest_report_{timestamp}.txt'
+            output_path = os.path.join(REPORTS_BACKTEST_DIR, f'backtest_report_{timestamp}.txt')
 
         stats = backtest_result.get('overall_stats', {})
         config = backtest_result.get('config', {})
@@ -506,20 +798,27 @@ class Backtester:
         lines.append('  5. 考虑引入更多特征（如012路、连号、重隔号等）提升模型性能')
 
         lines.append('\n' + '=' * 80)
-        lines.append('  ⚠️  重要提示：本报告仅基于历史数据统计，不构成任何投资建议')
+        lines.append(' 重要提示：本报告仅基于历史数据统计，不构成任何投资建议')
         lines.append('  彩票开奖具有随机性，历史规律不代表未来趋势，请理性购彩')
         lines.append('=' * 80)
 
         report_text = '\n'.join(lines)
 
-        # 持久化到数据库 (v3.3: 统一入库 p5_artifact, 不再写本地 .txt 文件)
+        # 持久化到数据库
         try:
             db = self._get_db()
             if getattr(db, 'connection', None) is None:
-                db.connect()
+                if not db.connect():
+                    raise RuntimeError('数据库连接失败，跳过回测报告入库')
+            if not issue:
+                try:
+                    issue = stats.get('eval_issue_range', [None])[0] if isinstance(stats.get('eval_issue_range'), (list, tuple)) else None
+                except Exception:
+                    issue = None
             db.save_artifact(
                 artifact_type='backtest_report',
                 data={'report_text': report_text, 'stats': stats, 'config': config},
+                issue=issue,
                 meta={'report_kind': 'backtest'}
             )
             logger.info('回测报告已保存(数据库 p5_artifact)')
@@ -542,7 +841,7 @@ class Backtester:
         """
         if output_path is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_path = f'reports/backtest/comparison_report_{timestamp}.txt'
+            output_path = os.path.join(REPORTS_BACKTEST_DIR, f'comparison_report_{timestamp}.txt')
 
         improvements = comparison_result.get('improvements', {})
         config = comparison_result.get('config', {})
@@ -619,9 +918,9 @@ class Backtester:
             lines.append(f'   新模型: {imp["new"]:.2f}/100')
             lines.append(f'   改善: {imp["improvement"]:.2f} ({imp["improvement_rate"]:.2f}%)')
             if imp['improvement'] > 0:
-                lines.append(f'   ✓ 综合预测能力提升')
+                lines.append(f' 综合预测能力提升')
             else:
-                lines.append(f'   ✗ 综合预测能力下降，需要检查优化逻辑')
+                lines.append(f' 综合预测能力下降，需要检查优化逻辑')
 
         # Top-1命中率
         if 'avg_top1_hit_rate' in improvements:
@@ -631,9 +930,9 @@ class Backtester:
             lines.append(f'   新模型: {imp["new"]:.2f}%')
             lines.append(f'   改善: {imp["improvement"]:.2f}% ({imp["improvement_rate"]:.2f}%)')
             if imp['improvement'] > 0:
-                lines.append(f'   ✓ 首选号码准确率提升')
+                lines.append(f' 首选号码准确率提升')
             else:
-                lines.append(f'   ✗ 首选号码准确率下降')
+                lines.append(f' 首选号码准确率下降')
 
         # 概率校准
         if 'avg_calibration_score' in improvements:
@@ -643,9 +942,9 @@ class Backtester:
             lines.append(f'   新模型: {imp["new"]:.2f}/100')
             lines.append(f'   改善: {imp["improvement"]:.2f} ({imp["improvement_rate"]:.2f}%)')
             if imp['improvement'] > 0:
-                lines.append(f'   ✓ 概率预测更准确')
+                lines.append(f' 概率预测更准确')
             else:
-                lines.append(f'   ✗ 概率预测偏差增大')
+                lines.append(f' 概率预测偏差增大')
 
         lines.append('\n【四、优化建议】')
         if avg_improvement > 10:
@@ -662,20 +961,29 @@ class Backtester:
             lines.append('  3. 考虑重新设计模型架构')
 
         lines.append('\n' + '=' * 80)
-        lines.append('  ⚠️  重要提示：本报告仅基于历史数据统计，不构成任何投资建议')
+        lines.append(' 重要提示：本报告仅基于历史数据统计，不构成任何投资建议')
         lines.append('  彩票开奖具有随机性，历史规律不代表未来趋势，请理性购彩')
         lines.append('=' * 80)
 
         report_text = '\n'.join(lines)
 
-        # 持久化到数据库 (v3.3: 统一入库 p5_artifact, 不再写本地 .txt 文件)
+        # 持久化到数据库
         try:
             db = self._get_db()
             if getattr(db, 'connection', None) is None:
-                db.connect()
+                if not db.connect():
+                    raise RuntimeError('数据库连接失败，跳过对比报告入库')
+            _cmp_issue = None
+            try:
+                _ri = config.get('eval_issue_range')
+                if isinstance(_ri, (list, tuple)) and _ri:
+                    _cmp_issue = _ri[0]
+            except Exception:
+                _cmp_issue = None
             db.save_artifact(
                 artifact_type='backtest_report',
                 data={'report_text': report_text, 'improvements': improvements, 'config': config},
+                issue=_cmp_issue,
                 meta={'report_kind': 'comparison'}
             )
             logger.info('对比报告已保存(数据库 p5_artifact)')
@@ -698,7 +1006,7 @@ class Backtester:
         """
         if output_path is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_path = f'reports/backtest/backtest_visualization_{timestamp}.png'
+            output_path = os.path.join(REPORTS_BACKTEST_DIR, f'backtest_visualization_{timestamp}.png')
 
         results = backtest_result.get('results', [])
         stats = backtest_result.get('overall_stats', {})

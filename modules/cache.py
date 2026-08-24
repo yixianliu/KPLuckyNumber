@@ -16,13 +16,15 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
-os.makedirs('logs', exist_ok=True)
+from paths import LOGS_DIR
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('logs/redis_client.log', encoding='utf-8')
+    file_handler = logging.FileHandler(LOGS_DIR + '/redis_client.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 

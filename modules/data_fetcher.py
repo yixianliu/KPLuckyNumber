@@ -1,5 +1,5 @@
 """
-排列5数据爬虫模块（完整版）
+排列5数据爬虫模块
 
 负责从多个数据源爬取排列5历史开奖数据和走势图数据
 支持多源备份、自动重试、请求间隔控制、增量爬取、数据校验等功能
@@ -16,13 +16,16 @@ import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
-os.makedirs('logs', exist_ok=True)
+from paths import LOGS_DIR
+from modules import database_utils
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('logs/data_fetcher.log', encoding='utf-8')
+    file_handler = logging.FileHandler(LOGS_DIR + '/data_fetcher.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -119,7 +122,7 @@ class P5Spider:
             }
         ]
         
-        # ★ ydniu.com 走势图数据源 (新增, 2026-07-08)
+        # ydniu.com 走势图数据源 (新增, 2026-07-08)
         self.ydniu_wan_trend_sources = [
             {
                 'name': 'ydniu_pl5_wan',
@@ -1853,7 +1856,7 @@ class P5Spider:
     # ============================================================
     # 一定牛 升平降走势(spjzs) / 和值走势(hzzst) 爬虫
     # 说明: 该页面数据通过 GraphQL 接口(/graphql/trend/, get_trend_result) 返回,
-    #       并非"动态渲染无法解析"。这里直接调用 GraphQL 获取结构化 JSON。
+    # 并非"动态渲染无法解析"。这里直接调用 GraphQL 获取结构化 JSON。
     # ============================================================
 
     def _fetch_ydniu_trend(self, tb_code: str, limit: int = 500) -> List[Dict[str, Any]]:
@@ -2000,133 +2003,82 @@ class P5Spider:
         return all_data[:max_records]
     
     def crawl_wan_trend_data(self, record: int = 1000) -> List[Dict[str, Any]]:
-        """
-        爬取万位走势图数据
-        
-        策略：优先从中华彩讯网站获取（含1000期完整数据）
-        
-        Args:
-            record: 获取的记录数量，默认1000条
-        
-        Returns:
-            万位走势数据列表
-        """
-        logger.info('开始获取排列5万位走势图数据（优先从中华彩讯获取）')
-        
-        for source in self.wan_trend_sources:
-            logger.info(f'尝试万位走势数据源: {source["name"]}')
-            html = self._get_page(source['url'])
-            
-            if html:
-                parser_method = getattr(self, source['parser'])
-                data = parser_method(html)
-                
-                if data:
-                    data.sort(key=lambda x: x['issue'], reverse=True)
-                    logger.info(f'万位走势数据获取成功，共 {len(data)} 条')
-                    return data[:record]
-            
-            time.sleep(random.uniform(1, 3))
-        
-        logger.warning('万位走势数据来源获取失败')
-        return []
-    
+        """爬取万位走势图数据（泛型方法）"""
+        return self._crawl_position_trend('wan', record)
+
     def crawl_qian_trend_data(self, record: int = 1000) -> List[Dict[str, Any]]:
-        """
-        爬取千位走势图数据
-        
-        策略：优先从中华彩讯网站获取（含1000期完整数据）
-        
-        Args:
-            record: 获取的记录数量，默认1000条
-        
-        Returns:
-            千位走势数据列表
-        """
-        logger.info('开始获取排列5千位走势图数据（优先从中华彩讯获取）')
-        
-        for source in self.qian_trend_sources:
-            logger.info(f'尝试千位走势数据源: {source["name"]}')
-            html = self._get_page(source['url'])
-            
-            if html:
-                parser_method = getattr(self, source['parser'])
-                data = parser_method(html)
-                
-                if data:
-                    data.sort(key=lambda x: x['issue'], reverse=True)
-                    logger.info(f'千位走势数据获取成功，共 {len(data)} 条')
-                    return data[:record]
-            
-            time.sleep(random.uniform(1, 3))
-        
-        logger.warning('千位走势数据来源获取失败')
-        return []
-    
+        """爬取千位走势图数据（泛型方法）"""
+        return self._crawl_position_trend('qian', record)
+
     def crawl_bai_trend_data(self, record: int = 1000) -> List[Dict[str, Any]]:
-        """
-        爬取百位走势图数据
-        
-        策略：优先从中华彩讯网站获取（含1000期完整数据）
-        
-        Args:
-            record: 获取的记录数量，默认1000条
-        
-        Returns:
-            百位走势数据列表
-        """
-        logger.info('开始获取排列5百位走势图数据（优先从中华彩讯获取）')
-        
-        for source in self.bai_trend_sources:
-            logger.info(f'尝试百位走势数据源: {source["name"]}')
-            html = self._get_page(source['url'])
-            
-            if html:
-                parser_method = getattr(self, source['parser'])
-                data = parser_method(html)
-                
-                if data:
-                    data.sort(key=lambda x: x['issue'], reverse=True)
-                    logger.info(f'百位走势数据获取成功，共 {len(data)} 条')
-                    return data[:record]
-            
-            time.sleep(random.uniform(1, 3))
-        
-        logger.warning('百位走势数据来源获取失败')
-        return []
-    
+        """爬取百位走势图数据（泛型方法）"""
+        return self._crawl_position_trend('bai', record)
+
     def crawl_shi_trend_data(self, record: int = 1000) -> List[Dict[str, Any]]:
+        """爬取十位走势图数据（泛型方法）"""
+        return self._crawl_position_trend('shi', record)
+
+    def crawl_ge_trend_data(self, record: int = 1000) -> List[Dict[str, Any]]:
+        """爬取个位走势图数据（泛型方法）"""
+        return self._crawl_position_trend('ge', record)
+
+    def _crawl_position_trend(self, position: str, record: int = 1000) -> List[Dict[str, Any]]:
         """
-        爬取十位走势图数据
-        
-        策略：优先从中华彩讯网站获取（含1000期完整数据）
-        
+        通用位置走势数据爬取（泛型方法）
+
+        根据位置参数动态选择对应的数据源和解析方法，
+        避免为每个位置编写重复的爬取逻辑。
+
         Args:
-            record: 获取的记录数量，默认1000条
-        
+            position: 位置标识 ('wan', 'qian', 'bai', 'shi', 'ge')
+            record: 获取的记录数量
+
         Returns:
-            十位走势数据列表
+            位置走势数据列表
         """
-        logger.info('开始获取排列5十位走势图数据（优先从中华彩讯获取）')
-        
-        for source in self.shi_trend_sources:
-            logger.info(f'尝试十位走势数据源: {source["name"]}')
+        position = position.lower()
+        sources_attr = f'{position}_trend_sources'
+        if not hasattr(self, sources_attr):
+            logger.warning(f'未找到{position}位走势数据源配置')
+            return []
+
+        sources = getattr(self, sources_attr)
+        if not sources:
+            logger.warning(f'{position}位走势数据源为空')
+            return []
+
+        logger.info(f'开始获取排列5{position}位走势图数据')
+
+        all_data = []
+        for source in sources:
+            logger.info(f'尝试{position}位走势数据源: {source["name"]}')
             html = self._get_page(source['url'])
-            
+
             if html:
                 parser_method = getattr(self, source['parser'])
                 data = parser_method(html)
-                
+
                 if data:
-                    data.sort(key=lambda x: x['issue'], reverse=True)
-                    logger.info(f'十位走势数据获取成功，共 {len(data)} 条')
-                    return data[:record]
-            
+                    all_data.extend(data)
+
             time.sleep(random.uniform(1, 3))
-        
-        logger.warning('十位走势数据来源获取失败')
+
+        if all_data:
+            # 去重并按期号排序
+            seen = set()
+            unique_data = []
+            for item in all_data:
+                if item['issue'] not in seen:
+                    seen.add(item['issue'])
+                    unique_data.append(item)
+
+            unique_data.sort(key=lambda x: x['issue'], reverse=True)
+            logger.info(f'{position}位走势数据获取成功，共 {len(unique_data)} 条')
+            return unique_data[:record]
+
+        logger.warning(f'{position}位走势数据来源获取失败')
         return []
-    
+
     def crawl_sum_end_trend_data(self, record: int = 1000) -> List[Dict[str, Any]]:
         """
         爬取和尾走势图数据
@@ -2283,30 +2235,82 @@ class P5Spider:
         logger.info(f'走势图数据生成完成，共 {len(trend_data)} 条')
         return trend_data[:record]
     
-    def crawl_incremental_data(self, last_issue: Optional[str] = None) -> List[Dict[str, Any]]:
+    def crawl_incremental_data(self, last_issue: Optional[str] = None, check_window: int = 10) -> List[Dict[str, Any]]:
         """
-        增量爬取最新数据
-        
+        增量爬取并补录缺失数据
+
+        策略：
+          1. 爬取最近 (check_window + 缓冲) 期的历史数据
+          2. 从数据库获取最近 check_window 期的期号集合
+          3. 返回"爬取到的数据中不在数据库里的期号"（即缺失/新增数据）
+          4. 若无 last_issue（首次），返回全部爬取数据
+
         Args:
-            last_issue: 已有的最新期号
-        
+            last_issue: 数据库中已有的最新期号
+            check_window: 检查窗口期数（默认10期），用于补录最近N期缺失的数据
+
         Returns:
-            新增的数据列表
+            需要入库的数据列表（包含新增 + 补录的缺失数据）
         """
-        logger.info(f'开始增量爬取，已有最新期号: {last_issue}')
-        
-        all_data = self.crawl_history_data()
-        
+        buffer = max(5, check_window)  # 额外缓冲，确保覆盖完整
+        fetch_limit = check_window + buffer
+
+        logger.info(f'开始增量爬取（检查窗口={check_window}期，缓冲={buffer}期）')
+
+        all_data = self.crawl_history_data(max_records=fetch_limit)
+        if not all_data:
+            logger.warning('爬取历史数据为空')
+            return []
+
+        # 按期号降序排列
+        all_data.sort(key=lambda x: x.get('issue', ''), reverse=True)
+
         if not last_issue:
-            logger.info(f'无历史数据，全量爬取 {len(all_data)} 条')
+            logger.info(f'首次爬取，返回全部 {len(all_data)} 条数据')
             return all_data
-        
+
+        # 解析 last_issue 为整数用于比较
+        try:
+            last_issue_int = int(last_issue)
+        except (ValueError, TypeError):
+            logger.warning(f'last_issue 格式异常: {last_issue}，退回全量模式')
+            return all_data
+
+        # 从数据库查询最近 check_window 期的已有期号（用于补录检测）
+        from modules.database import P5Database
+        db_tmp = P5Database()
+        existing_issues: set = set()
+        try:
+            if db_tmp.connect():
+                db_tmp.cursor.execute(
+                    'SELECT issue FROM p5_history_data ORDER BY issue DESC LIMIT %s',
+                    (check_window,)
+                )
+                for row in db_tmp.cursor.fetchall() or []:
+                    existing_issues.add(str(row['issue']))
+                db_tmp.disconnect()
+        except Exception as e:
+            logger.warning(f'查询已有期号失败: {e}')
+
+        # 筛选出需要入库的数据：
+        #   1. issue > last_issue（真正的新增期号）
+        #   2. issue <= last_issue 但不在 existing_issues（近期缺失需补录）
         new_data = []
         for item in all_data:
-            if item['issue'] > last_issue:
+            issue = item.get('issue', '')
+            try:
+                issue_int = int(issue)
+            except (ValueError, TypeError):
+                continue
+            if issue_int > last_issue_int:
                 new_data.append(item)
-        
-        logger.info(f'增量爬取完成，新增 {len(new_data)} 条数据')
+            elif issue not in existing_issues:
+                new_data.append(item)
+
+        logger.info(
+            f'爬取到 {len(all_data)} 条，其中新增 {sum(1 for i in new_data if int(i["issue"]) > last_issue_int) if new_data else 0} 条，'
+            f'需补录 {sum(1 for i in new_data if int(i["issue"]) <= last_issue_int) if new_data else 0} 条'
+        )
         return new_data
     
     def crawl_and_save_incremental(self) -> Dict[str, Tuple[int, int]]:
@@ -2320,13 +2324,17 @@ class P5Spider:
         4. 基础走势（完整5位号码）- 增量
         5. 升平降走势（p5_spjzs_data）- 增量
         6. 和值走势（p5_hzzst_data）- 增量
+        7. 和尾走势（p5_sum_end_trend_data）- 增量
+        8. 后三走势（p5_back_three_trend_data）- 增量
 
         Returns:
             {
-              'history': (新增, 跳过),
-              'trend':   (新增, 跳过),
-              'spjzs':   (新增, 跳过),
-              'hzzst':   (新增, 跳过),
+              'history':    (新增, 跳过),
+              'trend':      (新增, 跳过),
+              'spjzs':      (新增, 跳过),
+              'hzzst':      (新增, 跳过),
+              'sum_end':    (新增, 跳过),
+              'back_three': (新增, 跳过),
             }
         """
         from modules.database import P5Database
@@ -2334,150 +2342,381 @@ class P5Spider:
         db = P5Database()
         if not db.connect():
             logger.error('数据库连接失败，无法保存数据')
-            return {'history': (0, 0), 'trend': (0, 0), 'spjzs': (0, 0), 'hzzst': (0, 0)}
+            return {'history': (0, 0), 'trend': (0, 0), 'spjzs': (0, 0), 'hzzst': (0, 0), 'sum_end': (0, 0), 'back_three': (0, 0)}
 
         try:
             # 创建表
             db.create_tables()
-            
-            # 获取已有最新期号
-            latest_history_issue = db.get_latest_history_issue()
-            latest_trend_issue = db.get_latest_trend_issue()
-            
-            # 1. 增量爬取历史数据
-            new_history = self.crawl_incremental_data(latest_history_issue)
-            history_success, history_skip = db.insert_history_data(new_history)
-            logger.info(f'历史数据增量爬取: 新增{history_success}条, 跳过{history_skip}条')
-            
-            # 2. 增量爬取走势数据
-            if latest_trend_issue:
-                # 如果有已有的走势数据，从该期号之后开始爬取
-                logger.info(f'从期号 {latest_trend_issue} 之后开始增量爬取走势数据')
-                all_trend = self.crawl_trend_data(record=2000)  # 获取更多数据
-                # 过滤出新增的走势图数据
-                new_trend = [item for item in all_trend if item['issue'] > latest_trend_issue]
-                logger.info(f'过滤出新增走势数据 {len(new_trend)} 条')
-            else:
-                # 首次爬取，获取最新120条
-                new_trend = self.crawl_trend_data(record=120)
-            
-            trend_success, trend_skip = db.insert_trend_data(new_trend)
-            logger.info(f'走势数据增量爬取: 新增{trend_success}条, 跳过{trend_skip}条')
-            
-            # 3. 爬取并保存独立走势表数据 (ydniu.com) - 增量
-            ydniu_wan_success, ydniu_wan_skip = 0, 0
-            ydniu_qian_success, ydniu_qian_skip = 0, 0
-            ydniu_bai_success, ydniu_bai_skip = 0, 0
-            ydniu_shi_success, ydniu_shi_skip = 0, 0
-            ydniu_ge_success, ydniu_ge_skip = 0, 0
-            ydniu_basic_success, ydniu_basic_skip = 0, 0
-            
-            try:
-                # 万位走势
-                wan_trend = self.crawl_ydniu_wan_trend_data()
-                if wan_trend and latest_history_issue:
-                    # 过滤新增数据
-                    wan_trend = [item for item in wan_trend if item['issue'] > latest_history_issue]
-                if wan_trend:
-                    ydniu_wan_success, ydniu_wan_skip = db.insert_wan_trend_data(wan_trend)
-                    logger.info(f'一定牛万位走势数据保存: 新增{ydniu_wan_success}条, 跳过{ydniu_wan_skip}条')
-            except Exception as e:
-                logger.error(f'万位走势数据爬取失败: {e}')
-            
-            try:
-                # 千位走势
-                qian_trend = self.crawl_ydniu_qian_trend_data()
-                if qian_trend and latest_history_issue:
-                    qian_trend = [item for item in qian_trend if item['issue'] > latest_history_issue]
-                if qian_trend:
-                    ydniu_qian_success, ydniu_qian_skip = db.insert_qian_trend_data(qian_trend)
-                    logger.info(f'一定牛千位走势数据保存: 新增{ydniu_qian_success}条, 跳过{ydniu_qian_skip}条')
-            except Exception as e:
-                logger.error(f'千位走势数据爬取失败: {e}')
-            
-            try:
-                # 百位走势
-                bai_trend = self.crawl_ydniu_bai_trend_data()
-                if bai_trend and latest_history_issue:
-                    bai_trend = [item for item in bai_trend if item['issue'] > latest_history_issue]
-                if bai_trend:
-                    ydniu_bai_success, ydniu_bai_skip = db.insert_bai_trend_data(bai_trend)
-                    logger.info(f'一定牛百位走势数据保存: 新增{ydniu_bai_success}条, 跳过{ydniu_bai_skip}条')
-            except Exception as e:
-                logger.error(f'百位走势数据爬取失败: {e}')
-            
-            try:
-                # 十位走势
-                shi_trend = self.crawl_ydniu_shi_trend_data()
-                if shi_trend and latest_history_issue:
-                    shi_trend = [item for item in shi_trend if item['issue'] > latest_history_issue]
-                if shi_trend:
-                    ydniu_shi_success, ydniu_shi_skip = db.insert_shi_trend_data(shi_trend)
-                    logger.info(f'一定牛十位走势数据保存: 新增{ydniu_shi_success}条, 跳过{ydniu_shi_skip}条')
-            except Exception as e:
-                logger.error(f'十位走势数据爬取失败: {e}')
-            
-            try:
-                # 个位走势
-                ge_trend = self.crawl_ydniu_ge_trend_data()
-                if ge_trend and latest_history_issue:
-                    ge_trend = [item for item in ge_trend if item['issue'] > latest_history_issue]
-                if ge_trend:
-                    ydniu_ge_success, ydniu_ge_skip = db.insert_ge_trend_data(ge_trend)
-                    logger.info(f'一定牛个位走势数据保存: 新增{ydniu_ge_success}条, 跳过{ydniu_ge_skip}条')
-            except Exception as e:
-                logger.error(f'个位走势数据爬取失败: {e}')
-            
-            try:
-                # 基础走势 (完整5位号码)
+
+            # 使用事务包裹所有数据保存操作，确保原子性
+            with db.transaction():
+                # 获取已有最新期号
+                latest_history_issue = db.get_latest_history_issue()
+                latest_trend_issue = db.get_latest_trend_issue()
+
+                # 1. 增量爬取历史数据（含最近10期补录）
+                new_history = self.crawl_incremental_data(latest_history_issue, check_window=10)
+                history_success, history_skip = db.insert_history_data(new_history)
+                logger.info(f'历史数据增量爬取: 新增{history_success}条, 跳过{history_skip}条')
+
+                # 2. 增量爬取走势数据（含最近10期补录）
+                all_trend = self.crawl_trend_data(record=20)
+                if latest_trend_issue:
+                    try:
+                        latest_trend_int = int(latest_trend_issue)
+                    except (ValueError, TypeError):
+                        latest_trend_int = 0
+                    # 获取数据库最近10期的已有期号（用于补录检测）
+                    db.cursor.execute('SELECT issue FROM p5_trend_data ORDER BY issue DESC LIMIT 10')
+                    trend_existing = {str(r['issue']) for r in (db.cursor.fetchall() or [])}
+                    new_trend = [
+                        item for item in all_trend
+                        if (int(item['issue']) > latest_trend_int)
+                        or (item['issue'] not in trend_existing)
+                    ]
+                    logger.info(f'走势数据过滤: 爬取{len(all_trend)}条，新增{sum(1 for i in new_trend if int(i["issue"]) > latest_trend_int)}条，补录{sum(1 for i in new_trend if int(i["issue"]) <= latest_trend_int)}条')
+                else:
+                    new_trend = all_trend[:10]
+                    logger.info(f'走势数据首次爬取: {len(new_trend)}条')
+                trend_success, trend_skip = db.insert_trend_data(new_trend)
+                logger.info(f'走势数据增量爬取: 新增{trend_success}条, 跳过{trend_skip}条')
+
+                # 3. 爬取并保存独立走势表数据（万/千/百/十/个位）- 近10期检查+补录
+                _position_check_window = 10
+                ydniu_wan_success, ydniu_wan_skip = 0, 0
+                ydniu_qian_success, ydniu_qian_skip = 0, 0
+                ydniu_bai_success, ydniu_bai_skip = 0, 0
+                ydniu_shi_success, ydniu_shi_skip = 0, 0
+                ydniu_ge_success, ydniu_ge_skip = 0, 0
+                ydniu_basic_success, ydniu_basic_skip = 0, 0
+
+                def _filter_position_trend(crawled: List[Dict], table_name: str, pos_name: str) -> List[Dict]:
+                    """对位置走势表数据按最近N期检查补录模式过滤"""
+                    if not crawled:
+                        return []
+                    # 获取该表当前最新期号
+                    db.cursor.execute(f'SELECT issue FROM `{table_name}` ORDER BY issue DESC LIMIT 1')
+                    result = db.cursor.fetchone()
+                    latest_issue = result['issue'] if result else None
+                    if latest_issue:
+                        try:
+                            latest_int = int(latest_issue)
+                        except (ValueError, TypeError):
+                            latest_int = 0
+                        # 获取该表最近 check_window 期的已有期号
+                        db.cursor.execute(
+                            f'SELECT issue FROM `{table_name}` ORDER BY issue DESC LIMIT %s',
+                            (_position_check_window,)
+                        )
+                        existing = {str(r['issue']) for r in (db.cursor.fetchall() or [])}
+                        filtered = [
+                            item for item in crawled
+                            if (int(item['issue']) > latest_int) or (item['issue'] not in existing)
+                        ]
+                        new_cnt = sum(1 for i in filtered if int(i['issue']) > latest_int)
+                        recap_cnt = sum(1 for i in filtered if int(i['issue']) <= latest_int)
+                        logger.info(f'{pos_name}位走势过滤: 爬取{len(crawled)}条，新增{new_cnt}条，补录{recap_cnt}条（当前最新{latest_issue}）')
+                        return filtered
+                    else:
+                        # 首次运行，取最近10期
+                        crawled.sort(key=lambda x: x.get('issue', ''), reverse=True)
+                        logger.info(f'{pos_name}位走势首次运行，获取最近{min(10, len(crawled))}条')
+                        return crawled[:10]
+
+                try:
+                    wan_trend = self.crawl_ydniu_wan_trend_data()
+                    wan_trend = _filter_position_trend(wan_trend, 'p5_wan_trend_data', '万位')
+                    if wan_trend:
+                        ydniu_wan_success, ydniu_wan_skip = database_utils.insert_position_trend_data(
+                            db.cursor, 'wan', wan_trend
+                        )
+                        logger.info(f'万位走势数据保存: 新增{ydniu_wan_success}条, 跳过{ydniu_wan_skip}条')
+                except Exception as e:
+                    logger.error(f'万位走势数据爬取失败: {e}')
+
+                try:
+                    qian_trend = self.crawl_ydniu_qian_trend_data()
+                    qian_trend = _filter_position_trend(qian_trend, 'p5_qian_trend_data', '千位')
+                    if qian_trend:
+                        ydniu_qian_success, ydniu_qian_skip = database_utils.insert_position_trend_data(
+                            db.cursor, 'qian', qian_trend
+                        )
+                        logger.info(f'千位走势数据保存: 新增{ydniu_qian_success}条, 跳过{ydniu_qian_skip}条')
+                except Exception as e:
+                    logger.error(f'千位走势数据爬取失败: {e}')
+
+                try:
+                    bai_trend = self.crawl_ydniu_bai_trend_data()
+                    bai_trend = _filter_position_trend(bai_trend, 'p5_bai_trend_data', '百位')
+                    if bai_trend:
+                        ydniu_bai_success, ydniu_bai_skip = database_utils.insert_position_trend_data(
+                            db.cursor, 'bai', bai_trend
+                        )
+                        logger.info(f'百位走势数据保存: 新增{ydniu_bai_success}条, 跳过{ydniu_bai_skip}条')
+                except Exception as e:
+                    logger.error(f'百位走势数据爬取失败: {e}')
+
+                try:
+                    shi_trend = self.crawl_ydniu_shi_trend_data()
+                    shi_trend = _filter_position_trend(shi_trend, 'p5_shi_trend_data', '十位')
+                    if shi_trend:
+                        ydniu_shi_success, ydniu_shi_skip = database_utils.insert_position_trend_data(
+                            db.cursor, 'shi', shi_trend
+                        )
+                        logger.info(f'十位走势数据保存: 新增{ydniu_shi_success}条, 跳过{ydniu_shi_skip}条')
+                except Exception as e:
+                    logger.error(f'十位走势数据爬取失败: {e}')
+
+                try:
+                    ge_trend = self.crawl_ydniu_ge_trend_data()
+                    ge_trend = _filter_position_trend(ge_trend, 'p5_ge_trend_data', '个位')
+                    if ge_trend:
+                        ydniu_ge_success, ydniu_ge_skip = database_utils.insert_position_trend_data(
+                            db.cursor, 'ge', ge_trend
+                        )
+                        logger.info(f'个位走势数据保存: 新增{ydniu_ge_success}条, 跳过{ydniu_ge_skip}条')
+                except Exception as e:
+                    logger.error(f'个位走势数据爬取失败: {e}')
+
+                # 4. 基础走势（完整5位号码）- 近10期检查+补录
                 basic_trend = self.crawl_ydniu_basic_trend_data()
                 if basic_trend and latest_history_issue:
-                    basic_trend = [item for item in basic_trend if item['issue'] > latest_history_issue]
+                    try:
+                        latest_hist_int = int(latest_history_issue)
+                    except (ValueError, TypeError):
+                        latest_hist_int = 0
+                    db.cursor.execute('SELECT issue FROM p5_history_data ORDER BY issue DESC LIMIT 10')
+                    hist_existing = {str(r['issue']) for r in (db.cursor.fetchall() or [])}
+                    basic_trend = [
+                        item for item in basic_trend
+                        if (int(item['issue']) > latest_hist_int) or (item['issue'] not in hist_existing)
+                    ]
+                    new_basic = sum(1 for i in basic_trend if int(i['issue']) > latest_hist_int)
+                    recap_basic = sum(1 for i in basic_trend if int(i['issue']) <= latest_hist_int)
+                    logger.info(f'基础走势过滤: 新增{new_basic}条，补录{recap_basic}条')
                 if basic_trend:
                     ydniu_basic_success, ydniu_basic_skip = db.insert_history_data(basic_trend)
-                    logger.info(f'一定牛基础走势数据保存: 新增{ydniu_basic_success}条, 跳过{ydniu_basic_skip}条')
-            except Exception as e:
-                logger.error(f'基础走势数据爬取失败: {e}')
+                    logger.info(f'基础走势数据保存: 新增{ydniu_basic_success}条, 跳过{ydniu_basic_skip}条')
 
-            # 5. 爬取并保存升平降走势(spjzs) - 增量
-            # ★ 注意: spjzs/hzzst 使用各自的表, 不能用历史表最新期号(latest_history_issue)过滤,
-            #   否则只插入"超出历史的部分"(通常仅十几条), 永远回填不到完整 500 条。
-            #   改为: 直接幂等入库(insert 内部按 issue 去重, 已存在则跳过), 既能首次回填 500 条,
-            #   后续运行也只新增未入库的期号(增量)。
-            spjzs_success, spjzs_skip = 0, 0
-            try:
-                spjzs_data = self.crawl_ydniu_spjzs_data()
-                if spjzs_data:
-                    spjzs_success, spjzs_skip = db.insert_spjzs_data(spjzs_data)
-                    logger.info(f'升平降走势(spjzs)保存: 新增{spjzs_success}条, 跳过{spjzs_skip}条')
-            except Exception as e:
-                logger.error(f'升平降走势(spjzs)爬取失败: {e}')
+                # 5. 爬取并保存升平降走势(spjzs) - 增量
+                # 注意: spjzs/hzzst 使用各自的表, 不能用历史表最新期号(latest_history_issue)过滤,
+                # 否则只插入"超出历史的部分"(通常仅十几条), 永远回填不到完整 500 条。
+                # 改为: 直接幂等入库(insert 内部按 issue 去重, 已存在则跳过), 既能首次回填 500 条,
+                # 后续运行也只新增未入库的期号(增量)。
+                spjzs_success, spjzs_skip = 0, 0
+                try:
+                    spjzs_data = self.crawl_ydniu_spjzs_data()
+                    if spjzs_data:
+                        spjzs_success, spjzs_skip = db.insert_spjzs_data(spjzs_data)
+                        logger.info(f'升平降走势(spjzs)保存: 新增{spjzs_success}条, 跳过{spjzs_skip}条')
+                except Exception as e:
+                    logger.error(f'升平降走势(spjzs)爬取失败: {e}')
 
-            # 6. 爬取并保存和值走势(hzzst) - 增量 (同上, 不按历史期号过滤)
-            hzzst_success, hzzst_skip = 0, 0
-            try:
-                hzzst_data = self.crawl_ydniu_hzzst_data()
-                if hzzst_data:
-                    hzzst_success, hzzst_skip = db.insert_hzzst_data(hzzst_data)
-                    logger.info(f'和值走势(hzzst)保存: 新增{hzzst_success}条, 跳过{hzzst_skip}条')
-            except Exception as e:
-                logger.error(f'和值走势(hzzst)爬取失败: {e}')
+                # 6. 爬取并保存和值走势(hzzst) - 增量 (同上, 不按历史期号过滤)
+                hzzst_success, hzzst_skip = 0, 0
+                try:
+                    hzzst_data = self.crawl_ydniu_hzzst_data()
+                    if hzzst_data:
+                        hzzst_success, hzzst_skip = db.insert_hzzst_data(hzzst_data)
+                        logger.info(f'和值走势(hzzst)保存: 新增{hzzst_success}条, 跳过{hzzst_skip}条')
+                except Exception as e:
+                    logger.error(f'和值走势(hzzst)爬取失败: {e}')
 
-            logger.info(f'数据保存完成: 历史数据新增{history_success}条, 走势数据新增{trend_success}条, '
-                       f'独立走势表新增: 万{ydniu_wan_success}/千{ydniu_qian_success}/百{ydniu_bai_success}/十{ydniu_shi_success}/个{ydniu_ge_success}, '
-                       f'升平降{spjzs_success}/和值{hzzst_success}')
-            return {
-                'history': (history_success, history_skip),
-                'trend': (trend_success, trend_skip),
-                'spjzs': (spjzs_success, spjzs_skip),
-                'hzzst': (hzzst_success, hzzst_skip),
-            }
+                # 7. 爬取并保存和尾走势(sum_end) - 增量
+                sum_end_success, sum_end_skip = 0, 0
+                try:
+                    sum_end_data = self.crawl_sum_end_trend_data()
+                    if sum_end_data:
+                        sum_end_success, sum_end_skip = db.insert_sum_end_trend_data(sum_end_data)
+                        logger.info(f'和尾走势(sum_end)保存: 新增{sum_end_success}条, 跳过{sum_end_skip}条')
+                except Exception as e:
+                    logger.error(f'和尾走势(sum_end)爬取失败: {e}')
+
+                # 8. 爬取并保存后三走势(back_three) - 增量
+                back_three_success, back_three_skip = 0, 0
+                try:
+                    back_three_data = self.crawl_back_three_trend_data()
+                    if back_three_data:
+                        back_three_success, back_three_skip = db.insert_back_three_trend_data(back_three_data)
+                        logger.info(f'后三走势(back_three)保存: 新增{back_three_success}条, 跳过{back_three_skip}条')
+                except Exception as e:
+                    logger.error(f'后三走势(back_three)爬取失败: {e}')
+
+                logger.info(f'数据保存完成: 历史数据新增{history_success}条, 走势数据新增{trend_success}条, '
+                           f'独立走势表新增: 万{ydniu_wan_success}/千{ydniu_qian_success}/百{ydniu_bai_success}/十{ydniu_shi_success}/个{ydniu_ge_success}, '
+                           f'升平降{spjzs_success}/和值{hzzst_success}/和尾{sum_end_success}/后三{back_three_success}')
+
+                # 数据入库后回填 draw_date 并重新计算 hot_level（基于全量统计）
+                self._fix_position_trend_data(db)
+
+                return {
+                    'history':    (history_success, history_skip),
+                    'trend':      (trend_success, trend_skip),
+                    'spjzs':      (spjzs_success, spjzs_skip),
+                    'hzzst':      (hzzst_success, hzzst_skip),
+                    'sum_end':    (sum_end_success, sum_end_skip),
+                    'back_three': (back_three_success, back_three_skip),
+                }
 
         except Exception as e:
             logger.error(f'爬取并保存数据失败: {e}')
-            return {'history': (0, 0), 'trend': (0, 0), 'spjzs': (0, 0), 'hzzst': (0, 0)}
+            return {'history': (0, 0), 'trend': (0, 0), 'spjzs': (0, 0), 'hzzst': (0, 0), 'sum_end': (0, 0), 'back_three': (0, 0)}
         finally:
             db.disconnect()
+
+    def _fix_position_trend_data(self, db) -> None:
+        """修复位置走势表数据：回填 draw_date 并重新计算 hot_level
+
+        原因：
+          - 中华彩讯走势图不提供日期字段，parse_china_lottery_*_trend 全部硬编码 draw_date=''
+          - hot_level 按单批次频率计算，增量爬取每批数据量少导致统计失真
+        修复策略：
+          1. 从 p5_history_data 构建期号→日期映射，批量 UPDATE draw_date
+          2. 对每个位置全量统计各数字出现频次，按阈值（>平均×1.2=hot, <平均×0.8=cold, 否则=warm）更新 hot_level
+        """
+        try:
+            # 1. 构建期号→日期映射
+            db.cursor.execute(
+                'SELECT issue, draw_date FROM p5_history_data WHERE draw_date IS NOT NULL AND draw_date != \'\' ORDER BY issue DESC LIMIT 2000'
+            )
+            date_map: Dict[str, str] = {}
+            for row in db.cursor.fetchall() or []:
+                if row.get('issue') and row.get('draw_date'):
+                    date_map[str(row['issue'])] = str(row['draw_date'])
+            logger.info(f'构建期号→日期映射，共 {len(date_map)} 条')
+
+            if not date_map:
+                logger.warning('p5_history_data 无 draw_date 数据，跳过回填')
+                return
+
+            # 2. 批量更新各位置走势表的 draw_date（同步更新 trend_json）
+            position_map = {
+                'wan': ('p5_wan_trend_data', 'wan_number'),
+                'qian': ('p5_qian_trend_data', 'qian_number'),
+                'bai': ('p5_bai_trend_data', 'bai_number'),
+                'shi': ('p5_shi_trend_data', 'shi_number'),
+                'ge': ('p5_ge_trend_data', 'ge_number'),
+            }
+            for pos, (table, num_col) in position_map.items():
+                updated = 0
+                try:
+                    db.cursor.execute(
+                        f'SELECT issue FROM {table} WHERE draw_date IS NULL OR draw_date = \'\' ORDER BY issue DESC LIMIT 2000'
+                    )
+                    rows = db.cursor.fetchall() or []
+                    for row in rows:
+                        issue = str(row['issue'])
+                        if issue in date_map:
+                            new_date = date_map[issue]
+                            # 同步更新 trend_json，保持字段一致性
+                            db.cursor.execute(
+                                f'SELECT trend_json FROM {table} WHERE issue = %s',
+                                (issue,)
+                            )
+                            trend_row = db.cursor.fetchone()
+                            if trend_row and trend_row.get('trend_json'):
+                                try:
+                                    tj = json.loads(trend_row['trend_json'])
+                                    tj['draw_date'] = new_date
+                                    db.cursor.execute(
+                                        f'UPDATE {table} SET draw_date = %s, trend_json = %s WHERE issue = %s',
+                                        (new_date, json.dumps(tj, ensure_ascii=False), issue)
+                                    )
+                                except Exception:
+                                    # trend_json 解析失败时只更新 draw_date
+                                    db.cursor.execute(
+                                        f'UPDATE {table} SET draw_date = %s WHERE issue = %s',
+                                        (new_date, issue)
+                                    )
+                            else:
+                                db.cursor.execute(
+                                    f'UPDATE {table} SET draw_date = %s WHERE issue = %s',
+                                    (new_date, issue)
+                                )
+                            updated += 1
+                    logger.info(f'{pos}位走势表 draw_date 回填完成: {updated} 条')
+                except Exception as e:
+                    logger.error(f'{pos}位 draw_date 回填失败: {e}')
+
+            # 3. 全量重新计算各位置的 hot_level（同步更新 trend_json）
+            self._recalc_hot_level(db, position_map)
+
+        except Exception as e:
+            logger.error(f'修复位置走势表数据失败: {e}')
+
+    def _recalc_hot_level(self, db, position_map: Dict[str, Tuple[str, str]]) -> None:
+        """基于全量数据重新计算所有位置的 hot_level（同步更新 trend_json）
+
+        对每个位置：统计所有历史期各数字出现频次，按平均值的 1.2/0.8 阈值分类。
+        同时将新计算的 hot_level 同步写入 trend_json 以保持字段一致性。
+        """
+        for pos, (table, num_col) in position_map.items():
+            try:
+                # 全量统计各数字出现次数
+                db.cursor.execute(
+                    f'SELECT `{num_col}` AS n, COUNT(*) AS cnt FROM `{table}` GROUP BY `{num_col}`'
+                )
+                rows = db.cursor.fetchall() or []
+                counts: Dict[int, int] = {}
+                total_records = 0
+                for row in rows:
+                    n = int(row['n'])
+                    cnt = int(row['cnt'])
+                    counts[n] = cnt
+                    total_records += cnt
+
+                if total_records == 0:
+                    logger.warning(f'{pos}位走势表无数据，跳过 hot_level 计算')
+                    continue
+
+                avg_count = total_records / 10.0  # 0-9 共10个数字
+                hot_threshold = avg_count * 1.2
+                cold_threshold = avg_count * 0.8
+
+                # 计算各数字的 hot_level
+                level_map: Dict[int, str] = {}
+                for n, cnt in counts.items():
+                    if cnt > hot_threshold:
+                        level_map[n] = 'hot'
+                    elif cnt < cold_threshold:
+                        level_map[n] = 'cold'
+                    else:
+                        level_map[n] = 'warm'
+
+                # 按数字分批发批量更新（同时更新 hot_level 列和 trend_json）
+                for n, level in level_map.items():
+                    # 更新 hot_level 列
+                    db.cursor.execute(
+                        f'UPDATE `{table}` SET hot_level = %s WHERE `{num_col}` = %s',
+                        (level, n)
+                    )
+                    # 更新 trend_json 中的 hot_level
+                    db.cursor.execute(
+                        f'SELECT issue, trend_json FROM `{table}` WHERE `{num_col}` = %s',
+                        (n,)
+                    )
+                    trend_rows = db.cursor.fetchall() or []
+                    for tr in trend_rows:
+                        try:
+                            tj = json.loads(tr.get('trend_json') or '{}')
+                            tj['hot_level'] = level
+                            db.cursor.execute(
+                                f'UPDATE `{table}` SET trend_json = %s WHERE issue = %s',
+                                (json.dumps(tj, ensure_ascii=False), tr['issue'])
+                            )
+                        except Exception:
+                            pass  # trend_json 解析失败时跳过
+
+                hot_cnt = sum(1 for l in level_map.values() if l == 'hot')
+                warm_cnt = sum(1 for l in level_map.values() if l == 'warm')
+                cold_cnt = sum(1 for l in level_map.values() if l == 'cold')
+                logger.info(
+                    f'{pos}位 hot_level 重新计算完成: '
+                    f'hot={hot_cnt}, warm={warm_cnt}, cold={cold_cnt}, '
+                    f'总记录={total_records}'
+                )
+            except Exception as e:
+                logger.error(f'{pos}位 hot_level 重新计算失败: {e}')
     
     def full_crawl_and_save(self, max_records: int = 120) -> Tuple[int, int, int, int]:
         """
@@ -3387,7 +3626,7 @@ class P5Spider:
         except Exception as e:
             logger.error(f'解析专家详情页面失败: {e}')
             import traceback
-            logger.error(traceback.format_exc())
+            logger.error(traceback.format_exc)
             return None
     
     def _extract_js_objects(self, text):
@@ -3598,7 +3837,12 @@ def test_spider():
     
     print('\n=== 测试增量爬取并保存 ===')
     result = spider.crawl_and_save_incremental()
-    print(f'结果: 历史新增{result[0]}条, 跳过{result[1]}条, 走势新增{result[2]}条, 跳过{result[3]}条')
+    print(f'历史: 新增{result["history"][0]}条, 跳过{result["history"][1]}条')
+    print(f'走势: 新增{result["trend"][0]}条, 跳过{result["trend"][1]}条')
+    print(f'升平降: 新增{result["spjzs"][0]}条, 跳过{result["spjzs"][1]}条')
+    print(f'和值: 新增{result["hzzst"][0]}条, 跳过{result["hzzst"][1]}条')
+    print(f'和尾: 新增{result["sum_end"][0]}条, 跳过{result["sum_end"][1]}条')
+    print(f'后三: 新增{result["back_three"][0]}条, 跳过{result["back_three"][1]}条')
     
     return history_data, trend_data
 

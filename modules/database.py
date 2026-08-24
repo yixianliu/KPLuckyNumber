@@ -1,5 +1,5 @@
 """
-排列5数据库操作模块（完整版）
+排列5数据库操作模块
 
 职责：
     封装排列5系统对 MySQL 的全部访问：连接/断开、事务、建表（向后兼容）、
@@ -18,7 +18,7 @@
     - 权重历史表        ：insert_weight_history，支撑自适应权重（EWMA）的持久化与回放。
 
 与其它模块的关系：
-    - config.DB_CONFIG 提供连接参数（host/port/user/password/database）。
+    - config.DB_CONFIG / DB_POOL_CONFIG 提供连接参数与连接池配置。
     - predictor / pipeline 调用 save_artifact / get_artifacts 存取 JSON 化产物。
     - online_learner 调用权重相关方法实现「自我进化」的持久化。
 
@@ -26,6 +26,8 @@
     - 采用延迟导入（函数内部 ``from config import DB_CONFIG``），避免模块导入期失败。
     - 网络/数据库异常统一走 execute_with_reconnect 的重连机制，提升健壮性。
     - JSON 字段统一用 _safe_json_loads 解析，防止脏数据导致崩溃。
+    - **连接池模式**：默认使用 DBUtils.PooledDB 连接池（需安装 DBUtils），
+      兼容无连接池环境自动回退到单连接模式。
 """
 
 import pymysql
@@ -33,11 +35,16 @@ import logging
 import json
 import os
 import uuid
+import threading
+import numpy as np
 from datetime import datetime
+from decimal import Decimal
 from typing import Dict, List, Any, Optional, Tuple
 from contextlib import contextmanager
 
-os.makedirs('logs', exist_ok=True)
+from paths import LOGS_DIR
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 # 说明：本模块负责数据库的全部操作。按照 AGENTS.md 的约定：
 # - 在 connect() 中会尝试自动创建缺失的数据库（兼容新环境）
@@ -48,7 +55,7 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('logs/database_p5.log', encoding='utf-8')
+    file_handler = logging.FileHandler(LOGS_DIR + '/database_p5.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -65,19 +72,189 @@ def _safe_json_loads(raw):
         return raw
 
 
+def _decimal_default(obj):
+    """将 Decimal、numpy 类型等转换为 JSON 可序列化类型。"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if hasattr(obj, 'item'):  # numpy scalar
+        return obj.item()
+    if isinstance(obj, (np.ndarray,)):  # numpy array
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _clean_for_json(obj):
+    """递归清理数据，将 tuple 键转为 str，Decimal/numpy 值转为原生类型。"""
+    if isinstance(obj, dict):
+        return {_key_to_str(k): _clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean_for_json(item) for item in obj]
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if hasattr(obj, 'item'):  # numpy scalar
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
+def _key_to_str(key):
+    """将非字符串键（如 tuple）转为字符串。"""
+    if isinstance(key, (str, int, float, bool, type(None))):
+        return key
+    return str(key)
+
+
+def _safe_json_dumps(obj):
+    """安全序列化对象为 JSON 字符串, 失败返回 '{}'。"""
+    if obj is None:
+        return '{}'
+    if isinstance(obj, str):
+        return obj
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=_decimal_default)
+    except (json.JSONDecodeError, TypeError):
+        return '{}'
+
+
+# ============ 连接池管理（模块级单例） ============
+# 全局连接池实例，由 _init_pool() 延迟初始化
+# 使用 threading.local 确保多线程环境下每个线程持有独立连接
+_pool_instance = None
+_pool_lock = threading.Lock()
+_thread_connections = threading.local()
+
+
+def _init_pool():
+    """初始化数据库连接池（线程安全，幂等）。"""
+    global _pool_instance
+    if _pool_instance is not None:
+        return _pool_instance
+    
+    with _pool_lock:
+        if _pool_instance is not None:
+            return _pool_instance
+        
+        try:
+            from config import DB_CONFIG, DB_POOL_CONFIG
+            # 兼容 dbutils（小写）和 DBUtils（大写）两种安装方式
+            try:
+                from DBUtils.PooledDB import PooledDB
+            except ImportError:
+                from dbutils.pooled_db import PooledDB
+            
+            pool = PooledDB(
+                creator=pymysql,
+                mincached=DB_POOL_CONFIG.get('min_connections', 2),
+                maxcached=DB_POOL_CONFIG.get('max_connections', 10),
+                maxshared=0,
+                maxconnections=DB_POOL_CONFIG.get('max_connections', 10),
+                blocking=DB_POOL_CONFIG.get('blocking', True),
+                maxusage=None,
+                setsession=[],
+                ping=1,  # Ping MySQL server to check connection health
+                host=DB_CONFIG['host'],
+                port=DB_CONFIG['port'],
+                user=DB_CONFIG['user'],
+                password=DB_CONFIG['password'],
+                database=DB_CONFIG['database'],
+                charset=DB_CONFIG['charset'],
+                cursorclass=pymysql.cursors.DictCursor,
+                connect_timeout=10,
+                read_timeout=30,
+                write_timeout=30,
+            )
+            _pool_instance = pool
+            logger.info('MySQL连接池初始化成功 (min=%d, max=%d)', 
+                       DB_POOL_CONFIG.get('min_connections', 2),
+                       DB_POOL_CONFIG.get('max_connections', 10))
+            return pool
+        except ImportError:
+            logger.warning('DBUtils 未安装，回退到单连接模式。请执行: pip install DBUtils')
+            return None
+        except Exception as e:
+            logger.error(f'连接池初始化失败，回退到单连接模式: {e}')
+            return None
+
+
+def _get_pooled_connection():
+    """从连接池获取连接（每线程缓存一条）"""
+    pool = _init_pool()
+    if pool is None:
+        return None
+    
+    # 使用 thread-local 存储，避免多线程共享同一连接
+    if not hasattr(_thread_connections, 'conn') or _thread_connections.conn is None:
+        try:
+            _thread_connections.conn = pool.connection()
+            logger.debug('从连接池获取新连接 (thread=%s)', threading.current_thread().ident)
+        except Exception as e:
+            logger.error(f'从连接池获取连接失败: {e}')
+            return None
+    
+    # 验证连接是否有效
+    try:
+        _thread_connections.conn.ping(reconnect=True)
+    except Exception as e:
+        logger.warning('连接池连接失效，尝试重新获取: %s', e)
+        try:
+            if _thread_connections.conn:
+                _thread_connections.conn.close()
+        except:
+            pass
+        _thread_connections.conn = None
+        return _get_pooled_connection()
+    
+    return _thread_connections.conn
+
+
+def _release_pooled_connection():
+    """释放当前线程的连接回连接池"""
+    if hasattr(_thread_connections, 'conn') and _thread_connections.conn is not None:
+        try:
+            _thread_connections.conn.close()  # PooledDB 的 close() 会归还连接而非真正关闭
+            logger.debug('连接已归还连接池 (thread=%s)', threading.current_thread().ident)
+        except Exception as e:
+            logger.debug('归还连接池时异常: %s', e)
+        finally:
+            _thread_connections.conn = None
+
+
 class P5Database:
     """
-    排列5数据库操作类（完整版）
+    排列5数据库操作类（完整版，支持连接池）
     
     负责数据库连接、表结构管理、数据操作
     """
     # 该类封装了常用的数据库操作：连接/断开、事务、建表、插入/查询、报告入库、预测验证等。
     # 注意：为避免导入时失败，项目中有时使用延迟导入（在函数内部导入config或其他模块），本类保持该风格。
     
-    def __init__(self):
+    # 类级标记：是否使用连接池模式
+    _USE_POOL = True  # 可通过 P5Database._USE_POOL = False 强制禁用连接池
+    
+    def __init__(self, use_pool: Optional[bool] = None):
+        """初始化数据库封装对象，此时尚未建立真实连接。
+
+        说明:
+            connection / cursor 均延迟到 connect() 时创建；
+            _in_transaction 标记用于避免事务嵌套导致的提交错乱。
+        Args:
+            use_pool: 是否使用连接池。None=跟随类级设置，True=强制使用池，False=强制单连接
+        """
         self.connection = None
         self.cursor = None
         self._in_transaction = False
+        self._own_connection = False  # 标记是否拥有连接（用于释放）
+        
+        if use_pool is not None:
+            self._use_pool = use_pool
+        else:
+            self._use_pool = self._USE_POOL
+    
+    def _get_db_config(self):
+        """获取数据库配置（延迟导入）"""
+        from config import DB_CONFIG
+        return DB_CONFIG
     
     @contextmanager
     def transaction(self):
@@ -98,39 +275,83 @@ class P5Database:
             self._in_transaction = False
     
     def connect(self):
-        """连接MySQL数据库"""
+        """连接MySQL数据库（幂等：已连接且未关闭时直接返回 True）。
+        
+        连接池模式：从池中获取连接，标记 _own_connection=True
+        单连接模式：创建新连接（保持原有逻辑兼容）
+        """
+        # 幂等保护：已连接且未关闭时直接返回
+        if self.connection is not None:
+            try:
+                if hasattr(self.connection, '_closed'):
+                    if not self.connection._closed:
+                        return True
+                elif hasattr(self.connection, 'open'):
+                    if self.connection.open:
+                        return True
+            except:
+                pass
+            # 如果检查连接状态时出错，视为连接失效，继续重新连接
+            self.connection = None
+        
+        # 释放旧的 thread-local 连接
+        if hasattr(_thread_connections, 'conn') and _thread_connections.conn is not None:
+            _thread_connections.conn = None
+        
+        # 尝试连接池模式
+        if self._use_pool:
+            pooled_conn = _get_pooled_connection()
+            if pooled_conn is not None:
+                self.connection = pooled_conn
+                self.cursor = self.connection.cursor()
+                self._own_connection = True
+                logger.debug('使用连接池连接成功')
+                return True
+            else:
+                logger.warning('连接池不可用，回退到单连接模式')
+                self._use_pool = False
+        
+        # 单连接模式（原有逻辑，保持兼容）
         try:
-            from config import DB_CONFIG
-            db_name = DB_CONFIG['database']
+            db_name = self._get_db_config()['database']
             
             try:
                 self.connection = pymysql.connect(
-                    host=DB_CONFIG['host'],
-                    user=DB_CONFIG['user'],
-                    password=DB_CONFIG['password'],
+                    host=self._get_db_config()['host'],
+                    user=self._get_db_config()['user'],
+                    password=self._get_db_config()['password'],
                     database=db_name,
                     charset='utf8mb4',
                     cursorclass=pymysql.cursors.DictCursor,
-                    connect_timeout=10,   # 建立连接超时 10s，避免网络异常时无限等待
-                    read_timeout=30,      # 查询读超时 30s
-                    write_timeout=30      # 写入超时 30s
+                    connect_timeout=10,
+                    read_timeout=30,
+                    write_timeout=30
                 )
                 self.cursor = self.connection.cursor()
-                logger.debug('MySQL数据库连接成功（排列5）')
+                self._own_connection = True
+                logger.debug('MySQL数据库单连接成功（排列5）')
                 return True
-            except pymysql.err.OperationalError as e:
+            except (pymysql.err.OperationalError, pymysql.err.InternalError) as e:
                 error_code = e.args[0] if e.args else 0
+                error_msg = str(e).lower()
                 
-                # 处理"MySQL server has gone away"错误(错误码2006)
-                if error_code == 2006 or "MySQL server has gone away" in str(e):
+                # 处理各种连接错误
+                is_connection_error = (
+                    error_code == 2006 or 
+                    error_code == 2013 or
+                    "MySQL server has gone away" in error_msg or
+                    "lost connection" in error_msg
+                )
+                
+                if is_connection_error:
                     logger.warning('MySQL连接已断开，尝试重连...')
                     try:
                         import time
-                        time.sleep(1)  # 等待1秒后重试
+                        time.sleep(1)
                         self.connection = pymysql.connect(
-                            host=DB_CONFIG['host'],
-                            user=DB_CONFIG['user'],
-                            password=DB_CONFIG['password'],
+                            host=self._get_db_config()['host'],
+                            user=self._get_db_config()['user'],
+                            password=self._get_db_config()['password'],
                             database=db_name,
                             charset='utf8mb4',
                             cursorclass=pymysql.cursors.DictCursor,
@@ -139,6 +360,7 @@ class P5Database:
                             write_timeout=30
                         )
                         self.cursor = self.connection.cursor()
+                        self._own_connection = True
                         logger.info('MySQL重连成功')
                         return True
                     except Exception as reconnect_error:
@@ -149,9 +371,9 @@ class P5Database:
                 if "Unknown database" in str(e):
                     logger.info(f'数据库 {db_name} 不存在，尝试自动创建...')
                     conn = pymysql.connect(
-                        host=DB_CONFIG['host'],
-                        user=DB_CONFIG['user'],
-                        password=DB_CONFIG['password'],
+                        host=self._get_db_config()['host'],
+                        user=self._get_db_config()['user'],
+                        password=self._get_db_config()['password'],
                         charset='utf8mb4',
                         cursorclass=pymysql.cursors.DictCursor,
                         connect_timeout=10
@@ -163,15 +385,16 @@ class P5Database:
                     conn.close()
                     
                     self.connection = pymysql.connect(
-                        host=DB_CONFIG['host'],
-                        user=DB_CONFIG['user'],
-                        password=DB_CONFIG['password'],
+                        host=self._get_db_config()['host'],
+                        user=self._get_db_config()['user'],
+                        password=self._get_db_config()['password'],
                         database=db_name,
                         charset='utf8mb4',
                         cursorclass=pymysql.cursors.DictCursor,
                         connect_timeout=10
                     )
                     self.cursor = self.connection.cursor()
+                    self._own_connection = True
                     logger.info(f'数据库 {db_name} 创建成功并已连接（排列5）')
                     return True
                 raise
@@ -180,19 +403,42 @@ class P5Database:
             return False
     
     def disconnect(self):
-        """断开数据库连接（幂等操作：多次调用安全）"""
-        # PyMySQL Connection 对象的 _closed 属性（不是 closed）
-        if self.connection and not getattr(self.connection, '_closed', False):
-            try:
-                self.connection.close()
-                logger.debug('MySQL数据库连接已关闭')
-            except Exception as e:
-                logger.debug(f'关闭数据库连接时异常: {e}')
-        self.connection = None  # 置空防止重复关闭
-
+        """断开数据库连接（幂等操作：多次调用安全）。
+        
+        连接池模式：将连接归还池中
+        单连接模式：真正关闭连接
+        """
+        if self.connection is None:
+            return
+        
+        try:
+            if self._use_pool and self._own_connection:
+                # 连接池模式：归还连接
+                _release_pooled_connection()
+                self._own_connection = False
+                logger.debug('连接已归还连接池')
+            else:
+                # 单连接模式：真正关闭
+                if not getattr(self.connection, '_closed', False):
+                    self.connection.close()
+                    logger.debug('MySQL数据库连接已关闭')
+        except Exception as e:
+            logger.debug(f'关闭数据库连接时异常: {e}')
+        finally:
+            self.connection = None
+            self.cursor = None
+            self._own_connection = False
+    
+    def __del__(self):
+        """析构函数：确保连接被正确释放"""
+        try:
+            self.disconnect()
+        except:
+            pass
+    
     def execute_with_reconnect(self, query, params=None):
         """
-        执行SQL查询，自动处理连接超时并重连
+        执行SQL查询，自动处理连接超时并重连（连接池兼容版）
         
         Args:
             query: SQL查询语句
@@ -201,26 +447,41 @@ class P5Database:
         Returns:
             查询结果，失败返回None
         """
+        # 确保已连接
+        if not self.connection:
+            if not self.connect():
+                return None
+        
         try:
             if params:
                 return self.cursor.execute(query, params)
             else:
                 return self.cursor.execute(query)
-        except pymysql.err.OperationalError as e:
+        except (pymysql.err.OperationalError, pymysql.err.InternalError, pymysql.err.InterfaceError) as e:
             error_code = e.args[0] if e.args else 0
+            error_msg = str(e).lower()
             
-            # 处理"MySQL server has gone away"
-            if error_code == 2006 or "MySQL server has gone away" in str(e):
-                logger.warning('检测到连接断开，尝试重连...')
+            # 处理各种连接中断错误
+            is_connection_error = (
+                error_code == 2006 or 
+                error_code == 2013 or
+                "MySQL server has gone away" in error_msg or
+                "lost connection" in error_msg or
+                "invalid connection" in error_msg or
+                error_code == 0  # InvalidConnectionError 通常错误码为0
+            )
+            
+            if is_connection_error:
+                logger.warning(f'检测到连接异常 (error_code={error_code}, msg={error_msg[:100]}), 尝试重连...')
                 
-                # 关闭旧游标和连接
+                # 关闭旧游标
                 if self.cursor:
                     try:
                         self.cursor.close()
                     except:
                         pass
                 
-                # 重新连接
+                # 重新连接（连接池模式会自动从池获取新连接）
                 if self.connect():
                     logger.info('重连成功，重试查询...')
                     # 重试一次
@@ -254,8 +515,8 @@ class P5Database:
                 bai TINYINT NOT NULL COMMENT '百位号码(0-9)',
                 shi TINYINT NOT NULL COMMENT '十位号码(0-9)',
                 ge TINYINT NOT NULL COMMENT '个位号码(0-9)',
-                hezhi INT NULL DEFAULT NULL COMMENT '和值',
-                span INT NULL DEFAULT NULL COMMENT '跨度',
+                hezhi INT NULL DEFAULT NULL COMMENT '和值(0-45)',
+                span INT NULL DEFAULT NULL COMMENT '跨度(0-9)',
                 odd_even_ratio VARCHAR(10) NULL DEFAULT NULL COMMENT '奇偶比',
                 odd_even_pattern VARCHAR(10) NULL DEFAULT NULL COMMENT '奇偶模式',
                 big_small_ratio VARCHAR(10) NULL DEFAULT NULL COMMENT '大小比',
@@ -270,6 +531,13 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5历史开奖数据表';
             '''
             self.cursor.execute(sql_history)
+
+            # 向后兼容: 为 p5_history_data 添加 DESC 索引和优化后的复合索引
+            try:
+                self.cursor.execute("ALTER TABLE p5_history_data ADD INDEX idx_issue_desc (issue DESC) USING BTREE")
+            except Exception as e:
+                if getattr(e, 'args', (None,))[0] != 1061:  # Duplicate key name
+                    logger.warning(f'添加 idx_issue_desc 索引跳过: {e}')
             
             # 走势图数据表
             sql_trend = '''
@@ -393,7 +661,7 @@ class P5Database:
             '''
             self.cursor.execute(sql_prediction)
             
-            # ★ 预测验证明细记录表 (新增)
+            # 预测验证明细记录表 (新增)
             sql_verification_detail = '''
             CREATE TABLE IF NOT EXISTS p5_verification_detail (
                 id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
@@ -465,7 +733,15 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5万位走势图数据表';
             '''
             self.cursor.execute(sql_wan_trend)
-            
+
+            # 向后兼容: 合并 wan_number 单列索引为联合索引, 提升常见查询效率
+            try:
+                self.cursor.execute("ALTER TABLE p5_wan_trend_data DROP INDEX idx_wan_number")
+                self.cursor.execute("ALTER TABLE p5_wan_trend_data ADD INDEX idx_issue_wan (issue, wan_number) USING BTREE")
+            except Exception as e:
+                if getattr(e, 'args', (None,))[0] not in (1091, 1060):  # 列不存在或索引不存在
+                    logger.warning(f'优化 p5_wan_trend_data 索引跳过: {e}')
+
             # 千位走势数据表
             sql_qian_trend = '''
             CREATE TABLE IF NOT EXISTS p5_qian_trend_data (
@@ -490,7 +766,15 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5千位走势图数据表';
             '''
             self.cursor.execute(sql_qian_trend)
-            
+
+            # 向后兼容: 合并 qian_number 单列索引为联合索引
+            try:
+                self.cursor.execute("ALTER TABLE p5_qian_trend_data DROP INDEX idx_qian_number")
+                self.cursor.execute("ALTER TABLE p5_qian_trend_data ADD INDEX idx_issue_qian (issue, qian_number) USING BTREE")
+            except Exception as e:
+                if getattr(e, 'args', (None,))[0] not in (1091, 109):
+                    logger.warning(f'优化 p5_qian_trend_data 索引跳过: {e}')
+
             # 百位走势数据表
             sql_bai_trend = '''
             CREATE TABLE IF NOT EXISTS p5_bai_trend_data (
@@ -540,7 +824,15 @@ class P5Database:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5十位走势图数据表';
             '''
             self.cursor.execute(sql_shi_trend)
-            
+
+            # 向后兼容: 合并 shi_number 单列索引为联合索引
+            try:
+                self.cursor.execute("ALTER TABLE p5_shi_trend_data DROP INDEX idx_shi_number")
+                self.cursor.execute("ALTER TABLE p5_shi_trend_data ADD INDEX idx_issue_shi (issue, shi_number) USING BTREE")
+            except Exception as e:
+                if getattr(e, 'args', (None,))[0] not in (1091, 109):
+                    logger.warning(f'优化 p5_shi_trend_data 索引跳过: {e}')
+
             # 个位走势数据表
             sql_ge_trend = '''
             CREATE TABLE IF NOT EXISTS p5_ge_trend_data (
@@ -566,11 +858,19 @@ class P5Database:
             '''
             self.cursor.execute(sql_ge_trend)
 
-            # ★ 兼容迁移: 旧版曾以"后三/和尾"schema 创建过 p5_spjzs_data / p5_hzzst_data,
-            #   与当前"基于实际爬取5位号码"的 schema(wan/qian/bai/shi/ge/hezhi/...)不兼容。
-            #   若旧表存在且不带 wan 列(即旧schema), 先 DROP 再交由下方 CREATE 重建,
-            #   避免 CREATE TABLE IF NOT EXISTS 失效导致后续 INSERT 列不匹配。
-            #   (仅当表为空/旧schema时重建, 已含 wan 列的正确表不受影响)
+            # 向后兼容: 合并 ge_number 单列索引为联合索引
+            try:
+                self.cursor.execute("ALTER TABLE p5_ge_trend_data DROP INDEX idx_ge_number")
+                self.cursor.execute("ALTER TABLE p5_ge_trend_data ADD INDEX idx_issue_ge (issue, ge_number) USING BTREE")
+            except Exception as e:
+                if getattr(e, 'args', (None,))[0] not in (1091, 109):
+                    logger.warning(f'优化 p5_ge_trend_data 索引跳过: {e}')
+
+            # 兼容迁移: 旧版曾以"后三/和尾"schema 创建过 p5_spjzs_data / p5_hzzst_data,
+            # 与当前"基于实际爬取5位号码"的 schema(wan/qian/bai/shi/ge/hezhi/...)不兼容。
+            # 若旧表存在且不带 wan 列(即旧schema), 先 DROP 再交由下方 CREATE 重建,
+            # 避免 CREATE TABLE IF NOT EXISTS 失效导致后续 INSERT 列不匹配。
+            # (仅当表为空/旧schema时重建, 已含 wan 列的正确表不受影响)
             for _t in ('p5_spjzs_data', 'p5_hzzst_data'):
                 try:
                     self.cursor.execute(f'SELECT wan FROM {_t} LIMIT 0')
@@ -638,7 +938,7 @@ class P5Database:
             '''
             self.cursor.execute(sql_hzzst_trend)
 
-            # 贝叶斯推断结果专用表 (v3.5 新增, 按 issue 增量持久化, 避免每次重算/调AI)
+            # 贝叶斯推断结果专用表
             sql_bayesian = '''
             CREATE TABLE IF NOT EXISTS p5_bayesian_result (
                 id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
@@ -765,7 +1065,7 @@ class P5Database:
             '''
             self.cursor.execute(sql_weight_history)
             
-            # ★ 在线学习历史记录表 (新增)
+            # 在线学习历史记录表 (新增)
             sql_learning_history = '''
             CREATE TABLE IF NOT EXISTS p5_learning_history (
                 id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
@@ -788,7 +1088,7 @@ class P5Database:
             '''
             self.cursor.execute(sql_learning_history)
 
-            # ★ 运行时产物统一存储表 (v3.3 新增)
+            # 运行时产物统一存储表
             # 用于替代所有运行时生成的 JSON 文件(在线学习报告/验证报告/贝叶斯结果/权重历史/
             # 自适应权重/预测结果/特征分析/回测报告等), 统一持久化到数据库, 并保留元信息。
             sql_artifact = '''
@@ -809,8 +1109,43 @@ class P5Database:
             '''
             self.cursor.execute(sql_artifact)
 
+            # 向后兼容: 为 p5_artifact 添加复合索引，优化按类型+期号的查询
+            try:
+                self.cursor.execute("ALTER TABLE p5_artifact ADD INDEX idx_type_issue (artifact_type, issue) USING BTREE")
+            except Exception as e:
+                if getattr(e, 'args', (None,))[0] != 1061:  # Duplicate key name
+                    logger.warning(f'添加 p5_artifact.idx_type_issue 索引跳过: {e}')
+
+            # 向后兼容: 为 p5_prediction_record 添加复合索引，优化验证状态+期号查询
+            try:
+                self.cursor.execute("ALTER TABLE p5_prediction_record ADD INDEX idx_status_issue (verification_status, target_issue) USING BTREE")
+            except Exception as e:
+                if getattr(e, 'args', (None,))[0] != 1061:
+                    logger.warning(f'添加 p5_prediction_record.idx_status_issue 索引跳过: {e}')
+
+            # 自我进化版本表（专用表，替代原先混入 p5_artifact 的 evolution_version 产物，
+            # 字段与 data/database.sql 导出结构保持一致，提升进化版本数据的可读性与一致性）
+            sql_evolution_version = '''
+            CREATE TABLE IF NOT EXISTS p5_evolution_version (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                version_tag VARCHAR(64) NOT NULL COMMENT '版本标识(唯一)',
+                parent_tag VARCHAR(64) NULL DEFAULT NULL COMMENT '父版本标识',
+                created_at DATETIME NULL DEFAULT NULL COMMENT '创建时间',
+                status VARCHAR(16) NULL DEFAULT NULL COMMENT '版本状态(active/trial/rolledback)',
+                params_json TEXT NULL COMMENT '参数快照JSON(融合权重/lookback/ML状态等)',
+                metrics_json TEXT NULL COMMENT '评估指标JSON(Top1/Top3/Top5等)',
+                baseline_json TEXT NULL COMMENT '基线版本JSON',
+                note TEXT NULL COMMENT '版本说明',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_version_tag (version_tag ASC) USING BTREE,
+                INDEX idx_status (status ASC) USING BTREE,
+                INDEX idx_created (created_at DESC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5自我进化版本表';
+            '''
+            self.cursor.execute(sql_evolution_version)
+
             self.connection.commit()
-            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、验证明细、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐、权重历史、学习历史、运行时产物）')
+            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、验证明细、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐、权重历史、学习历史、运行时产物、自我进化版本）')
             return True
         except Exception as e:
             logger.error(f'创建数据表失败: {e}')
@@ -837,8 +1172,11 @@ class P5Database:
         skip_count = 0
         
         try:
-            # 获取已有期号
-            self.cursor.execute('SELECT issue FROM p5_history_data')
+            # 获取已有期号（使用 execute_with_reconnect 避免连接中断时失败）
+            result = self.execute_with_reconnect('SELECT issue FROM p5_history_data')
+            if result is None:
+                logger.error('获取已有期号失败: 数据库连接不可用')
+                return 0, len(data)
             existing_issues = {row['issue'] for row in self.cursor.fetchall()}
             
             sql = '''
@@ -879,11 +1217,15 @@ class P5Database:
                 big_count = sum(1 for n in [wan, qian, bai, shi, ge] if n >= 5)
                 big_small_ratio = f"{big_count}:{5-big_count}"
                 
-                self.cursor.execute(sql, (
+                params = (
                     issue, item.get('date', ''), wan, qian, bai, shi, ge,
                     hezhi, span, odd_even_ratio, odd_even_pattern, big_small_ratio,
                     item.get('source', 'spider')
-                ))
+                )
+                if self.execute_with_reconnect(sql, params) is None:
+                    logger.error(f'插入历史数据失败: issue={issue}, 连接异常')
+                    skip_count += 1
+                    continue
                 success_count += 1
             
             self.connection.commit()
@@ -914,7 +1256,38 @@ class P5Database:
         except Exception as e:
             logger.error(f'获取最新走势期号失败: {e}')
             return None
-    
+
+    def get_history_data_count(self) -> int:
+        """获取历史开奖数据总条数（供自我进化引擎采集阶段统计样本量）。"""
+        try:
+            self.cursor.execute('SELECT COUNT(*) AS cnt FROM p5_history_data')
+            row = self.cursor.fetchone()
+            return int(row['cnt']) if row and row.get('cnt') is not None else 0
+        except Exception as e:
+            logger.error(f'获取历史数据条数失败: {e}')
+            return 0
+
+    def get_table_count(self, table: str) -> int:
+        """获取任意数据表的总记录数（用于 GUI 数据概览，白名单校验表名防注入）。"""
+        allowed = {
+            'p5_history_data', 'p5_trend_data', 'p5_ai_report', 'p5_prediction_record',
+            'p5_verification_detail', 'p5_performance_stats', 'p5_wan_trend_data',
+            'p5_qian_trend_data', 'p5_bai_trend_data', 'p5_shi_trend_data', 'p5_ge_trend_data',
+            'p5_spjzs_data', 'p5_hzzst_data', 'p5_bayesian_result', 'p5_sum_end_trend_data',
+            'p5_back_three_trend_data', 'p5_expert_recommendation', 'p5_weight_history',
+            'p5_learning_history', 'p5_artifact', 'p5_evolution_version',
+        }
+        if table not in allowed:
+            logger.warning(f'get_table_count 拒绝未知表名: {table}')
+            return 0
+        try:
+            self.cursor.execute(f'SELECT COUNT(*) AS cnt FROM `{table}`')
+            row = self.cursor.fetchone()
+            return int(row['cnt']) if row and row.get('cnt') is not None else 0
+        except Exception as e:
+            logger.error(f'获取表 {table} 记录数失败: {e}')
+            return 0
+
     def get_history_data(self, limit: int = 500, order_by: str = 'issue DESC',
                          order: str = None) -> List[Dict[str, Any]]:
         """
@@ -1017,7 +1390,11 @@ class P5Database:
         skip_count = 0
         
         try:
-            self.cursor.execute('SELECT issue FROM p5_trend_data')
+            # 获取已有期号（使用 execute_with_reconnect 避免连接中断时失败）
+            result = self.execute_with_reconnect('SELECT issue FROM p5_trend_data')
+            if result is None:
+                logger.error('获取已有期号失败: 数据库连接不可用')
+                return 0, len(data)
             existing_issues = {row['issue'] for row in self.cursor.fetchall()}
             
             sql = '''
@@ -1042,14 +1419,18 @@ class P5Database:
                 shi = int(trend.get('shi', numbers[3] if len(numbers) > 3 else 0))
                 ge = int(trend.get('ge', numbers[4] if len(numbers) > 4 else 0))
                 
-                self.cursor.execute(sql, (
+                params = (
                     issue, wan, qian, bai, shi, ge,
                     item.get('hezhi', ''),
                     item.get('odd_even_ratio', ''),
                     item.get('big_small_ratio', ''),
                     item.get('prime_composite_ratio', ''),
                     json.dumps(item, ensure_ascii=False)
-                ))
+                )
+                if self.execute_with_reconnect(sql, params) is None:
+                    logger.error(f'插入走势数据失败: issue={issue}, 连接异常')
+                    skip_count += 1
+                    continue
                 success_count += 1
             
             self.connection.commit()
@@ -1253,8 +1634,8 @@ class P5Database:
             # 解析预测号码
             predicted_raw = json.loads(record['predicted_numbers'])
             
-            # ★ 兼容处理: 新旧两种 predicted_numbers 格式
-            # 新格式: {'wan': [4, 5, 6], 'qian': [...], ...}  (扁平化)
+            # 兼容处理: 新旧两种 predicted_numbers 格式
+            # 新格式: {'wan': [4, 5, 6], 'qian': [...], ...} (扁平化)
             # 旧格式: {'wan': {'numbers': [4, 5, 6], 'confidence': [...]}, ...} (非扁平化)
             predicted = {}
             for _pos in ['wan', 'qian', 'bai', 'shi', 'ge']:
@@ -1270,7 +1651,7 @@ class P5Database:
                 # 确保所有元素都是整数
                 predicted[_pos] = [int(n) for n in _nums] if _nums else []
             
-            # 启用容错匹配机制(v3.1优化)
+            # 启用容错匹配机制
             tolerance_enabled = True  # 允许号码偏差±1也算命中
             
             def check_match(actual_num, pred_nums):
@@ -1414,32 +1795,77 @@ class P5Database:
             logger.error(f'获取待验证预测失败: {e}')
             return []
     
+    # 同一期号只保留最新一条已验证记录（verified_at 最新，同刻取 id 最大）。
+    # 背景：一期开奖会被多次预测（流水线 / 快速预测 / 运维脚本各写一条），
+    # 每条都会被验证，导致 p5_prediction_record 同期号多行（实测 1142 条 verified
+    # 只对应 972 个期号）。旧实现只用 MAX(verified_at) 关联，同一秒批量验证的多条
+    # 会全部命中，去重不彻底（972 个期号被算成 988 行）。改为定位到唯一 id。
+    DEDUPED_VERIFIED_SQL = '''
+        SELECT p.*
+        FROM p5_prediction_record p
+        INNER JOIN (
+            SELECT target_issue, MAX(id) AS keep_id
+            FROM p5_prediction_record
+            WHERE verification_status = 'verified'
+              AND (target_issue, verified_at) IN (
+                  SELECT target_issue, MAX(verified_at)
+                  FROM p5_prediction_record
+                  WHERE verification_status = 'verified'
+                  GROUP BY target_issue
+              )
+            GROUP BY target_issue
+        ) latest ON p.id = latest.keep_id
+    '''
+
     def get_verification_stats(self) -> Dict[str, Any]:
-        """获取验证统计信息"""
+        """获取验证统计信息（按期号去重合并后统计）
+
+        口径说明（v3.25）：
+        - 去重：同一 target_issue 只取最新一条验证记录，避免重复期号重复计数。
+        - 平均准确率：统一按「命中位数 / 5」计算，不再直接平均历史遗留的
+          accuracy_rate 字段——该字段由不同版本写入、分母不一致
+          （库中存在 4 命中却记为 42.86% 的脏数据）。
+        - 严格命中率（v3.35）：新增 strict_wan_accuracy 等字段，表示精确匹配（无容错）
+        """
         try:
-            sql = '''
-            SELECT 
+            sql = f'''
+            SELECT
                 COUNT(*) as total,
                 SUM(is_matched) as total_matched,
                 AVG(match_count) as avg_match,
-                AVG(accuracy_rate) as avg_accuracy,
+                AVG(match_count) / 5 * 100 as avg_accuracy,
                 SUM(wan_match) as wan_hits,
                 SUM(qian_match) as qian_hits,
                 SUM(bai_match) as bai_hits,
                 SUM(shi_match) as shi_hits,
                 SUM(ge_match) as ge_hits
-            FROM p5_prediction_record 
-            WHERE verification_status = 'verified'
+            FROM ( {self.DEDUPED_VERIFIED_SQL} ) AS deduped_records
             '''
             self.cursor.execute(sql)
             result = self.cursor.fetchone()
-            
+
             total = result.get('total', 0) or 0
             if total == 0:
                 return {'total': 0, 'message': '暂无验证数据'}
-            
+
+            # 去重前的原始条数（供 UI 提示「已合并 N 条重复记录」）
+            raw_total = total
+            try:
+                self.cursor.execute(
+                    "SELECT COUNT(*) AS n FROM p5_prediction_record "
+                    "WHERE verification_status = 'verified'"
+                )
+                raw_total = (self.cursor.fetchone() or {}).get('n', total) or total
+            except Exception:
+                pass
+
+            # 严格命中率统计（无容错匹配）
+            strict_stats = self._calculate_strict_hit_rates(total)
+
             return {
                 'total': total,
+                'raw_total': raw_total,
+                'merged_duplicates': max(0, int(raw_total) - int(total)),
                 'total_matched': result.get('total_matched', 0) or 0,
                 'avg_match': round(result.get('avg_match', 0) or 0, 2),
                 'avg_accuracy': round(result.get('avg_accuracy', 0) or 0, 2),
@@ -1448,11 +1874,97 @@ class P5Database:
                 'bai_accuracy': round((result.get('bai_hits', 0) or 0) / total * 100, 2),
                 'shi_accuracy': round((result.get('shi_hits', 0) or 0) / total * 100, 2),
                 'ge_accuracy': round((result.get('ge_hits', 0) or 0) / total * 100, 2),
-                'overall_accuracy': round((result.get('avg_accuracy', 0) or 0), 2)
+                'overall_accuracy': round((result.get('avg_accuracy', 0) or 0), 2),
+                # 严格命中率（无容错）
+                'strict_total_matched': strict_stats.get('total_matched', 0),
+                'strict_full_matches': strict_stats.get('full_matches', 0),  # 完全命中5位的期数
+                'strict_avg_match': strict_stats.get('avg_match', 0),
+                'strict_avg_accuracy': strict_stats.get('avg_accuracy', 0),
+                'strict_wan_accuracy': strict_stats.get('wan_accuracy', 0),
+                'strict_qian_accuracy': strict_stats.get('qian_accuracy', 0),
+                'strict_bai_accuracy': strict_stats.get('bai_accuracy', 0),
+                'strict_shi_accuracy': strict_stats.get('shi_accuracy', 0),
+                'strict_ge_accuracy': strict_stats.get('ge_accuracy', 0),
             }
+
         except Exception as e:
             logger.error(f'获取验证统计失败: {e}')
             return {}
+
+    def _calculate_strict_hit_rates(self, total: int) -> Dict[str, Any]:
+        """计算严格命中率（无容错匹配，精确命中）
+
+        需要从 p5_prediction_record 表中读取 predicted_numbers 和 actual_numbers，
+        重新计算精确匹配结果。
+        """
+        try:
+            # 获取去重后的验证记录
+            self.cursor.execute(self.DEDUPED_VERIFIED_SQL)
+            records = self.cursor.fetchall()
+
+            if not records:
+                return {
+                    'total_matched': 0,
+                    'avg_match': 0,
+                    'avg_accuracy': 0,
+                    'wan_accuracy': 0,
+                    'qian_accuracy': 0,
+                    'bai_accuracy': 0,
+                    'shi_accuracy': 0,
+                    'ge_accuracy': 0,
+                }
+
+            import json
+            strict_match = 0
+            strict_full_matches = 0  # 完全命中5位的期数
+            strict_total_matched = 0  # 保留向后兼容，但实际含义是位置命中总次数
+            positions = ['wan', 'qian', 'bai', 'shi', 'ge']
+            strict_pos_hits = {p: 0 for p in positions}
+
+            for r in records:
+                try:
+                    pred = json.loads(r['predicted_numbers'])
+                    actual = json.loads(r['actual_numbers'])
+
+                    # 严格匹配（精确匹配，无容错）
+                    record_strict_match = 0
+                    for i, pos in enumerate(positions):
+                        if actual[i] in pred.get(pos, []):
+                            strict_pos_hits[pos] += 1
+                            strict_match += 1
+                            strict_total_matched += 1
+                            record_strict_match += 1
+
+                    # 统计完全命中5位的期数
+                    if record_strict_match == 5:
+                        strict_full_matches += 1
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    continue
+
+            actual_total = len(records)
+            return {
+                'total_matched': strict_total_matched,
+                'full_matches': strict_full_matches,  # 完全命中5位的期数
+                'avg_match': round(strict_match / actual_total, 2) if actual_total > 0 else 0,
+                'avg_accuracy': round(strict_match / actual_total * 100 / 5, 2) if actual_total > 0 else 0,
+                'wan_accuracy': round(strict_pos_hits['wan'] / actual_total * 100, 2) if actual_total > 0 else 0,
+                'qian_accuracy': round(strict_pos_hits['qian'] / actual_total * 100, 2) if actual_total > 0 else 0,
+                'bai_accuracy': round(strict_pos_hits['bai'] / actual_total * 100, 2) if actual_total > 0 else 0,
+                'shi_accuracy': round(strict_pos_hits['shi'] / actual_total * 100, 2) if actual_total > 0 else 0,
+                'ge_accuracy': round(strict_pos_hits['ge'] / actual_total * 100, 2) if actual_total > 0 else 0,
+            }
+        except Exception as e:
+            logger.warning(f'计算严格命中率失败: {e}')
+            return {
+                'total_matched': 0,
+                'avg_match': 0,
+                'avg_accuracy': 0,
+                'wan_accuracy': 0,
+                'qian_accuracy': 0,
+                'bai_accuracy': 0,
+                'shi_accuracy': 0,
+                'ge_accuracy': 0,
+            }
     
     # ============================================================
     # 性能统计操作
@@ -1498,7 +2010,7 @@ class P5Database:
                 stats['shi_accuracy'],
                 stats['ge_accuracy'],
                 stats['overall_accuracy'],
-                json.dumps(stats, ensure_ascii=False)
+                _safe_json_dumps(stats)
             ))
             self.connection.commit()
             logger.info('性能统计更新成功')
@@ -1533,17 +2045,20 @@ class P5Database:
         """
         if not data:
             return 0, 0
-        
+
         success_count = 0
         skip_count = 0
-        
         try:
-            self.cursor.execute('SELECT issue FROM p5_wan_trend_data')
+            # 使用 execute_with_reconnect 自动处理连接超时重连
+            result = self.execute_with_reconnect('SELECT issue FROM p5_wan_trend_data')
+            if result is None:
+                logger.error('获取万位已有期号失败: 数据库连接不可用')
+                return 0, len(data)
             existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
+
             sql = '''
-            INSERT INTO p5_wan_trend_data 
-            (issue, wan_number, draw_date, is_odd, is_big, is_prime, 
+            INSERT INTO p5_wan_trend_data
+            (issue, wan_number, draw_date, is_odd, is_big, is_prime,
              omission, hot_level, consecutive_count, trend_json, source)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
@@ -1558,19 +2073,23 @@ class P5Database:
                 trend_json = VALUES(trend_json),
                 source = VALUES(source)
             '''
-            
+
+            insert_errors = []
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
                     skip_count += 1
                     continue
-                
+                if issue in existing_issues:
+                    skip_count += 1
+                    continue
+
                 wan_number = item.get('wan_number', 0)
                 if not (0 <= wan_number <= 9):
                     skip_count += 1
                     continue
-                
-                self.cursor.execute(sql, (
+
+                params = (
                     issue,
                     wan_number,
                     item.get('draw_date', ''),
@@ -1582,14 +2101,19 @@ class P5Database:
                     item.get('consecutive_count', 0),
                     json.dumps(item, ensure_ascii=False),
                     item.get('source', 'china_lottery')
-                ))
+                )
+                if self.execute_with_reconnect(sql, params) is None:
+                    logger.error(f'插入万位走势数据失败: issue={issue}, 连接异常')
+                    skip_count += 1
+                    continue
                 success_count += 1
-            
+            if insert_errors:
+                logger.warning(f'万位走势数据部分插入失败, 失败期号示例: {insert_errors[:5]}')
             self.connection.commit()
             logger.info(f'万位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
-            logger.error(f'插入万位走势数据失败: {e}')
+            logger.error(f'插入万位走势数据失败: {type(e).__name__}: {e}')
             return 0, len(data)
     
     def get_wan_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -1668,17 +2192,20 @@ class P5Database:
         """
         if not data:
             return 0, 0
-        
+
         success_count = 0
         skip_count = 0
-        
         try:
-            self.cursor.execute('SELECT issue FROM p5_qian_trend_data')
+            # 使用 execute_with_reconnect 自动处理连接超时重连
+            result = self.execute_with_reconnect('SELECT issue FROM p5_qian_trend_data')
+            if result is None:
+                logger.error('获取千位已有期号失败: 数据库连接不可用')
+                return 0, len(data)
             existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
+
             sql = '''
-            INSERT INTO p5_qian_trend_data 
-            (issue, qian_number, draw_date, is_odd, is_big, is_prime, 
+            INSERT INTO p5_qian_trend_data
+            (issue, qian_number, draw_date, is_odd, is_big, is_prime,
              omission, hot_level, consecutive_count, trend_json, source)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
@@ -1693,19 +2220,22 @@ class P5Database:
                 trend_json = VALUES(trend_json),
                 source = VALUES(source)
             '''
-            
+
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
                     skip_count += 1
                     continue
-                
+                if issue in existing_issues:
+                    skip_count += 1
+                    continue
+
                 qian_number = item.get('qian_number', 0)
                 if not (0 <= qian_number <= 9):
                     skip_count += 1
                     continue
-                
-                self.cursor.execute(sql, (
+
+                params = (
                     issue,
                     qian_number,
                     item.get('draw_date', ''),
@@ -1717,14 +2247,17 @@ class P5Database:
                     item.get('consecutive_count', 0),
                     json.dumps(item, ensure_ascii=False),
                     item.get('source', 'china_lottery')
-                ))
+                )
+                if self.execute_with_reconnect(sql, params) is None:
+                    logger.error(f'插入千位走势数据失败: issue={issue}, 连接异常')
+                    skip_count += 1
+                    continue
                 success_count += 1
-            
             self.connection.commit()
             logger.info(f'千位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
-            logger.error(f'插入千位走势数据失败: {e}')
+            logger.error(f'插入千位走势数据失败: {type(e).__name__}: {e}')
             return 0, len(data)
     
     def get_qian_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -1938,17 +2471,20 @@ class P5Database:
         """
         if not data:
             return 0, 0
-        
+
         success_count = 0
         skip_count = 0
-        
         try:
-            self.cursor.execute('SELECT issue FROM p5_shi_trend_data')
+            # 使用 execute_with_reconnect 自动处理连接超时重连
+            result = self.execute_with_reconnect('SELECT issue FROM p5_shi_trend_data')
+            if result is None:
+                logger.error('获取十位已有期号失败: 数据库连接不可用')
+                return 0, len(data)
             existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
+
             sql = '''
-            INSERT INTO p5_shi_trend_data 
-            (issue, shi_number, draw_date, is_odd, is_big, is_prime, 
+            INSERT INTO p5_shi_trend_data
+            (issue, shi_number, draw_date, is_odd, is_big, is_prime,
              omission, hot_level, consecutive_count, trend_json, source)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
@@ -1963,19 +2499,22 @@ class P5Database:
                 trend_json = VALUES(trend_json),
                 source = VALUES(source)
             '''
-            
+
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
                     skip_count += 1
                     continue
-                
+                if issue in existing_issues:
+                    skip_count += 1
+                    continue
+
                 shi_number = item.get('shi_number', 0)
                 if not (0 <= shi_number <= 9):
                     skip_count += 1
                     continue
-                
-                self.cursor.execute(sql, (
+
+                params = (
                     issue,
                     shi_number,
                     item.get('draw_date', ''),
@@ -1987,14 +2526,17 @@ class P5Database:
                     item.get('consecutive_count', 0),
                     json.dumps(item, ensure_ascii=False),
                     item.get('source', 'china_lottery')
-                ))
+                )
+                if self.execute_with_reconnect(sql, params) is None:
+                    logger.error(f'插入十位走势数据失败: issue={issue}, 连接异常')
+                    skip_count += 1
+                    continue
                 success_count += 1
-            
             self.connection.commit()
             logger.info(f'十位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
-            logger.error(f'插入十位走势数据失败: {e}')
+            logger.error(f'插入十位走势数据失败: {type(e).__name__}: {e}')
             return 0, len(data)
     
     def get_shi_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -2073,17 +2615,20 @@ class P5Database:
         """
         if not data:
             return 0, 0
-        
+
         success_count = 0
         skip_count = 0
-        
         try:
-            self.cursor.execute('SELECT issue FROM p5_ge_trend_data')
+            # 使用 execute_with_reconnect 自动处理连接超时重连
+            result = self.execute_with_reconnect('SELECT issue FROM p5_ge_trend_data')
+            if result is None:
+                logger.error('获取个位已有期号失败: 数据库连接不可用')
+                return 0, len(data)
             existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
+
             sql = '''
-            INSERT INTO p5_ge_trend_data 
-            (issue, ge_number, draw_date, is_odd, is_big, is_prime, 
+            INSERT INTO p5_ge_trend_data
+            (issue, ge_number, draw_date, is_odd, is_big, is_prime,
              omission, hot_level, consecutive_count, trend_json, source)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
@@ -2098,19 +2643,22 @@ class P5Database:
                 trend_json = VALUES(trend_json),
                 source = VALUES(source)
             '''
-            
+
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
                     skip_count += 1
                     continue
-                
+                if issue in existing_issues:
+                    skip_count += 1
+                    continue
+
                 ge_num = item.get('ge_number', 0)
                 if not (0 <= ge_num <= 9):
                     skip_count += 1
                     continue
-                
-                self.cursor.execute(sql, (
+
+                params = (
                     issue,
                     ge_num,
                     item.get('draw_date', ''),
@@ -2122,14 +2670,17 @@ class P5Database:
                     item.get('consecutive_count', 0),
                     json.dumps(item, ensure_ascii=False),
                     item.get('source', 'china_lottery')
-                ))
+                )
+                if self.execute_with_reconnect(sql, params) is None:
+                    logger.error(f'插入个位走势数据失败: issue={issue}, 连接异常')
+                    skip_count += 1
+                    continue
                 success_count += 1
-            
             self.connection.commit()
             logger.info(f'个位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
-            logger.error(f'插入个位走势数据失败: {e}')
+            logger.error(f'插入个位走势数据失败: {type(e).__name__}: {e}')
             return 0, len(data)
     
     def get_ge_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -2179,7 +2730,11 @@ class P5Database:
         success_count = 0
         skip_count = 0
         try:
-            self.cursor.execute('SELECT issue FROM p5_spjzs_data')
+            # 使用 execute_with_reconnect 自动处理连接超时重连
+            result = self.execute_with_reconnect('SELECT issue FROM p5_spjzs_data')
+            if result is None:
+                logger.error('获取已有期号失败: 数据库连接不可用')
+                return 0, len(data)
             existing_issues = {row['issue'] for row in self.cursor.fetchall()}
             sql = '''
             INSERT INTO p5_spjzs_data
@@ -2196,6 +2751,10 @@ class P5Database:
                 if not issue:
                     skip_count += 1
                     continue
+                # 幂等性: 已存在则跳过(由 ON DUPLICATE KEY UPDATE 处理, 这里可选预过滤)
+                if issue in existing_issues:
+                    skip_count += 1
+                    continue
                 try:
                     wan = int(item.get('wan'))
                     if not (0 <= wan <= 9):
@@ -2204,7 +2763,7 @@ class P5Database:
                 except (TypeError, ValueError):
                     skip_count += 1
                     continue
-                self.cursor.execute(sql, (
+                params = (
                     issue,
                     item.get('numbers', ''),
                     item.get('wan'), item.get('qian'), item.get('bai'),
@@ -2212,7 +2771,11 @@ class P5Database:
                     item.get('hezhi'), item.get('hewei'), item.get('kuadu'),
                     item.get('avg'), item.get('miss_json'),
                     item.get('source', 'ydniu_spjzs'),
-                ))
+                )
+                if self.execute_with_reconnect(sql, params) is None:
+                    logger.error(f'插入升平降走势数据失败: issue={issue}, 连接异常')
+                    skip_count += 1
+                    continue
                 success_count += 1
             self.connection.commit()
             logger.info(f'升平降走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
@@ -2235,7 +2798,11 @@ class P5Database:
         success_count = 0
         skip_count = 0
         try:
-            self.cursor.execute('SELECT issue FROM p5_hzzst_data')
+            # 使用 execute_with_reconnect 保持与 insert_spjzs_data 一致，避免连接中断时静默失败
+            result = self.execute_with_reconnect('SELECT issue FROM p5_hzzst_data')
+            if result is None:
+                logger.error('获取已有期号失败: 数据库连接不可用')
+                return 0, len(data)
             existing_issues = {row['issue'] for row in self.cursor.fetchall()}
             sql = '''
             INSERT INTO p5_hzzst_data
@@ -2247,9 +2814,13 @@ class P5Database:
                 hezhi = VALUES(hezhi), kuadu = VALUES(kuadu), hewei = VALUES(hewei),
                 miss_json = VALUES(miss_json), source = VALUES(source)
             '''
+            insert_errors = []
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
+                    skip_count += 1
+                    continue
+                if issue in existing_issues:
                     skip_count += 1
                     continue
                 try:
@@ -2260,7 +2831,7 @@ class P5Database:
                 except (TypeError, ValueError):
                     skip_count += 1
                     continue
-                self.cursor.execute(sql, (
+                params = (
                     issue,
                     item.get('numbers', ''),
                     item.get('wan'), item.get('qian'), item.get('bai'),
@@ -2268,13 +2839,20 @@ class P5Database:
                     item.get('hezhi'), item.get('kuadu'), item.get('hewei'),
                     item.get('miss_json'),
                     item.get('source', 'ydniu_hzzst'),
-                ))
+                )
+                if self.execute_with_reconnect(sql, params) is None:
+                    logger.error(f'插入和值走势数据失败: issue={issue}, 连接异常')
+                    skip_count += 1
+                    insert_errors.append(issue)
+                    continue
                 success_count += 1
+            if insert_errors:
+                logger.warning(f'和值走势数据部分插入失败, 失败期号示例: {insert_errors[:5]}')
             self.connection.commit()
             logger.info(f'和值走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
-            logger.error(f'插入和值走势数据失败: {e}')
+            logger.error(f'插入和值走势数据失败: {type(e).__name__}: {e}')
             return 0, len(data)
 
     def get_latest_spjzs_issue(self) -> Optional[str]:
@@ -2809,26 +3387,48 @@ class P5Database:
             logger.error(f'获取预测详情失败: {e}')
             return None
     
-    def get_verified_predictions(self, days: int = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_verified_predictions(self, days: int = 30, limit: int = 50,
+                                 dedupe: bool = True,
+                                 min_created_at: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        获取已验证的预测记录（供学习报告生成使用）
-        
+        获取已验证的预测记录（供命中率明细表与学习报告使用）
+
         Args:
             days: 查询最近N天的数据
             limit: 返回记录数限制
-            
+            dedupe: 是否按期号去重合并（默认 True，v3.25 新增）。
+                同一期号可能存在多条验证记录（不同预测来源各写一条），
+                去重后每期只保留最新一条，避免明细表出现大量重复行、
+                以及命中率被同期号重复样本拉偏。
+            min_created_at: 仅统计创建时间 >= 该日期的预测记录(格式 'YYYY-MM-DD')。
+                v3.44 新增：用于「归因覆盖率」指标仅统计 v3.44 修复后产生的记录，
+                避免 v3.44 前大量历史 NULL 归因记录污染指标。
+
         Returns:
             预测记录列表
         """
         try:
-            sql = '''
-            SELECT * FROM p5_prediction_record 
-            WHERE verification_status = 'verified'
-            AND verified_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
-            ORDER BY verified_at DESC
-            LIMIT %s
-            '''
-            self.cursor.execute(sql, (days, limit))
+            extra = ' AND created_at >= %s' if min_created_at else ''
+            if dedupe:
+                sql = f'''
+                SELECT * FROM ( {self.DEDUPED_VERIFIED_SQL} ) AS deduped
+                WHERE verified_at >= DATE_SUB(NOW(), INTERVAL %s DAY){extra}
+                ORDER BY verified_at DESC, target_issue DESC
+                LIMIT %s
+                '''
+            else:
+                sql = f'''
+                SELECT * FROM p5_prediction_record
+                WHERE verification_status = 'verified'
+                AND verified_at >= DATE_SUB(NOW(), INTERVAL %s DAY){extra}
+                ORDER BY verified_at DESC
+                LIMIT %s
+                '''
+            params = [days]
+            if min_created_at:
+                params.append(min_created_at)
+            params.append(limit)
+            self.cursor.execute(sql, tuple(params))
             return self.cursor.fetchall()
             
         except Exception as e:
@@ -2974,8 +3574,19 @@ class P5Database:
             logger.error(f'获取算法性能统计失败: {e}')
             return []
     
-    def save_adaptive_weights(self, weights_json, version='v3.0'):
-        """保存当前自适应权重配置到数据库 p5_artifact(type='adaptive_weights') (v3.3 起替代本地文件)"""
+    def save_adaptive_weights(self, weights_json, version=None):
+        """保存当前自适应权重配置到数据库 p5_artifact(type='adaptive_weights') (v3.3 起替代本地文件)
+        
+        Args:
+            weights_json: 权重配置（dict 或 JSON 字符串）
+            version: 版本标识，默认从 version.py 读取 APP_VERSION
+        """
+        if version is None:
+            try:
+                from version import APP_VERSION
+                version = APP_VERSION
+            except Exception:
+                version = 'unknown'
         try:
             config = {
                 'version': version,
@@ -2990,12 +3601,22 @@ class P5Database:
             logger.error(f'保存自适应权重配置失败: {e}')
             return False
     
-    def load_adaptive_weights(self, version='v3.0'):
-        """加载自适应权重配置 (v3.3: 优先从数据库 p5_artifact 读取, 不再依赖本地文件)"""
+    def load_adaptive_weights(self, version=None):
+        """加载自适应权重配置：优先从数据库 p5_artifact 读取, 不再依赖本地文件
+        
+        Args:
+            version: 期望版本，默认从 version.py 读取 APP_VERSION
+        """
+        if version is None:
+            try:
+                from version import APP_VERSION
+                version = APP_VERSION
+            except Exception:
+                version = 'unknown'
         try:
             artifact = self.get_latest_artifact('adaptive_weights')
             if not artifact:
-                logger.warning('数据库无常权重配置记录')
+                logger.warning('数据库无自适应权重配置记录')
                 return None
             data = artifact.get('data') or {}
             if data.get('version') != version:
@@ -3008,7 +3629,7 @@ class P5Database:
             return None
 
     # ============================================================
-    # 运行时产物统一存储 (v3.3 新增, 替代所有运行时 JSON 文件)
+    # 运行时产物统一存储
     # ============================================================
 
     def save_artifact(self, artifact_type: str, data: Any, issue: str = None,
@@ -3028,20 +3649,28 @@ class P5Database:
             是否保存成功
         """
         try:
-            data_json = json.dumps(data, ensure_ascii=False, default=str)
-            meta_json = json.dumps(meta, ensure_ascii=False, default=str) if meta is not None else None
+            data_json = json.dumps(_clean_for_json(data), ensure_ascii=False)
+            meta_json = json.dumps(_clean_for_json(meta), ensure_ascii=False) if meta is not None else None
             sql = (
                 'INSERT INTO p5_artifact (artifact_type, issue, ref_uuid, data_json, meta_json) '
                 'VALUES (%s, %s, %s, %s, %s)'
             )
             params = (artifact_type, issue, ref_uuid, data_json, meta_json)
             try:
+                # 写入前确保连接有效
+                if getattr(self, 'connection', None) is None or not getattr(self.connection, 'open', False):
+                    connected = self.connect()
+                    if not connected:
+                        raise RuntimeError('数据库未连接，无法保存产物')
                 self.execute_with_reconnect(sql, params)
                 self.connection.commit()
             except Exception as e:
                 err_code = getattr(e, 'args', (None, None))[0]
                 if err_code == 1146:  # Table doesn't exist
                     self._ensure_artifact_table()
+                    if getattr(self, 'connection', None) is None or not getattr(self.connection, 'open', False):
+                        if not self.connect():
+                            raise RuntimeError('建表后重连失败，无法保存产物')
                     self.execute_with_reconnect(sql, params)
                     self.connection.commit()
                 else:
@@ -3131,6 +3760,147 @@ class P5Database:
         return items[0] if items else None
 
     # ============================================================
+    # 自我进化版本持久化 (专用表 p5_evolution_version, v3.54 规范化)
+    # ============================================================
+
+    def _ensure_evolution_version_table(self):
+        """运行时安全补齐 p5_evolution_version 表(幂等, 兼容未执行 create_tables 的旧库)。"""
+        try:
+            self.execute_with_reconnect('''
+            CREATE TABLE IF NOT EXISTS p5_evolution_version (
+                id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                version_tag VARCHAR(64) NOT NULL COMMENT '版本标识(唯一)',
+                parent_tag VARCHAR(64) NULL DEFAULT NULL COMMENT '父版本标识',
+                created_at DATETIME NULL DEFAULT NULL COMMENT '创建时间',
+                status VARCHAR(16) NULL DEFAULT NULL COMMENT '版本状态(active/trial/rolledback)',
+                params_json TEXT NULL COMMENT '参数快照JSON',
+                metrics_json TEXT NULL COMMENT '评估指标JSON',
+                baseline_json TEXT NULL COMMENT '基线版本JSON',
+                note TEXT NULL COMMENT '版本说明',
+                PRIMARY KEY (id) USING BTREE,
+                UNIQUE INDEX uk_version_tag (version_tag ASC) USING BTREE,
+                INDEX idx_status (status ASC) USING BTREE,
+                INDEX idx_created (created_at DESC) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5自我进化版本表'
+            ''')
+        except Exception as e:
+            logger.warning(f'补齐 p5_evolution_version 表失败(非致命): {e}')
+
+    def save_evolution_version(self, record: Dict[str, Any]) -> bool:
+        """
+        幂等保存一个自我进化版本到 p5_evolution_version 表（按 version_tag 唯一）。
+
+        Args:
+            record: 版本字典, 需含 version_tag; 其余字段 params_json/metrics_json/
+                    baseline_json/note/status/parent_tag/created_at 可选。
+        Returns:
+            是否保存成功
+        """
+        try:
+            version_tag = record.get('version_tag')
+            if not version_tag:
+                logger.warning('save_evolution_version 跳过: version_tag 缺失')
+                return False
+            # 确保表存在
+            self._ensure_evolution_version_table()
+            if getattr(self, 'connection', None) is None or not getattr(self.connection, 'open', False):
+                if not self.connect():
+                    raise RuntimeError('数据库未连接，无法保存进化版本')
+
+            params_json = _safe_json_dumps(record.get('params_json', {}))
+            metrics_json = _safe_json_dumps(record.get('metrics_json', {}))
+            baseline_json = _safe_json_dumps(record.get('baseline_json', {}))
+            note = record.get('note')
+            status = record.get('status')
+            parent_tag = record.get('parent_tag')
+            created_at = record.get('created_at')
+
+            sql = '''
+            INSERT INTO p5_evolution_version
+                (version_tag, parent_tag, created_at, status, params_json, metrics_json, baseline_json, note)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                parent_tag = VALUES(parent_tag),
+                created_at = VALUES(created_at),
+                status = VALUES(status),
+                params_json = VALUES(params_json),
+                metrics_json = VALUES(metrics_json),
+                baseline_json = VALUES(baseline_json),
+                note = VALUES(note)
+            '''
+            self.execute_with_reconnect(sql, (
+                version_tag, parent_tag, created_at, status,
+                params_json, metrics_json, baseline_json, note,
+            ))
+            self.connection.commit()
+            return True
+        except Exception as e:
+            logger.error(f'保存进化版本失败(tag={record.get("version_tag")}): {e}')
+            return False
+
+    def get_evolution_versions(self, limit: int = 200, status: str = None) -> List[Dict[str, Any]]:
+        """
+        查询自我进化版本列表（按创建时间倒序）。
+
+        Returns: [{id, version_tag, parent_tag, created_at, status,
+                   params_json, metrics_json, baseline_json, note}, ...]
+        各 *_json 字段为已解析的 dict/list（解析失败返回 {}）。
+        """
+        try:
+            self._ensure_evolution_version_table()
+            if getattr(self, 'connection', None) is None or not getattr(self.connection, 'open', False):
+                if not self.connect():
+                    return []
+            conds = []
+            params: List[Any] = []
+            if status:
+                conds.append('status = %s')
+                params.append(status)
+            where = (' WHERE ' + ' AND '.join(conds)) if conds else ''
+            sql = (
+                'SELECT id, version_tag, parent_tag, created_at, status, '
+                'params_json, metrics_json, baseline_json, note '
+                f'FROM p5_evolution_version{where} ORDER BY created_at DESC, id DESC LIMIT %s'
+            )
+            params.append(limit)
+            self.execute_with_reconnect(sql, params)
+            rows = self.cursor.fetchall() or []
+            out = []
+            for r in rows:
+                out.append({
+                    'id': r.get('id'),
+                    'version_tag': r.get('version_tag'),
+                    'parent_tag': r.get('parent_tag') or '',
+                    'created_at': r.get('created_at'),
+                    'status': r.get('status') or 'trial',
+                    'params_json': _safe_json_loads(r.get('params_json')) or {},
+                    'metrics_json': _safe_json_loads(r.get('metrics_json')) or {},
+                    'baseline_json': _safe_json_loads(r.get('baseline_json')) or {},
+                    'note': r.get('note') or '',
+                })
+            return out
+        except Exception as e:
+            logger.error(f'查询进化版本失败: {e}')
+            return []
+
+    def update_evolution_version_status(self, version_tag: str, status: str) -> bool:
+        """更新指定进化版本的状态（用于回滚操作）。"""
+        try:
+            if not version_tag:
+                return False
+            self._ensure_evolution_version_table()
+            if getattr(self, 'connection', None) is None or not getattr(self.connection, 'open', False):
+                if not self.connect():
+                    return False
+            sql = 'UPDATE p5_evolution_version SET status = %s WHERE version_tag = %s'
+            self.execute_with_reconnect(sql, (status, version_tag))
+            self.connection.commit()
+            return True
+        except Exception as e:
+            logger.error(f'更新进化版本状态失败(tag={version_tag}): {e}')
+            return False
+
+    # ============================================================
     # 贝叶斯推断结果持久化 (幂等增量写入, v3.3 新增)
     # ============================================================
 
@@ -3194,7 +3964,7 @@ class P5Database:
         } for a in artifacts]
 
     # ============================================================
-    # 贝叶斯推断结果专用表 p5_bayesian_result (v3.5 新增, 增量复用)
+    # 贝叶斯推断结果专用表 p5_bayesian_result
     # ============================================================
 
     def insert_bayesian_result(self, issue: str, bayes_list: Any,
@@ -3314,6 +4084,134 @@ class P5Database:
             logger.warning(f'获取贝叶斯可视化摘要失败: {e}')
             return None
 
+    # ============================================================
+    # 数据库健康检查与数据一致性校验（v3.58 新增）
+    # ============================================================
+
+    def check_data_consistency(self) -> Dict[str, Any]:
+        """
+        检查数据库数据一致性，返回各表期号范围与记录数对比结果。
+
+        Returns:
+            {
+                'history': {'min_issue': str, 'max_issue': str, 'count': int},
+                'trend_tables': {table_name: {'min_issue': str, 'max_issue': str, 'count': int}},
+                'orphan_records': int,  # 孤立记录数（存在于走势表但不在历史开奖表）
+                'consistent': bool
+            }
+        """
+        try:
+            # 获取历史开奖表的期号范围
+            self.cursor.execute(
+                "SELECT MIN(issue), MAX(issue), COUNT(*) FROM p5_history_data"
+            )
+            hist_row = self.cursor.fetchone()
+            history = {
+                'min_issue': hist_row['MIN(issue)'],
+                'max_issue': hist_row['MAX(issue)'],
+                'count': hist_row['COUNT(*)'],
+            }
+
+            # 获取各位置走势表的期号范围
+            position_tables = ['wan', 'qian', 'bai', 'shi', 'ge']
+            trend_tables = {}
+            orphan_count = 0
+
+            for pos in position_tables:
+                table = f'p5_{pos}_trend_data'
+                self.cursor.execute(f"SELECT MIN(issue), MAX(issue), COUNT(*) FROM `{table}`")
+                row = self.cursor.fetchone()
+                trend_tables[table] = {
+                    'min_issue': row['MIN(issue)'],
+                    'max_issue': row['MAX(issue)'],
+                    'count': row['COUNT(*)'],
+                }
+                # 统计孤立记录（存在于走势表但不在历史开奖表）
+                self.cursor.execute(
+                    f"SELECT COUNT(*) FROM `{table}` t "
+                    f"LEFT JOIN p5_history_data h ON t.issue = h.issue "
+                    f"WHERE h.issue IS NULL"
+                )
+                orphan_count += self.cursor.fetchone()['COUNT(*)']
+
+            consistent = orphan_count == 0
+
+            return {
+                'history': history,
+                'trend_tables': trend_tables,
+                'orphan_records': orphan_count,
+                'consistent': consistent,
+            }
+        except Exception as e:
+            logger.error(f'数据一致性检查失败: {e}')
+            return {'error': str(e)}
+
+    def clean_orphan_trend_records(self) -> int:
+        """
+        清理五位置走势表中的孤立记录（存在于走势表但不在历史开奖表）。
+
+        Returns:
+            清理的记录总数
+        """
+        cleaned = 0
+        position_tables = ['wan', 'qian', 'bai', 'shi', 'ge']
+        for pos in position_tables:
+            table = f'p5_{pos}_trend_data'
+            try:
+                self.cursor.execute(
+                    f"DELETE FROM `{table}` WHERE issue NOT IN (SELECT issue FROM p5_history_data)"
+                )
+                cleaned += self.cursor.rowcount
+                logger.info(f'清理 {table} 孤立记录: {self.cursor.rowcount} 条')
+            except Exception as e:
+                logger.error(f'清理 {table} 孤立记录失败: {e}')
+        if cleaned > 0:
+            self.connection.commit()
+        return cleaned
+
+    def get_database_stats(self) -> Dict[str, Any]:
+        """
+        获取数据库整体统计信息（各表记录数与大小）。
+
+        Returns:
+            {
+                'total_tables': int,
+                'total_records': int,
+                'total_size_kb': float,
+                'table_stats': [{table_name, record_count, data_kb, index_kb, total_kb}]
+            }
+        """
+        try:
+            self.cursor.execute("""
+                SELECT
+                    TABLE_NAME AS table_name,
+                    TABLE_ROWS AS record_count,
+                    ROUND(DATA_LENGTH / 1024, 1) AS data_kb,
+                    ROUND(INDEX_LENGTH / 1024, 1) AS index_kb,
+                    ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024, 1) AS total_kb
+                FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA = DATABASE()
+                ORDER BY (DATA_LENGTH + INDEX_LENGTH) DESC
+            """)
+            rows = self.cursor.fetchall()
+
+            table_stats = []
+            total_records = 0
+            total_size = 0.0
+            for row in rows:
+                table_stats.append(row)
+                total_records += int(row['record_count'])
+                total_size += float(row['total_kb'])
+
+            return {
+                'total_tables': len(table_stats),
+                'total_records': total_records,
+                'total_size_kb': round(total_size, 1),
+                'table_stats': table_stats,
+            }
+        except Exception as e:
+            logger.error(f'获取数据库统计信息失败: {e}')
+            return {'error': str(e)}
 
 
 def test_database():

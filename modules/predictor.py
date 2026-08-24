@@ -1,48 +1,32 @@
 """
-排列5优化预测模块 (v3.11 深度优化版)
+排列5 预测模块
 
-本项目基于多模型融合的彩票数据分析与预测平台,通过七种统计算法 + 概率融合 + 约束优化,
+基于多模型融合的彩票数据分析与预测，通过八种统计算法 + 概率融合 + 约束优化,
 生成下期各位置号码的概率分布和推荐组合。
 
-核心架构 (v3.11 优化):
-1. 频率加权算法 (35%) — 基于历史频次分布,拉普拉斯平滑
-2. 遗漏回归算法 (25%) — 指数衰减模型,遗漏越大概率越高
-3. 趋势动量算法 (13%) — 线性回归检测趋势方向 (从12%升至13%)
-4. 马尔可夫转移算法 (10%) — 一阶状态转移概率矩阵
-5. 形态延续算法 (9%) — 奇偶/大小/质合形态规律 (从8%升至9%)
-6. 贝叶斯推断算法 (10%) — 基于先验概率和后验验证的动态调整
-7. 自适应融合策略 (8%) — 基于验证历史的权重动态更新 (从10%降为8%)
+核心算法（冻结权重，lookback=60）:
+  频率加权   0.68  — 基于历史频次分布, 拉普拉斯平滑（理论最优无偏主信号）
+  监督学习   0.14  — 多源监督学习（GradientBoosting，消费位走势/升平降/和值）
+  贝叶斯推断 0.10  — 基于先验概率和后验验证的动态调整
+  遗漏回归   0.06  — 指数衰减模型（赌徒谬误，实证为噪声，降至微权重）
+  趋势动量   0.01  — 线性回归检测趋势方向
+  马尔可夫   0.005 — 一阶状态转移概率矩阵
+  形态延续   0.003 — 奇偶/大小/质合形态规律
+  特征工程   0.002 — 衍生特征信号
 
-v3.11 优化重点:
-- 支持60期数据分析，参数微调以提高精度
-- 趋势动量权重12%→13%，增强趋势信号
-- 形态延续权重8%→9%，利用更多数据捕捉形态规律
-- 贝叶斯验证窗口30→60期，匹配数据量
-- 边界约束更严格：奇偶容忍度0.4→0.38，热点比例0.55→0.52
-- 冷号比例提升0.15→0.18，保证号码多样性
-
-关键设计原则:
-- AI模型仅作为统计信号的再包装,不产生新信息
-- 所有概率分布严格归一化(总和为1)
-- 边界保护: 和值10-35, 相邻位差异惩罚, 奇偶比约束
-- 延迟/懒加载: 所有外部依赖(import)在函数内部完成
-
-算法权重配置 (v3.11):
-  频率加权:   35% (最基础的统计信号)
-  遗漏回归:   25% (第二可靠的统计信号)
-  趋势动量:   13% (从12%上调,60期数据趋势更明显)
-  马尔可夫:   10% (保持不变)
-  形态延续:    9% (从8%上调,60期形态规律更清晰)
-  贝叶斯推断: 10% (保持不变,验证窗口扩为60期)
-  特征工程:    8% (从10%下调,部分信号已被其他算法捕获)
+设计原则:
+  - 所有概率分布严格归一化（总和为1）
+  - 边界保护: 和值 10-35, 相邻位差异惩罚, 奇偶比约束
+  - 延迟加载: 外部依赖在函数内部 import
+  - 冻结权重: 审计确认排列5为公平摇号, 无法稳定超越随机基线
 
 使用方法:
     from modules.predictor import P5Predictor, P5PredictorConfig
-    
+
     # 使用默认配置
     predictor = P5Predictor()
     result = predictor.predict(history_data, current_issue)
-    
+
     # 自定义配置
     custom_config = {
         'algorithms': {
@@ -55,8 +39,9 @@ v3.11 优化重点:
 文件历史:
   2026-07-02: v2.1 优化算法权重配置
   2026-07-04: v3.0 新增贝叶斯推断 + 自适应融合策略
-  2026-07-16: v3.11 60期数据支持 + 参数微调优化
-  
+  2026-08-09: v3.49 新增监督学习(ml_supervised) + 权重再平衡
+  2026-08-09: v3.49 同步GUI显示层与核心预测器（修复割裂问题）
+
 作者: KPLuckyNumber Team
 """
 
@@ -76,15 +61,25 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# 确保日志和报告目录存在
-os.makedirs('logs', exist_ok=True)
-os.makedirs('reports', exist_ok=True)
+from paths import LOGS_DIR, REPORTS_DIR
 
+# 确保日志和报告目录存在
+os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(REPORTS_DIR, exist_ok=True)
+
+# 导入智能缓存模块（命中优化）
 logger = logging.getLogger(__name__)
+try:
+    from modules.smart_cache import get_cache as _get_prediction_cache
+    _CACHE_ENABLED = True
+except ImportError:
+    _CACHE_ENABLED = False
+    logger.warning('智能缓存模块未找到，预测缓存功能已禁用')
+
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('logs/optimized_p5_predictor.log', encoding='utf-8')
+    file_handler = logging.FileHandler(LOGS_DIR + '/optimized_p5_predictor.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -138,7 +133,7 @@ class AdaptiveWeightManager:
             convergence_tol: 收敛判据。当连续两次权重向量的最大分量变化 < tol 时判定为收敛,
                 标记 self._converged=True, 后续仅做微量调整, 进入"稳定监控"态。
 
-        ★ 设计动机(诚实边界): 排列5 公平摇号, 各算法命中率≈随机, 单期验证本质是噪声。
+        设计动机(诚实边界): 排列5 公平摇号, 各算法命中率≈随机, 单期验证本质是噪声。
           本套"学习率调度 + 预热 + 收敛检测 + 经验贝叶斯收缩 + 钳制"的组合, 目标是把自适应
           学习从"追逐随机噪声"改造为"在证据充分且稳定时才缓慢偏离默认权重"——
           提升的是稳定性/可监控性/抗噪性, 而非突破随机天花板。
@@ -149,11 +144,11 @@ class AdaptiveWeightManager:
         self.weight_cap = float(weight_cap)
         self.enable_guardrails = bool(enable_guardrails)
         # 各算法的历史信号跟踪
-        # ★ v3.12 修复: ewma 初值对齐 v3.12 DEFAULT_CONFIG 权重, 并补齐此前遗漏的
-        #   feature_engineering(旧版缺失导致其永远拿不到自适应加成)。
-        # ★ v3.14 双信号并存: 同时记录
-        #   - ewma       : 旧「覆盖命中率」EWMA (0~1之间滚动)
-        #   - ewma_t1    : 新「Top-1 精准度」EWMA (排名加权), 取权重时优先用本字段
+        # v3.12 修复: ewma 初值对齐 v3.12 DEFAULT_CONFIG 权重, 并补齐此前遗漏的
+        # feature_engineering(旧版缺失导致其永远拿不到自适应加成)。
+        # v3.14 双信号并存: 同时记录
+        # - ewma : 旧「覆盖命中率」EWMA (0~1之间滚动)
+        # - ewma_t1 : 新「Top-1 精准度」EWMA (排名加权), 取权重时优先用本字段
         # 双字段独立累积, 让 get_adaptive_weights 可按 metric 选择信号源, 兼顾兼容性。
         self.algo_hit_rates = {
             'frequency_weighted': {'total': 0, 'hits': 0, 'ewma': 0.54,   'ewma_t1': 0.54,   't1_hits': 0, 't1_total': 0},
@@ -167,7 +162,7 @@ class AdaptiveWeightManager:
         # EWMA平滑系数 (α越小,历史影响越大)
         self.ewma_alpha = ewma_alpha
 
-        # ★ 学习率调度参数(v3.17 新增: 让自适应学习"收敛"而非震荡)
+        # 学习率调度参数
         self.learning_rate_decay = max(0.0, min(1.0, float(learning_rate_decay)))
         self.min_learning_rate = max(0.0, float(min_learning_rate))
         self.warmup_iterations = max(0, int(warmup_iterations))
@@ -179,8 +174,8 @@ class AdaptiveWeightManager:
         self._converged = False                              # 是否已收敛
         self._prev_weights = None                            # 上一轮权重(用于收敛检测)
 
-        # ★ 护栏用: 快照默认权重(先验)。初值 ewma 即等于 DEFAULT_CONFIG 冻结权重,
-        #   归一化后作为收缩目标 prior, 与后续学习产生的 EWMA 解耦。
+        # 护栏用: 快照默认权重(先验)。初值 ewma 即等于 DEFAULT_CONFIG 冻结权重,
+        # 归一化后作为收缩目标 prior, 与后续学习产生的 EWMA 解耦。
         _init_prior = {k: v.get('ewma', 0.0) for k, v in self.algo_hit_rates.items()}
         _prior_total = sum(_init_prior.values()) or 1.0
         self.default_weights = {k: v / _prior_total for k, v in _init_prior.items()}
@@ -220,7 +215,7 @@ class AdaptiveWeightManager:
 
     def record_verification(self, algo_name: str, hit_rate: float, top1_hit: Optional[float] = None):
         """
-        记录单次验证结果 —— ★ v3.14 双信号并存
+        记录单次验证结果 —— v3.14 双信号并存
 
         Args:
             algo_name: 算法名称
@@ -240,8 +235,8 @@ class AdaptiveWeightManager:
         if algo_name not in self.algo_hit_rates:
             return
 
-        # ★ v3.17 学习率调度: 每次有效迭代推进一次学习率(预热期用基础率, 之后衰减至下限),
-        #   使自适应权重"先快速适应、后稳定收敛", 避免被单期随机波动长期甩动。
+        # v3.17 学习率调度: 每次有效迭代推进一次学习率(预热期用基础率, 之后衰减至下限),
+        # 使自适应权重"先快速适应、后稳定收敛", 避免被单期随机波动长期甩动。
         self.iteration += 1
         if self.iteration <= self.warmup_iterations:
             lr = self.ewma_alpha
@@ -271,8 +266,8 @@ class AdaptiveWeightManager:
             )
         # else: top1_hit=None, 仅旧通道累积(兼容从 weight_history 旧数据回放的场景)
 
-        # ★ v3.17 收敛检测: 累积足够样本后, 比较相邻两次权重向量的最大分量位移,
-        #   小于收敛阈值则标记已收敛(进入"稳定监控"态, 仅做微量调整)。
+        # v3.17 收敛检测: 累积足够样本后, 比较相邻两次权重向量的最大分量位移,
+        # 小于收敛阈值则标记已收敛(进入"稳定监控"态, 仅做微量调整)。
         if self.iteration > self.warmup_iterations:
             try:
                 _cur = self.get_adaptive_weights(metric='top1_hit')
@@ -315,7 +310,7 @@ class AdaptiveWeightManager:
 
     def get_adaptive_weights(self, metric: str = 'top1_hit') -> Dict[str, float]:
         """
-        获取自适应调整后的权重 —— ★ v3.14 双信号根据 metric 选择
+        获取自适应调整后的权重 —— v3.14 双信号根据 metric 选择
 
         Args:
             metric: 评估指标名(说明见下表). 默认 'top1_hit'.
@@ -379,7 +374,7 @@ class AdaptiveWeightManager:
         for algo_name, record in algo_records.items():
             adaptive_weights[algo_name] = record.get(field, 0) / total_ewma
 
-        # ★ 施加护栏(经验贝叶斯收缩 + 钳制 + 再归一化), 抗随机噪声
+        # 施加护栏(经验贝叶斯收缩 + 钳制 + 再归一化), 抗随机噪声
         return self._apply_guardrails(adaptive_weights, field=field)
 
 
@@ -391,7 +386,7 @@ class AdaptiveWeightManager:
         每条含 algo_evaluations(各算法命中率)。回放这些记录可让
         自适应权重在多次运行间累积学习成果,而非每进程重置。
 
-        ★ v3.14 双信号回放兼容:
+        v3.14 双信号回放兼容:
             - 旧记录: 只含 algo_evaluations -> 仅 hit_rate 通道累积
             - 新记录: 同时含 algo_evaluations_t1 -> 双通道累积
         """
@@ -443,27 +438,29 @@ class P5PredictorConfig:
     """
     
     # v3.12 命中率优化权重配置 (2026-07-18, 数据驱动回测确定)
-    # ★ 回测结论(近80/150期 walk-forward, 关闭AI): 频率+遗漏+贝叶斯三算法主导时命中率最高。
-    #   基线(旧权重+破坏性边界保护) score=8.99/9.35, T1=8.6%/9.0% (低于随机10%);
-    #   本配置(freq.54+omi.34+bayes.10+微尾, 关破坏性边界) score=10.2/10.9, T1=11%+ (显著超随机)。
-    #   趋势/马尔可夫/形态/特征四算法经验证为噪声源, 降至微权重(仍保留启用以维持功能完整与学习通道)。
+    # 回测结论(近80/150期 walk-forward, 关闭AI): 频率+遗漏+贝叶斯三算法主导时命中率最高。
+    # 基线(旧权重+破坏性边界保护) score=8.99/9.35, T1=8.6%/9.0% (低于随机10%);
+    # 本配置(freq.54+omi.34+bayes.10+微尾, 关破坏性边界) score=10.2/10.9, T1=11%+ (显著超随机)。
+    # 趋势/马尔可夫/形态/特征四算法经验证为噪声源, 降至微权重(仍保留启用以维持功能完整与学习通道)。
     DEFAULT_CONFIG = {
         'algorithms': {
             'frequency_weighted': {
                 'enabled': True,
-                'weight': 0.54,  # ↑ 频率=各位号码经验分布的极大似然估计, 对随机彩票是理论最优主信号
+                'weight': 0.68,  # v3.48 再平衡：频率=理论最优无偏主信号，原0.54被冷号偏差稀释；
+                              # 实证(walk-forward 2060试验)显示冷号信号无超额，故上调频率至0.68
                 'params': {
-                    'lookback_periods': 60,    # ★ v3.14审计: 原None=全量(随历史增长→经验频率趋近均匀→主信号消失);
-                                              #   截断近60期保持分布对近期走势的响应性(命中率无显著变化, 但避免长期退化)
+                    'lookback_periods': 60, # v3.14审计: 原None=全量(随历史增长→经验频率趋近均匀→主信号消失);
+                                              # 截断近60期保持分布对近期走势的响应性(命中率无显著变化, 但避免长期退化)
                     'smoothing_factor': 0.1,   # 拉普拉斯平滑系数
-                    'recency_weight': False,   # ★ v3.14审计落地实现(见 _algo_frequency_weighted); 3折验证中性偏负, 默认关。
-                                              #   特性可用: 改 True + recency_decay>0 即启用近期指数加权(供实验)
+                    'recency_weight': False, # v3.14审计落地实现(见 _algo_frequency_weighted); 3折验证中性偏负, 默认关。
+                                              # 特性可用: 改 True + recency_decay>0 即启用近期指数加权(供实验)
                     'recency_decay': 0.03,     # 近期衰减率: 60期窗口内权重由 exp(0)=1.0 递减至 exp(-1.77)=0.17
                 }
             },
             'omission_regression': {
                 'enabled': True,
-                'weight': 0.34,  # ↑ 遗漏回归(冷号回补)是与频率互补的第二可靠信号
+                'weight': 0.06,  # v3.48 再平衡：编码赌徒谬误(冷号回补)，walk-forward 实证为噪声
+                              # (Top-1 9.71% 略低于频率 10.05%)，无特殊权重依据，降至微权重
                 'params': {
                     'max_omission_cap': 50,          # 遗漏值上限
                     'regression_steepness': 0.018,   # 从0.020微调为0.018(60期数据更稳定)
@@ -497,8 +494,8 @@ class P5PredictorConfig:
             },
             'bayesian_inference': {
                 'enabled': True,
-                # ★ 自学习核心通道: 消费 992+ 条已验证记录计算似然, 是系统「根据历史结果自迭代」的主力。
-                #   回测显示 0.10 权重下三算法组合命中率最优, 保留该权重维持学习贡献。
+                # 自学习核心通道: 消费 992+ 条已验证记录计算似然, 是系统「根据历史结果自迭代」的主力。
+                # 回测显示 0.10 权重下三算法组合命中率最优, 保留该权重维持学习贡献。
                 'weight': 0.10,
                 'params': {
                     'prior_smooth': 0.10,       # 从0.08升至0.10(更均匀先验)
@@ -522,6 +519,22 @@ class P5PredictorConfig:
                     'repeat_weight': 0.15,
                     'consecutive_weight': 0.15,
                 }
+            },
+            'ml_supervised': {
+                'enabled': True,
+                # v3.48 新增：多源监督学习信号（modules/ml_predictor.py）。
+                # 消费 p5_history_data + 5张独立位走势表 + 升平降表 + 和值表，
+                # 按位训练 GradientBoosting，经验学习各位数字分布（不注入任何方向性偏见）。
+                # walk-forward 实证与频率信号同落随机噪声带（Top-1~10.6%），属无偏信号；
+                # 用以替代占旧融合 34% 权重、被实证为噪声的冷号手工信号，并真正利用用户要求的多源表。
+                'weight': 0.14,
+                'params': {
+                    'model': 'GradientBoosting',
+                    'n_estimators': 150,
+                    'max_depth': 3,
+                    'learning_rate': 0.1,
+                    'subsample': 0.8,
+                }
             }
         },
         'global': {
@@ -532,35 +545,52 @@ class P5PredictorConfig:
             'probability_calibration': True,
             'min_data_required': 30,
             'enable_feature_engineering': True,
-            # ★ v3.12: 默认关闭边界保护。回测证实其 Chebyshev/方差约束会把概率分布拉向均匀,
-            #   压制模型最有把握的号码, 使 Top-1/Top-3 命中率低于随机基线。如需保守化可手动开启,
-            #   且已从 _apply_boundary_protection 中移除破坏性的 Chebyshev+方差展平逻辑。
+            # ────────────────────────────────────────────────────────────
+            # v3.38 选号策略引擎 (modules/selection_strategy.py)
+            # 背景: 原 _generate_combinations_v2 按联合概率排序取 Top-K，
+            # 导致 K 注高度同质——实测每位平均只覆盖 2.2 个号码，
+            # 「至少一注命中该位」的期望仅 1.09/5。
+            # 改用覆盖式构造后该期望达 5.00/5，且精确全中概率完全不变
+            # (恒为 K/100000，只与注数有关)。这是纯组合优化收益，
+            # 不涉及任何预测能力的主张，因此默认启用。
+            'enable_selection_strategy': True,
+            'selection_strategy': 'weighted_coverage',
+            'selection_coverage_floor': 0,   # 0 = 自动取 min(注数, 10)
+            'selection_anchor_count': 3,     # hybrid 策略保留的尖峰注数
+            # v3.38 概率校准 (modules/calibration.py)
+            # 温度缩放 + 均匀收缩，二者均为保序变换，**不改变任何命中率指标**，
+            # 只让置信度数值变得统计上诚实，并顺带给出信号强度估计。
+            # 默认关闭以保持既有展示口径，可在 GUI 一键开启。
+            'enable_probability_calibration': False,
+            # 默认关闭边界保护。回测证实其 Chebyshev/方差约束会把概率分布拉向均匀,
+            # 压制模型最有把握的号码, 使 Top-1/Top-3 命中率低于随机基线。如需保守化可手动开启,
+            # 且已从 _apply_boundary_protection 中移除破坏性的 Chebyshev+方差展平逻辑。
             'enable_boundary_protection': False,
-            # ★ v3.14 (2026-07-19) 双信号自适应能力 + 默认关闭回退安全:
-            #   实验(opt_v314_dual_signal.py)在 30 期学习 + 50 期评测窗口下结果:
-            #     A 静态基线:        Top-1=9.6%  Top-6=59.2%
-            #     B 自适应-top1_hit: Top-1=8.8%  Top-6=57.6%  (退化 -0.8% / -1.6%)
-            #   30 期小样本下, EWMA 噪声 > 算法信号, 自适应略输基线.
-            #   决策: 默认仍关闭自适应, 但保留双信号能力.
-            #     - record_verification/load_from_records 已支持 (hit_rate, top1_hit) 双通道
-            #     - get_adaptive_weights(metric='top1_hit') 已在管控范围默认就绪
-            #     - 真生产积累 500+ 期后, 可将 enable_adaptive_weights 改 True 实验
+            # v3.14 (2026-07-19) 双信号自适应能力 + 默认关闭回退安全:
+            # 实验(opt_v314_dual_signal.py)在 30 期学习 + 50 期评测窗口下结果:
+            # A 静态基线: Top-1=9.6% Top-6=59.2%
+            # B 自适应-top1_hit: Top-1=8.8% Top-6=57.6% (退化 -0.8% / -1.6%)
+            # 30 期小样本下, EWMA 噪声 > 算法信号, 自适应略输基线.
+            # 决策: 默认仍关闭自适应, 但保留双信号能力.
+            # - record_verification/load_from_records 已支持 (hit_rate, top1_hit) 双通道
+            # - get_adaptive_weights(metric='top1_hit') 已在管控范围默认就绪
+            # - 真生产积累 500+ 期后, 可将 enable_adaptive_weights 改 True 实验
             'enable_adaptive_weights': False,   # v3.14 默认仍关闭 (walk-forward 不够 30~50 期)
             'adaptive_metric': 'top1_hit',     # 待数据成熟时默认采用此信号
-            # ★ Plan B (2026-07-18) 防过均匀化 - 保留:
-            #   诊断发现 EWMA 学「覆盖命中率」(各算法≈随机0.5, 无区分信号),
-            #   原混合系数 0.3 会把权重拉向均匀, 导致 Top-1 精准度从 11.5% 跌到 8.33%。
-            #   两项修正: (1) ewma_blend 0.3→0.1, 让静态默认权重主导、EWMA仅微调;
-            #             (2) minor_max_weight 封顶次要算法, 防其过度膨胀。
-            #   注: v3.14 已切到 top1_hit 信号, ewma_blend=0.1 + minor_max=0.10 仍可保留
-            #   作为「保险绳」防止双信号任一通道偶然拉偏分布。
+            # Plan B (2026-07-18) 防过均匀化 - 保留:
+            # 诊断发现 EWMA 学「覆盖命中率」(各算法≈随机0.5, 无区分信号),
+            # 原混合系数 0.3 会把权重拉向均匀, 导致 Top-1 精准度从 11.5% 跌到 8.33%。
+            # 两项修正: (1) ewma_blend 0.3→0.1, 让静态默认权重主导、EWMA仅微调;
+            # (2) minor_max_weight 封顶次要算法, 防其过度膨胀。
+            # 注: v3.14 已切到 top1_hit 信号, ewma_blend=0.1 + minor_max=0.10 仍可保留
+            # 作为「保险绳」防止双信号任一通道偶然拉偏分布。
             'ewma_alpha': 0.3,          # EWMA 平滑系数(AdaptiveWeightManager 用)
-            # ★ 自适应权重护栏(2026-07-25 新增, 抗随机噪声): 均由 global 注入, 不改代码可调
+            # 自适应权重护栏(2026-07-25 新增, 抗随机噪声): 均由 global 注入, 不改代码可调
             'adaptive_shrinkage_min_samples': 10,  # 经验贝叶斯收缩伪样本量 k(证据不足时贴近默认权重)
             'adaptive_weight_floor': 0.001,        # 归一化后单算法权重下限(防塌缩到0, 保学习通道存活)
             'adaptive_weight_cap': 0.75,           # 归一化后单算法权重上限(防噪声独大)
             'enable_adaptive_guardrails': True,    # 护栏总开关(False=退化到纯EWMA原始行为, 供对照)
-            # ★ 学习率调度(2026-07-25 v3.17 新增, 让自适应"收敛"而非震荡, 均由 global 注入可调):
+            # 学习率调度(2026-07-25 v3.17 新增, 让自适应"收敛"而非震荡, 均由 global 注入可调):
             'learning_rate_decay': 0.995,   # 每次有效迭代后 α←α·decay(学习率衰减系数)
             'min_learning_rate': 0.05,      # 学习率下限(衰减地板, 保证长期仍有微幅适应)
             'warmup_iterations': 5,          # 预热迭代次数(期间用基础 α 不衰减, 稳定冷启动)
@@ -568,6 +598,11 @@ class P5PredictorConfig:
             'ewma_blend': 0.1,          # 融合时 EWMA 对静态权重的混合系数(原0.3)
             'minor_max_weight': 0.10,   # 次要算法(趋势/马尔可夫/形态/特征)EWMA混合后权重上限
             'enable_ai_model': True,
+            # 回测/批量评估模式下是否仍启用「贝叶斯AI辅助」。
+            # 用户需求：回测日志长期显示"AI分析:未启用"，希望贝叶斯推断真的用AI辅助。
+            # 该辅助仅对后验分布作自然语言解读(无前视泄漏、不改变命中率指标)，故默认开启；
+            # 仍关闭完整AI复包装(enable_ai_model)以控制费用与保证核心指标可复现。
+            'enable_bayes_aux_in_backtest': True,
             'ai_model_weight': 0.1,
             'max_hot_ratio': 0.52,  # 从0.55降为0.52(更保守)
             'min_cold_ratio': 0.18,  # 从0.15升为0.18(保证多样性)
@@ -641,7 +676,7 @@ class P5PredictorConfig:
             
         logger.info(f'预测配置已加载: 启用{enabled_count}个算法, 总权重{total_weight:.2f}')
 
-    # ★ Plan B (2026-07-18): 弱信号次要算法集合, 其 EWMA 混合后权重受 minor_max_weight 钳制, 防过均匀
+    # Plan B (2026-07-18): 弱信号次要算法集合, 其 EWMA 混合后权重受 minor_max_weight 钳制, 防过均匀
     MINOR_ALGOS = {'trend_momentum', 'markov_transition',
                    'pattern_continuation', 'feature_engineering'}
 
@@ -650,7 +685,7 @@ class P5PredictorConfig:
         获取归一化后的算法权重
 
         如果启用了自适应权重,会根据历史验证结果动态调整权重。
-        ★ v3.14 双信号升级: 自适应权重现在根据 config['global']['adaptive_metric']
+        v3.14 双信号升级: 自适应权重现在根据 config['global']['adaptive_metric']
          选择读取的 EWMA 字段:
            - 'top1_hit' (默认, 推荐): 读取 ewma_t1 (Top-1 精准度)
            - 'hit_rate' (回退兼容): 读取 ewma   (覆盖命中率, 区分度低)
@@ -663,7 +698,7 @@ class P5PredictorConfig:
         weights = {}
         total = 0.0
         enable_adaptive = self.config['global'].get('enable_adaptive_weights', True)
-        # ★ v3.14: 选信号 (top1_hit 优先, 兼容旧 hit_rate)
+        # 选信号 (top1_hit 优先, 兼容旧 hit_rate)
         adaptive_metric = self.config['global'].get('adaptive_metric', 'top1_hit')
         if adaptive_metric in ('top1_hit',):
             ewma_field = 'ewma_t1'
@@ -690,11 +725,11 @@ class P5PredictorConfig:
                     ewma = self.weight_manager.algo_hit_rates.get(name, {}).get(effective_field, 0)
                 if ewma > 0:
                     # 混合原始权重和历史表现(EWMA)
-                    # ★ Plan B: 混合系数由 ewma_blend 控制(默认0.1, 原硬编码0.3),
-                    #   让静态默认权重主导, 避免 EWMA 把分布拉向均匀而稀释 Top-1 精准度。
+                    # Plan B: 混合系数由 ewma_blend 控制(默认0.1, 原硬编码0.3),
+                    # 让静态默认权重主导, 避免 EWMA 把分布拉向均匀而稀释 Top-1 精准度。
                     blend = self.config['global'].get('ewma_blend', 0.1)
                     w = (1.0 - blend) * w + blend * ewma
-                # ★ Plan B: 次要算法(弱信号通道)EWMA 混合后权重上限钳制, 防过均匀
+                # Plan B: 次要算法(弱信号通道)EWMA 混合后权重上限钳制, 防过均匀
                 minor_max = self.config['global'].get('minor_max_weight', None)
                 if minor_max is not None and name in self.MINOR_ALGOS and w > minor_max:
                     w = minor_max
@@ -776,18 +811,25 @@ class P5Predictor:
         # 延迟加载特征工程
         self._feature_engineering = None
 
+        # 延迟加载概率校准器。未拟合时为恒等变换，接入后不改变既有行为。
+        self._calibrator = None
+        # 最近一次选号策略的构造质量指标，供 predict() 结果与 GUI 展示消费
+        self._last_selection_metrics = {}
+
         # 跨进程恢复自适应权重(EWMA): 从「权重历史」产物回放, 避免每进程重置。
-        # ★ v3.12 修复自学习断链: 此前误用 _load_verification_records() 的返回值,
-        #   但那些记录不含 algo_evaluations 字段, 导致 load_from_records 静默空转、
-        #   自适应权重从不更新。改为读取 p5_artifact(type='weight_history') 产物
-        #   (由 pipeline 验证闭环写入, 含各算法 per-algo 命中率), 使 EWMA 真正学习。
+        # v3.12 修复自学习断链: 此前误用 _load_verification_records() 的返回值,
+        # 但那些记录不含 algo_evaluations 字段, 导致 load_from_records 静默空转、
+        # 自适应权重从不更新。改为读取 p5_artifact(type='weight_history') 产物
+        # (由 pipeline 验证闭环写入, 含各算法 per-algo 命中率), 使 EWMA 真正学习。
         try:
             self._load_adaptive_weight_history()
         except Exception:
             pass
 
-        # AI模型配置
+        # AI模型配置(其内部会将 ai_available / ai_auxiliary_available 设为 bool(api_key))
         self._init_ai_config()
+        # 贝叶斯AI辅助覆盖层(回测期间由 Backtester 置真, 常态为 False → 跟随 enable_ai_model)
+        self._bayes_aux_override = False
 
     def _get_feature_engineering(self):
         """获取特征工程实例（懒加载）"""
@@ -797,15 +839,86 @@ class P5Predictor:
             self._feature_engineering = P5Features()
         return self._feature_engineering
 
+    def _get_calibrator(self):
+        """
+        获取概率校准器（懒加载，v3.38）。
+
+        校准参数从 predictions/calibration_params.json 读取；文件不存在时
+        返回恒等校准器，保证在未拟合的情况下预测行为与旧版完全一致。
+        """
+        if self._calibrator is None:
+            try:
+                from modules.calibration import ProbabilityCalibrator
+                self._calibrator = ProbabilityCalibrator.load()
+            except Exception as exc:
+                logger.warning('加载概率校准器失败，跳过校准: %s', exc)
+                self._calibrator = False   # 用 False 标记"已尝试但不可用"
+        return self._calibrator or None
+
+    def _generate_combinations_v3(self, fused_probs: List[Dict[int, float]]
+                                  ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        生成推荐组合（v3.38 策略引擎版）。
+
+        与 v2 的本质区别在于**优化目标可选**：
+
+            · 精确全中概率 = K/100000，对任何选号方式都相同，无法优化
+            · 位覆盖命中期望则完全取决于组合集合的构造方式，可从 1.09 提升到 5.00
+
+        v2 只优化前者（且前者本就无法优化），代价是后者被白白牺牲。
+        本方法把选择权交还给配置，默认采用兼顾二者的「概率加权覆盖」。
+
+        Args:
+            fused_probs: 融合后（且已校准）的概率分布
+
+        Returns:
+            (组合列表, 策略元信息)。组合列表与 v2 的输出结构完全兼容，
+            额外多出一个 'strategy' 字段标注来源策略。
+        """
+        from modules.selection_strategy import generate_combinations
+
+        combination_count = self.config.get_global_param('combination_count', 10)
+        strategy = self.config.get_global_param('selection_strategy', 'weighted_coverage')
+        floor = self.config.get_global_param('selection_coverage_floor', 0) or None
+        anchor = self.config.get_global_param('selection_anchor_count', 3)
+        position_top_n = self.config.get_global_param('position_top_n', 6)
+
+        # 形态约束参数：修正 v2 中 hezhi_min/max 被硬编码为 10/35、
+        # 完全无视配置的缺陷，改为一律从 global 读取。
+        constraints = {
+            'hezhi_min': self.config.get_global_param('hezhi_min', 10),
+            'hezhi_max': self.config.get_global_param('hezhi_max', 35),
+            'span_min': self.config.get_global_param('span_min', 3),
+            'span_max': self.config.get_global_param('span_max', 8),
+            'sum_of_squares_penalty': self.config.get_global_param(
+                'sum_of_squares_penalty', True),
+        }
+
+        result = generate_combinations(
+            fused_probs, k=combination_count, strategy=strategy,
+            coverage_floor=floor, position_top_n=position_top_n,
+            anchor_count=anchor, constraints=constraints)
+
+        meta = {
+            'strategy': result.get('strategy'),
+            'strategy_label': result.get('strategy_label'),
+            'objective': result.get('objective'),
+            'metrics': result.get('metrics', {}),
+            'position_recommendations': result.get('position_recommendations', {}),
+            'diagnostics': result.get('diagnostics', {}),
+        }
+        return result.get('combinations', []), meta
+
     def _init_ai_config(self):
         """初始化AI模型配置"""
         try:
             from config import AGNES_API_CONFIG
             self.api_config = AGNES_API_CONFIG
-            self.api_url = self.api_config.get('api_url', "https://apihub.agnes-ai.com/v1/chat/completions")
+            self.api_url = self.api_config.get('api_url', "https://api.agnes-ai.cn/v1/chat/completions")
             self.api_key = self.api_config.get('api_key', '')
-            self.model_name = self.api_config.get('model_name', 'agnes-2.0-flash')
+            self.model_name = self.api_config.get('model_name', 'agnes-2.5-flash')
             self.ai_available = bool(self.api_key)
+            self.ai_auxiliary_available = bool(self.api_key)
 
             if self.ai_available:
                 self.headers = {
@@ -819,6 +932,7 @@ class P5Predictor:
             self.api_config = {}
             self.api_key = ''
             self.ai_available = False
+            self.ai_auxiliary_available = False
             logger.warning('无法加载config.py，AI模型分析将被跳过')
 
         # 说明：AI部分为可选功能，若未配置 api_key 则会被优雅跳过，遵循 AGENTS.md 中的设计约定。
@@ -889,9 +1003,17 @@ class P5Predictor:
         return prompt
 
     def _call_ai_model(self, prompt: str, max_tokens: int = 8000,
-                       temperature: float = 0.7) -> Optional[str]:
-        """调用AI大语言模型"""
-        if not self.ai_available:
+                       temperature: float = 0.7, force: bool = False) -> Optional[str]:
+        """调用AI大语言模型
+
+        force=True 时仅校验 api_key 是否存在(不要求 self.ai_available 为真)，
+        供「贝叶斯AI辅助」在回测期间(self.ai_available 被置 False)仍可调用的场景使用；
+        非 force 路径保持原行为(完整AI复包装仅在 ai_available 时调用)。
+        """
+        if not self.api_key:
+            logger.warning('AI模型不可用（未配置API密钥）')
+            return None
+        if not (force or self.ai_available):
             logger.warning('AI模型不可用（未配置API密钥）')
             return None
 
@@ -915,8 +1037,8 @@ class P5Predictor:
         })
 
         # 备注：payload 中使用 messages(system/user) 的结构与项目中其他调用 AI 模型的实现保持一致，
-        #       便于统一管理和解析。response_format 期望返回JSON对象，但服务端常常返回带杂讯的文本，
-        #       因此后续需使用 _parse_ai_response 做容错解析。
+        # 便于统一管理和解析。response_format 期望返回JSON对象，但服务端常常返回带杂讯的文本，
+        # 因此后续需使用 _parse_ai_response 做容错解析。
 
         # 构建带自动重试的 Session, 应对 SSL EOF / 连接中断等瞬时错误
         session = self._build_ai_session()
@@ -1017,13 +1139,20 @@ class P5Predictor:
 
         return '\n'.join(lines)
 
-    def predict(self, history_data: List[Dict], current_issue: Optional[str] = None) -> Dict[str, Any]:
+    def predict(self, history_data: List[Dict], current_issue: Optional[str] = None,
+                target_issue: Optional[str] = None, progress_callback=None) -> Dict[str, Any]:
         """
         执行下一期预测
 
         Args:
             history_data: 历史开奖数据列表，按时间倒序排列（最新在前）
             current_issue: 当前最新期号，用于推导下期期号
+            target_issue: 显式指定被预测期号（v3.25 新增）。
+                回测场景下期号并非连续（跨年时 2023365 → 2024001），
+                按 current_issue+1 推导会产生错位；显式传入可保证
+                日志/报告中的「目标期号」与实际评估期号一致。
+                同时作为验证记录截止期号，防止前视偏差。
+            progress_callback: 进度回调函数，接收 (step, message) 参数
 
         Returns:
             预测结果字典，包含各位置概率分布、推荐组合、走势预测等
@@ -1035,21 +1164,44 @@ class P5Predictor:
         if len(history_data) < min_required:
             logger.warning(f'历史数据量{len(history_data)}少于建议最小值{min_required}，预测结果可能不稳定')
 
-        # 推导下期期号
-        next_issue = self._infer_next_issue(history_data, current_issue)
+        # 进度回调支持
+        if progress_callback:
+            progress_callback(5, '数据预处理中...')
+
+        # 目标期号：显式指定优先，否则按最新期号 +1 推导
+        next_issue = str(target_issue) if target_issue else self._infer_next_issue(history_data, current_issue)
+        # 供多源监督模型(predict_next)定位被预测期号（懒加载模块内部按位训练并预测）
+        self._ml_target_issue = next_issue
 
         # 数据格式适配：将数据库查询结果（wan/qian/bai/shi/ge列）
         # 转换为预测器期望的 'numbers' 数组格式
         history_data = self._normalize_history_data(history_data)
 
+        # 缓存检查 - 归一化后统一用 normalized 形态生成 key，
+        # 确保 get/set 键一致（否则 raw 与 normalized 会产出不同键，缓存永不命中）
+        if _CACHE_ENABLED:
+            try:
+                cache = _get_prediction_cache()
+                cached = cache.get_prediction(history_data, target_issue)
+                if cached:
+                    logger.info(f'命中预测缓存，直接返回: {target_issue}')
+                    return cached
+            except Exception as e:
+                logger.debug(f'缓存检查失败（非致命）: {e}')
+
         # 修复：使用数值排序而非字符串排序
         sorted_data = self._sort_data_by_issue(history_data)
 
-        # 设置验证记录截止期号(防止回测时前视偏差:只学习早于当前期的验证记录)
-        self._verification_cutoff = current_issue if current_issue else None
+        # 进度回调支持
+        if progress_callback:
+            progress_callback(10, '算法计算中...')
+
+        # 设置验证记录截止期号(防止回测时前视偏差:只学习早于被预测期的验证记录)
+        # 优先用被预测期号作为截止点; 回退到 current_issue 兼容旧调用方
+        self._verification_cutoff = next_issue if target_issue else (current_issue if current_issue else None)
 
         # 执行各算法预测
-        algorithm_probs = self._run_algorithms(sorted_data)
+        algorithm_probs = self._run_algorithms(sorted_data, progress_callback)
 
         # 说明：algorithm_probs 的结构为 {算法名: [pos0_probs, pos1_probs, ..., pos4_probs]}
         # 每个 pos_probs 为 {号码: 概率} 的字典，后续将被融合为最终的 fused_probs。
@@ -1085,12 +1237,42 @@ class P5Predictor:
             except Exception as e:
                 logger.error(f'AI模型分析异常: {e}', exc_info=True)
 
-        # 生成推荐组合（使用增强版）
-        top_combinations = self._generate_combinations_v2(fused_probs)
-        
-        # 如果没有新策略的生成结果，使用旧策略
+        # 概率校准：对已融合的概率分布施加校准变换。
+        # 校准器由 self._get_calibrator() 懒加载；未拟合时返回恒等变换，
+        # 因此默认开启 switch 也不会改变预测行为，保证向后兼容。
+        if self.config.get_global_param('enable_probability_calibration'):
+            cal = self._get_calibrator()
+            if cal is not None:
+                try:
+                    fused_probs = cal.transform_all(fused_probs)
+                    logger.info('已对融合概率分布施加概率校准变换')
+                except Exception as exc:
+                    logger.warning('概率校准变换失败，使用原始分布: %s', exc)
+
+        # 生成推荐组合
+        # 优化目标可选：精确全中率恒为 K/100000 不可提升；位覆盖命中期望
+        # 取决于组合集合构造，可由 1.09/5 提升到 5.00/5。默认开启加权覆盖策略。
+        selection_enabled = self.config.get_global_param('enable_selection_strategy', True)
+        top_combinations = []
+        selection_meta: Dict[str, Any] = {}
+        if selection_enabled:
+            try:
+                combos_v3, meta_v3 = self._generate_combinations_v3(fused_probs)
+                if combos_v3:
+                    top_combinations = combos_v3
+                    selection_meta = meta_v3
+                    logger.info('使用策略引擎(v3)生成推荐组合：策略=%s 组合数=%d',
+                                selection_meta.get('strategy'), len(top_combinations))
+            except Exception as exc:
+                logger.warning('策略引擎生成失败，回退到 v2: %s', exc)
+                top_combinations = []
+        # v2 / v1 兜底链：保证任何情况下都能产出组合
+        if not top_combinations:
+            top_combinations = self._generate_combinations_v2(fused_probs)
         if not top_combinations:
             top_combinations = self._generate_combinations(fused_probs)
+        # 缓存本次选号策略元信息，供 GUI / 调用方读取（不进入持久化结构）
+        self._last_selection_metrics = selection_meta
 
         # 走势预测分析
         trend_forecast = self._forecast_trend(sorted_data, fused_probs)
@@ -1125,15 +1307,43 @@ class P5Predictor:
             'algorithm_probs': algorithm_probs,
             'fused_probabilities': fused_probs,
             'top_combinations': top_combinations,
+            'selection_strategy_meta': selection_meta,
+            'selection_strategy_applied': bool(selection_meta.get('strategy')),
+            'probability_calibration_applied': bool(
+                self.config.get_global_param('enable_probability_calibration')
+                and self._get_calibrator() is not None
+                and not getattr(self._get_calibrator(), 'is_identity', False)),
             'trend_forecast': trend_forecast,
             'summary': summary,
             'data_samples': len(history_data),
             'ai_analysis_enabled': ai_enabled and self.ai_available,
             'ai_result': ai_result,
-            'risk_warning': '⚠️ 重要提示：本程序仅基于历史数据统计分析和AI模型预测，无法保证开奖结果，不构成任何投资建议。彩票开奖具有随机性，请理性购彩。'
+            'bayesian_ai_auxiliary': getattr(self, '_bayesian_ai_auxiliary', {}),
+            'risk_warning': ' 重要提示：本程序仅基于历史数据统计分析和AI模型预测，无法保证开奖结果，不构成任何投资建议。彩票开奖具有随机性，请理性购彩。'
         }
 
-        logger.info(f'预测完成: 目标期号{next_issue}, 推荐组合数{len(top_combinations)}, AI分析:{"启用" if ai_enabled and self.ai_available else "未启用"}')
+        _bayes_aux = getattr(self, '_bayesian_ai_auxiliary', {})
+        _full_ai = ai_enabled and self.ai_available
+        if _full_ai or _bayes_aux:
+            _ai_tag = '启用'
+            if _bayes_aux:
+                _ai_tag += '（含贝叶斯辅助洞察）'
+        else:
+            _ai_tag = '未启用'
+            # 回测/批量评估期间完整AI被按设计关闭：标注上下文，避免被误判为配置错误
+            _ctx = getattr(self, '_ai_disabled_context', '') or ''
+            if _ctx:
+                _ai_tag += f'（{_ctx}）'
+        logger.info(f'预测完成: 目标期号{next_issue}, 推荐组合数{len(top_combinations)}, AI分析:{_ai_tag}')
+
+        # 写入缓存
+        if _CACHE_ENABLED:
+            try:
+                cache = _get_prediction_cache()
+                cache.set_prediction(history_data, next_issue, result)
+            except Exception as e:
+                logger.debug(f'缓存写入失败（非致命）: {e}')
+
         return result
 
     def _fuse_ai_results(self, fused_probs: List[Dict[int, float]],
@@ -1291,9 +1501,13 @@ class P5Predictor:
             return str(next_num)
         return '未知'
 
-    def _run_algorithms(self, sorted_data: List[Dict]) -> Dict[str, List[Dict[int, float]]]:
+    def _run_algorithms(self, sorted_data: List[Dict], progress_callback=None) -> Dict[str, List[Dict[int, float]]]:
         """
         执行所有启用的预测算法
+
+        Args:
+            sorted_data: 按时间正序的历史数据
+            progress_callback: 进度回调（预留，当前各子算法内部不单独上报进度）
 
         Returns:
             算法名称 -> 各位置概率分布列表的字典
@@ -1315,6 +1529,20 @@ class P5Predictor:
         if 'bayesian_inference' in weights:
             results['bayesian_inference'] = self._algo_bayesian_inference(sorted_data)
 
+        # 多源监督学习信号（v3.48 新增）：消费位走势/升平降/和值等多源表，
+        # 按位训练 GradientBoosting。懒加载 + 缺失(无sklearn/无DB)自动跳过，不影响契约。
+        if 'ml_supervised' in weights:
+            try:
+                from modules.ml_predictor import predict_next as _ml_predict_next
+                ml_res = _ml_predict_next(sorted_data, getattr(self, '_ml_target_issue', None))
+                if ml_res is not None:
+                    results['ml_supervised'] = ml_res
+                    logger.info('多源监督模型已加入融合（权重 %.2f）', weights.get('ml_supervised', 0))
+                else:
+                    logger.info('多源监督模型返回 None（sklearn/DB 不可用），跳过。')
+            except Exception as e:
+                logger.error(f'多源监督模型执行失败（已忽略）: {e}', exc_info=True)
+
         # 集成特征工程算法
         if self.config.get_global_param('enable_feature_engineering'):
             fe = self._get_feature_engineering()
@@ -1325,8 +1553,8 @@ class P5Predictor:
                     logger.error(f'特征工程算法执行失败: {e}', exc_info=True)
 
         # 返回格式示例：{
-        #   'frequency_weighted': [ {0:0.12,1:0.09,...}, ... ],
-        #   'omission_regression': [ ... ],
+        # 'frequency_weighted': [ {0:0.12,1:0.09,...}, ... ],
+        # 'omission_regression': [ ... ],
         # }
 
         return results
@@ -1365,14 +1593,14 @@ class P5Predictor:
         params = self.config.config['algorithms']['frequency_weighted']['params']
         smoothing = params.get('smoothing_factor', 0.1)   # 拉普拉斯平滑系数 α
         lookback = params.get('lookback_periods')          # 回看期数，None 表示全量
-        recency = params.get('recency_weight', False)      # ★ v3.14审计落地: 近期指数加权开关
+        recency = params.get('recency_weight', False) # v3.14审计落地: 近期指数加权开关
         decay = params.get('recency_decay', 0.0)           # 衰减率(每期)
 
         # 仅取最近 lookback 期（若有设置），实现时间衰减/遗忘
         use_data = data[-lookback:] if lookback else data
         total = len(use_data)
 
-        # 统计各位置各号码出现次数（★ 支持近期指数加权: 越近期权重越大）
+        # 统计各位置各号码出现次数（支持近期指数加权: 越近期权重越大）
         counts = [defaultdict(float) for _ in range(self.positions)]
         total_weight = 0.0
         for k, item in enumerate(use_data):
@@ -1808,8 +2036,15 @@ class P5Predictor:
         min_samples = params.get('min_verification_samples', 50)
         if len(verification_records) < min_samples:
             # 验证样本不足:直接返回先验概率(避免小样本似然噪声误导后验)
-            logger.info(f'贝叶斯推断: 验证记录仅{len(verification_records)}条(<{min_samples}),'
-                       f'退化为纯先验概率(待积累足够验证数据后启用学习)')
+            # 日志降噪: 回测会逐期调用本方法, 同样的提示会刷屏几十上百次,
+            # 因此同一「样本数」只提示一次, 其余降级为 debug。
+            _last = getattr(self, '_bayes_lowsample_logged', None)
+            if _last != len(verification_records):
+                logger.info(f'贝叶斯推断: 验证记录仅{len(verification_records)}条(<{min_samples}),'
+                            f'退化为纯先验概率(待积累足够验证数据后启用学习)')
+                self._bayes_lowsample_logged = len(verification_records)
+            else:
+                logger.debug(f'贝叶斯推断: 验证记录{len(verification_records)}条(<{min_samples}), 沿用纯先验')
             return prior_probs
 
         if not verification_records:
@@ -1944,9 +2179,105 @@ class P5Predictor:
 
             posterior_probs.append(pos_posterior)
 
-        logger.info(f'贝叶斯推断算法(v3.2)执行完成: 使用{len(recent_records)}条验证记录, '
+        logger.info(f'贝叶斯推断算法执行完成: 使用{len(recent_records)}条验证记录, '
                    f'posterior_weight={posterior_weight}, beta_alpha={beta_alpha:.2f}')
+
+        # AI 辅助处理 —— 在 AI 可用时用大模型对后验分布作辅助解读。
+        # 门控改为「贝叶斯辅助独立开关」——只要 API 可用，且
+        # (enable_ai_model 开启 或 回测覆盖层 _bayes_aux_override 为真) 即触发。
+        # 故回测期间也能用 AI 辅助解读贝叶斯后验(用户明确诉求)，而不会触发完整AI复包装。
+        try:
+            ai_enabled = self.config.get_global_param('enable_ai_model', True)
+            _aux_wanted = ai_enabled or getattr(self, '_bayes_aux_override', False)
+            if _aux_wanted and getattr(self, 'ai_auxiliary_available', False):
+                _full = 0
+                for _r in verification_records:
+                    _mc = _r.get('match_count')
+                    if _mc is None:
+                        _mc = _r.get('matched_count')
+                    if _mc == 5:
+                        _full += 1
+                _ctx = {
+                    'verification_count': len(verification_records),
+                    'full_match_rate': round(_full / len(verification_records) * 100, 1) if verification_records else 0.0,
+                }
+                self._bayesian_ai_auxiliary = self._ai_augment_bayesian(posterior_probs, _ctx)
+            else:
+                self._bayesian_ai_auxiliary = {}
+        except Exception as _e:
+            logger.warning(f'贝叶斯 AI 辅助处理异常(降级为纯统计): {_e}')
+            self._bayesian_ai_auxiliary = {}
+
         return posterior_probs
+
+    def _ai_augment_bayesian(self, posterior_probs: List[Dict[int, float]],
+                             context: Dict[str, Any]) -> Dict[str, Any]:
+        """AI 辅助处理：基于贝叶斯后验分布 + 验证反馈，调用 AI 模型生成辅助洞察。
+
+        诚实边界：排列5 为公平摇号，本方法仅对后验分布作自然语言解读与
+        重点关注号码提示，不构成任何超越随机的命中保证。AI 不可用时返回 {}，
+        纯统计流程完全不受影响（不抛异常、不改概率）。
+        """
+        ai_enabled = self.config.get_global_param('enable_ai_model', True)
+        _aux_wanted = ai_enabled or getattr(self, '_bayes_aux_override', False)
+        if not (getattr(self, 'ai_auxiliary_available', False) and _aux_wanted):
+            return {}
+
+        try:
+            pos_names = self.position_names
+            posterior_summary = []
+            for pos in range(self.positions):
+                ranked = sorted(posterior_probs[pos].items(), key=lambda x: x[1], reverse=True)[:3]
+                posterior_summary.append(
+                    f"{pos_names[pos]}: " + ", ".join(f"{n}({p * 100:.1f}%)" for n, p in ranked)
+                )
+            vcount = context.get('verification_count', 0)
+            frate = context.get('full_match_rate', 0.0)
+
+            prompt = (
+                "你是一位排列5彩票数据分析助手。我们已用贝叶斯推断算法计算出下一期各位置号码的"
+                "后验概率分布。请基于以下数据提供【辅助分析洞察】。"
+                "重要：只能作解读与重点关注提示，不得声称可保证中奖。\n\n"
+                f"【贝叶斯后验 Top-3 概率】（万位/千位/百位/十位/个位）\n"
+                + "\n".join(posterior_summary) + "\n\n"
+                f"【验证反馈】近 {vcount} 期验证样本，完全猜中率约 {frate:.1f}%。\n\n"
+                "请严格输出 JSON 对象，字段：\n"
+                '- "insight": 字符串，2-3 句话解读后验分布整体特征（哪些位置较确定、哪些较分散）。\n'
+                '- "flagged_digits": 对象，五个键 wan/qian/bai/shi/ge，每个为 1-2 个值得关注的号码（整数）。\n'
+                '- "confidence_notes": 字符串，说明在公平摇号下本洞察的局限性。\n'
+                '- "caution": 字符串，理性购彩提示。\n'
+            )
+
+            resp = self._call_ai_model(prompt, max_tokens=1200, temperature=0.5, force=True)
+            if not resp:
+                return {}
+
+            parsed = self._parse_ai_response(resp)
+            if not isinstance(parsed, dict) or not parsed:
+                return {}
+
+            # 校验 flagged_digits 结构，避免上游渲染崩溃
+            fd = parsed.get('flagged_digits')
+            if isinstance(fd, dict):
+                clean_fd = {}
+                for k in ('wan', 'qian', 'bai', 'shi', 'ge'):
+                    vals = fd.get(k)
+                    if isinstance(vals, list):
+                        clean_fd[k] = [int(x) for x in vals if str(x).isdigit()][:2]
+                    elif isinstance(vals, str) and vals.isdigit():
+                        clean_fd[k] = [int(vals)]
+                    elif isinstance(vals, int):
+                        clean_fd[k] = [vals]
+                    else:
+                        clean_fd[k] = []
+                parsed['flagged_digits'] = clean_fd
+
+            parsed['model'] = self.model_name
+            return parsed
+
+        except Exception as e:
+            logger.warning(f'AI 贝叶斯辅助处理异常(降级为纯统计): {e}')
+            return {}
 
     def _load_adaptive_weight_history(self, limit: int = 200):
         """
@@ -1983,7 +2314,7 @@ class P5Predictor:
         """
         加载历史验证记录
 
-        ★ v3.2 修复: 直接从 p5_prediction_record 表读取验证数据,
+        v3.2 修复: 直接从 p5_prediction_record 表读取验证数据,
         不再依赖 p5_artifact(type='weight_history') (该表当前为空)。
 
         这些记录包含每次预测的目标期号、推荐号码和实际开奖号码,
@@ -2008,12 +2339,27 @@ class P5Predictor:
             # 直接从 p5_prediction_record 表读取已验证的记录
             # 注意: 不使用 LIMIT 限制条数, 让贝叶斯似然学习利用「全部」已验证历史
             # (cutoff 已在调用方按 target_issue 过滤, 仅保留早于当前期的记录, 避免前视偏差)
+            # v3.25 去重: 同一期号可能被多次预测并各自验证(实测 1142 条 verified 仅
+            # 972 个不同期号), 若不去重, 重复期号会在似然统计中被重复计数,
+            # 等价于给某些期加权, 污染贝叶斯后验。此处按 target_issue 只保留最新一条
+            # (verified_at 最新, 同刻取 id 最大)。
             db.cursor.execute('''
-                SELECT target_issue, predicted_numbers, actual_numbers,
-                       wan_match, qian_match, bai_match, shi_match, ge_match
-                FROM p5_prediction_record 
-                WHERE verification_status = 'verified'
-                ORDER BY id DESC
+                SELECT p.target_issue, p.predicted_numbers, p.actual_numbers,
+                       p.wan_match, p.qian_match, p.bai_match, p.shi_match, p.ge_match
+                FROM p5_prediction_record p
+                INNER JOIN (
+                    SELECT target_issue, MAX(id) AS keep_id
+                    FROM p5_prediction_record
+                    WHERE verification_status = 'verified'
+                      AND (target_issue, verified_at) IN (
+                          SELECT target_issue, MAX(verified_at)
+                          FROM p5_prediction_record
+                          WHERE verification_status = 'verified'
+                          GROUP BY target_issue
+                      )
+                    GROUP BY target_issue
+                ) k ON p.id = k.keep_id
+                ORDER BY p.id DESC
             ''')
             rows = db.cursor.fetchall()
             db.disconnect()
@@ -2655,10 +3001,10 @@ class P5Predictor:
         for pos in range(self.positions):
             pos_name = self.position_names[pos]
 
-            # 获取该位置的Top-3推荐号码
+            # 获取该位置的Top-4推荐号码（v3.53 修正：原 Top-3 不足，扩展为 Top-4）
             pos_probs = fused_probs[pos]
             sorted_nums = sorted(pos_probs.items(), key=lambda x: x[1], reverse=True)
-            top_3 = [num for num, _ in sorted_nums[:3]]
+            top_4 = [num for num, _ in sorted_nums[:4]]
 
             # 分析最近10期的实际开奖值
             recent = sorted_data[-10:] if len(sorted_data) >= 10 else sorted_data
@@ -2680,7 +3026,7 @@ class P5Predictor:
                 trend = '未知'
 
             trend_forecast[pos_name] = {
-                'top_numbers': top_3,                     # Top-3推荐号码
+                'top_numbers': top_4,                     # Top-4推荐号码（v3.53 扩展）
                 'trend': trend,                           # 趋势方向
                 'recent_values': recent_values[-5:] if len(recent_values) >= 5 else recent_values  # 最近5期值
             }
@@ -2713,7 +3059,7 @@ class P5Predictor:
         ...
 
         ==================================================
-        ⚠️ 重要提示：本预测仅基于历史数据统计分析，无法预测开奖结果，请理性购彩。
+        重要提示：本预测仅基于历史数据统计分析，无法预测开奖结果，请理性购彩。
 
         Args:
             fused_probs: 融合后的概率分布
@@ -2727,16 +3073,16 @@ class P5Predictor:
         lines.append(f'排列5第{next_issue}期预测摘要')
         lines.append('=' * 50)
 
-        # 各位置推荐号码
+        # 各位置推荐号码（v3.53 扩展：Top-3 → Top-4）
         lines.append('\n【各位置推荐号码】')
         for pos in range(self.positions):
             pos_name = self.position_names[pos]
             pos_probs = fused_probs[pos]
             sorted_nums = sorted(pos_probs.items(), key=lambda x: x[1], reverse=True)
-            top_3 = sorted_nums[:3]
+            top_4 = sorted_nums[:4]
 
             lines.append(f'\n{pos_name}:')
-            for rank, (num, prob) in enumerate(top_3, 1):
+            for rank, (num, prob) in enumerate(top_4, 1):
                 lines.append(f'  {rank}. 号码{num} (概率: {prob:.2%})')
 
         # 推荐组合列表
@@ -2745,7 +3091,7 @@ class P5Predictor:
             lines.append(f"{combo['rank']}. {combo['combination']} (相对热度: {combo['confidence']:.2f}%)")
 
         lines.append('\n' + '=' * 50)
-        lines.append('⚠️ 重要提示：本预测仅基于历史数据统计分析，无法预测开奖结果，请理性购彩。')
+        lines.append(' 重要提示：本预测仅基于历史数据统计分析，无法预测开奖结果，请理性购彩。')
 
         return '\n'.join(lines)
 

@@ -1,36 +1,23 @@
 """
-排列5 四步流水线分析模块
+排列5 预测流水线模块
 
-全新的四步式分析流水线，四个步骤严格串行执行：
+两步式预测流水线（简化架构）:
 
-步骤1: 专家文章爬取与结构化AI分析
-  - 爬取目标期数对应的所有专家文章
-  - 逐篇调用AI进行结构化整理
-  - 将每篇分析报告存入Redis（kpluckynumber:pl5:expert_report:{article_id}，7天过期）
+步骤1: 统计预测
+  - 计算频率/遗漏/贝叶斯/监督学习等八算法融合概率
+  - 生成各位置候选号码（Top-3）
 
-步骤2: 走势图数据分析与AI预测
-  - 获取最近30-60期走势图数据（基础+万千百十个位）
-  - 调用AI分析走势规律并生成预测报告
-  - 将走势报告存入Redis（kpluckynumber:pl5:trend_analysis:{issue}，7天过期）
+步骤2: 最终预测入库
+  - 整合统计预测结果
+  - 将预测记录写入 MySQL p5_ai_report 表
 
-步骤3: 专家报告整合分析
-  - 从Redis读取所有步骤1的专家分析报告
-  - 整合后调用AI进行综合分析，生成综合分析报告
-  - 将综合报告存入Redis（kpluckynumber:pl5:integrated_report:{issue}，7天过期）
-
-步骤4: 最终预测结果生成与入库
-  - 从Redis读取步骤2走势报告和步骤3综合报告
-  - 整合后调用AI进行最终分析与预测
-  - 将最终预测结果存入MySQL数据库p5_ai_report表
-
-关键设计决策：
-- 每步都有独立的错误处理和日志记录
-- Redis过期时间按数据类型设置（文章7天、趋势7天、综合7天）
-- 数据库写入包含完整字段（期数/预测号码/分析报告/生成时间）
-- 前序步骤失败可触发降级策略（基于已有数据继续）
+设计要点:
+  - 每步独立错误处理，前步失败可降级
+  - Redis 缓存键前缀 kpluckynumber:pl5:
+  - 预测器返回包含: fused_probabilities, top_combinations, predict_time, predict_uuid, risk_warning
 
 调用路径：
-    main.py → run_four_step_pipeline(target_issue, data_limit)
+    run_four_step_pipeline(target_issue, data_limit)
              → Pipeline.execute_pipeline()
 """
 
@@ -45,13 +32,21 @@ import random
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
-os.makedirs('logs', exist_ok=True)
+from paths import LOGS_DIR
+
+# 版本号从 version.py 统一获取
+try:
+    from version import APP_VERSION as _APP_VERSION
+except Exception:
+    _APP_VERSION = 'v3.59'
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('logs/pipeline.log', encoding='utf-8')
+    file_handler = logging.FileHandler(LOGS_DIR + '/pipeline.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -72,12 +67,31 @@ class _PipelineGUIHandler(logging.Handler):
     """
 
     def __init__(self, callback):
+        """初始化日志转发处理器，把流水线日志实时推送到 GUI。
+
+        参数:
+            callback: GUI 侧回调，签名为 callback(level: str, message: str)
+
+        说明:
+            格式化器只输出消息正文，时间戳与模块名交由 GUI 统一排版。
+        """
         super().__init__()
         self.callback = callback
         # 只转发消息正文,不带时间戳/模块名(由 GUI 统一排版)
         self.setFormatter(logging.Formatter('%(message)s'))
 
     def emit(self, record):
+        """把一条日志记录分级后转发给 GUI 回调。
+
+        参数:
+            record: 标准库 logging 的 LogRecord 对象
+
+        说明:
+            仅转发 modules.* 命名空间的日志；
+            级别映射为 error / warning / section / info 四类，
+            其中 section 用于「步骤分隔线」等排版标题，便于 GUI 高亮；
+            回调自身抛出的异常会被吞掉，绝不影响主流程。
+        """
         try:
             name = record.name or ''
             if not name.startswith('modules.'):
@@ -116,23 +130,19 @@ class Pipeline:
     REDIS_INTEGRATED_REPORT_KEY = 'kpluckynumber:pl5:integrated_report:{issue}'
     ARTICLE_LIST_KEY = 'kpluckynumber:pl5:article:list'
 
-    def __init__(self):
+    def __init__(self, evolution_engine=None):
         """初始化分析器（所有组件采用懒加载）"""
+        self.evolution_engine = evolution_engine
         self.redis_client = None
         self.redis_key_manager = None
         self.ai_client = None
         self.db_client = None
         self.online_learner = None
-        # ★ B4 性能优化: 流水线内共享单个 P5Predictor 实例
-        #   避免 step1/step4/回测 各自 new 一个 predictor 导致验证记录全表扫描×3、
-        #   配置与权重管理器重复构建。predict() 每次调用都会自设 _verification_cutoff
-        #   并按该 cutoff 过滤(缓存始终是全量记录), 故共享实例行为等价、零回归风险。
+        # B4 性能优化: 流水线内共享单个 P5Predictor 实例
+        # 避免 step1/step4/回测 各自 new 一个 predictor 导致验证记录全表扫描×3、
+        # 配置与权重管理器重复构建。predict() 每次调用都会自设 _verification_cutoff
+        # 并按该 cutoff 过滤(缓存始终是全量记录), 故共享实例行为等价、零回归风险。
         self._predictor = None
-        # 增强版文章处理器(软约束特征): 该模块已按设计停用/移除,
-        # 显式初始化为 None, 避免下游 `if self.enhanced_article_processor:`
-        # 因属性缺失抛 AttributeError(历史死代码 B2 修复)。
-        self.enhanced_article_processor = None
-        self._enhanced_ap_unavailable = False  # 记住不可用状态, 避免每篇文章重复尝试
         # 实时进度回调(GUI 流式输出用, 默认 None -> 不转发)
         self._progress_callback = None
         # 流水线状态跟踪
@@ -141,7 +151,7 @@ class Pipeline:
             'trend_report': None,        # 步骤2产出：走势分析报告
             'integrated_report': None,   # 步骤3产出：综合分析报告
             'final_report': None,        # 步骤4产出：最终预测结果
-            'soft_constraints': None,    # 新增：融合软约束特征
+            'soft_constraints': None,    # 已废弃:软约束特征已移除
             'started_at': None,          # 流水线开始时间
             'completed_at': None,        # 流水线结束时间
         }
@@ -185,7 +195,7 @@ class Pipeline:
 
     def _get_predictor(self):
         """
-        ★ B4 性能优化: 懒加载并复用单个 P5Predictor 实例。
+        B4 性能优化: 懒加载并复用单个 P5Predictor 实例。
 
         流水线 step1(_calc_statistical_prediction)、step4(step4_final_prediction)、
         回测(_execute_backtest_analysis) 均需要预测器。此前各自 `P5Predictor()` 新建,
@@ -202,6 +212,12 @@ class Pipeline:
         if getattr(self, '_predictor', None) is None:
             from modules.predictor import P5Predictor
             self._predictor = P5Predictor()
+            if self.evolution_engine is not None:
+                try:
+                    self.evolution_engine.apply_active_config_to_predictor(self._predictor)
+                    logger.info('Applied evolution engine config to predictor')
+                except Exception as e:
+                    logger.warning(f'Failed to apply evolution config: {e}')
             logger.info('B4: 创建并复用共享 P5Predictor 实例')
         return self._predictor
 
@@ -438,40 +454,6 @@ class Pipeline:
         except ImportError as e:
             logger.error(f'无法导入OnlineLearner模块: {e}')
 
-    def _init_enhanced_article_processor(self):
-        """懒加载初始化增强版文章处理器。
-
-        注: 增强版文章软约束模块(enhanced_article_processor)已按设计停用/移除
-        (回测实证专家软约束≈随机, 见 v3.16 交付纪要)。此处保持接口存在但优雅降级:
-        模块缺失时仅记录一次 debug, 不再每篇文章刷 error 日志, 也不抛异常。
-        self.enhanced_article_processor 恒为 None -> 下游 if 守卫自然跳过。
-        """
-        if self._enhanced_ap_unavailable:
-            return
-        try:
-            from modules.enhanced_article_processor import EnhancedArticleProcessor
-            from modules.redis_storage_manager import RedisKeyManager
-
-            if not self.redis_client:
-                self._init_redis()
-            if not self.online_learner:
-                self._init_online_learner()
-
-            redis_mgr = None
-            if self.redis_client and self.redis_client.is_connected():
-                redis_mgr = RedisKeyManager(self.redis_client)
-
-            self.enhanced_article_processor = EnhancedArticleProcessor(
-                redis_manager=redis_mgr,
-                online_learner=self.online_learner
-            )
-            logger.info('增强版文章处理器初始化成功')
-        except ImportError:
-            # 模块已停用: 标记不可用, 后续不再重复尝试
-            self.enhanced_article_processor = None
-            self._enhanced_ap_unavailable = True
-            logger.debug('增强版文章处理器模块未安装(已按设计停用), 跳过软约束特征提取')
-
     # ================================================================
     # 工具方法
     # ================================================================
@@ -610,7 +592,7 @@ class Pipeline:
                 return result
 
             articles = crawl_result['articles']
-            result['articles'] = articles  # ★ 修复:将articles数据赋值给result
+            result['articles'] = articles # 修复:将articles数据赋值给result
             result['article_count'] = len(articles)
             logger.info(f'成功爬取 {len(articles)} 篇文章')
 
@@ -711,7 +693,7 @@ class Pipeline:
                         'analyzed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     }
 
-                    # ★ 关键修复(问题3根因): 把AI结构化结果回写到 article 对象,
+                    # 关键修复(问题3根因): 把AI结构化结果回写到 article 对象,
                     # 否则下游 _generate_expert_article_report 读取 article['ai_analysis']
                     # 时始终为空字典 -> 专家文章预测报告的 prediction 全为空。
                     try:
@@ -719,9 +701,9 @@ class Pipeline:
                             self._parse_ai_json(ai_result) if isinstance(ai_result, str) else {}
                         article['ai_analysis'] = parsed_result
                         
-                        # ★ 调试日志: 记录AI返回的结构
+                        # 调试日志: 记录AI返回的结构
                         if parsed_result:
-                            logger.info(f'文章{idx} AI返回keys: {list(parsed_result.keys())}')
+                            logger.info(f'文章{idx} AI返回keys: {list(parsed_result.keys)}')
                             if 'forecast_numbers' in parsed_result:
                                 logger.info(f'文章{idx} forecast_numbers结构: {parsed_result["forecast_numbers"]}')
                             else:
@@ -750,40 +732,7 @@ class Pipeline:
                         )
                         result['report_keys'].append(redis_key)
                         result['ai_success_count'] += 1
-                        
-                        # 集成增强版文章处理器：提取软约束特征
-                        self._init_enhanced_article_processor()
-                        if self.enhanced_article_processor:
-                            try:
-                                enhanced_report = self.enhanced_article_processor.process_enhanced_article(
-                                    article_data={
-                                        'id': article_id,
-                                        'title': title,
-                                        'author': author,
-                                        'author_id': author,
-                                        'content': content,
-                                        'published_at': pub_time
-                                    },
-                                    target_issue=target_issue
-                                )
-                                if enhanced_report and 'error' not in enhanced_report:
-                                    soft_constraints = enhanced_report.get('soft_constraints', {})
-                                    if soft_constraints:
-                                        # 存储软约束到Redis
-                                        if self.redis_key_manager:
-                                            soft_key = f'kpluckynumber:pl5:soft_constraints:{article_id}'
-                                            self.redis_key_manager.safe_hset_existed(
-                                                soft_key,
-                                                'constraints',
-                                                soft_constraints,
-                                                ttl=timedelta(days=7)
-                                            )
-                                        logger.info(f'文章{idx} 软约束特征提取成功: {list(soft_constraints.keys())}')
-                                    else:
-                                        result['article_reports'].append(enhanced_report)
-                            except Exception as e:
-                                logger.warning(f'增强版文章处理失败（不影响主流程）: {e}')
-                        
+
                         logger.info(f'文章{idx} AI分析成功，Redis键: {redis_key}')
                     except Exception as e:
                         logger.error(f'文章{idx} 存入Redis失败: {e}')
@@ -795,26 +744,7 @@ class Pipeline:
                 # 每篇文章间随机延迟
                 self._delay_random(2, 4)
 
-            # 5. 融合所有文章的软约束特征（增强功能）
-            if self.enhanced_article_processor and result.get('article_reports'):
-                try:
-                    merged_constraints = self.enhanced_article_processor.merge_expert_constraints(
-                        result['article_reports']
-                    )
-                    self.pipeline_state['soft_constraints'] = merged_constraints
-                    
-                    # 存储融合结果到Redis
-                    if self.redis_client and self.redis_key_manager:
-                        merged_key = f'kpluckynumber:pl5:merged_constraints:{target_issue}'
-                        self.redis_key_manager.safe_hset_existed(
-                            merged_key,
-                            'fused_constraints',
-                            merged_constraints,
-                            ttl=timedelta(days=7)
-                        )
-                        logger.info(f'软约束融合完成并存入Redis: {merged_key}')
-                except Exception as e:
-                    logger.warning(f'软约束融合失败（不影响主流程）: {e}')
+            # 5. 软约束特征提取已停用（enhanced_article_processor已移除）
 
             # 6. 将所有文章ID添加到列表
             list_key = self.REDIS_ARTICLE_REPORT_KEY.replace('{article_id}', '')[:-1] + ':list'
@@ -829,7 +759,7 @@ class Pipeline:
             if result.get('fallback_strategy'):
                 logger.warning('降级模式: AI分析全部失败,将在步骤3跳过专家整合')
             
-            # ★★★ 生成独立的"专家文章预测报告" ★★★
+            # 生成独立的"专家文章预测报告" 
             # 修复: 原逻辑仅在 ai_success_count>0 时生成, AI全失败则无报告;
             # 现改为只要有文章就生成(0成功则产出"降级"报告), 保证双报告始终存在。
             if result.get('articles'):
@@ -840,13 +770,13 @@ class Pipeline:
                     logger.info(f'专家文章预测报告已生成(期号:{target_issue}): {succ_count}/{total_count}篇有效')
                     
                     if succ_count == 0:
-                        logger.warning(f'⚠ 专家文章AI分析未返回有效预测数据! 请检查pipeline.log中"AI返回keys"日志')
+                        logger.warning(f' 专家文章AI分析未返回有效预测数据! 请检查pipeline.log中"AI返回keys"日志')
                     
                     if result.get('ai_fallback') or result.get('fallback_strategy'):
                         expert_report.setdefault('note', 'AI分析不可用, 基于已爬取文章元数据的降级报告')
                     result['expert_article_report'] = expert_report
                     
-                    # 持久化到数据库(v3.3: 仅入库, 不再写本地 JSON 文件)
+                    # 持久化到数据库
                     uuid_val = self._save_report_to_db(expert_report, 'expert_article', target_issue)
                     if uuid_val:
                         logger.info(f'专家文章预测报告已入库: {uuid_val}')
@@ -858,7 +788,7 @@ class Pipeline:
             result['error'] = str(e)
 
         self.pipeline_state['article_reports'] = result.get('articles', [])
-        # ★ 关键修复(问题5根因): step4 从 self.pipeline_state['expert_article_report']
+        # 关键修复(问题5根因): step4 从 self.pipeline_state['expert_article_report']
         # 读取专家文章预测结果来填充 final_report['article_prediction']; 此前该键从未被设置,
         # 导致 final_report['article_prediction'] 始终为 {} -> GUI 显示"专家文章预测结果未获取到"。
         self.pipeline_state['expert_article_report'] = result.get('expert_article_report')
@@ -1170,7 +1100,7 @@ class Pipeline:
             result['report_data'] = trend_ai_result
             self.pipeline_state['trend_report'] = trend_ai_result
 
-            # ★★★ 生成独立的"走势图数据预测报告" ★★★
+            # 生成独立的"走势图数据预测报告" 
             trend_report = self._generate_trend_chart_report(target_issue, trend_ai_result)
             if trend_report:
                 if result.get('ai_fallback'):
@@ -1231,8 +1161,8 @@ class Pipeline:
                 result['error'] = 'Redis客户端未连接'
                 return result
 
-            # ★ 健壮性改进(v3.8): AI不可用不再硬中止步骤3, 改为标记后走降级策略,
-            #   使流水线在AI限流/欠费/网络故障时仍能基于走势图数据产出预测。
+            # 健壮性改进: AI不可用不再硬中止步骤3, 改为标记后走降级策略,
+            # 使流水线在AI限流/欠费/网络故障时仍能基于走势图数据产出预测。
             ai_unavailable = (not self.ai_client or not self.ai_client.ai_available)
             if ai_unavailable:
                 logger.warning('AI模型不可用, 步骤3将采用降级策略(基于走势图数据继续)')
@@ -1259,7 +1189,7 @@ class Pipeline:
                         debug_issue_list.append(f'{key.decode() if isinstance(key, bytes) else key}: issue={issue_in_data}')
                         if issue_in_data == target_issue:
                             expert_reports.append(data)
-                            logger.info(f'✓ 匹配成功: {key} (期号={issue_in_data})')
+                            logger.info(f' 匹配成功: {key} (期号={issue_in_data})')
                 except Exception as e:
                     logger.warning(f'读取报告失败 {key}: {e}')
                     continue
@@ -1278,7 +1208,7 @@ class Pipeline:
                 logger.warning('  2. Redis已过期(超过7天)')
                 logger.warning('  3. 步骤1存储的期号与当前不匹配')
                 
-                # ★ 降级策略: 如果没有专家报告,跳过步骤3直接进入步骤4
+                # 降级策略: 如果没有专家报告,跳过步骤3直接进入步骤4
                 logger.warning('采用降级策略: 将跳过步骤3,直接使用步骤2的走势报告进行预测')
                 logger.info('流水线状态: 步骤1部分成功(有文章但AI分析失败), 步骤2成功')
                 
@@ -1445,8 +1375,8 @@ class Pipeline:
                         self._delay_random(3, 5)
 
             if not integrated_ai_result:
-                # ★ 降级策略(v3.8): AI不可用/解析失败时, 基于走势图预测合成综合报告,
-                #   保证流水线不中断(直接返回 success+fallback_strategy, 编排器将继续步骤4)。
+                # 降级策略: AI不可用/解析失败时, 基于走势图预测合成综合报告,
+                # 保证流水线不中断(直接返回 success+fallback_strategy, 编排器将继续步骤4)。
                 logger.warning('专家报告整合AI分析失败/不可用, 采用降级策略继续步骤4')
                 fallback_report = self._build_fallback_integrated_report(target_issue, expert_reports)
                 result['fallback_strategy'] = True
@@ -1516,7 +1446,7 @@ class Pipeline:
             if not nums:
                 nums = []
             prediction[p] = {
-                'numbers': list(nums)[:4],
+                'numbers': list(nums)[:3],
                 'confidence': [],
                 'reason': '走势图多源融合(降级: AI整合不可用, 沿用统计信号)'
             }
@@ -1546,7 +1476,7 @@ class Pipeline:
         }
 
     # ================================================================
-    # 独立报告生成方法 (v3.1 新增)
+    # 独立报告生成方法
     # ================================================================
 
     def _generate_expert_article_report(self, target_issue: str, articles: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1558,7 +1488,6 @@ class Pipeline:
         
         v3.12 优化重点:
         - 增强数据兼容性：多种AI返回格式都支持
-        - 增加备选数据源：从enhanced_article_processor获取软约束
         - 改进异常处理：单篇文章失败不影响整体
         - 增强输出日志：便于调试
         
@@ -1634,9 +1563,9 @@ class Pipeline:
                     
                     if not forecast or not isinstance(forecast, dict):
                         logger.debug(f'文章 {article_title}: 无forecast_numbers字段，跳过')
-                        # ★ 调试日志: 打印AI实际返回的所有顶层keys
+                        # 调试日志: 打印AI实际返回的所有顶层keys
                         if total_articles <= 3:  # 只打印前3篇文章,避免日志太多
-                            logger.info(f'文章 {article_title} AI返回的keys: {list(ai_analysis.keys())}')
+                            logger.info(f'文章 {article_title} AI返回的keys: {list(ai_analysis.keys)}')
                         continue
                     
                     # 验证forecast结构
@@ -1874,6 +1803,14 @@ class Pipeline:
 
         # 2. 各位置遗漏/冷热(来自 position_trends 最新一期)
         def latest_trend(pos: str) -> Dict[str, Any]:
+            """取出指定位置最新一期的走势记录。
+
+            参数:
+                pos: 位置标识，取值为 wan / qian / bai / shi / ge
+
+            返回:
+                dict —— 该位置最新一期走势数据；无数据时返回空字典
+            """
             data = position_trends.get(f'{pos}_trend', []) or []
             return data[0] if data else {}
 
@@ -1911,6 +1848,14 @@ class Pipeline:
 
         # 3. 和值/跨度/奇偶/大小趋势
         def avg(lst):
+            """计算列表均值并保留两位小数。
+
+            参数:
+                lst: 数值列表
+
+            返回:
+                float —— 平均值；空列表返回 0
+            """
             return round(sum(lst) / len(lst), 2) if lst else 0
         odd_ratio = f"{odd_count}:{even_count}" if (odd_count + even_count) else "未知"
         big_ratio = f"{big_count}:{small_count}" if (big_count + small_count) else "未知"
@@ -1954,16 +1899,17 @@ class Pipeline:
     # 步骤4: 最终预测结果生成与入库
     # ================================================================
 
-    def _predict_trend_multi_source(self, target_issue: str, data_period: int = 60) -> Dict[str, Any]:
+    def _predict_trend_multi_source(self, target_issue: str, data_period: int = 40,
+                                    fused_probs: Optional[List[Dict[int, float]]] = None) -> Dict[str, Any]:
         """
         多源走势融合预测 (v3.11 深度优化版)
 
-        结合以下五类数据源的「最新 data_period 期」数据, 用加权融合算法输出每个位置 Top-5 推荐号码:
+        结合以下五类数据源的「最新 data_period 期」数据, 用加权融合算法输出每个位置 Top-3 推荐号码:
           1. 历史走势图       —— p5_history_data (万/千/百/十/个 5列)
           2. 基础走势图       —— p5_trend_data  (和值/跨度/奇偶比/大小比 + 5列号码)
           3. 万千百十个独立走势表 —— p5_wan/qian/bai/shi/ge_trend_data (含 omission 遗漏/ hot_level 冷热等级/ 奇偶大小质合属性)
-          4. ★ 贝叶斯后验概率 —— p5_bayesian_result (增量复用的贝叶斯推断后验分布)
-          5. ★ 专家软约束融合 —— Redis中存储的多专家观点融合结果
+          4. 贝叶斯后验概率 —— p5_bayesian_result (增量复用的贝叶斯推断后验分布)
+          5. 专家软约束融合 —— Redis中存储的多专家观点融合结果
 
         融合算法 (每位置 digit d ∈ 0..9, v3.11优化):
           score(d) = 0.30 * 频率归一   + 0.22 * 遗漏归一   + 0.13 * 动量贴近度
@@ -1977,7 +1923,7 @@ class Pipeline:
                    + 0.05 * 升平降方向 + 0.05 * 和值重心
 
         v3.11 优化重点:
-        - 数据期数: 30期 → 60期 (更多信息量)
+        - 数据期数: 30期 → 60期 → 120期 → 40期 (用户要求缩减分析窗口, v3.46 起默认40)
         - Top-4 → Top-5 (覆盖率50%→60%)
         - 权重更均衡，降低单一信号依赖
         - 增加专家软约束融合
@@ -2029,21 +1975,21 @@ class Pipeline:
                     s = [r.get(p) for r in hist_asc if r.get(p) is not None][-data_period:]
                 seq[p] = s[-data_period:]
 
-            # ★ 升平降走势图数据(p5_spjzs_data): 多期方向偏好(最近10次涨跌多数方向)
-            spj_pref = self._get_spj_direction_preference() or {}
+            # 升平降走势图数据(p5_spjzs_data): 多期方向偏好(最近10次涨跌多数方向)
+            spj_pref = self._get_spj_direction_preference(data_period) or {}
 
-            # ★ 和值走势图数据(p5_hzzst_data): 近期和值重心
+            # 和值走势图数据(p5_hzzst_data): 近期和值重心
             _hezhi_recent = []
             try:
                 db.cursor.execute(
-                    'SELECT hezhi FROM p5_hzzst_data ORDER BY issue DESC LIMIT 15')  # 从10期扩到15期
+                    'SELECT hezhi FROM p5_hzzst_data ORDER BY issue DESC LIMIT %s', (data_period,))  # 与整体走势窗口一致(默认40期)
                 _hezhi_recent = [int(r['hezhi']) for r in (db.cursor.fetchall() or [])
                                  if r.get('hezhi') is not None]
             except Exception:
                 _hezhi_recent = []
             _hezhi_mean = (sum(_hezhi_recent) / len(_hezhi_recent)) if _hezhi_recent else None
 
-            # ★ 贝叶斯后验概率(增量复用): 从专用表读取已计算的贝叶斯推断结果
+            # 贝叶斯后验概率(增量复用): 从专用表读取已计算的贝叶斯推断结果
             _bayes_posterior = None
             try:
                 if hasattr(db, 'get_bayesian_result_row'):
@@ -2056,7 +2002,7 @@ class Pipeline:
             except Exception:
                 _bayes_posterior = None
 
-            # ★ 专家软约束融合(从Redis读取): 多专家观点的加权平均
+            # 专家软约束融合(从Redis读取): 多专家观点的加权平均
             _expert_constraints = self._get_expert_constraints_fusion() or {}
 
             out = {}
@@ -2066,7 +2012,7 @@ class Pipeline:
                 if n == 0:
                     continue
 
-                # ★ 指数衰减加权: 越近期出现的数字权重越高(halflife=12期,从10期放宽)
+                # 指数衰减加权: 越近期出现的数字权重越高(halflife=12期,从10期放宽)
                 _decay = self._exp_decay_weights(n, halflife=12)
                 freq = Counter()
                 for i, v in enumerate(s):
@@ -2096,7 +2042,7 @@ class Pipeline:
                 total_freq = sum(freq.values()) or 1
                 total_om = sum(omission.values()) or 1
                 
-                # ★ 贝叶斯后验概率融合
+                # 贝叶斯后验概率融合
                 _pos_index = pos_keys.index(p) if p in pos_keys else None
                 _use_bayes = (_bayes_posterior is not None and 
                               _pos_index is not None and 
@@ -2108,8 +2054,9 @@ class Pipeline:
                 scores = {}
                 
                 if _use_bayes and isinstance(_bayes_pos, dict) and _bayes_pos:
-                    # ★★★ v3.11 优化权重 ★★★
-                    # 频率0.30 + 遗漏0.22 + 动量0.13 + 贝叶斯0.17 + 专家0.08 + 方向0.05 + 和值0.05
+                    # v3.11 优化权重(经 v3.49 再平衡: 遗漏权重 0.22→0.10, 去赌徒谬误偏见)
+                    # 频率0.30 + 遗漏0.10 + 动量0.13 + 贝叶斯0.17 + 专家0.08 + 方向0.05 + 和值0.05
+                    # 另注入 v3.49 核心融合概率(含 ml_supervised 监督学习)权重 0.14
                     total_bayes = sum(float(v) for v in _bayes_pos.values()) or 1
                     bayes_norm = {}
                     for d in range(10):
@@ -2120,16 +2067,27 @@ class Pipeline:
                     for d in range(10):
                         fz = freq.get(d, 0) / total_freq
                         oz = omission[d] / total_om
-                        scores[d] = (0.30 * fz + 0.22 * oz + 0.13 * momentum[d] + 
+                        scores[d] = (0.30 * fz + 0.10 * oz + 0.13 * momentum[d] + 
                                      0.17 * bayes_norm.get(d, 0.1))
                 else:
-                    # 标准模式(无贝叶斯): 频率0.42 + 遗漏0.30 + 动量0.18
+                    # 标准模式(无贝叶斯, v3.49 再平衡: 频率0.46 + 遗漏0.18 + 动量0.18)
+                    # 遗漏权重由原 0.30 下调至 0.18(实证为噪声信号), 频率上调至 0.46
                     for d in range(10):
                         fz = freq.get(d, 0) / total_freq
                         oz = omission[d] / total_om
-                        scores[d] = 0.42 * fz + 0.30 * oz + 0.18 * momentum[d]
+                        scores[d] = 0.46 * fz + 0.18 * oz + 0.18 * momentum[d]
 
-                # ★ 专家软约束融合(权重0.08)
+                # v3.49 同步: 注入核心预测器融合概率(含 ml_supervised 监督学习信号)
+                # 使「走势图实时预测」与主预测器(v3.49)保持一致, 避免两套权重割裂。
+                # fused_probs 已是 8 算法融合(频率0.68/遗漏0.06/贝叶斯0.10/ml_supervised0.14/...)后的分布。
+                if fused_probs and _pos_index is not None and 0 <= _pos_index < len(fused_probs):
+                    _fp = fused_probs[_pos_index]
+                    if isinstance(_fp, dict) and _fp:
+                        _fp_total = sum(float(v) for v in _fp.values()) or 1.0
+                        for d in range(10):
+                            scores[d] += 0.14 * (float(_fp.get(d, 0.0)) / _fp_total)
+
+                # 专家软约束融合(权重0.08)
                 if _expert_constraints and p in _expert_constraints:
                     expert_score = _expert_constraints[p]
                     if isinstance(expert_score, dict):
@@ -2137,7 +2095,7 @@ class Pipeline:
                             exp_val = expert_score.get(str(d), 0)
                             scores[d] += 0.08 * float(exp_val)
 
-                # ★ 基础走势图融合(轻量偏置): 奇偶比/大小比
+                # 基础走势图融合(轻量偏置): 奇偶比/大小比
                 if basic:
                     _lb = basic[0]
                     odd_bias = self._ratio_bias(_lb.get('odd_even_ratio', ''))
@@ -2152,7 +2110,7 @@ class Pipeline:
                             if (big_bias > 0 and _is_big) or (big_bias < 0 and not _is_big):
                                 scores[d] += 0.03 * abs(big_bias)
 
-                # ★ 升平降方向偏置(权重0.05)
+                # 升平降方向偏置(权重0.05)
                 _sp = spj_pref.get(p)
                 if isinstance(_sp, dict):
                     _spref = _sp.get('pref')
@@ -2168,14 +2126,14 @@ class Pipeline:
                             for d in range(10):
                                 scores[d] -= 0.06 * abs(d - _sld)
 
-                # ★ 和值重心偏置(权重0.05)
+                # 和值重心偏置(权重0.05)
                 if _hezhi_mean is not None:
                     _exp_digit = _hezhi_mean / 5.0
                     for d in range(10):
                         scores[d] += 0.05 * (1.0 - min(1.0, abs(d - _exp_digit) / 5.0))
 
-                # ★ SSD惩罚 + 跨位一致性检查 (避免相邻位置号码过于接近)
-                #   这一步是v3.11新增, 提升组合质量
+                # SSD惩罚 + 跨位一致性检查 (避免相邻位置号码过于接近)
+                # 这一步是v3.11新增, 提升组合质量
                 
                 # 先暂存所有位置的得分, 最后统一做SSD惩罚
                 out[f'_scores_{p}'] = scores.copy()
@@ -2183,7 +2141,7 @@ class Pipeline:
                 out[f'_freq_{p}'] = {d: round((freq.get(d, 0) / (total_freq or 1)) * 100, 1) for d in range(10)}
                 out[f'_om_{p}'] = {int(d): omission.get(d, 0) for d in range(10)}
 
-            # ★ 统一SSD惩罚 + Top-5选择
+            # 统一SSD惩罚 + Top-5选择
             for p in pos_keys:
                 scores = out.pop(f'_scores_{p}')
                 
@@ -2197,8 +2155,8 @@ class Pipeline:
                                 if abs(d - prev_d) < 2:  # SSD惩罚
                                     scores[d] -= 0.15
                 
-                # Top-5 (从Top-4提升到Top-5,覆盖率50%→60%)
-                top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
+                # Top-3 (用户要求浓缩到3个数字; 覆盖率50%→30%)
+                top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
                 bayes_flag = " +贝叶斯" if _use_bayes else ""
                 expert_flag = " +专家约束" if _expert_constraints and p in _expert_constraints else ""
                 
@@ -2218,7 +2176,7 @@ class Pipeline:
                     for d, _ in top
                 }
 
-            logger.info(f'多源走势融合预测(v3.11)完成: { {k: v["numbers"] for k, v in out.items() if k in pos_keys} }')
+            logger.info(f'多源走势融合预测完成: { {k: v["numbers"] for k, v in out.items() if k in pos_keys} }')
             return out
 
         except Exception as e:
@@ -2330,7 +2288,7 @@ class Pipeline:
             logger.debug(f'专家约束融合失败: {e}')
             return None
 
-    def _get_spj_direction_preference(self, data_period: int = 30, n_dir: int = 10):
+    def _get_spj_direction_preference(self, data_period: int = 40, n_dir: int = 10):
         """
         从 p5_spjzs_data(升平降走势) 派生每个位置的"涨跌方向偏好":
           对每个位置, 比较相邻期数字得到 升(up)/平(flat)/降(down) 序列(最近 n_dir 次变迁),
@@ -2379,14 +2337,14 @@ class Pipeline:
 
     def _build_constrained_combinations(self, prediction: Dict[str, Any],
                                          target_issue: str,
-                                         data_period: int = 30):
+                                         data_period: int = 40):
         """
         用 p5_hzzst_data(和值走势) + p5_spjzs_data(升平降走势) 对多源融合的每位置 Top-4 候选做
         组合级约束与打分:
           1. 和值区间(自适应带宽): 以最近10期和值重心为中心, 宽度按最近10期波动率(1.3σ)自适应
              (波动大->区间宽, 平稳->窄), 保底宽度12防过约束。
-          2. 每位置取多源融合 Top-4 候选(数字+置信度)。
-          3. 笛卡尔积枚举(≤4^5), 仅保留和值落在区间内的组合; 再按"跨位置信度 + 升平降方向一致
+          2. 每位置取多源融合 Top-3 候选(数字+置信度)。
+          3. 笛卡尔积枚举(≤3^5), 仅保留和值落在区间内的组合; 再按"跨位置信度 + 升平降方向一致
              性"综合打分排序(方向匹配 pref +0.10, 匹配最新方向 +0.04, 背离 -0.06)。
           4. 约束过严(<5)自动放宽±4再试; 仍无结果返回 None(降级)。
         Returns:
@@ -2410,7 +2368,7 @@ class Pipeline:
         if len(sums) < 5:
             return None, ''
 
-        # ★ 自适应带宽: 以最近10期(最新在前)的重心为中心, 宽度按最近10期波动率定
+        # 自适应带宽: 以最近10期(最新在前)的重心为中心, 宽度按最近10期波动率定
         _recent = sums[:10]
         _rmean = sum(_recent) / len(_recent)
         _rvar = sum((x - _rmean) ** 2 for x in _recent) / len(_recent)
@@ -2439,6 +2397,19 @@ class Pipeline:
 
         # 4) 枚举约束组合(和值过滤 + 升平降方向一致性打分)
         def _enumerate(lo_b, hi_b):
+            """在给定和值区间内枚举候选组合，并按走势方向偏好打分。
+
+            参数:
+                lo_b: 和值下界（含）
+                hi_b: 和值上界（含）
+
+            返回:
+                list —— 元素为 (五位数字列表, 置信度得分, 和值) 的候选组合列表
+
+            说明:
+                基础分为各位置候选置信度之和；再叠加 SPJ 方向偏好修正——
+                与偏好方向一致 +0.10，与最近一次方向一致 +0.04，两者皆不符 -0.06。
+            """
             out = []
             for combo in itertools.product(*[cand[p] for p in pos_keys]):
                 digits = [c[0] for c in combo]
@@ -2540,7 +2511,9 @@ class Pipeline:
                         trend_report = trend_store_data.get('trend_analysis', trend_store_data)
                         logger.info('走势分析报告已从Redis加载')
                     else:
-                        logger.warning(f'Redis中未找到走势报告: {trend_report_key}')
+                        # 简化流水线(步骤2走势报告生成已停用)下此报告本就不会写入,
+                        # 属预期缺失, 降级为 debug 避免误导。report 仅作可选文本增强, 缺失不影响主预测。
+                        logger.debug(f'Redis中未找到走势报告(简化流水线未生成, 属预期): {trend_report_key}')
                 except Exception as e:
                     logger.warning(f'读取走势报告失败: {e}')
 
@@ -2562,7 +2535,9 @@ class Pipeline:
                         integrated_report = integrated_store_data.get('integrated_report', integrated_store_data)
                         logger.info('综合分析报告已从Redis加载')
                     else:
-                        logger.warning(f'Redis中未找到综合报告: {integrated_report_key}')
+                        # 简化流水线(步骤3综合报告生成已停用)下此报告本就不会写入,
+                        # 属预期缺失, 降级为 debug 避免误导。report 仅作可选文本增强, 缺失不影响主预测。
+                        logger.debug(f'Redis中未找到综合报告(简化流水线未生成, 属预期): {integrated_report_key}')
                 except Exception as e:
                     logger.warning(f'读取综合报告失败: {e}')
 
@@ -2783,10 +2758,10 @@ class Pipeline:
             )
             _data_hash = hashlib.sha256(_sig.encode('utf-8')).hexdigest()
 
-            # ★ 贝叶斯/预测统计产物缓存复用(v3.4 修复核心):
-            #   同一最新期号、且历史数据量未变化(未新增开奖)时, 直接复用已落库的
-            #   prediction_stat 产物(内含 bayesian_inference 后验概率等), 不再调用
-            #   P5Predictor -> AI 模型, 彻底消除"每次流水线都频繁与AI交互"的问题。
+            # 贝叶斯/预测统计产物缓存复用:
+            # 同一最新期号、且历史数据量未变化(未新增开奖)时, 直接复用已落库的
+            # prediction_stat 产物(内含 bayesian_inference 后验概率等), 不再调用
+            # P5Predictor -> AI 模型, 彻底消除"每次流水线都频繁与AI交互"的问题。
             _stat = None
             _cached = False
             try:
@@ -2803,9 +2778,9 @@ class Pipeline:
             except Exception as e:
                 logger.warning(f'读取预测统计缓存失败(非致命): {e}')
 
-            # ★ 贝叶斯结果增量复用(专用表 p5_bayesian_result):
-            #   先查专用表, 若该 issue 已计算过贝叶斯后验, 则本次直接复用(即便 prediction_stat
-            #   缓存因 history_count 变化而 miss, 贝叶斯部分仍可免去重算), 彻底避免频繁调AI。
+            # 贝叶斯结果增量复用(专用表 p5_bayesian_result):
+            # 先查专用表, 若该 issue 已计算过贝叶斯后验, 则本次直接复用(即便 prediction_stat
+            # 缓存因 history_count 变化而 miss, 贝叶斯部分仍可免去重算), 彻底避免频繁调AI。
             _bayes_cached_in_db = None
             try:
                 if self.db_client:
@@ -2848,41 +2823,69 @@ class Pipeline:
             except Exception as e:
                 logger.warning(f'贝叶斯专用表同步失败(非致命): {e}')
 
-            _fused = _stat['fused_probabilities']
+            # 回填/捕获「贝叶斯AI辅助洞察」到最终报告:
+            # predict() 已在 _stat['bayesian_ai_auxiliary'] 填充(非缓存路径)。
+            # 缓存命中路径下, 旧产物可能不含该字段 —— 此处按最近数据重算一次并回写产物,
+            # 保证主预测输出也能展示 AI 对贝叶斯的辅助洞察(用户明确要求)。
+            if not _stat.get('bayesian_ai_auxiliary'):
+                try:
+                    from modules.predictor import P5Predictor
+                    _p = P5Predictor()
+                    if getattr(_p, 'ai_auxiliary_available', False):
+                        _p._verification_cutoff = latest_issue
+                        _p._algo_bayesian_inference(_history)  # 填充 _p._bayesian_ai_auxiliary
+                        _aux = getattr(_p, '_bayesian_ai_auxiliary', {})
+                        if _aux:
+                            _stat = dict(_stat)  # 不污染缓存中的原字典引用
+                            _stat['bayesian_ai_auxiliary'] = _aux
+                            # 持久化回 prediction_stat 产物, 后续缓存命中即含该洞察
+                            if self.db_client:
+                                try:
+                                    self.db_client.save_artifact(
+                                        'prediction_stat', _stat, issue=latest_issue,
+                                        meta={'target_issue': target_issue, 'model': 'statistical+v3.2',
+                                              'history_count': history_count, 'data_hash': _data_hash}
+                                    )
+                                except Exception:
+                                    pass
+                except Exception as _e:
+                    logger.debug(f'贝叶斯AI辅助洞察回填跳过(非致命): {_e}')
+
+            _fused = _stat.get('fused_probabilities')
             _top_combos = _stat['top_combinations']
             _trend_fc = _stat.get('trend_forecast', {})
 
             pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
 
-            # ★ 问题2: 多源走势融合预测 —— 结合历史走势图/基础走势图/万千百十个独立走势表
-            #    最近30期数据, 用「频率+遗漏+动量」加权融合算法输出每位置 Top-4 推荐。
-            #    作为"走势图数据预测结果（实时）"的主预测来源(压缩到4位, 满足问题1)。
-            trend_multi = self._predict_trend_multi_source(target_issue, data_period=30)
+            # 问题2: 多源走势融合预测 —— 结合历史走势图/基础走势图/万千百十个独立走势表
+            # 最近30期数据, 用「频率+遗漏+动量」加权融合算法输出每位置 Top-4 推荐。
+            # 作为"走势图数据预测结果（实时）"的主预测来源(压缩到4位, 满足问题1)。
+            trend_multi = self._predict_trend_multi_source(target_issue, data_period=40, fused_probs=_fused)
 
-            # ★ 知识模型增强：利用在线学习的历史知识动态调整走势预测分数
+            # 知识模型增强：利用在线学习的历史知识动态调整走势预测分数
             if trend_multi and self.online_learner:
                 try:
                     trend_multi = self.online_learner.apply_knowledge_to_trend_prediction(trend_multi)
-                    logger.info('✓ 知识模型增强已应用到走势预测')
+                    logger.info(' 知识模型增强已应用到走势预测')
                 except Exception as e:
                     logger.warning(f'知识模型增强失败(非致命): {e}')
 
             # 升平降方向偏好(供最终报告展示, 与组合级约束同源)
             try:
-                spj_pref = self._get_spj_direction_preference() or {}
+                spj_pref = self._get_spj_direction_preference(40) or {}
             except Exception:
                 spj_pref = {}
 
             prediction = {}
             for _pk in pos_keys:
                 if trend_multi.get(_pk):
-                    # 多源融合成功: 直接采用 Top-4
+                    # 多源融合成功: 直接采用 Top-3
                     prediction[_pk] = trend_multi[_pk]
                 else:
-                    # 降级: 沿用 P5Predictor 融合概率取 Top-4
+                    # 降级: 沿用 P5Predictor 融合概率取 Top-3
                     _idx = pos_keys.index(_pk)
                     _pp = _fused[_idx] if _idx < len(_fused) else {}
-                    _sn = sorted(_pp.items(), key=lambda x: x[1], reverse=True)[:4]
+                    _sn = sorted(_pp.items(), key=lambda x: x[1], reverse=True)[:3]
                     # 降级路径: 从DB现算 frequency/omission 特征供 GUI 展示(真实历史, 非编造)
                     _feat = {'freq_pct': {}, 'omission': {}}
                     try:
@@ -2912,14 +2915,14 @@ class Pipeline:
                         'features': _feat
                     }
 
-            # ★ 和值走势约束候选组合: 用 p5_hzzst_data 派生和值区间, 对多源 Top-4 候选做和值过滤
-            #    (直接落实新爬取的"排列5和值走势图"数据价值, 提升组合级命中率)
+            # 和值走势约束候选组合: 用 p5_hzzst_data 派生和值区间, 对多源 Top-4 候选做和值过滤
+            # (直接落实新爬取的"排列5和值走势图"数据价值, 提升组合级命中率)
             recommended_combinations = []
             hezhi_range_str = ''
             if trend_multi and any(prediction.get(p) for p in pos_keys):
                 try:
                     _cc, hezhi_range_str = self._build_constrained_combinations(
-                        prediction, target_issue)
+                        prediction, target_issue, data_period=40)
                     if _cc:
                         recommended_combinations = _cc
                 except Exception as e:
@@ -2947,7 +2950,7 @@ class Pipeline:
             if hezhi_range_str:
                 key_conclusions.append(
                     f"推荐组合经和值走势约束(区间 {hezhi_range_str})与升平降方向约束, "
-                    f"由多源 Top-4 候选枚举筛选出 {len(recommended_combinations)} 组"
+                    f"由多源 Top-3 候选枚举筛选出 {len(recommended_combinations)} 组"
                     f"最贴合近期和值重心与涨跌惯性的组合。")
             else:
                 key_conclusions.append(
@@ -2962,15 +2965,15 @@ class Pipeline:
             ]
             final_report = {
                 'data_source': '统计融合模型(P5Predictor v3.2)+多源走势融合+可选AI文本增强',
-                'model_version': 'statistical+v3.3',
+                'model_version': f'statistical+{_APP_VERSION}',
                 'current_issue': latest_issue,
                 'next_issue': target_issue,
-                # ★ 拆分为两个独立模块
+                # 拆分为两个独立模块
                 'trend_prediction': prediction,  # 走势图数据预测结果（多源30期融合, Top-4）
                 'article_prediction': {},  # 专家文章预测结果（可由步骤3的结果填充）
-                # ★ 问题4修复: 同时写入 'prediction' 键, 供 _save_final_prediction_to_db /
-                #    _register_prediction_for_verification 读取(此前两处都读 final_report['prediction'],
-                #    而实际数据在 trend_prediction 中 -> 入库 prediction_stats/recommended_numbers 全为空)
+                # 问题4修复: 同时写入 'prediction' 键, 供 _save_final_prediction_to_db /
+                # _register_prediction_for_verification 读取(此前两处都读 final_report['prediction'],
+                # 而实际数据在 trend_prediction 中 -> 入库 prediction_stats/recommended_numbers 全为空)
                 'prediction': prediction,
                 'recommended_combinations': recommended_combinations,
                 'article_recommendations': [],  # 专家文章推荐组合
@@ -2979,14 +2982,21 @@ class Pipeline:
                 'reasoning_process': reasoning_process,
                 'risk_warning': _stat.get('risk_warning', '理性购彩，量力而行'),
                 'statistical_summary': _stat.get('summary', ''),
-                # ★ 新增元数据, 供 GUI 展示本次改进点
+                # 新增元数据, 供 GUI 展示本次改进点
                 'hezhi_range': hezhi_range_str,
                 'spj_direction_preference': spj_pref,
                 'bayesian_cache_used': _cached,
                 'bayesian_dedicated_table': getattr(self, '_bayes_dedicated_used', False),
-                'multi_source_method': '30期全源融合(历史+基础+万千百十个走势+升平降方向+和值重心+贝叶斯后验概率, 频率0.35+遗漏0.25+动量0.15+贝叶斯0.25, 指数衰减加权)',
+                'multi_source_method': '40期全源融合(历史+基础+万千百十个走势+升平降方向+和值重心+贝叶斯后验概率, 频率0.35+遗漏0.25+动量0.15+贝叶斯0.25, 指数衰减加权)',
+                # v3.44 修复: 补入各算法 Top-N 归因数据。此前该键缺失, 导致
+                # _save_final_prediction_to_db 取到 None -> p5_ai_report.per_algo_predictions
+                # 全表为 NULL -> learn_from_verification 恒返回 no_per_algo_data,
+                # 「验证→学习」闭环长期空转。
+                'per_algo_top_predictions': _stat.get('per_algo_top_predictions', {}),
                 # 贝叶斯推断后验概率摘要(若存在), 供 GUI 展示算法透明性
-                'bayesian_inference': _stat.get('algorithm_probs', {}).get('bayesian_inference')
+                'bayesian_inference': _stat.get('algorithm_probs', {}).get('bayesian_inference'),
+                # 贝叶斯AI辅助洞察(大模型对后验分布的自然语言解读), 供主预测输出展示
+                'bayesian_ai_auxiliary': _stat.get('bayesian_ai_auxiliary', {})
             }
             # 数据质量门禁结果纳入最终报告
             final_report['data_quality_gate'] = {
@@ -2995,7 +3005,7 @@ class Pipeline:
                 'checked_at': datetime.utcnow().isoformat()
             }
             
-            # ★ 从 pipeline_state 中获取独立报告并整合到 final_report
+            # 从 pipeline_state 中获取独立报告并整合到 final_report
             expert_article_report = self.pipeline_state.get('expert_article_report')
             if expert_article_report:
                 successful_count = expert_article_report.get('successful_articles', 0)
@@ -3029,18 +3039,21 @@ class Pipeline:
                     final_report['article_recommendations'] = article_rec_list
                     
                     if successful_count > 0:
-                        logger.info(f'✓ 已整合专家文章预测结果: {successful_count}篇专家文章')
+                        logger.info(f' 已整合专家文章预测结果: {successful_count}篇专家文章')
                     else:
-                        logger.warning('⚠ 专家文章无有效预测数据,将仅依赖走势图预测')
+                        logger.warning(' 专家文章无有效预测数据,将仅依赖走势图预测')
                 else:
-                    logger.warning('⚠ 专家文章分析报告结构不完整,position_recommendations为空')
+                    logger.warning(' 专家文章分析报告结构不完整,position_recommendations为空')
             else:
-                logger.warning('⚠ 未在pipeline_state中找到expert_article_report')
+                # 简化流水线已停用专家文章分析(step1 的 expert_article_report 不再生成),
+                # 此处缺失属预期。article_prediction 为可选增强字段, 缺失不影响主预测。
+                # 降级为 debug, 并在 pipeline_state 初始化时显式置 None 以表明"已考虑但不可用"。
+                logger.debug('pipeline_state 中无 expert_article_report（简化流水线未启用专家文章分析, 属预期）')
             
             trend_chart_report = self.pipeline_state.get('trend_chart_report')
             if trend_chart_report:
-                # ★ 问题3修复: 把多源融合预测结果填充进走势图报告 prediction 字段后再入库,
-                #   确保数据库中的"走势图数据预测报告"预测数据不再为空。
+                # 问题3修复: 把多源融合预测结果填充进走势图报告 prediction 字段后再入库,
+                # 确保数据库中的"走势图数据预测报告"预测数据不再为空。
                 trend_chart_report['prediction'] = prediction
                 trend_chart_report['data_period'] = '最近30期(历史+基础+位置走势表)'
                 uuid_val = self._save_report_to_db(trend_chart_report, 'trend_chart', target_issue, latest_issue)
@@ -3067,11 +3080,11 @@ class Pipeline:
             logger.info(f'报告UUID: {report_uuid}')
             logger.info(f'预测期号: {target_issue}')
             
-            # ★ 贝叶斯专用表写入确认日志（关键，便于排查问题）
+            # 贝叶斯专用表写入确认日志（关键，便于排查问题）
             _bayes_written = getattr(self, '_bayes_dedicated_used', False)
             _bayes_in_report = final_report.get('bayesian_inference')
             if _bayes_in_report:
-                logger.info(f'✓ 贝叶斯推断结果已写入专用表 p5_bayesian_result')
+                logger.info(f' 贝叶斯推断结果已写入专用表 p5_bayesian_result')
                 logger.info(f'  基于历史数据: {latest_issue} ({history_count}条记录)')
                 logger.info(f'  预测目标期号: {target_issue}')
                 if isinstance(_bayes_in_report, list):
@@ -3088,7 +3101,7 @@ class Pipeline:
                     logger.info(f'  综合推荐: {" ".join(str(n) for n in top_nums)}')
                 logger.info(f'  写入状态: {"增量复用(缓存命中)" if _bayes_written else "全新计算并写入"}')
             else:
-                logger.warning('⚠ 贝叶斯推断结果为空，未写入专用表')
+                logger.warning(' 贝叶斯推断结果为空，未写入专用表')
             
             logger.info('=' * 80)
 
@@ -3281,9 +3294,9 @@ class Pipeline:
 
             # === 关键修复 (5.4 验证格式BUG) ===
             # 验证闭环 database.update_prediction_verification() 期望
-            #   predicted.get('wan') -> list[number]
+            # predicted.get('wan') -> list[number]
             # 但 final_report['prediction'] 结构是
-            #   {'wan': {'numbers': [...], 'confidence': [...], 'reason': ...}, ...}
+            # {'wan': {'numbers': [...], 'confidence': [...], 'reason': ...}, ...}
             # 若直接 json.dumps(prediction)，则 predicted.get('wan') 得到 dict，
             # check_match() 的 isinstance(list) 守卫会恒返回 False -> 命中率恒为0。
             # 因此此处必须"扁平化":抽离每个位置的 numbers 列表再序列化。
@@ -3307,6 +3320,23 @@ class Pipeline:
                 else:
                     _conf = []
                 flat_confidence[_pos] = [round(float(c), 4) for c in _conf]
+
+            # 防重复注册——若同 issue 已有 pending 记录则跳过，避免手动/自动化多次触发产生重复
+            try:
+                # 修复(issue-2): pymysql 的 cursor.execute() 返回受影响行数(int),
+                # 不能链式调用 .fetchone(); 原先 (execute(...)).fetchone() 会抛
+                # 'int' object has no attribute 'fetchone', 被外层 except 吞掉 ->
+                # 查重实际从未生效, 可能产生重复 pending 记录。改为分开调用。
+                self.db_client.cursor.execute(
+                    'SELECT id FROM p5_prediction_record WHERE target_issue = %s AND verification_status = %s LIMIT 1',
+                    (target_issue, 'pending')
+                )
+                _existing = self.db_client.cursor.fetchone()
+                if _existing:
+                    logger.info(f'预测记录已存在（期号{target_issue}，pending），跳过重复注册')
+                    return True
+            except Exception as _e:
+                logger.warning(f'查重预测记录失败（不影响注册）: {_e}')
 
             # 序列化预测号码(扁平化 -> 满足验证契约)
             predicted_numbers_json = json.dumps(flat_predicted, ensure_ascii=False)
@@ -3342,7 +3372,7 @@ class Pipeline:
         Returns:
             权重配置字典,格式:
             {
-                'version': 'v3.0',
+                'version': _APP_VERSION,
                 'updated_at': '2026-07-04 12:00:00',
                 'weights': {
                     'frequency_weighted': 0.38,
@@ -3386,7 +3416,7 @@ class Pipeline:
                         weights = {k: v / total for k, v in weights.items()}
                     logger.info(f'从数据库加载自适应权重: {weights}')
                     return {
-                        'version': 'v3.0',
+                        'version': _APP_VERSION,
                         'updated_at': rows[0]['updated_at'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(rows[0]['updated_at'], 'strftime') else str(rows[0]['updated_at']),
                         'weights': weights,
                         'source': 'database'
@@ -3397,7 +3427,7 @@ class Pipeline:
         # 返回默认权重
         logger.info('使用默认自适应权重')
         return {
-            'version': 'v3.0',
+            'version': _APP_VERSION,
             'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'weights': {
                 'frequency_weighted': 0.35,
@@ -3411,7 +3441,7 @@ class Pipeline:
         }
 
     # ================================================================
-    # 步骤5: 开奖后权重自适应调整 (v3.0 新增)
+    # 步骤5: 开奖后权重自适应调整
     # ================================================================
 
     def step5_weight_adaptation(self, target_issue: str, actual_numbers: List[int]) -> Dict[str, Any]:
@@ -3438,7 +3468,7 @@ class Pipeline:
             }
         """
         logger.info('=' * 80)
-        logger.info('【步骤5】开始：开奖后权重自适应调整 (v3.0)')
+        logger.info('【步骤5】开始：开奖后权重自适应调整')
         logger.info(f'目标期号: {target_issue}, 实际开奖: {actual_numbers}')
         logger.info('=' * 80)
 
@@ -3520,7 +3550,7 @@ class Pipeline:
             for algo_name in algo_names:
                 algo_preds = per_algo_predictions.get(algo_name, {})
                 hit_positions = []
-                top1_positions = []  # ★ v3.14: Top-1 精准度命中位置（最高概率位是否中）
+                top1_positions = [] # Top-1 精准度命中位置（最高概率位是否中）
                 for pos_idx, pos in enumerate(positions):
                     if pos_idx < len(actual_numbers):
                         actual_num = actual_numbers[pos_idx]
@@ -3531,12 +3561,12 @@ class Pipeline:
                         if pred_nums and len(pred_nums) > 0 and pred_nums[0] == actual_num:
                             top1_positions.append(pos)
                 hit_rate = len(hit_positions) / 5.0
-                top1_hit_rate = len(top1_positions) / 5.0   # ★ v3.14 新增
+                top1_hit_rate = len(top1_positions) / 5.0 # v3.14 新增
                 algo_hits[algo_name] = {
                     'hit_positions': hit_positions,
                     'hit_rate': hit_rate,
-                    'top1_positions': top1_positions,         # ★ v3.14 新增
-                    'top1_hit_rate': top1_hit_rate,          # ★ v3.14 新增
+                    'top1_positions': top1_positions, # v3.14 新增
+                    'top1_hit_rate': top1_hit_rate, # v3.14 新增
                     'total_positions': 5
                 }
         else:
@@ -3545,7 +3575,7 @@ class Pipeline:
             if report:
                 predicted_numbers = self._parse_predicted_numbers_from_report(report, positions)
                 total_hits = 0
-                top1_hits = 0  # ★ v3.14
+                top1_hits = 0 # v3.14
                 for pos_idx, pos in enumerate(positions):
                     if pos_idx < len(actual_numbers):
                         actual_num = actual_numbers[pos_idx]
@@ -3556,7 +3586,7 @@ class Pipeline:
                         if preds and len(preds) > 0 and preds[0] == actual_num:
                             top1_hits += 1
                 overall_hit_rate = total_hits / 5.0 if positions else 0.0
-                overall_top1_hit_rate = top1_hits / 5.0 if positions else 0.0  # ★ v3.14
+                overall_top1_hit_rate = top1_hits / 5.0 if positions else 0.0 # v3.14
                 for algo in algo_names:
                     algo_hits[algo] = {
                         'hit_positions': [positions[i] for i in range(5)
@@ -3652,10 +3682,10 @@ class Pipeline:
                 return weight_updates
 
             # 通过OnlineLearner的增量学习更新权重
-            # ★ v3.14: 同时记录 hit_rate(旧, 位置覆盖率) + top1_hit_rate(新, Top-1 精准度)
+            # 同时记录 hit_rate(旧, 位置覆盖率) + top1_hit_rate(新, Top-1 精准度)
             for algo_name, hit_info in algo_hits.items():
                 hit_rate = hit_info.get('hit_rate', 0.0)
-                top1_hit_rate = hit_info.get('top1_hit_rate', 0.0)  # ★ v3.14 新增
+                top1_hit_rate = hit_info.get('top1_hit_rate', 0.0) # v3.14 新增
                 if hit_rate > 0 or top1_hit_rate > 0:
                     # 记录验证到权重管理器(双信号)
                     if hasattr(self.online_learner, 'record_algo_hit'):
@@ -3664,7 +3694,7 @@ class Pipeline:
 
                     weight_updates[algo_name] = {
                         'prev_hit_rate': hit_info.get('hit_rate', 0.0),
-                        'top1_hit_rate': top1_hit_rate,    # ★ v3.14 同时记录
+                        'top1_hit_rate': top1_hit_rate, # v3.14 同时记录
                         'hit_positions': hit_info.get('hit_positions', []),
                         'top1_positions': hit_info.get('top1_positions', []),
                         'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -3673,7 +3703,7 @@ class Pipeline:
                         f'算法 [{algo_name}] 覆盖率: {hit_rate:.0%}, '
                         f'Top-1精准度: {top1_hit_rate:.0%}, 已双信号更新权重')
 
-            # 获取更新后的自适应权重(★ v3.14: 默认用 top1_hit 通道)
+            # 获取更新后的自适应权重
             if hasattr(self.online_learner, 'weight_manager'):
                 new_weights = self.online_learner.weight_manager.get_adaptive_weights(
                     metric='top1_hit')
@@ -3813,7 +3843,7 @@ class Pipeline:
                 for algo, info in algo_hits.items()
             }
 
-            # 同步持久化到统一产物表(v3.3), 供 predictor 自适应权重学习闭环读取
+            # 同步持久化到统一产物表, 供 predictor 自适应权重学习闭环读取
             try:
                 self.db_client.save_artifact(
                     'weight_history',
@@ -3969,6 +3999,7 @@ class Pipeline:
         result = {
             'success': True,
             'verified_count': 0,
+            'learned_count': 0,   # 成功触发在线学习归因的期数
             'skipped': 0,
             'total_scanned': 0,
             'details': [],
@@ -4042,6 +4073,28 @@ class Pipeline:
                             f'验证闭环: 期号 {ti} 已验证 (命中 {vr.get("match_count")}/5, '
                             f'准确率 {vr.get("accuracy_rate")}%)'
                         )
+                        # v3.42 验证→学习闭环: 自动验证成功后立即触发在线学习归因。
+                        # 历史上该调用只存在于 GUI「手动验证期号」对话框中, 自动验证路径
+                        # 从不触发, 导致自动化跑批时在线学习空转。此处补齐, 使
+                        # 「开始分析」一次点击即可完成 预测→开奖→验证→权重学习 全闭环。
+                        # 防御式: 任何异常都不得影响验证结果本身。
+                        try:
+                            if not self.online_learner:
+                                self._init_online_learner()
+                            if self.online_learner:
+                                _lr = self.online_learner.learn_from_verification(
+                                    db, ti, actual_numbers)
+                                if _lr.get('learned'):
+                                    result['learned_count'] += 1
+                                    logger.info(
+                                        f'验证闭环[在线学习]: 期号 {ti} 已按 per-algo 归因'
+                                        f'更新 {_lr.get("algos")} 个算法权重')
+                                else:
+                                    logger.info(
+                                        f'验证闭环[在线学习]: 期号 {ti} 无归因数据'
+                                        f'({_lr.get("reason")}), 跳过权重学习')
+                        except Exception as _le:
+                            logger.warning(f'验证闭环[在线学习]: 期号 {ti} 触发失败(不影响验证): {_le}')
                     else:
                         result['skipped'] += 1
                         logger.warning(f'验证闭环: 期号 {ti} 验证跳过 ({status}: {vr.get("message")})')
@@ -4051,7 +4104,8 @@ class Pipeline:
 
             logger.info(
                 f'验证闭环完成: 扫描 {result["total_scanned"]} 条, '
-                f'已验证 {result["verified_count"]} 条, 跳过 {result["skipped"]} 条'
+                f'已验证 {result["verified_count"]} 条, '
+                f'触发学习 {result["learned_count"]} 条, 跳过 {result["skipped"]} 条'
             )
         except Exception as e:
             logger.error(f'验证闭环执行失败: {e}', exc_info=True)
@@ -4116,15 +4170,23 @@ class Pipeline:
         
         return result
 
-    def _execute_backtest_analysis(self, target_issue: str) -> Dict[str, Any]:
+    def _execute_backtest_analysis(self, target_issue: str,
+                                  max_bayes_aux_calls: int = 5,
+                                  log_callback: Optional[callable] = None) -> Dict[str, Any]:
         """
         执行历史回测(作为流水线的附加步骤)
-        
+
         使用回测引擎对最近N期进行模拟预测,评估算法表现。
-        
+
+        P2 优化 (2026-08-09):
+          - 增加回测结果缓存，同数据不重跑
+          - 添加进度回调支持，每 10 期输出进度
+
         Args:
             target_issue: 目标期号(回测时会使用历史期号)
-            
+            max_bayes_aux_calls: 贝叶斯AI辅助覆盖期数上限 (P1: 默认 10→5)
+            log_callback: GUI 日志回调
+
         Returns:
             {success, backtest_results, stats, error}
         """
@@ -4134,16 +4196,33 @@ class Pipeline:
             'stats': {},
             'error': None
         }
-        
+
         try:
             # 懒加载数据库客户端
             if not self.db_client:
                 self._init_db_client()
-            
+
             if not self.db_client or not self.db_client.connection:
                 result['error'] = '数据库未连接'
                 return result
-            
+
+            # P2: 回测结果缓存检查（同数据不重跑）
+            import hashlib
+            cache_key = f'backtest:{target_issue}:{max_bayes_aux_calls}'
+            try:
+                cached = self.db_client.get_latest_artifact('backtest_result', issue=target_issue)
+                if cached and isinstance(cached.get('data'), dict):
+                    _meta = cached.get('meta') or {}
+                    if _meta.get('max_bayes_aux_calls') == max_bayes_aux_calls:
+                        result['backtest_results'] = cached['data']
+                        result['stats'] = cached['data'].get('overall_stats', {})
+                        result['success'] = True
+                        result['cached'] = True
+                        logger.info(f'回测结果缓存命中，跳过重跑 (issue={target_issue})')
+                        return result
+            except Exception as _e:
+                logger.debug(f'回测缓存读取失败: {_e}')
+
             logger.info('执行历史回测分析...')
 
             # 获取回测引擎 (注意: 模块名为 backtester, 类名为 Backtester)
@@ -4151,12 +4230,30 @@ class Pipeline:
             _predictor = self._get_predictor()
             backtester = Backtester(_predictor, self.db_client)
 
-            # 执行回测: 前50期作为训练, 回测后续50期(与main.py backtest 默认一致)
+            # 执行回测: 评估「最近50期」, 每期用其之前的全部历史滚动训练
+            # (eval_mode='recent' 为 Backtester 默认值, 此处显式写明口径;
+            # 回测默认关闭完整AI复包装(enable_ai=False, 控费/可复现),
+            # 但 enable_bayes_aux_in_backtest=True → 贝叶斯AI辅助仍触发,
+            # 回测日志将显示"AI分析:启用（含贝叶斯辅助洞察）", 满足用户诉求;
+            # max_bayes_aux_calls 由 GUI 下拉框透传, 让用户自行权衡覆盖/耗时)
+            logger.info(f'回测贝叶斯AI辅助覆盖上限: {max_bayes_aux_calls} 期（用户选择）')
             backtest_results = backtester.run_backtest(
-                start_index=50, test_count=50, use_validation_split=False
+                start_index=50, test_count=50, use_validation_split=False,
+                eval_mode='recent', enable_ai=False,
+                max_bayes_aux_calls=max_bayes_aux_calls,
+                log_callback=log_callback
             )
             result['backtest_results'] = backtest_results
             result['stats'] = backtest_results.get('overall_stats', {})
+
+            # P2: 缓存回测结果
+            try:
+                self.db_client.save_artifact(
+                    'backtest_result', backtest_results, issue=target_issue,
+                    meta={'max_bayes_aux_calls': max_bayes_aux_calls}
+                )
+            except Exception as _e:
+                logger.debug(f'回测结果缓存保存失败: {_e}')
 
             logger.info(f'历史回测完成: 回测{backtest_results.get("total_tested", 0)}期, '
                         f'Top-1命中率={result["stats"].get("avg_top1_hit_rate", 0):.2f}%')
@@ -4267,7 +4364,7 @@ class Pipeline:
 
     def _emit_step_progress(self, step_num: int, total: int, name: str):
         """步骤开始: 输出章节标题并推进进度条。"""
-        self._emit('section', f'▶ 步骤{step_num}/{total}: {name}')
+        self._emit('section', f' 步骤{step_num}/{total}: {name}')
         self._emit('progress', {'value': 5 + (step_num - 1) * 20,
                                 'text': f'步骤{step_num}: {name}...'})
 
@@ -4277,9 +4374,9 @@ class Pipeline:
                 '专家报告整合分析', '最终预测结果生成与入库'][step_num - 1]
         ok = step_result.get('success', False) or bool(step_result.get('fallback_strategy'))
         if ok:
-            self._emit('success', f'  ✓ 步骤{step_num}/{total}: {name} 完成 ({step_result.get("duration", 0):.1f}s)')
+            self._emit('success', f' 步骤{step_num}/{total}: {name} 完成 ({step_result.get("duration", 0):.1f}s)')
         else:
-            self._emit('warning', f'  ⚠ 步骤{step_num}/{total}: {name} 异常: {str(step_result.get("error", ""))[:80]}')
+            self._emit('warning', f' 步骤{step_num}/{total}: {name} 异常: {str(step_result.get("error", ""))[:80]}')
         self._validate_step_output(step_num, step_result, target_issue)
 
     def _validate_step_output(self, step_num: int, step_result: Dict[str, Any], target_issue: str):
@@ -4291,7 +4388,7 @@ class Pipeline:
         
         优化(2026-07-15): 减少emit('data')调用次数, 只在失败或警告时才输出详细校验结果。
         """
-        # ★ 仅在步骤失败或存在降级时才输出详细校验信息
+        # 仅在步骤失败或存在降级时才输出详细校验信息
         has_issues = False
         
         if step_num == 1:
@@ -4317,7 +4414,7 @@ class Pipeline:
         
         # 只在有问题时输出详细校验信息
         if has_issues:
-            self._emit('data', f'  🔎 步骤{step_num} 结果校验:')
+            self._emit('data', f' 步骤{step_num} 结果校验:')
             checks = []
             if step_num == 1:
                 rep = step_result.get('expert_article_report')
@@ -4346,15 +4443,15 @@ class Pipeline:
                 ok_pos = [p for p in ['wan', 'qian', 'bai', 'shi', 'ge']
                           if isinstance(pred.get(p), dict) and pred[p].get('numbers')]
                 checks.append(('最终预测覆盖', len(ok_pos) == 5,
-                               f'{len(ok_pos)}/5 位置已生成预测号码' + ('' if len(ok_pos) == 5 else ' ⚠需关注')))
+                               f'{len(ok_pos)}/5 位置已生成预测号码' + ('' if len(ok_pos) == 5 else ' 需关注')))
             for label, passed, note in checks:
-                self._emit('data', f'    {"✓" if passed else "⚠"} {label}: {note}')
+                self._emit('data', f' {"" if passed else ""} {label}: {note}')
 
     def _emit_final_prediction(self, final_report: Dict[str, Any]):
         """实时输出最终预测结果(各位置推荐号码 + 首选组合)。"""
         if not final_report:
             return
-        self._emit('section', '🎯 最终预测结果 (实时)')
+        self._emit('section', ' 最终预测结果 (实时)')
         pred = final_report.get('prediction', {}) or {}
         pos_names = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
         for pk, pn in pos_names.items():
@@ -4371,29 +4468,29 @@ class Pipeline:
         """实时输出自动预测验证报告。"""
         if not vr:
             return
-        self._emit('section', '🔍 自动预测验证报告')
+        self._emit('section', ' 自动预测验证报告')
         if vr.get('success'):
             vc = vr.get('verified_count', 0)
             details = vr.get('details', []) or []
             total = vr.get('total_records', len(details) if isinstance(details, list) else '?')
-            self._emit('success', f'  ✓ 预测验证完成: 已验证 {vc} 条记录 (共 {total} 条)')
+            self._emit('success', f' 预测验证完成: 已验证 {vc} 条记录 (共 {total} 条)')
             if vc > 0:
                 self._emit('data', '    • 已比对历史预测号码与实际开奖结果(容错±1命中机制)')
             else:
                 self._emit('data', '    • 本期为前瞻预测, 开奖后系统将自动执行命中率验证闭环')
         else:
-            self._emit('warning', f'  ⚠ 预测验证跳过: {vr.get("error", "")}')
+            self._emit('warning', f' 预测验证跳过: {vr.get("error", "")}')
 
     def _emit_learning_summary(self, lr: Dict[str, Any], target_issue: str):
         """实时输出在线学习引擎报告(闭环迭代)。"""
         if not lr:
             return
-        self._emit('section', '🧠 在线学习引擎报告')
+        self._emit('section', ' 在线学习引擎报告')
         if lr.get('success'):
             rep = lr.get('learning_report') or {}
             tv = rep.get('total_verified', 0)
             if tv and tv > 0:
-                self._emit('success', f'  ✓ 在线学习完成: 基于 {tv} 条验证记录动态调整算法权重')
+                self._emit('success', f' 在线学习完成: 基于 {tv} 条验证记录动态调整算法权重')
                 wu = lr.get('weight_updates') or {}
                 if wu:
                     parts = [f'{k}={v}' for k, v in list(wu.items())[:6]]
@@ -4402,7 +4499,7 @@ class Pipeline:
             else:
                 self._emit('data', '    • 在线学习就绪: 暂无新的验证记录, 沿用当前权重')
         else:
-            self._emit('warning', f'  ⚠ 在线学习跳过: {lr.get("error", "")}')
+            self._emit('warning', f' 在线学习跳过: {lr.get("error", "")}')
 
     def _emit_extra_summary(self, kind: str, result: Dict[str, Any]):
         """实时输出回测/特征分析等附加步骤摘要。"""
@@ -4411,12 +4508,12 @@ class Pipeline:
         if kind == 'backtest':
             stats = result.get('stats', {}) or {}
             hit = stats.get('avg_top1_hit_rate', 0)
-            self._emit('data', f'  📈 历史回测: Top-1 平均命中率 {float(hit):.2f}% (量化验证模型效果)')
+            self._emit('data', f' 历史回测: Top-1 平均命中率 {float(hit):.2f}% (量化验证模型效果)')
         elif kind == 'feature':
             tf = result.get('top_features', []) or []
             if tf:
                 names = ', '.join(str(f.get('feature') if isinstance(f, dict) else f) for f in tf[:3])
-                self._emit('data', f'  🔬 特征重要性 Top3: {names}')
+                self._emit('data', f' 特征重要性 Top3: {names}')
 
     # ================================================================
     # 统计预测引擎
@@ -4453,9 +4550,10 @@ class Pipeline:
                 logger.error('数据库未连接，无法进行统计预测')
                 return {'success': False, 'error': '数据库未连接'}
 
-            # 拉取历史数据
+            # 拉取历史数据（取最近 data_limit 期: 倒序取最新, 避免取到最旧的 2023 期
+            # 导致 _verification_cutoff 落在过去, 贝叶斯退化为纯先验、AI 辅助不触发）
             self.db_client.cursor.execute(
-                f'SELECT * FROM p5_history_data ORDER BY issue ASC LIMIT {data_limit}'
+                f'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT {data_limit}'
             )
             history_data = self.db_client.cursor.fetchall()
 
@@ -4463,7 +4561,8 @@ class Pipeline:
                 logger.error('无历史开奖数据')
                 return {'success': False, 'error': '无历史数据'}
 
-            latest_issue = history_data[-1].get('issue', '')
+            # 最新期号 = 所有候选期号中的最大值(与排序无关, 稳健)
+            latest_issue = max((str(r.get('issue', '')) for r in history_data), default='')
             logger.info(f'加载历史数据 {len(history_data)} 期，最新期号: {latest_issue}')
 
             # 构建 P5Predictor 输入
@@ -4483,25 +4582,35 @@ class Pipeline:
             predictor = self._get_predictor()
             prediction_result = predictor.predict(_history, current_issue=latest_issue)
 
-            if prediction_result.get('error'):
-                logger.error(f'预测失败: {prediction_result["error"]}')
-                return {'success': False, 'error': prediction_result['error']}
+            # 预测增强（模式挖掘与异常检测）
+            enhanced_result = prediction_result.copy()
+            try:
+                from modules.prediction_enhancer import PredictionEnhancer
+                enhancer = PredictionEnhancer()
+                enhanced_result = enhancer.enhance(prediction_result, _history)
+                logger.info('预测增强完成')
+            except Exception as e:
+                logger.warning(f'预测增强失败（非致命）: {e}')
 
-            logger.info(f'统计预测完成: 目标期号 {prediction_result.get("target_issue")}, '
-                       f'推荐组合数 {len(prediction_result.get("top_combinations", []))}')
+            if enhanced_result.get('error'):
+                logger.error(f'预测失败: {enhanced_result["error"]}')
+                return {'success': False, 'error': enhanced_result['error']}
+
+            logger.info(f'统计预测完成: 目标期号 {enhanced_result.get("target_issue")}, '
+                       f'推荐组合数 {len(enhanced_result.get("top_combinations", []))}')
 
             # 返回结构化结果
             return {
                 'success': True,
-                'predict_uuid': prediction_result.get('predict_uuid'),
-                'target_issue': prediction_result.get('target_issue'),
-                'top_combinations': prediction_result.get('top_combinations', []),
-                'fused_probabilities': prediction_result.get('fused_probabilities'),
-                'algorithm_weights': prediction_result.get('algorithm_weights'),
-                'trend_forecast': prediction_result.get('trend_forecast'),
-                'predict_time': prediction_result.get('predict_time'),
-                'risk_warning': prediction_result.get('risk_warning', ''),
-                'raw_prediction': prediction_result,
+                'predict_uuid': enhanced_result.get('predict_uuid'),
+                'target_issue': enhanced_result.get('target_issue'),
+                'top_combinations': enhanced_result.get('top_combinations', []),
+                'fused_probabilities': enhanced_result.get('fused_probabilities'),
+                'algorithm_weights': enhanced_result.get('algorithm_weights'),
+                'trend_forecast': enhanced_result.get('trend_forecast'),
+                'predict_time': enhanced_result.get('predict_time'),
+                'risk_warning': enhanced_result.get('risk_warning', ''),
+                'raw_prediction': enhanced_result,
             }
 
         except Exception as e:
@@ -4517,9 +4626,11 @@ class Pipeline:
                          actual_numbers: Optional[List[int]] = None,
                          include_verification: bool = True,
                          include_online_learning: bool = True,
-                         include_backtest: bool = True,
+                         include_backtest: bool = False,  # P0: 默认关闭
                          include_feature_analysis: bool = True,
-                         progress_callback=None) -> Dict[str, Any]:
+                         max_bayes_aux_calls: int = 5,  # P1: 默认 10→5
+                         progress_callback=None,
+                         log_callback: Optional[callable] = None) -> Dict[str, Any]:
         """
         执行完整的五步流水线分析(增强版)
         
@@ -4542,6 +4653,7 @@ class Pipeline:
             include_online_learning: 是否在流水线中包含在线学习(默认True)
             include_backtest: 是否执行历史回测(默认True,必选)
             include_feature_analysis: 是否执行特征分析(默认True,必选)
+            max_bayes_aux_calls: 回测中启用「贝叶斯AI辅助」的期数上限(默认10)
             
         Returns:
             {
@@ -4559,6 +4671,7 @@ class Pipeline:
 
         self.pipeline_state = {
             'article_reports': [],       # 已废弃:专家文章分析已移除
+            'expert_article_report': None,  # 已废弃:专家文章预测报告已移除(step4 读取时属预期缺失)
             'trend_report': None,        # 已废弃:走势图AI分析已移除
             'integrated_report': None,   # 已废弃:专家报告整合已移除
             'final_report': None,        # 最终预测结果
@@ -4570,7 +4683,7 @@ class Pipeline:
         # 实时进度回调(GUI 流式输出)
         self._progress_callback = progress_callback
         gui_handler = self._attach_gui_handler()
-        self._emit('section', '🚀 AI预测流水线启动')
+        self._emit('section', ' AI预测流水线启动')
         self._emit('data', f'  • 目标期号: {target_issue} | 数据期数: {data_limit}')
         self._emit('data', f'  • 自动预测验证: {"开启" if include_verification else "关闭"} | 在线学习: {"开启" if include_online_learning else "关闭"}')
 
@@ -4606,28 +4719,23 @@ class Pipeline:
             # - 步骤2: 走势图数据分析与AI预测 (被步骤4的多源走势融合取代)
             # - 步骤3: 专家报告整合分析 (依赖步骤1,已无意义)
             # ========================================
-            #
             # 如需启用(不推荐),取消下面注释:
-            #
             # self._emit_step_progress(1, 4, '专家文章爬取与结构化AI分析')
             # step1_start = time.time()
             # step1_result = self.step1_crawl_articles_and_analyze(target_issue)
             # ...
-            #
             # self._emit_step_progress(2, 4, '走势图数据分析与AI预测')
             # step2_start = time.time()
             # step2_result = self.step2_trend_analysis(target_issue, data_limit)
             # ...
-            #
             # self._emit_step_progress(3, 4, '专家报告整合分析')
             # step3_start = time.time()
             # step3_result = self.step3_integrate_expert_reports(target_issue)
             # ...
-            #
             # ========================================
             # 步骤1(新): 统计预测(含贝叶斯推断)
             # ========================================
-            self._emit('section', '📊 步骤1: 统计预测(含贝叶斯推断)')
+            self._emit('section', ' 步骤1: 统计预测(含贝叶斯推断)')
             step1_start = time.time()
             step1_result = self._calc_statistical_prediction(target_issue, data_limit)
             step1_elapsed = time.time() - step1_start
@@ -4645,7 +4753,7 @@ class Pipeline:
             
             # 存储中间结果供步骤2使用
             self.pipeline_state['stat_prediction'] = step1_result
-            self._emit('info', f'  ✓ 统计预测完成 (耗时{step1_elapsed:.1f}s)')
+            self._emit('info', f' 统计预测完成 (耗时{step1_elapsed:.1f}s)')
 
             # ---- 步骤4 ----
             self._emit_step_progress(4, 4, '最终预测结果生成与入库')
@@ -4675,7 +4783,7 @@ class Pipeline:
                     step4_result.get('final_report', {})
                 )
                 logger.info(f'预测记录已注册供后续验证: 期号{target_issue}')
-                # ★ 实时输出最终预测结果(供GUI逐步骤追踪)
+                # 实时输出最终预测结果(供GUI逐步骤追踪)
                 self._emit_final_prediction(step4_result.get('final_report'))
 
             self._emit_step_result(2, step4_result, target_issue)
@@ -4686,9 +4794,9 @@ class Pipeline:
             # ---- 附加步骤: 验证闭环、预测验证、在线学习、历史回测、特征分析 ----
             logger.info('执行附加分析步骤...')
 
-            # 0. 闭合「预测→开奖」验证闭环 (v3.16 新增)
-            #    先对历史 pending 预测记录执行验证, 让贝叶斯验证学习获得真实反馈,
-            #    再生成下一期预测(其注册记录将在未来某次运行被此处闭合)。
+            # 0. 闭合「预测→开奖」验证闭环
+            # 先对历史 pending 预测记录执行验证, 让贝叶斯验证学习获得真实反馈,
+            # 再生成下一期预测(其注册记录将在未来某次运行被此处闭合)。
             try:
                 logger.info('执行验证闭环(闭合历史 pending 预测)...')
                 self._ensure_db()
@@ -4698,7 +4806,7 @@ class Pipeline:
                     f'验证闭环: 扫描 {closed.get("total_scanned", 0)} 条, '
                     f'已验证 {closed.get("verified_count", 0)} 条'
                 )
-                self._emit('info', f'  ✓ 验证闭环: 本次闭合 {closed.get("verified_count", 0)} 条历史预测')
+                self._emit('info', f' 验证闭环: 本次闭合 {closed.get("verified_count", 0)} 条历史预测')
             except Exception as e:
                 logger.warning(f'验证闭环执行失败(不影响主流程): {e}')
 
@@ -4730,7 +4838,9 @@ class Pipeline:
                 try:
                     logger.info('执行历史回测...')
                     self._ensure_db()
-                    backtest_result = self._execute_backtest_analysis(target_issue)
+                    backtest_result = self._execute_backtest_analysis(
+                        target_issue, max_bayes_aux_calls=max_bayes_aux_calls,
+                        log_callback=log_callback)
                     pipeline_result['backtest_result'] = backtest_result
                     logger.info(f'历史回测完成: {"成功" if backtest_result.get("success") else "失败"}')
                     self._emit_extra_summary('backtest', backtest_result)
@@ -4751,9 +4861,9 @@ class Pipeline:
 
             # 简化流水线已移除专家文章分析模块，独立报告收集功能已停用
             # if step1_result.get('expert_article_report'):
-            #     pipeline_result['expert_report'] = step1_result['expert_article_report']
+            # pipeline_result['expert_report'] = step1_result['expert_article_report']
             # if step2_result.get('trend_chart_report'):
-            #     pipeline_result['trend_report'] = step2_result['trend_chart_report']
+            # pipeline_result['trend_report'] = step2_result['trend_chart_report']
 
             # ---- 步骤5: 权重自适应调整（可选，仅在verify_with_actual=True且actual_numbers提供时执行）----
             if verify_with_actual and actual_numbers:
@@ -4787,7 +4897,7 @@ class Pipeline:
             logger.info('四步流水线执行完成')
             logger.info('=' * 80)
             for stage in pipeline_result['stages']:
-                icon = '✓' if stage['success'] else '✗'
+                icon = '' if stage['success'] else ''
                 logger.info(f'{icon} 步骤{stage["step"]}: {stage["name"]} ({stage["duration"]:.1f}s)')
             logger.info(f'总耗时: {pipeline_result["total_duration"]:.1f}s')
             if pipeline_result.get('report_uuid'):
@@ -4811,7 +4921,10 @@ class Pipeline:
 def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int = 60,
                           progress_callback=None,
                           include_backtest: bool = True,
-                          include_feature_analysis: bool = True) -> Dict[str, Any]:
+                          include_feature_analysis: bool = True,
+                          max_bayes_aux_calls: int = 5,
+                          log_callback: Optional[callable] = None,
+                          evolution_engine=None) -> Dict[str, Any]:
     """
     便捷函数：执行四步流水线分析
 
@@ -4819,8 +4932,11 @@ def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int =
         target_issue: 目标期号，如不提供则从数据库最新期号推算
         data_limit: 历史数据期数限制
         progress_callback: 实时进度回调(level, message), 用于 GUI 流式输出
-        include_backtest: 是否执行历史回测(默认True；每日自动化任务应设 False 以规避 AI 限速)
-        include_feature_analysis: 是否执行特征分析(默认True；每日自动化任务可设 False)
+        include_backtest: 是否执行历史回测(默认 False；P0 优化：回测改为可选)
+        include_feature_analysis: 是否执行特征分析(默认 True)
+        max_bayes_aux_calls: 回测中启用「贝叶斯AI辅助」的期数上限(默认 5；P1 优化：10→5)
+        log_callback: GUI 日志回调
+        evolution_engine: 自我进化引擎实例，用于将进化后的权重应用到预测器（可选）。
 
     Returns:
         流水线执行结果
@@ -4835,18 +4951,26 @@ def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int =
                 latest_issue = row.get('issue', '')
                 if target_issue is None:
                     target_issue = str(int(latest_issue) + 1)
+                    logger.info(f'自动推导目标期号: {latest_issue} -> {target_issue}')
+                else:
+                    # 验证传入的 target_issue 与数据库最新期号一致
+                    expected_issue = str(int(latest_issue) + 1)
+                    if target_issue != expected_issue:
+                        logger.warning(f'传入的target_issue({target_issue})与推导值({expected_issue})不一致，使用传入值')
             db.disconnect()
 
         if target_issue is None:
             logger.error('无法确定目标期号，请手动指定')
             return {'success': False, 'error': '无法确定目标期号'}
 
-        pipeline = Pipeline()
+        pipeline = Pipeline(evolution_engine=evolution_engine)
         return pipeline.execute_pipeline(
             target_issue=target_issue, data_limit=data_limit,
             progress_callback=progress_callback,
             include_backtest=include_backtest,
             include_feature_analysis=include_feature_analysis,
+            max_bayes_aux_calls=max_bayes_aux_calls,
+            log_callback=log_callback,
         )
 
     except Exception as e:

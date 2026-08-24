@@ -93,6 +93,14 @@ class RedisKeyManager:
     }
     
     def __init__(self, redis_client):
+        """初始化 Redis 键管理器。
+
+        参数:
+            redis_client: 已建立连接的 Redis 客户端实例
+
+        说明:
+            统一管理 kpluckynumber:pl5:* 键空间的命名与过期策略。
+        """
         self.redis = redis_client
         logger.info('Redis Key管理器初始化完成')
     

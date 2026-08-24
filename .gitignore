@@ -2,6 +2,10 @@
 /logs/
 reports
 .idea
+.pytest_cache/
+.cleanup_trash_*/
+*.bak
+*.bak_*
 api/ai_api.py
 ai_report_generator.py
 modules/ai_analyzer.py
@@ -15,3 +19,4 @@ __pycache__
 .workbuddy
 modules/__pycache__
 data
+maint/

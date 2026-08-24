@@ -1,18 +1,18 @@
 """
-排列5 AI分析模块
+排列5 AI 分析模块
 
-基于 AGNES AI 大语言模型，整合多数据源进行深度分析，
-生成结构化AI分析报告并存储到数据库。
+基于 AGNES 大语言模型，整合多数据源进行分析，
+生成结构化报告并存储到数据库。
 
 核心功能：
-1. 数据源整合 - 读取30期走势图、万位/千位/百位/十位走势图数据
-2. AI模型调用 - 使用 AGNES API 进行深度分析
+1. 数据源整合 - 读取走势图、万位/千位/百位/十位走势图数据
+2. AI 模型调用 - 使用 AGNES API 进行分析
 3. 报告生成 - 生成包含预测结果、置信度、趋势分析的结构化报告
-4. 数据库存储 - 将报告完整存入p5_ai_report表
+4. 数据库存储 - 将报告存入 p5_ai_report 表
 
 参考接口规范：
-- API端点：https://apihub.agnes-ai.com/v1/chat/completions
-- 模型：agnes-2.0-flash
+- API端点：https://api.agnes-ai.cn/v1/chat/completions
+- 模型：agnes-2.5-flash
 - 认证方式：Bearer Token
 """
 
@@ -28,7 +28,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-os.makedirs('logs', exist_ok=True)
+from paths import LOGS_DIR
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 # 日志目录保证：遵循项目约定，将日志写入 logs/ 供集中查看。
 
@@ -36,7 +38,7 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler('logs/ernie_ai_analyzer.log', encoding='utf-8')
+    file_handler = logging.FileHandler(LOGS_DIR + '/ernie_ai_analyzer.log', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -52,6 +54,12 @@ class AIAnalyzer:
     """
 
     def __init__(self):
+        """初始化 AI 分析器，加载接口配置并预置位置名称映射。
+
+        说明:
+            位置中文名与英文键按 万/千/百/十/个 顺序一一对应，
+            供构造提示词与解析模型返回结果时统一使用。
+        """
         self._init_ai_config()
         self.position_names = ['万位', '千位', '百位', '十位', '个位']
         self.position_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
@@ -62,9 +70,9 @@ class AIAnalyzer:
             # 尝试从config.py加载配置（使用模块导入以避免在except路径中出现未定义名警告）
             import config as cfg
             self.api_config = getattr(cfg, 'AGNES_API_CONFIG', {}) or {}
-            self.api_url = self.api_config.get('api_url', "https://apihub.agnes-ai.com/v1/chat/completions")
+            self.api_url = self.api_config.get('api_url', "https://api.agnes-ai.cn/v1/chat/completions")
             self.api_key = self.api_config.get('api_key', '')
-            self.model_name = self.api_config.get('model_name', 'agnes-2.0-flash')
+            self.model_name = self.api_config.get('model_name', 'agnes-2.5-flash')
             self.ai_available = bool(self.api_key)
 
             if self.ai_available:
@@ -78,9 +86,9 @@ class AIAnalyzer:
         except Exception:
             # 如果无法导入config模块，使用空配置继续
             self.api_config = {}
-            self.api_url = "https://apihub.agnes-ai.com/v1/chat/completions"
+            self.api_url = "https://api.agnes-ai.cn/v1/chat/completions"
             self.api_key = ''
-            self.model_name = 'agnes-2.0-flash'
+            self.model_name = 'agnes-2.5-flash'
             self.ai_available = False
             logger.info('未能从config.py加载配置')
 
@@ -91,7 +99,7 @@ class AIAnalyzer:
         调用 AGNES AI 模型
 
         参考接口规范：
-        - POST https://apihub.agnes-ai.com/v1/chat/completions
+        - POST https://api.agnes-ai.cn/v1/chat/completions
         - Content-Type: application/json
         - Authorization: Bearer <token>
 
@@ -204,11 +212,12 @@ class AIAnalyzer:
 
             history_data = db.get_history_data(limit=limit, order_by='issue DESC')
             trend_data = db.get_trend_data(limit=limit)
-            wan_trend_data = db.get_wan_trend_data(limit=limit)
-            qian_trend_data = db.get_qian_trend_data(limit=limit)
-            bai_trend_data = db.get_bai_trend_data(limit=limit)
-            shi_trend_data = db.get_shi_trend_data(limit=limit)
-            ge_trend_data = db.get_ge_trend_data(limit=limit)
+            from modules import database_utils
+            wan_trend_data = database_utils.get_position_trend_data(db.cursor, 'wan', limit=limit)
+            qian_trend_data = database_utils.get_position_trend_data(db.cursor, 'qian', limit=limit)
+            bai_trend_data = database_utils.get_position_trend_data(db.cursor, 'bai', limit=limit)
+            shi_trend_data = database_utils.get_position_trend_data(db.cursor, 'shi', limit=limit)
+            ge_trend_data = database_utils.get_position_trend_data(db.cursor, 'ge', limit=limit)
 
             db.disconnect()
 
@@ -739,7 +748,7 @@ class AIAnalyzer:
         logger.info('步骤5：生成结构化报告...')
         report = self._generate_structured_report(ai_result, data)
 
-        # 6. 保存报告到数据库 (v3.3 起不再写本地 JSON 文件, 统一入库 p5_ai_report)
+        # 6. 保存报告到数据库
         logger.info('步骤6：保存报告到数据库...')
         report_uuid = self._save_report_to_database(report)
 

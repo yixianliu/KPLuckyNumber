@@ -1,12 +1,11 @@
 """
-排列5 AI预测系统 - 在线学习与模型进化引擎
+排列5 在线学习引擎
 
 核心功能：
 1. 自动命中追踪 - 每次开奖后自动对比预测结果与实际结果
 2. 增量学习机制 - 基于新数据动态调整模型权重
 3. 专家表现评估 - 追踪各专家推荐采纳率与命中率
 4. 反例学习 - 分析未命中组合的共同特征，避免重复犯错
-5. 模型版本管理 - 支持A/B测试与模型回滚
 """
 
 import logging
@@ -18,6 +17,36 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+# v3.44 起四步流水线才将 per_algo_top_predictions 落库到
+# p5_ai_report.per_algo_predictions 独立列。此前产生的历史预测该列为 NULL 且
+# 不可回溯补齐，会污染「归因覆盖率」指标。故覆盖率默认仅统计该部署日之后创建的记录。
+ATTRIBUTION_FIX_DEPLOY_DATE = '2026-08-05'
+
+
+def _created_at_ge(created_at: Any, since_str: str) -> bool:
+    """判断预测记录的 created_at 是否 >= since_str (格式 'YYYY-MM-DD')。
+
+    兼容 created_at 为 datetime 或字符串两种返回形态；非预期形态一律视为「不在范围内」。
+    """
+    if created_at is None:
+        return False
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.strptime(created_at[:19], '%Y-%m-%d %H:%M:%S')
+        except Exception:
+            try:
+                created_at = datetime.strptime(created_at[:10], '%Y-%m-%d')
+            except Exception:
+                return False
+    try:
+        since = datetime.strptime(since_str, '%Y-%m-%d')
+    except Exception:
+        return True
+    try:
+        return created_at.date() >= since.date()
+    except Exception:
+        return False
+
 
 class OnlineLearner:
     """
@@ -28,7 +57,7 @@ class OnlineLearner:
     2. 模型增量更新
     3. 专家表现追踪
     4. 反例分析与策略调整
-    5. ★ 多模块联动：与走势图分析、专家文章分析形成自适应智能体系
+    5. 多模块联动：与走势图分析、专家文章分析形成自适应智能体系
     
     新增联动能力：
     - 动态学习实时数据反馈，持续更新分析模型
@@ -37,11 +66,22 @@ class OnlineLearner:
     """
     
     def __init__(self, db, redis_client=None):
+        """初始化在线学习引擎。
+
+        参数:
+            db: 已连接的 P5Database 实例，用于读取验证记录与归因数据
+            redis_client: 可选的 Redis 客户端，用于缓存中间学习状态
+
+        说明:
+            自适应权重管理器的学习率调度参数（衰减率、下限、预热轮数、收敛阈值）
+            统一从 P5PredictorConfig.DEFAULT_CONFIG['global'] 注入，
+            使学习策略可配置、可监控，而非硬编码。
+        """
         self.db = db
         self.redis = redis_client
         # 内置自适应权重管理器：支持 _update_weight_manager 在会话期内直接调用
-        # ★ v3.17: 从 predictor.DEFAULT_CONFIG['global'] 注入学习率调度参数(衰减/下限/预热/收敛),
-        #   使引擎的"学习率/迭代/收敛策略"可配置、可监控, 而非写死。
+        # 从 predictor.DEFAULT_CONFIG['global'] 注入学习率调度参数(衰减/下限/预热/收敛),
+        # 使引擎的"学习率/迭代/收敛策略"可配置、可监控, 而非写死。
         from modules.predictor import AdaptiveWeightManager, P5PredictorConfig
         _g = getattr(P5PredictorConfig, 'DEFAULT_CONFIG', {}).get('global', {})
         self.weight_manager = AdaptiveWeightManager(
@@ -64,7 +104,7 @@ class OnlineLearner:
         该方法被 pipeline 的 _update_weight_manager() 调用，
         使在会话期内也能累积算法命中率用于自适应权重调整。
 
-        ★ v3.14 双信号并存:
+        v3.14 双信号并存:
             - hit_rate: 5 位位置覆盖率(保留旧通道)
             - top1_hit: 5 位最高概率位命中数/5, 即 Top-1 精准度(新通道, 推荐)
 
@@ -122,10 +162,10 @@ class OnlineLearner:
             self._incremental_update_weights(hit_tracking, expert_tracking,
                                              prediction_record, actual_numbers)
             
-            # 5. ★ 联动：更新走势图知识模型
+            # 5. 联动：更新走势图知识模型
             self._update_trend_knowledge_model(target_issue, actual_numbers, hit_tracking)
             
-            # 6. ★ 联动：更新专家文章语义模型
+            # 6. 联动：更新专家文章语义模型
             self._update_expert_semantic_model(prediction_record, actual_numbers, expert_tracking)
             
             # 7. 更新命中率统计表
@@ -145,6 +185,51 @@ class OnlineLearner:
         except Exception as e:
             logger.error(f'追踪预测结果失败: {e}', exc_info=True)
             return {'status': 'error', 'error': str(e)}
+
+    @staticmethod
+    def _load_report_attribution(db, report_uuid: str):
+        """读取一份报告的 per-algo 归因数据（v3.44）。
+
+        存储事实：`insert_ai_report` 把归因写进**独立列** `per_algo_predictions`，
+        而 `report_content` 存的是纯文本推理过程（并非 JSON），因此早期
+        "从 report_content 解析 per_algo_top_predictions" 的做法永远失败，
+        致使「验证→学习」闭环长期空转。
+
+        这里优先读独立列，再回退 report_content 以兼容历史 JSON 格式报告。
+
+        Returns:
+            (per_algo: dict|None, content: dict) —— content 仅在回退命中时非空
+        """
+        import json as _json
+        per_algo, content = None, {}
+
+        # A. 独立列（当前写入路径）
+        try:
+            db.cursor.execute(
+                "SELECT per_algo_predictions FROM p5_ai_report "
+                "WHERE report_uuid=%s LIMIT 1", (report_uuid,))
+            raw = (db.cursor.fetchone() or {}).get('per_algo_predictions')
+            if raw:
+                per_algo = _json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            pass  # 老库可能无此列，静默回退
+
+        # B. 回退 report_content（历史 JSON 格式报告）
+        if not per_algo:
+            try:
+                db.cursor.execute(
+                    "SELECT report_content FROM p5_ai_report "
+                    "WHERE report_uuid=%s LIMIT 1", (report_uuid,))
+                c = (db.cursor.fetchone() or {}).get('report_content')
+                if isinstance(c, str):
+                    c = _json.loads(c)
+                if isinstance(c, dict):
+                    content = c
+                    per_algo = c.get('per_algo_top_predictions')
+            except Exception:
+                pass  # 纯文本 report_content 解析失败属预期
+
+        return per_algo, content
 
     def learn_from_verification(self, db, target_issue: str,
                                 actual_numbers: List[int]) -> Dict[str, Any]:
@@ -176,21 +261,8 @@ class OnlineLearner:
             if not report_uuid:
                 return {'learned': False, 'algos': 0, 'reason': 'no_report_uuid'}
 
-            # 2) 取 AI 报告内容(含 per_algo_top_predictions)
-            db.cursor.execute(
-                "SELECT report_content FROM p5_ai_report WHERE report_uuid=%s LIMIT 1",
-                (report_uuid,))
-            row = db.cursor.fetchone()
-            if not row or not row.get('report_content'):
-                return {'learned': False, 'algos': 0, 'reason': 'no_report_content'}
-            import json as _json
-            content = row['report_content']
-            if isinstance(content, str):
-                try:
-                    content = _json.loads(content)
-                except Exception:
-                    return {'learned': False, 'algos': 0, 'reason': 'report_parse_fail'}
-            per_algo = content.get('per_algo_top_predictions') if isinstance(content, dict) else None
+            # 2) 取 per-algo 归因数据(独立列优先, report_content 仅作历史兼容回退)
+            per_algo, content = self._load_report_attribution(db, report_uuid)
             if not per_algo:
                 return {'learned': False, 'algos': 0, 'reason': 'no_per_algo_data'}
 
@@ -211,47 +283,70 @@ class OnlineLearner:
             return {'learned': False, 'algos': 0, 'reason': f'error:{e}'}
 
     def estimate_attribution_coverage(self, db, days: int = 30,
-                                      limit: int = 20) -> Dict[str, Any]:
+                                      limit: int = 20,
+                                      since_created_at: str = ATTRIBUTION_FIX_DEPLOY_DATE
+                                      ) -> Dict[str, Any]:
         """
         估算「验证→学习」闭环的 per-algo 归因覆盖率(诚实报告用, v3.17)。
 
-        扫描最近已验证预测, 统计其中能取到 per_algo_top_predictions 的比例,
-        让用户看到在线学习是否真的在「按算法归因」学习, 还是因数据缺失而空转。
+        默认仅统计 since_created_at (v3.44 部署日) 之后创建的预测记录,
+        避免 v3.44 修复前产生的大量历史 NULL 归因记录把覆盖率拉到 0%,
+        造成「功能失效」的误判。v3.44 之后新建的预测都会正确落库 per-algo 归因,
+        覆盖率会随新预测被开奖验证后自然回升。
 
         Returns:
-            {'coverage': float|None, 'sampled': int, 'with_attribution': int}
+            {
+                'coverage': float|None,      # 主口径: 仅 v3.44 后记录
+                'sampled': int,              # 主口径采样期数
+                'with_attribution': int,     # 主口径含归因期数
+                'excluded_pre_fix': int,     # 被排除的 v3.44 前记录数(透明披露)
+                'raw_sampled': int,          # 全量(含历史)采样期数
+                'raw_with_attribution': int, # 全量含归因期数
+                'raw_coverage': float|None,  # 全量口径(仅供诚实对照)
+            }
         """
+        _empty = {'coverage': None, 'sampled': 0, 'with_attribution': 0,
+                  'excluded_pre_fix': 0, 'raw_sampled': 0,
+                  'raw_with_attribution': 0, 'raw_coverage': None}
         try:
             if not db or not hasattr(db, 'cursor'):
-                return {'coverage': None, 'sampled': 0, 'with_attribution': 0}
-            verified = db.get_verified_predictions(days=days, limit=limit)
-            if not verified:
-                return {'coverage': None, 'sampled': 0, 'with_attribution': 0}
-            with_attr = 0
-            for v in verified:
+                return _empty
+            # 全量(含历史)用于透明披露与主口径筛选
+            all_verified = db.get_verified_predictions(
+                days=days, limit=max(limit, 200), min_created_at=None)
+            if not all_verified:
+                return _empty
+            with_attr = 0        # 主口径(仅 v3.44 后)含归因数
+            raw_with = 0         # 全量含归因数
+            post_n = 0           # 主口径采样期数
+            for v in all_verified:
                 ru = v.get('report_uuid')
-                if not ru:
-                    continue
-                try:
-                    db.cursor.execute(
-                        "SELECT report_content FROM p5_ai_report WHERE report_uuid=%s LIMIT 1",
-                        (ru,))
-                    r = db.cursor.fetchone()
-                    if r and r.get('report_content'):
-                        import json as _json
-                        c = r['report_content']
-                        if isinstance(c, str):
-                            c = _json.loads(c)
-                        if isinstance(c, dict) and c.get('per_algo_top_predictions'):
+                has = False
+                if ru:
+                    try:
+                        # 与 learn_from_verification 同源取数，确保覆盖率反映真实学习能力
+                        per_algo, _ = self._load_report_attribution(db, ru)
+                        has = bool(per_algo)
+                    except Exception:
+                        has = False
+                if has:
+                    raw_with += 1
+                if _created_at_ge(v.get('created_at'), since_created_at):
+                    post_n += 1
+                    if has:
                             with_attr += 1
-                except Exception:
-                    continue
-            cov = round(with_attr / len(verified), 3)
-            return {'coverage': cov, 'sampled': len(verified),
-                    'with_attribution': with_attr}
+            excluded = len(all_verified) - post_n
+            cov = round(with_attr / post_n, 3) if post_n else None
+            raw_cov = round(raw_with / len(all_verified), 3) if all_verified else None
+            return {'coverage': cov, 'sampled': post_n,
+                    'with_attribution': with_attr,
+                    'excluded_pre_fix': excluded,
+                    'raw_sampled': len(all_verified),
+                    'raw_with_attribution': raw_with,
+                    'raw_coverage': raw_cov}
         except Exception as e:
             logger.warning(f'estimate_attribution_coverage 异常: {e}')
-            return {'coverage': None, 'sampled': 0, 'with_attribution': 0}
+            return _empty
 
     def _calculate_hits(self, prediction_record: Dict, actual_numbers: List[int]) -> Dict[str, Any]:
         """计算基础命中统计"""
@@ -361,7 +456,7 @@ class OnlineLearner:
     def _update_trend_knowledge_model(self, target_issue: str, actual_numbers: List[int],
                                        hit_tracking: Dict):
         """
-        ★ 联动：更新走势图知识模型
+        联动：更新走势图知识模型
         
         利用在线学习的结果，辅助走势图趋势预测分析：
         1. 记录各位置近期命中模式
@@ -419,7 +514,7 @@ class OnlineLearner:
                     ttl_days=90
                 )
             
-            logger.info(f'✓ 走势图知识模型已更新: {target_issue}')
+            logger.info(f' 走势图知识模型已更新: {target_issue}')
             
         except Exception as e:
             logger.warning(f'更新走势图知识模型失败(非致命): {e}')
@@ -428,7 +523,7 @@ class OnlineLearner:
                                        actual_numbers: List[int],
                                        expert_tracking: Dict):
         """
-        ★ 联动：更新专家文章语义模型
+        联动：更新专家文章语义模型
         
         利用在线学习的结果，辅助专家文章语义内容解读：
         1. 记录哪些专家推荐的特征/模式被验证为有效
@@ -491,7 +586,7 @@ class OnlineLearner:
                         ttl_days=30
                     )
             
-            logger.info(f'✓ 专家语义模型已更新 (处理{len(source_tracking)}个专家源)')
+            logger.info(f' 专家语义模型已更新 (处理{len(source_tracking)}个专家源)')
             
         except Exception as e:
             logger.warning(f'更新专家语义模型失败(非致命): {e}')
@@ -572,7 +667,7 @@ class OnlineLearner:
                                      expert_tracking: Dict,
                                      prediction_record: Optional[Dict] = None,
                                      actual_numbers: Optional[List[int]] = None):
-        """增量更新模型权重 —— ★ 2026-07-25 修复(B1): 从"算完即弃"改为真实生效。
+        """增量更新模型权重 —— 2026-07-25 修复(B1): 从"算完即弃"改为真实生效。
 
         历史缺陷: 旧实现调用 _calculate_weight_adjustment 得到一组基于全局 partial_hits
         的魔法数调整量, 却只 logger.info 打印、从不写回任何存储 —— 是彻底的死代码;
@@ -800,7 +895,7 @@ class OnlineLearner:
                 'trend_analysis': self._analyze_trends(recent_issues)
             }
 
-            # ★ 记录本次学习到p5_learning_history
+            # 记录本次学习到p5_learning_history
             # 注意: 必须在 db.disconnect() 之前使用本地刚建立的连接写入
             try:
                 if db.connection:
@@ -890,7 +985,7 @@ class OnlineLearner:
     
     def apply_knowledge_to_trend_prediction(self, trend_scores: Dict[str, Dict]) -> Dict[str, Dict]:
         """
-        ★ 联动：将知识模型应用到走势图预测
+        联动：将知识模型应用到走势图预测
         
         利用在线学习的历史知识，动态调整走势图预测分数。
         
