@@ -38,7 +38,7 @@ from paths import LOGS_DIR
 try:
     from version import APP_VERSION as _APP_VERSION
 except Exception:
-    _APP_VERSION = 'v3.59'
+    _APP_VERSION = 'v3.60'
 
 os.makedirs(LOGS_DIR, exist_ok=True)
 
@@ -817,7 +817,7 @@ class Pipeline:
         
         Args:
             target_issue: 目标期号
-            data_limit: 获取历史数据的期数限制(默认40期,建议30-60期)
+            data_limit: 获取历史数据的期数限制(默认60期,建议30-80期)
             
         Returns:
             {success, report_key, report_data, trend_chart_report, error}
@@ -1746,8 +1746,8 @@ class Pipeline:
                 'recommended_combinations': trend_data.get('recommended_combinations', []),
                 'hot_numbers': trend_data.get('trend_summary', {}).get('hot_numbers_summary', ''),
                 'cold_numbers': trend_data.get('trend_summary', {}).get('cold_numbers_summary', ''),
-                'methodology': '基于最近40期走势图数据，AI分析各位置冷热号、遗漏趋势、奇偶大小比等规律',
-                'data_period': '最近40期历史开奖数据',
+                'methodology': '基于最近60期走势图数据，AI分析各位置冷热号、遗漏趋势、奇偶大小比等规律',
+                'data_period': '最近60期历史开奖数据',
                 'risk_warning': '走势分析基于历史数据，彩票具有随机性，请理性投注'
             }
             
@@ -1899,7 +1899,7 @@ class Pipeline:
     # 步骤4: 最终预测结果生成与入库
     # ================================================================
 
-    def _predict_trend_multi_source(self, target_issue: str, data_period: int = 40,
+    def _predict_trend_multi_source(self, target_issue: str, data_period: int = 60,
                                     fused_probs: Optional[List[Dict[int, float]]] = None) -> Dict[str, Any]:
         """
         多源走势融合预测 (v3.11 深度优化版)
@@ -1923,7 +1923,7 @@ class Pipeline:
                    + 0.05 * 升平降方向 + 0.05 * 和值重心
 
         v3.11 优化重点:
-        - 数据期数: 30期 → 60期 → 120期 → 40期 (用户要求缩减分析窗口, v3.46 起默认40)
+        - 数据期数: 30期 → 60期（v3.60 统一至 60期，与核心预测器 lookback 对齐）
         - Top-4 → Top-5 (覆盖率50%→60%)
         - 权重更均衡，降低单一信号依赖
         - 增加专家软约束融合
@@ -1982,7 +1982,7 @@ class Pipeline:
             _hezhi_recent = []
             try:
                 db.cursor.execute(
-                    'SELECT hezhi FROM p5_hzzst_data ORDER BY issue DESC LIMIT %s', (data_period,))  # 与整体走势窗口一致(默认40期)
+                    'SELECT hezhi FROM p5_hzzst_data ORDER BY issue DESC LIMIT %s', (data_period,))  # 与整体走势窗口一致(默认60期)
                 _hezhi_recent = [int(r['hezhi']) for r in (db.cursor.fetchall() or [])
                                  if r.get('hezhi') is not None]
             except Exception:
@@ -2256,9 +2256,9 @@ class Pipeline:
                             try:
                                 data = json.loads(row['constraint_data'])
                                 all_constraints.append(data)
-                            except:
+                            except (json.JSONDecodeError, TypeError):
                                 pass
-            except:
+            except (sqlite3.Error, Exception):
                 pass
             
             if not all_constraints:
@@ -2288,7 +2288,7 @@ class Pipeline:
             logger.debug(f'专家约束融合失败: {e}')
             return None
 
-    def _get_spj_direction_preference(self, data_period: int = 40, n_dir: int = 10):
+    def _get_spj_direction_preference(self, data_period: int = 60, n_dir: int = 10):
         """
         从 p5_spjzs_data(升平降走势) 派生每个位置的"涨跌方向偏好":
           对每个位置, 比较相邻期数字得到 升(up)/平(flat)/降(down) 序列(最近 n_dir 次变迁),
@@ -2337,7 +2337,7 @@ class Pipeline:
 
     def _build_constrained_combinations(self, prediction: Dict[str, Any],
                                          target_issue: str,
-                                         data_period: int = 40):
+                                         data_period: int = 60):
         """
         用 p5_hzzst_data(和值走势) + p5_spjzs_data(升平降走势) 对多源融合的每位置 Top-4 候选做
         组合级约束与打分:
@@ -2860,7 +2860,7 @@ class Pipeline:
             # 问题2: 多源走势融合预测 —— 结合历史走势图/基础走势图/万千百十个独立走势表
             # 最近30期数据, 用「频率+遗漏+动量」加权融合算法输出每位置 Top-4 推荐。
             # 作为"走势图数据预测结果（实时）"的主预测来源(压缩到4位, 满足问题1)。
-            trend_multi = self._predict_trend_multi_source(target_issue, data_period=40, fused_probs=_fused)
+            trend_multi = self._predict_trend_multi_source(target_issue, data_period=60, fused_probs=_fused)
 
             # 知识模型增强：利用在线学习的历史知识动态调整走势预测分数
             if trend_multi and self.online_learner:
@@ -2872,7 +2872,7 @@ class Pipeline:
 
             # 升平降方向偏好(供最终报告展示, 与组合级约束同源)
             try:
-                spj_pref = self._get_spj_direction_preference(40) or {}
+                spj_pref = self._get_spj_direction_preference(60) or {}
             except Exception:
                 spj_pref = {}
 
@@ -2922,7 +2922,7 @@ class Pipeline:
             if trend_multi and any(prediction.get(p) for p in pos_keys):
                 try:
                     _cc, hezhi_range_str = self._build_constrained_combinations(
-                        prediction, target_issue, data_period=40)
+                        prediction, target_issue, data_period=60)
                     if _cc:
                         recommended_combinations = _cc
                 except Exception as e:
@@ -2987,7 +2987,7 @@ class Pipeline:
                 'spj_direction_preference': spj_pref,
                 'bayesian_cache_used': _cached,
                 'bayesian_dedicated_table': getattr(self, '_bayes_dedicated_used', False),
-                'multi_source_method': '40期全源融合(历史+基础+万千百十个走势+升平降方向+和值重心+贝叶斯后验概率, 频率0.35+遗漏0.25+动量0.15+贝叶斯0.25, 指数衰减加权)',
+                'multi_source_method': '60期全源融合(历史+基础+万千百十个走势+升平降方向+和值重心+贝叶斯后验概率, 频率0.35+遗漏0.25+动量0.15+贝叶斯0.25, 指数衰减加权)',
                 # v3.44 修复: 补入各算法 Top-N 归因数据。此前该键缺失, 导致
                 # _save_final_prediction_to_db 取到 None -> p5_ai_report.per_algo_predictions
                 # 全表为 NULL -> learn_from_verification 恒返回 no_per_algo_data,
@@ -4172,7 +4172,8 @@ class Pipeline:
 
     def _execute_backtest_analysis(self, target_issue: str,
                                   max_bayes_aux_calls: int = 5,
-                                  log_callback: Optional[callable] = None) -> Dict[str, Any]:
+                                  log_callback: Optional[callable] = None,
+                                  cancel_event=None) -> Dict[str, Any]:
         """
         执行历史回测(作为流水线的附加步骤)
 
@@ -4241,7 +4242,8 @@ class Pipeline:
                 start_index=50, test_count=50, use_validation_split=False,
                 eval_mode='recent', enable_ai=False,
                 max_bayes_aux_calls=max_bayes_aux_calls,
-                log_callback=log_callback
+                log_callback=log_callback,
+                cancel_event=cancel_event,
             )
             result['backtest_results'] = backtest_results
             result['stats'] = backtest_results.get('overall_stats', {})
@@ -4553,7 +4555,8 @@ class Pipeline:
             # 拉取历史数据（取最近 data_limit 期: 倒序取最新, 避免取到最旧的 2023 期
             # 导致 _verification_cutoff 落在过去, 贝叶斯退化为纯先验、AI 辅助不触发）
             self.db_client.cursor.execute(
-                f'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT {data_limit}'
+                'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT %s',
+                (data_limit,)
             )
             history_data = self.db_client.cursor.fetchall()
 
@@ -4630,7 +4633,8 @@ class Pipeline:
                          include_feature_analysis: bool = True,
                          max_bayes_aux_calls: int = 5,  # P1: 默认 10→5
                          progress_callback=None,
-                         log_callback: Optional[callable] = None) -> Dict[str, Any]:
+                         log_callback: Optional[callable] = None,
+                         cancel_event=None) -> Dict[str, Any]:
         """
         执行完整的五步流水线分析(增强版)
         
@@ -4646,7 +4650,7 @@ class Pipeline:
         
         Args:
             target_issue: 目标预测期号(如"2026165")
-            data_limit: 获取历史数据的期数限制(默认40期)
+            data_limit: 获取历史数据的期数限制(默认60期)
             verify_with_actual: 是否执行步骤5(权重自适应调整)
             actual_numbers: 实际开奖号码 [wan, qian, bai, shi, ge],需与verify_with_actual配合使用
             include_verification: 是否在流水线中包含预测验证(默认True)
@@ -4687,6 +4691,28 @@ class Pipeline:
         self._emit('data', f'  • 目标期号: {target_issue} | 数据期数: {data_limit}')
         self._emit('data', f'  • 自动预测验证: {"开启" if include_verification else "关闭"} | 在线学习: {"开启" if include_online_learning else "关闭"}')
 
+        # v3.60：取消信号贯穿整个流水线（之前 pipeline 零处 cancel 检查，
+        # 30+ 分钟的回测被取消时仍然跑完，导致 _last_*_final 全空、
+        # 复制按钮兜底链失效）。cancel_event 由调用方（GUI / task_manager）
+        # 传入；为 None 时表示不响应取消（如批处理场景）。
+        self._cancel_event = cancel_event
+        # 内部取消标记：cancel_event 被 set 时由 _check_cancel 写入 True，
+        # 主循环和附加步骤都用 _is_cancelled() 检测，避免散落的 .is_set() 调用。
+        self._cancelled_flag = False
+
+        def _check_cancel(stage_name: str) -> bool:
+            """统一的取消检查入口。返回 True 表示已取消，应中止流水线。"""
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                self._cancelled_flag = True
+                logger.warning(f'流水线在[{stage_name}]检测到取消信号，提前结束')
+                self._emit('warning', f' ⚠ 流水线已被用户取消（{stage_name} 阶段），跳过剩余步骤')
+                return True
+            return False
+
+        # 实例方法存根（让 _execute_backtest_analysis 等子流程能复用同一检查入口）
+        self._check_cancel = _check_cancel
+        self._is_cancelled = lambda: self._cancelled_flag
+
         start_time = time.time()
         pipeline_result = {
             'success': False,
@@ -4707,6 +4733,7 @@ class Pipeline:
             'expert_report': None,  # 已废弃
             'trend_report': None,   # 已废弃
             'error': None,
+            'cancelled': False,     # v3.60：标记流水线是否被取消
             'stages': []
         }
 
@@ -4750,10 +4777,18 @@ class Pipeline:
             pipeline_result['step1_result'] = step1_result
             if step1_result.get('success'):
                 pipeline_result['completed_steps'] += 1
-            
+
             # 存储中间结果供步骤2使用
             self.pipeline_state['stat_prediction'] = step1_result
             self._emit('info', f' 统计预测完成 (耗时{step1_elapsed:.1f}s)')
+
+            # v3.60：步骤1 后取消检查（避免耗时步骤4 被取消后还跑入库）
+            if self._check_cancel('步骤1 后'):
+                pipeline_result['cancelled'] = True
+                pipeline_result['error'] = '用户取消'
+                pipeline_result['total_duration'] = time.time() - start_time
+                self.pipeline_state['completed_at'] = datetime.now()
+                return pipeline_result
 
             # ---- 步骤4 ----
             self._emit_step_progress(4, 4, '最终预测结果生成与入库')
@@ -4791,27 +4826,40 @@ class Pipeline:
             pipeline_result['total_duration'] = time.time() - start_time
             pipeline_result['step2_result'] = step4_result  # 复用step4_result到step2
 
+            # v3.60：步骤4 后取消检查 —— 用户已经拿到最终预测，跳过附加步骤
+            # （验证闭环 / 预测验证 / 在线学习 / 历史回测 / 特征分析）。
+            # 回测默认 50 期，单次可达 17+ 分钟，是取消的主要目标。
+            if self._check_cancel('步骤4 后'):
+                pipeline_result['cancelled'] = True
+                pipeline_result['error'] = '用户取消（最终预测已生成，跳过附加步骤）'
+                self.pipeline_state['completed_at'] = datetime.now()
+                logger.info(
+                    f'流水线被取消但步骤4已成功（final_report 已生成），'
+                    f'耗时 {pipeline_result["total_duration"]:.1f}s')
+                return pipeline_result
+
             # ---- 附加步骤: 验证闭环、预测验证、在线学习、历史回测、特征分析 ----
             logger.info('执行附加分析步骤...')
 
             # 0. 闭合「预测→开奖」验证闭环
             # 先对历史 pending 预测记录执行验证, 让贝叶斯验证学习获得真实反馈,
             # 再生成下一期预测(其注册记录将在未来某次运行被此处闭合)。
-            try:
-                logger.info('执行验证闭环(闭合历史 pending 预测)...')
-                self._ensure_db()
-                closed = self.verify_pending_predictions()
-                pipeline_result['verification_closed'] = closed
-                logger.info(
-                    f'验证闭环: 扫描 {closed.get("total_scanned", 0)} 条, '
-                    f'已验证 {closed.get("verified_count", 0)} 条'
-                )
-                self._emit('info', f' 验证闭环: 本次闭合 {closed.get("verified_count", 0)} 条历史预测')
-            except Exception as e:
-                logger.warning(f'验证闭环执行失败(不影响主流程): {e}')
+            if not self._check_cancel('验证闭环前'):
+                try:
+                    logger.info('执行验证闭环(闭合历史 pending 预测)...')
+                    self._ensure_db()
+                    closed = self.verify_pending_predictions()
+                    pipeline_result['verification_closed'] = closed
+                    logger.info(
+                        f'验证闭环: 扫描 {closed.get("total_scanned", 0)} 条, '
+                        f'已验证 {closed.get("verified_count", 0)} 条'
+                    )
+                    self._emit('info', f' 验证闭环: 本次闭合 {closed.get("verified_count", 0)} 条历史预测')
+                except Exception as e:
+                    logger.warning(f'验证闭环执行失败(不影响主流程): {e}')
 
             # 1. 预测验证(如果有已验证的历史数据)
-            if include_verification:
+            if include_verification and not self._check_cancel('预测验证前'):
                 try:
                     logger.info('执行预测验证...')
                     self._ensure_db()
@@ -4823,7 +4871,7 @@ class Pipeline:
                     logger.warning(f'预测验证执行失败(不影响主流程): {e}')
 
             # 2. 在线学习(如果有验证结果)
-            if include_online_learning:
+            if include_online_learning and not self._check_cancel('在线学习前'):
                 try:
                     logger.info('执行在线学习...')
                     learning_result = self._execute_online_learning(target_issue)
@@ -4833,14 +4881,15 @@ class Pipeline:
                 except Exception as e:
                     logger.warning(f'在线学习执行失败(不影响主流程): {e}')
 
-            # 3. 历史回测(可选)
-            if include_backtest:
+            # 3. 历史回测(可选) —— 这是取消的主目标，单独检查一次。
+            if include_backtest and not self._check_cancel('历史回测前'):
                 try:
                     logger.info('执行历史回测...')
                     self._ensure_db()
+                    # v3.60：透传 cancel_event 到回测器，让回测内部循环也能响应取消。
                     backtest_result = self._execute_backtest_analysis(
                         target_issue, max_bayes_aux_calls=max_bayes_aux_calls,
-                        log_callback=log_callback)
+                        log_callback=log_callback, cancel_event=cancel_event)
                     pipeline_result['backtest_result'] = backtest_result
                     logger.info(f'历史回测完成: {"成功" if backtest_result.get("success") else "失败"}')
                     self._emit_extra_summary('backtest', backtest_result)
@@ -4848,7 +4897,7 @@ class Pipeline:
                     logger.warning(f'历史回测执行失败(不影响主流程): {e}')
 
             # 4. 特征分析(可选)
-            if include_feature_analysis:
+            if include_feature_analysis and not self._check_cancel('特征分析前'):
                 try:
                     logger.info('执行特征分析...')
                     self._ensure_db()
@@ -4924,7 +4973,8 @@ def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int =
                           include_feature_analysis: bool = True,
                           max_bayes_aux_calls: int = 5,
                           log_callback: Optional[callable] = None,
-                          evolution_engine=None) -> Dict[str, Any]:
+                          evolution_engine=None,
+                          cancel_event=None) -> Dict[str, Any]:
     """
     便捷函数：执行四步流水线分析
 
@@ -4971,6 +5021,7 @@ def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int =
             include_feature_analysis=include_feature_analysis,
             max_bayes_aux_calls=max_bayes_aux_calls,
             log_callback=log_callback,
+            cancel_event=cancel_event,
         )
 
     except Exception as e:
@@ -5001,5 +5052,5 @@ if __name__ == '__main__':
     print('=' * 80)
     print('四步流水线分析模块测试')
     print('=' * 80)
-    result = run_four_step_pipeline(target_issue='2026165', data_limit=40)
+    result = run_four_step_pipeline(target_issue='2026165', data_limit=60)
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

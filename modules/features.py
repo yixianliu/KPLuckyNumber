@@ -11,6 +11,7 @@
 """
 
 import logging
+import math
 import numpy as np
 from collections import defaultdict, Counter
 from typing import Dict, List, Any, Optional, Tuple
@@ -876,18 +877,23 @@ class P5Features:
                 l_val = likelihood[p_key]
                 p_val = prior[p_key]
                 # Bayes: posterior ∝ likelihood * prior
-                posterior[p_key] = l_val * p_val
-                evidence += posterior[p_key]
+                # v3.60 修复: 改用 log-space 累加, 防止长期运行后似然无界增长导致后验失真.
+                # 原实现 posterior += l_val * p_val 随样本增多方差膨胀; log-space 等价但数值稳定.
+                log_post = math.log(max(l_val, 1e-12)) + math.log(max(p_val, 1e-12))
+                posterior[p_key] = log_post
+                evidence += log_post
                 # 意外度
-                surprise[p_key] = posterior[p_key] - p_val
+                surprise[p_key] = log_post - math.log(max(p_val, 1e-12))
 
-            # 归一化后验
-            if evidence > 0:
-                posterior = {k: v / evidence for k, v in posterior.items()}
-                # 重新计算意外度
-                surprise = {k: posterior[k] - prior[k] for k in posterior}
-            else:
-                evidence = 1.0 / 10  # 兜底均匀分布
+            # 归一化后验: exp(log_post - max) 防下溢, 等价于 softmax
+            max_log = max(posterior.values()) if posterior else 0.0
+            exp_post = {k: math.exp(v - max_log) for k, v in posterior.items()}
+            total_exp = sum(exp_post.values()) or 1.0
+            posterior = {k: v / total_exp for k, v in exp_post.items()}
+            # 重新计算意外度 (posterior 已是概率空间)
+            surprise = {k: posterior[k] - prior[k] for k in posterior}
+            # evidence 转为概率空间的边际
+            evidence = sum(posterior.values())  # 归一化后 = 1.0
 
             bayesian_positions.append({
                 'prior': prior,

@@ -23,15 +23,17 @@ ml_predictor.py - 多源数据监督学习预测器（排列5）
 
 约束
 ----
-- 懒加载：sklearn 与数据库连接均在方法内按需导入，避免污染启动路径。
-- 优雅降级：若运行环境无 sklearn 或 DB 不可用，``predict_next`` 返回 ``None``，
-  调用方（predictor）将跳过本算法，不影响其它信号与返回契约。
+- 纯 numpy 实现：无需 sklearn，任何 Python 环境均可运行。
+- 数据库懒加载：DB 连接在方法内按需建立，失败时自动降级为仅用历史序列特征。
+- 串行训练：避免 Windows daemon 进程嵌套限制，5 位依次训练。
 - 返回契约：``predict_next`` 返回 ``List[Dict[int, float]]``（长度=5 个位置，
   每位为 {0..9: 概率} 且和为 1），与 predictor 的算法输出格式一致。
 
-注意：sklearn 仅存在于 GUI 运行环境（Anaconda），托管 python 不含。
+注意：本模块已改为纯 numpy 实现，不再依赖 sklearn，任何 Python 环境均可运行。
 """
 from typing import Optional, List, Dict, Any, Tuple
+import numpy as np
+import traceback
 
 logger = None  # 延迟初始化，避免循环导入
 
@@ -46,6 +48,7 @@ def _get_logger():
 
 POS = ['wan', 'qian', 'bai', 'shi', 'ge']
 NUM = list(range(10))
+ML_MIN_SAMPLES = 160  # GBRT 有效训练所需最少期数（warmup 60 + 特征样本 100）
 
 
 # ----------------------------------------------------------------------------
@@ -73,6 +76,31 @@ def _connect_db():
         return None
 
 
+def _load_full_history(conn) -> List[Dict]:
+    """
+    从数据库加载 p5_history_data 全量有效记录（按 issue 正序）。
+    用于调用方传入数据不足时的补全回退。
+
+    Args:
+        conn: 已建立的数据库连接。
+
+    Returns:
+        按 issue 正序排列的历史记录列表，每项含 issue + numbers 字段；
+        连接无效时返回空列表。
+    """
+    if conn is None:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute('SELECT issue, wan, qian, bai, shi, ge, hezhi FROM p5_history_data WHERE is_valid = 1 ORDER BY issue ASC')
+        rows = cur.fetchall()
+        return [{'issue': str(r[0]), 'numbers': [int(r[1]), int(r[2]), int(r[3]), int(r[4]), int(r[5])],
+                 'hezhi': int(r[6]) if r[6] is not None else None} for r in rows]
+    except Exception as e:
+        _get_logger().warning('[ml_predictor] 加载全量历史失败: %s', e)
+        return []
+
+
 # ----------------------------------------------------------------------------
 # 辅助：从 sorted_data 解析序列
 # ----------------------------------------------------------------------------
@@ -90,14 +118,23 @@ def _parse_history(sorted_data: List[Dict]) -> Tuple[List[str], Dict[str, List[i
     for row in sorted_data:
         num = row.get('numbers')
         if not isinstance(num, (list, tuple)) or len(num) != 5:
+            # 兼容数据库拆分行格式（wan/qian/bai/shi/ge 五列）
+            if all(k in row for k in ('wan', 'qian', 'bai', 'shi', 'ge')):
+                num = [row['wan'], row['qian'], row['bai'], row['shi'], row['ge']]
+            else:
+                continue
+        try:
+            num = [int(x) for x in num]
+        except (TypeError, ValueError):
             continue
         issue = str(row.get('issue', ''))
         if not issue:
             continue
         issues.append(issue)
         for i, p in enumerate(POS):
-            digits[p].append(int(num[i]))
-        hezhi.append(sum(int(x) for x in num))
+            digits[p].append(num[i])
+        hz_val = row.get('hezhi')
+        hezhi.append(int(hz_val) if hz_val is not None else sum(num))
     return issues, digits, hezhi
 
 
@@ -122,7 +159,6 @@ def _build_feature(p: str, i: int, issues: List[str], digits: Dict[str, List[int
         10) 和值表        miss_hezhiwei(10)        -> 10       （来自 p5_hzzst_data）
     合计 ~98 维（部分源缺失时自动缩减，不影响训练）。
     """
-    import numpy as np
     if i < 60:
         return None
     y = digits[p]
@@ -289,23 +325,53 @@ def _load_hz(conn) -> Dict[str, List]:
 def predict_next(sorted_data: List[Dict], target_issue: Optional[str] = None,
                  progress_callback=None) -> Optional[List[Dict[int, float]]]:
     """
-    训练并按位预测下一期各位数字的概率分布。
+    按位训练 GBRT（梯度提升回归树，纯 numpy 实现），预测下一期各位数字的概率分布。
+
+    设计要点：
+      - 仅用 issue i 之前（<= i）的可观测数据构造特征，严禁前视泄漏。
+      - 每位置独立训练一个 One-vs-Rest GBDT，输出 softmax 概率向量。
+      - 纯 numpy 实现，无需 sklearn，任何 Python 环境均可运行。
+      - 串行训练 5 位，异常时自动降级为均匀分布。
+      - 诚实声明：公平摇号下该模型期望命中率 = 随机基线（Top-1 ≈ 10%）。
 
     Args:
-        sorted_data: 按 issue 正序排列的历史数据（predictor 已归一化为 numbers 格式）。
-        target_issue: 被预测期号（用于日志；本模块以「最新一期 +1」为预测目标，
-                      由特征构造自然落在最后一段可得数据之后）。
+        sorted_data: 按 issue 正序排列的历史数据。
+        target_issue: 目标期号（用于日志）。
         progress_callback: 进度回调（可选）。
 
     Returns:
-        ``List[Dict[int, float]]``（5 个位置，每位 {0..9: 概率} 且和为 1）；
-        若数据不足，返回 None。
+        List[Dict[int, float]]（5 个位置，每位 {0..9: 概率} 且和为 1）；
+        若数据不足或训练失败，返回 None。
     """
-    import numpy as np
     issues, digits, hezhi = _parse_history(sorted_data)
+    _get_logger().info('[ml_predictor] _parse_history 返回: issues=%d, digits 类型=%s, hezhi=%d',
+                       len(issues), type(digits).__name__, len(hezhi))
+    if not isinstance(digits, dict):
+        _get_logger().error('[ml_predictor] digits 不是字典！类型=%s, 值=%s', type(digits).__name__, digits)
+        return None
     n = len(issues)
-    if n < 60:  # 至少需要足够样本
-        _get_logger().warning('[ml_predictor] 历史样本不足(%d)，跳过。', n)
+    if n < ML_MIN_SAMPLES:
+        # 调用方传入数据不足（如 pipeline 默认 data_limit=60），自动从数据库补全全量历史
+        _get_logger().info(
+            '[ml_predictor] 传入样本 %d 期不足 %d 期，尝试从数据库补全全量历史...', n, ML_MIN_SAMPLES)
+        conn_full = _connect_db()
+        if conn_full is not None:
+            try:
+                full_data = _load_full_history(conn_full)
+                if full_data and len(full_data) >= ML_MIN_SAMPLES:
+                    _get_logger().info(
+                        '[ml_predictor] 数据库补全成功: %d 期，重新解析...', len(full_data))
+                    issues, digits, hezhi = _parse_history(full_data)
+                    n = len(issues)
+            except Exception as e:
+                _get_logger().warning('[ml_predictor] 数据库补全失败: %s', e)
+            finally:
+                try:
+                    conn_full.close()
+                except Exception:
+                    pass
+    if n < ML_MIN_SAMPLES:
+        _get_logger().warning('[ml_predictor] 历史样本不足(%d < %d)，跳过。', n, ML_MIN_SAMPLES)
         return None
 
     conn = _connect_db()
@@ -318,35 +384,234 @@ def predict_next(sorted_data: List[Dict], target_issue: Optional[str] = None,
         except Exception:
             pass
 
-    # 加权滑动频率模型：多窗口频率加权融合（与统计预测同质，但融合更多特征维度）
     result: List[Dict[int, float]] = []
+    DEFAULT_DIST = {d: 0.1 for d in NUM}
+
+    # ---- 纯 numpy GBRT 路径（无 sklearn 依赖，串行训练避免 Windows daemon 限制）----
     for p_idx, p in enumerate(POS):
-        y = digits[p]
-        counts = np.zeros(10, dtype=float)
-        total = 0.0
-        # 多窗口加权（近窗权重更高）
-        for w, weight in [(20, 3.0), (40, 2.0), (60, 1.0)]:
-            win = y[max(0, n - w):]
-            for v in win:
-                counts[v] += weight
-            total += weight * len(win)
-        # 特征修正：遗漏偏置（近20期未出现则小幅降低权重）
-        miss_vec = pos_trend.get(p, {}).get(str(issues[-1])) if pos_trend and issues else None
-        if miss_vec:
-            om = miss_vec.get('omission', 0)
-            if isinstance(om, (int, float)) and om > 20:
-                counts[int(issues[-1][-1] if issues else 5)] *= 0.5
-        # 归一化为概率
-        s = counts.sum()
-        if s > 0:
-            dist = {d: float(counts[d] / s) for d in NUM}
-        else:
-            dist = {d: 0.1 for d in NUM}
-        result.append(dist)
-        if progress_callback:
-            progress_callback(1, f'监督模型[{p}]完成')
+        try:
+            _get_logger().debug('[ml_predictor] 开始训练 %s 位，digits 长度=%d, n=%d', p, len(digits[p]), n)
+            dist = _train_gbml_model(p, issues, digits, hezhi, pos_trend, spj, hz, n)
+            if dist is not None:
+                result.append(dist)
+                if progress_callback:
+                    progress_callback(1, f'监督模型[{p}]完成（GBRT-numpy）')
+            else:
+                result.append(DEFAULT_DIST)
+                _get_logger().warning('[ml_predictor] %s 位 GBRT 训练失败，回退均匀分布。', p)
+        except Exception as e:
+            result.append(DEFAULT_DIST)
+            _get_logger().error('[ml_predictor] %s 位训练异常: %s\n%s', p, e, traceback.format_exc())
 
     _get_logger().info('[ml_predictor] 多源监督模型预测完成（目标期 %s）。', target_issue)
+    return result if result else None
+
+
+def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
+                      hezhi: List[int], pos_trend: Dict, spj: Dict, hz: Dict,
+                      n: int, progress_callback=None) -> Optional[Dict[int, float]]:
+    """
+    对指定位置用纯 numpy 实现 GBRT（梯度提升回归树），输出预测概率向量。
+
+    方法：
+      - 特征向量 ~98 维（由 _build_feature 构造）。
+      - One-vs-Rest 策略：对每个数字类训练一个 GBDT 二分类器。
+      - 每棵树为简单深度3决策树（手工实现节点分裂）。
+      - 最终概率 = softmax(各classifier的预测值)。
+
+    Returns:
+        {0: prob, 1: prob, ..., 9: prob} 归一化概率分布，或 None（训练失败）。
+    """
+    y_seq = digits[p]
+    _get_logger().info('[ml_predictor] %s 位: y_seq 类型=%s, 长度=%d, 前5项=%s',
+                       p, type(y_seq).__name__, len(y_seq), y_seq[:5] if y_seq else '空')
+    X, y_labels = [], []
+
+    for i in range(60, n):  # 从第60期开始（特征需60期历史）
+        feat = _build_feature(p, i, issues, digits, hezhi, pos_trend, spj, hz)
+        if feat is not None:
+            X.append(feat)
+            try:
+                label = y_seq[i]
+                # v3.57：循环逐样本 INFO → DEBUG，避免 ML 训练时刷屏几百行日志，
+                # 进而触发 RotatingFileHandler 频繁 rollover（多线程并发 rollover 在
+                # Windows 下会报 WinError 32）。仅在调试时开启。
+                _get_logger().debug('[ml_predictor] i=%d, label=%s (type=%s)', i, label, type(label).__name__)
+                y_labels.append(label)
+            except Exception as e2:
+                _get_logger().error('[ml_predictor] y_seq[%d] 索引失败: %s, y_seq 类型=%s, len=%d',
+                                   i, e2, type(y_seq).__name__, len(y_seq))
+                raise
+
+    if len(X) < 100:
+        _get_logger().warning(
+            '[ml_predictor] %s 位: 有效特征样本不足(len X=%d, n=%d)，回退均匀分布。',
+            p, len(X), n)
+        return None  # 样本不足
+
+    X = np.array(X, dtype=float)
+    y = np.array(y_labels, dtype=int)
+    n_samples, n_features = X.shape
+
+    # One-vs-Rest：对每个数字类训练 GBDT 二分类器
+    n_classes = 10
+    n_estimators = 30   # 树的数量
+    learning_rate = 0.1
+    max_depth = 3
+    final_scores = np.zeros(n_classes)
+
+    for c in range(n_classes):
+        y_bin = (y == c).astype(float)
+        if y_bin.sum() < 5:
+            continue  # 该类样本太少，保持 score=0
+        try:
+            score = _gbrt_predict(X, y_bin, n_estimators, learning_rate, max_depth, n_samples)
+            final_scores[c] = score
+        except Exception as ex:
+            _get_logger().warning('[ml_predictor] %s 位 数字%d GBRT训练异常: %s', p, c, ex)
+            pass  # 保持 score=0
+
+    # softmax 归一化
+    exp_vals = np.exp(final_scores - np.max(final_scores))
+    probs = exp_vals / exp_vals.sum()
+
+    return {d: float(probs[d]) for d in NUM}
+
+
+# ----------------------------------------------------------------------------
+# 纯 numpy GBDT 实现（无 sklearn 依赖）
+# ----------------------------------------------------------------------------
+def _gbrt_predict(X: np.ndarray, y: np.ndarray,
+                  n_estimators: int, learning_rate: float,
+                  max_depth: int, n_samples: int) -> float:
+    """
+    手工实现 GBDT 二分类器，返回最后一个样本的预测值（log-odds 空间）。
+
+    算法：负梯度下降 + 回归树拟合残差
+      - 初始预测：log(p/(1-p))，p = mean(y)
+      - 每轮：计算负梯度（残差）→ 用决策树拟合 → 更新预测值
+      - 最终预测值 = 初始值 + learning_rate * 所有树的预测之和
+
+    Args:
+        X: (n_samples, n_features) 特征矩阵
+        y: (n_samples,) 二分类标签（0/1 float）
+        n_estimators: 树的数量
+        learning_rate: 学习率（步长）
+        max_depth: 树的最大深度
+        n_samples: 样本数（用于初始预测）
+
+    Returns:
+        最后一个样本的预测值（标量）
+    """
+    eps = 1e-12
+
+    # 初始预测：log-odds
+    p0 = np.clip(y.mean(), eps, 1 - eps)
+    F = np.full(n_samples, np.log(p0 / (1 - p0)))
+
+    for _ in range(n_estimators):
+        # 负梯度（伪残差）：y - sigmoid(F)
+        sigmoid_F = 1.0 / (1.0 + np.exp(-np.clip(F, -500, 500)))
+        residuals = y - sigmoid_F
+
+        # 用决策树拟合残差
+        tree = _build_tree(X, residuals, depth=0, max_depth=max_depth)
+        tree_pred = _tree_predict(X, tree)
+
+        # 更新预测值
+        F = F + learning_rate * tree_pred
+
+    # 返回最后一个样本的预测值
+    return float(F[-1])
+
+
+def _build_tree(X: np.ndarray, y: np.ndarray,
+                depth: int, max_depth: int) -> dict:
+    """
+    手工构建回归树（CART），使用方差最小化分裂。
+
+    Returns:
+        树节点字典：{'leaf': value} 或 {'feature': f, 'threshold': t, 'left': ..., 'right': ...}
+    """
+    n = len(y)
+    if n < 2:
+        return {'leaf': float(y[0]) if n == 1 else 0.0}
+
+    if depth >= max_depth or n <= 4:
+        return {'leaf': float(y.mean())}
+
+    best_gain = -1.0
+    best_feature = 0
+    best_threshold = 0.0
+    total_var = np.var(y) * n
+
+    # 采样特征子集（约一半特征，加速训练）
+    n_feat = X.shape[1]
+    feat_indices = np.random.choice(n_feat, size=min(n_feat, max(8, n_feat // 2)), replace=False)
+
+    for f in feat_indices:
+        col = X[:, f]
+        # 对特征值排序后取中点作为候选阈值
+        sorted_idx = np.argsort(col)
+        sorted_col = col[sorted_idx]
+        sorted_y = y[sorted_idx]
+
+        # 跳过相同特征值的边界
+        unique_vals = np.unique(sorted_col)
+        if len(unique_vals) <= 1:
+            continue
+
+        # 取均匀采样的候选阈值（最多20个）
+        if len(unique_vals) > 20:
+            thresholds = np.percentile(sorted_col, np.linspace(10, 90, 20))
+        else:
+            thresholds = (unique_vals[:-1] + unique_vals[1:]) / 2.0
+
+        for t in thresholds:
+            left_mask = col <= t
+            right_mask = ~left_mask
+            n_left = left_mask.sum()
+            n_right = right_mask.sum()
+            if n_left < 2 or n_right < 2:
+                continue
+
+            left_var = np.var(y[left_mask]) * n_left
+            right_var = np.var(y[right_mask]) * n_right
+            gain = total_var - left_var - right_var
+
+            if gain > best_gain:
+                best_gain = gain
+                best_feature = f
+                best_threshold = t
+
+    if best_gain <= 0:
+        return {'leaf': float(y.mean())}
+
+    left_mask = X[:, best_feature] <= best_threshold
+    right_mask = ~left_mask
+
+    return {
+        'feature': int(best_feature),
+        'threshold': float(best_threshold),
+        'left': _build_tree(X[left_mask], y[left_mask], depth + 1, max_depth),
+        'right': _build_tree(X[right_mask], y[right_mask], depth + 1, max_depth),
+    }
+
+
+def _tree_predict(X: np.ndarray, tree: dict) -> np.ndarray:
+    """用训练好的树对 X 所有样本进行预测。"""
+    if 'leaf' in tree:
+        return np.full(X.shape[0], tree['leaf'])
+
+    feature = tree['feature']
+    threshold = tree['threshold']
+    left = tree['left']
+    right = tree['right']
+
+    result = np.zeros(X.shape[0])
+    left_mask = X[:, feature] <= threshold
+    result[left_mask] = _tree_predict(X[left_mask], left)
+    result[~left_mask] = _tree_predict(X[~left_mask], right)
     return result
 
 

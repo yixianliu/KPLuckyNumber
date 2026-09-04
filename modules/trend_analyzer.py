@@ -332,7 +332,7 @@ class TrendAnalyzer:
             'honest_disclaimer': HONEST_DISCLAIMER,
         }
 
-    def predict(self, target_issue: str = '', period: int = 40) -> Dict[str, Any]:
+    def predict(self, target_issue: str = '', period: int = 60) -> Dict[str, Any]:
         """输出各位置 Top-3 + 相对热度 + 信号源分解 + 诊断 + 诚实免责
 
         内部 = load_trend_data + predict_with_data; 回测场景请直接调
@@ -358,7 +358,7 @@ def _cli():
 
     parser = argparse.ArgumentParser(description='走势图分析预测引擎 (v3.15 增量, 诚实口径)')
     parser.add_argument('--issue', default='', help='目标期号(仅标注, 不影响数据加载)')
-    parser.add_argument('--period', type=int, default=40, help='使用历史期数 (默认40)')
+    parser.add_argument('--period', type=int, default=60, help='使用历史期数 (默认60)')
     parser.add_argument('--adapt', action='store_true', help='启用信号源自适应(实验性, 默认关闭)')
     args = parser.parse_args()
 

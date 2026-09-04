@@ -30,6 +30,10 @@ def _get_position_info(position: str) -> Tuple[str, str]:
 
     Returns:
         (table_name, number_field)
+
+    安全性：
+        表名和字段名均通过白名单严格校验，杜绝SQL注入风险。
+        即使position被篡改，也会因不在白名单内而抛出 ValueError。
     """
     position = position.lower()
     table_map = {
@@ -39,9 +43,17 @@ def _get_position_info(position: str) -> Tuple[str, str]:
         'shi': ('p5_shi_trend_data', 'shi_number'),
         'ge': ('p5_ge_trend_data', 'ge_number'),
     }
+    # 严格白名单校验，防止SQL注入
     if position not in table_map:
         raise ValueError(f"不支持的位置: {position}，支持: {list(table_map.keys())}")
-    return table_map[position]
+    table, field = table_map[position]
+    # 二次校验：确保返回值本身合法（仅包含字母、数字、下划线）
+    import re
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table):
+        raise ValueError(f"非法表名: {table}")
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', field):
+        raise ValueError(f"非法字段名: {field}")
+    return table, field
 
 
 def insert_position_trend_data(cursor, position: str, data: List[Dict[str, Any]]) -> Tuple[int, int]:

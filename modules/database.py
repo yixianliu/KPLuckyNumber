@@ -177,12 +177,19 @@ def _init_pool():
             return None
 
 
-def _get_pooled_connection():
-    """从连接池获取连接（每线程缓存一条）"""
+def _get_pooled_connection(max_retries: int = 3):
+    """从连接池获取连接（每线程缓存一条）
+
+    参数:
+        max_retries: 最大重试次数，防止连接失败时无限递归导致栈溢出
+
+    返回:
+        pymysql.Connection 实例或 None
+    """
     pool = _init_pool()
     if pool is None:
         return None
-    
+
     # 使用 thread-local 存储，避免多线程共享同一连接
     if not hasattr(_thread_connections, 'conn') or _thread_connections.conn is None:
         try:
@@ -191,7 +198,7 @@ def _get_pooled_connection():
         except Exception as e:
             logger.error(f'从连接池获取连接失败: {e}')
             return None
-    
+
     # 验证连接是否有效
     try:
         _thread_connections.conn.ping(reconnect=True)
@@ -200,11 +207,14 @@ def _get_pooled_connection():
         try:
             if _thread_connections.conn:
                 _thread_connections.conn.close()
-        except:
+        except Exception:  # noqa: BLE001
             pass
         _thread_connections.conn = None
-        return _get_pooled_connection()
-    
+        # 限制递归深度，防止栈溢出
+        if max_retries > 0:
+            return _get_pooled_connection(max_retries - 1)
+        return None
+
     return _thread_connections.conn
 
 
@@ -289,7 +299,7 @@ class P5Database:
                 elif hasattr(self.connection, 'open'):
                     if self.connection.open:
                         return True
-            except:
+            except Exception:  # noqa: BLE001
                 pass
             # 如果检查连接状态时出错，视为连接失效，继续重新连接
             self.connection = None
@@ -433,7 +443,7 @@ class P5Database:
         """析构函数：确保连接被正确释放"""
         try:
             self.disconnect()
-        except:
+        except Exception:  # noqa: BLE001
             pass
     
     def execute_with_reconnect(self, query, params=None):
@@ -478,7 +488,7 @@ class P5Database:
                 if self.cursor:
                     try:
                         self.cursor.close()
-                    except:
+                    except Exception:  # noqa: BLE001
                         pass
                 
                 # 重新连接（连接池模式会自动从池获取新连接）
@@ -3307,7 +3317,7 @@ class P5Database:
             if schemes_json:
                 try:
                     record['schemes'] = json.loads(schemes_json)
-                except:
+                except (json.JSONDecodeError, TypeError):
                     record['schemes'] = []
             else:
                 record['schemes'] = []

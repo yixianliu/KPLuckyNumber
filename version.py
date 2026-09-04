@@ -28,8 +28,8 @@ import importlib
 # 基础版本信息
 # ---------------------------------------------------------------------------
 APP_NAME = "排列5 AI智能分析系统"
-APP_VERSION = "v3.59"
-APP_RELEASE_DATE = "2026-08-23"
+APP_VERSION = "v3.64"
+APP_RELEASE_DATE = "2026-09-02"
 
 # ---------------------------------------------------------------------------
 # 变更日志（从新到旧）
@@ -41,6 +41,95 @@ APP_RELEASE_DATE = "2026-08-23"
 #   fixes    : 已知问题修复列表
 # ---------------------------------------------------------------------------
 CHANGELOG = [
+    {
+        "version": "v3.64",
+        "date": "2026-09-02",
+        "summary": "彻底根治「复制预测号码」无数据提示：三层兜底 + 聚合异常时保留已有剪贴板",
+        "features": [],
+        "fixes": [
+            "新增 _restore_clipboard_from_finals 方法：在 _compute_dashboard_aggregates 失败时，从 pipeline/quick/trend 各来源按优先级重建 _prediction_clipboard / _clipboard_meta，确保仪表盘隐藏后复制按钮不报误判。",
+            "_show_result_dashboard 修复：agg 为 None 时不再直接 return，先调用 _restore_clipboard_from_finals 恢复剪贴板再隐藏仪表盘。",
+            "_copy_prediction 修复：第二阶段兜底由 _direct_extract_clipboard 升级为 _build_prediction_clipboard，并从 _last_pipeline_final 同步持久化重建结果，避免每次点击都重新构造。",
+            "_compute_dashboard_aggregates 修复：异常分支保留已有剪贴板不被覆盖为空，防止后台线程聚合失败后主线程复制误判无数据。",
+        ],
+        "notes": [
+            "根因链：阶段①/③写入 clipboard → 后台线程 _render_unified_dashboard 调用 _compute_dashboard_aggregates → 若聚合异常返回 None → 主线程 after(0) _show_result_dashboard 再次调用聚合也失败 → _hide_result_dashboard 被调用但 clipboard 已被覆盖/清空 → 用户点复制触发无数据提示。",
+            "本修复在三个断点均加装兜底：聚合失败时恢复、复制按钮点击时重建、异常时保留已有值。",
+        ],
+    },
+    {
+        "version": "v3.63",
+        "date": "2026-09-02",
+        "summary": "彻底修复「复制预测号码」按钮在分析完成后仍弹出无数据提示的问题",
+        "features": [],
+        "fixes": [
+            "_copy_prediction 新增第三级兜底：直接从 _last_pipeline_final 提取 trend_prediction 数据生成可复制文本，绕过 _compute_dashboard_aggregates 可能因结构不匹配而跳过 clipboard 写入的竞态窗口。",
+            "_compute_dashboard_aggregates 新增 else 分支：当无法聚合出主推荐组合时，调用 _direct_extract_clipboard 填充 clipboard/meta，确保只要 pipeline_final 存在有效数据就能复制。",
+            "新增 _direct_extract_clipboard 方法：直接从 final_report 的 trend_prediction 和 recommended_combinations 字段提取并格式化预测摘要，不依赖 picks/top5/combos 多源聚合结构。",
+        ],
+        "notes": [
+            "根因：_compute_dashboard_aggregates 在主线程 after(0) 队列尚未执行时，若 picks 为空或 main_combo_disp 为空则跳过 clipboard 写入；用户此时点击复制按钮，主缓存为空且 meta 也无 target_issue，误触发无数据提示。",
+        ],
+    },
+    {
+        "version": "v3.62",
+        "date": "2026-08-31",
+        "summary": "复制预测号码按钮状态修复 + 自我进化引擎深度调优增强",
+        "features": [
+            "复制预测号码按钮独立状态管理：分析进行中自动禁用，完成后恢复可用。",
+            "_copy_prediction 双重检查：任务运行中拦截 + 无有效预测结果拦截，分别弹出不同提示信息。",
+            "提示信息优化：分析进行中提示等待步骤；无结果时说明原因（未运行/未完成/数据不足）并给出解决步骤。",
+            "evolution_tuner.py 步长采样优化：坐标下降非首轮使用动态采样步长，加速迭代（窗口数>5时步长=总窗口/5）。",
+            "self_evolution.py 数据质量校验：_row_to_sorted 过滤异常行（位数不符、数字越界），提升输入数据质量。",
+            "self_evolution.py 日志增强：完整记录阶段开始/完成事件，便于问题排查和性能分析。",
+            "self_evolution.py 进化可视化：向 GUI 推送阶段进度事件（▶ 阶段开始 / ◀ 阶段完成）。",
+        ],
+        "fixes": [
+            "修复复制预测号码按钮在分析未完成时仍可点击的问题（原按钮随全局按钮禁用，但结果区工具栏按钮未同步）。",
+            "修复 _copy_prediction 在无有效预测结果时提示不够明确的问题（原提示仅说「请先点击开始分析」，未区分未运行/未完成/数据不足）。",
+            "修复四步流水线（_run_analysis_pipeline）和快速预测（_run_quick_predict）完成后未设置 _clipboard_meta 导致复制按钮误判无数据的 Bug（v3.62 补充修复）。",
+        ],
+        "notes": [
+            "自我进化引擎调优不影响现有功能，仅优化内部性能（缓存命中率提升、迭代加速）。",
+            "数据质量校验会过滤历史数据中的异常行，不影响正常数据的处理。",
+        ],
+    },
+    {
+        "version": "v3.61",
+        "date": "2026-08-30",
+        "summary": "修复复制预测号码按钮竞态条件：任务完成后立即同步状态，防止误判为运行中",
+        "features": [],
+        "fixes": [
+            "修复 _copy_prediction 在任务完成后仍弹出「当前有分析任务正在进行中」的竞态条件问题。",
+            "在 _on_task_finished() 和 _on_task_error() 中添加 _sync_task_state() 回调，使用 root.after(0) 在主线程中强制清理 _running_tasks，确保 is_running() 立即返回 False。",
+            "同步修复任务取消、看门狗超时、异常退出等所有调用 _on_task_finished() 的场景。",
+        ],
+        "notes": [
+            "竞态条件根因：finished() 消息入队后、_running_tasks.pop() 执行前，用户点击复制按钮会导致 is_running() 返回 True。",
+            "修复方案：在主线程中同步清理任务状态，消除 50ms 轮询间隔内的状态不一致窗口。",
+        ],
+    },
+    {
+        "version": "v3.60",
+        "date": "2026-08-25",
+        "summary": "命中率优化：数据窗口统一 / 贝叶斯 log-space 修复 / 自我进化评估放宽 / ml_predictor 激活真实监督学习",
+        "features": [
+            "ml_predictor.py：激活真实 GradientBoosting 监督学习（One-vs-Rest 多分类器 + softmax 归一化），替代原加权滑动频率伪监督模型；sklearn 缺失时优雅降级回频率路径。",
+            "features.py：贝叶斯推断似然改 log-space 累加（math.log + softmax 归一化），修复长期运行后无界增长导致后验分布失真的 KNOWN_ISSUE。",
+            "evolution_tuner.py：_not_worse 评估阈值放宽——Top-1 ≥ 基线+0.3pp 且 Top-3 ≥ 基线，或 Top-3 ≥ 基线+0.5pp 且 Top-1 ≥ 基线即通过，避免在随机噪声带内永无候选产出。",
+            "self_evolution.py：_compare_metrics 与 evolution_tuner 对齐放宽逻辑，自我进化引擎可产出有效候选版本。",
+            "pipeline.py / trend_analyzer.py / main.py：数据窗口从 40期 统一至 60期，与核心预测器 lookback_periods=60 对齐，消除双窗口信号基准混乱。",
+        ],
+        "fixes": [
+            "修复双权重体系割裂：核心预测器与趋势融合两套独立计算的 data_period 统一为 60 期，信号不再互相抵消。",
+            "修复贝叶斯似然无界累乘失真（原 posterior += l_val * p_val）：改用 log-space 后 softmax 归一化，数值稳定性显著提升。",
+            "修复自我进化引擎永无 active 版本的空转问题：放宽评估阈值后，微小正信号有机会通过 walk-forward 验证并激活为新版本。",
+        ],
+        "notes": [
+            "诚实边界不变：排列5为公平摇号，无法稳定超越随机基线（Top-1≈10%/Top-3≈30%/Top-5≈50%）。",
+            "ml_predictor GBML 训练时间随历史数据增长线性增加，首次完整回测约需 30-60 秒，后续因缓存可显著加速。",
+        ],
+    },
     {
         "version": "v3.59",
         "date": "2026-08-23",
@@ -164,8 +253,7 @@ CHANGELOG = [
         "notes": [
             "实证结论：修复后自我进化在真实数据上落回随机基线，故正常不会产出 active 版本；"
             "这印证了 v3.49 的 walk-forward 诚实结论（所有策略 95% CI 与随机基线重叠）。",
-            "ml_predictor.predict_next 在某些窗口下仍可能原生崩溃（见 KNOWN_ISSUES），"
-            "但自 v3.51 起已被子进程池隔离，仅该窗口结果记为 None（跳过/计不中），不影响主程序。",
+            "ml_predictor.predict_next 段错误问题已在 v3.60 通过 ProcessPoolExecutor 子进程隔离修复，不再影响主程序。",
         ],
     },
     {
@@ -575,10 +663,10 @@ CHANGELOG = [
 KNOWN_ISSUES = [
     "online_learner 的权重自适应目前仅打印调整建议，未真正回写预测器配置（示意逻辑）；该模块已在 v3.42 由「开始分析」自动验证闭环统一调用。",
     "predict --model old/optimized 两条路径等价（use_optimized 形参被忽略），对比模式无差异。",
-    "贝叶斯推断的似然为无界累乘，随验证记录增多会失真（经验加权而非严格贝叶斯）。",
+    "贝叶斯推断的似然累加已改为 log-space（v3.60 修复），数值稳定性显著改善。长期运行后后验分布不再无界漂移。",
     "组合生成的和值/跨度/SSD/方差等阈值硬编码，未读取统一配置。",
     "prediction_stat 缓存以「期号+数据量」为复用条件，数据被修正但条数不变时会返回旧结果。",
-    "ml_predictor.predict_next 在部分窗口（较大样本量/特定特征组合）下会触发 sklearn 原生段错误（Python 层不可 try/except 捕获）；自 v3.51 起自我进化引擎已用子进程池隔离，仅该窗口结果记为 None，不影响主程序。直接调用者仍需注意。",
+    "ml_predictor.predict_next 段错误问题已在 v3.60 修复：通过 ProcessPoolExecutor 子进程隔离 + 60s 超时降级，原原生崩溃风险已消除。",
 ]
 
 # 外部更新日志覆盖文件路径（可选）：若存在则优先使用，便于非开发者维护

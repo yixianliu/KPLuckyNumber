@@ -128,6 +128,8 @@ from version import get_current_version, get_changelog
 from paths import PROJECT_ROOT, REPORTS_DIR, REPORTS_CHARTS_DIR, LOG_GUI_RUN
 # 新版任务管理器（多线程、优先级队列、协作式取消、超时控制）
 from modules.task_manager import TaskManager
+# 四步流水线（模块级别导入，避免方法内部导入导致 P5Database 局部变量遮蔽）
+from modules.pipeline import run_four_step_pipeline
 
     # ============================================================
 # 主题自适应系统
@@ -399,8 +401,19 @@ class LotteryGUI:
 
     def _setup_keyboard_shortcuts(self):
         """配置键盘快捷键（v3.36 新增）"""
-        # Ctrl+C 复制预测号码
-        self.root.bind('<Control-c>', lambda e: self._copy_prediction() if self._prediction_clipboard else None)
+        # Ctrl+C 复制预测号码（检查任务运行状态，防止分析中复制到中间态结果）
+        def _on_ctrl_c(e):
+            try:
+                import logging
+                _log = logging.getLogger('kplucky.debug')
+                _log.info('HOTKEY_CTRL_C: clipboard_exists=%s task_running=%s',
+                          bool(self._prediction_clipboard), self.task_mgr.is_running())
+            except Exception:
+                pass
+            if self._prediction_clipboard and not self.task_mgr.is_running():
+                self._copy_prediction()
+
+        self.root.bind('<Control-c>', _on_ctrl_c)
         # 运行日志标签页已移除，相关快捷键停用
         self.root.unbind('<Control-f>')
         self.root.unbind('<Control-a>')
@@ -1016,8 +1029,14 @@ class LotteryGUI:
                                     self._export_result_board, 'secondary').pack(side=tk.RIGHT, padx=(6, 0))
         self._create_toolbar_button(btn_frame, " 清空结果",
                                     self._clear_result_board, 'danger').pack(side=tk.RIGHT, padx=(6, 0))
-        self._create_toolbar_button(btn_frame, " 复制预测号码",
-                                    self._copy_prediction, 'primary').pack(side=tk.RIGHT, padx=(0, 4))
+        # 关键修复：先调用 _create_toolbar_button 获取按钮句柄，再 pack，
+        # 否则 `.pack()` 返回 None 会导致 _result_copy_btn 被赋值为 None，
+        # _set_buttons_state 中对该按钮的独立 state 控制将永远失效。
+        self._result_copy_btn = self._create_toolbar_button(
+            btn_frame, " 复制预测号码", self._copy_prediction, 'primary')
+        self._result_copy_btn.pack(side=tk.RIGHT, padx=(0, 4))
+        # 工具栏按钮独立于全局 _buttons，确保分析进行中可单独禁用复制按钮
+        # （主按钮在 task_mgr 运行中被禁用，但结果区按钮需独立管理）
 
         # ---- 2) 概览卡片区（信息架构第一层）----
         overview_container = tk.Frame(parent, bg=COLORS['bg_primary'])
@@ -1199,6 +1218,8 @@ class LotteryGUI:
         self._create_toolbar_button(tb, "🔗 联动状态", self._show_evolution_link_state,
                                     'secondary').pack(side=tk.LEFT, padx=(0, 8))
         self._create_toolbar_button(tb, "💡 改进建议", self._on_evo_proposals,
+                                    'secondary').pack(side=tk.LEFT, padx=(0, 8))
+        self._create_toolbar_button(tb, "❤️ 健康诊断", self._on_system_health_diagnostic,
                                     'secondary').pack(side=tk.LEFT, padx=(0, 8))
         self._create_toolbar_button(tb, "🗑️ 清空日志", self._clear_evolution_log,
                                     'danger').pack(side=tk.LEFT)
@@ -1785,6 +1806,55 @@ class LotteryGUI:
         except Exception:
             pass
 
+    def _on_system_health_diagnostic(self):
+        """触发系统健康诊断：离线评估命中率基线 / 权重漂移 / 进化版本对比 / 学习闭环覆盖率，
+        并把 Markdown 报告在进化日志区展示。
+
+        调用路径：
+            modules.system_health.run_diagnostic(days=60, limit=200) -> Dict
+              ├─ metrics.top1_rate_pct / top3_rate_pct / top5_rate_pct  (诚实对照)
+              ├─ metrics.weight_drifts                                 (冻结权重偏离度)
+              ├─ metrics.version_summary                               (active/trial 统计)
+              ├─ attribution_coverage                                  (per-algo 归因覆盖率)
+              └─ suggestions                                           (可执行优化建议清单)
+        """
+        try:
+            # 惰性导入，避免启动时加载重型依赖
+            from modules.system_health import run_diagnostic, render_markdown
+            # 使用数据库的 lazy connect：DB 不可用时给出明确提示
+            eng = getattr(self, 'evolution', None)
+            if eng is None:
+                self._init_evolution_engine()
+                eng = self.evolution
+            self._show_toast('正在生成系统健康诊断报告…', COLORS['info'])
+            report = run_diagnostic(days=60, limit=200)
+            if not report or report.get('status') == 'error':
+                self._show_toast('诊断失败：数据库不可用', COLORS['accent_danger_light'])
+                return
+            md = render_markdown(report)
+            # 追加到进化日志末尾（保留历史）
+            self.evo_log.insert(tk.END, f'\n{"="*40}\n', 'section')
+            self.evo_log.insert(tk.END, f'[系统健康诊断] {report.get("ts", "")} | {report.get("status", "")}\n', 'section')
+            self.evo_log.insert(tk.END, f'{md}\n', 'info')
+            self.evo_log.see(tk.END)
+            paths = report.get('_paths', {})
+            json_p = paths.get('json', '')
+            md_p = paths.get('markdown', '')
+            detail = []
+            if json_p:
+                detail.append(f'JSON={json_p}')
+            if md_p:
+                detail.append(f'MD={md_p}')
+            self._show_toast(
+                f'健康分 {report.get("summary","")}'
+                + (f' | 已保存 {", ".join(detail)}' if detail else ''),
+                COLORS['success'] if report.get('status') == 'healthy' else COLORS['warning'],
+                duration=4000,
+            )
+        except Exception as e:
+            logger.warning('[GUI] 系统健康诊断异常: %s', e, exc_info=True)
+            self._show_toast(f'诊断异常: {e}', COLORS['accent_danger_light'])
+
     # =========================================================================
     # 结果显示板块（v3.50 重构辅助）：滚动 / 分类 / 清空 / 导出
     # =========================================================================
@@ -2263,11 +2333,25 @@ class LotteryGUI:
         self.task_status_label.config(text=f"{self._current_task_name} 已完成", fg=COLORS['success'])
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['success'])
 
+        # 关键修复：强制重置任务运行状态，防止竞态条件导致复制按钮误判
+        # 使用 after(0) 确保在主线程中执行，避免多线程问题
+        self.root.after(0, self._sync_task_state)
+
         # 使用 TaskManager 刷新日志
         now = datetime.now().strftime('%H:%M:%S')
         self.task_mgr.log(f"\n{'=' * 70}\n")
         self.task_mgr.log(f"  [{now}] 任务完成: {self._current_task_name}\n")
         self.task_mgr.log(f"{'=' * 70}\n")
+
+    def _sync_task_state(self):
+        """同步任务状态，确保 is_running() 立即返回 False（v3.60 修复竞态条件）"""
+        try:
+            # 强制清理所有运行中任务记录，防止竞态条件
+            with self.task_mgr._running_lock:
+                self.task_mgr._running_tasks.clear()
+        except Exception as e:
+            import logging
+            logging.getLogger('kplucky.debug').error(f'SYNC_TASK_STATE_ERROR: {e}', exc_info=True)
 
     def _on_task_error(self, error_msg):
         """任务出错时：恢复按钮、进度条归零、状态指示器变红、弹窗提示（v3.36 优化版）"""
@@ -2280,6 +2364,10 @@ class LotteryGUI:
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['accent_danger'])
 
         messagebox.showerror("错误", f"任务执行失败:\n{error_msg}")
+
+        # 关键修复：强制重置任务运行状态，防止竞态条件导致后续操作误判
+        # 使用 after(0) 确保在主线程中执行，避免多线程问题
+        self.root.after(0, self._sync_task_state)
 
     def _cancel_current_task(self):
         """取消当前任务（v3.36 新增）"""
@@ -2366,6 +2454,9 @@ class LotteryGUI:
         btn.bind('<Enter>', lambda e, b=btn: self._on_button_enter(e, b, button_type))
         btn.bind('<Leave>', lambda e, b=btn: self._on_button_leave(e, b, button_type))
         
+        # 注册到按钮列表，便于批量启用/禁用（任务运行时自动禁用）
+        self._buttons.append(btn)
+        
         return btn
 
     def _on_button_enter(self, event, button, button_type):
@@ -2430,12 +2521,47 @@ class LotteryGUI:
     # 一键复制预测号码
     # ============================================================
 
+    def _build_copy_from_cached_results(self):
+        """兜底：从未渲染缓冲（_last_*_final）现场拼出可复制的预测摘要。
+
+        适用场景：
+          - _prediction_clipboard 尚未写入（仪表盘 after(0) 还没轮到执行）
+          - _prediction_clipboard 已写入但被新分析清空（单源聚合时 main_combo_disp 为空）
+          - 历史残留数据
+        任意场景下若缓存的 final_report 包含 trend_prediction 或 recommended_combinations，
+        都能拼出符合微信格式的可复制文本。
+        """
+        try:
+            pf = getattr(self, '_last_pipeline_final', None)
+            qf = getattr(self, '_last_quick_final', None)
+            tr = getattr(self, '_last_trend_result', None)
+            candidates = [pf, qf, tr]
+            # 选一个含 trend_prediction 的最完整 final
+            for c in candidates:
+                if isinstance(c, dict) and (c.get('trend_prediction') or c.get('recommended_combinations')):
+                    return self._build_prediction_clipboard(c)
+            # 退化：任意一个有 target_issue / next_issue 的 final，强行拼一份
+            for c in candidates:
+                if isinstance(c, dict) and (c.get('target_issue') or c.get('next_issue')):
+                    fb = dict(c)
+                    fb.setdefault('trend_prediction', {})
+                    fb.setdefault('recommended_combinations', [])
+                    return self._build_prediction_clipboard(fb)
+            return ""
+        except Exception:
+            return ""
+
     def _copy_prediction(self):
         """将「预测结果仪表盘」中的预测号码一键复制到剪贴板（微信兼容版）
 
         严格绑定到预测号码区域：仅复制预测仪表盘生成的结构化预测摘要
         （self._prediction_clipboard），不扫描/复制日志或其它报告区域的数据。
         若尚未运行分析生成预测，则提示先运行「开始分析」。
+        若分析任务正在进行中，提示用户等待分析完成后再复制，避免获取到中间态结果。
+
+        v3.62 兜底链路：即便 _prediction_clipboard 暂未写入（仪表盘渲染在主线程
+        after(0) 队列中尚未轮到），也会尝试从未渲染的 final_report 缓存中现场
+        拼出可复制文本，确保用户点复制按钮一定能拿到分析结果。
 
         微信格式优化：
         - 替换特殊字符为微信兼容字符（━━━━━━━━ → ━━━━）
@@ -2443,11 +2569,109 @@ class LotteryGUI:
         - 控制单行长度（≤80字符）
         - 移除可能导致格式错乱的不可见字符
         """
-        clip = getattr(self, '_prediction_clipboard', "")
-        if not clip or not clip.strip():
+        # 详细日志：记录复制尝试的上下文
+        try:
+            import logging
+            _log = logging.getLogger('kplucky.debug')
+            _clip = getattr(self, '_prediction_clipboard', '') or ''
+            _meta = getattr(self, '_clipboard_meta', {}) or {}
+            _log.info('COPY_ATTEMPT: clipboard_len=%d task_running=%s has_meta=%s',
+                      len(_clip), self.task_mgr.is_running(), bool(_meta))
+        except Exception:
+            pass
+
+        # ① 检查是否有任务正在运行，防止在分析过程中复制到中间态结果
+        if self.task_mgr.is_running():
+            try:
+                _log.warning('COPY_BLOCKED_TASK_RUNNING: 任务运行中，拒绝复制中间态结果')
+            except Exception:
+                pass
             messagebox.showinfo(
-                "提示",
-                "当前没有可复制的预测号码数据。\n请先点击「 开始分析」生成预测结果。")
+                "分析进行中",
+                "当前有分析任务正在进行中，预测结果尚未最终确定。\n\n"
+                "解决步骤：\n"
+                "  1. 请等待当前分析任务完成（状态栏会显示「已完成」）\n"
+                "  2. 完成后「复制预测号码」按钮自动恢复可用\n"
+                "  3. 再次点击即可复制最终预测号码\n\n"
+                "注：分析通常耗时 1~3 分钟，请耐心等待。")
+            return
+
+        # ② 检查是否有有效的预测结果（剪贴板内容或元数据）
+        clip = getattr(self, '_prediction_clipboard', "")
+        meta = getattr(self, '_clipboard_meta', {}) or {}
+        has_valid_result = (clip and clip.strip()) or (meta and meta.get('target_issue'))
+
+        # ── v3.64 修复：clipboard/meta 可能因聚合异常丢失，此时直接从 _last_pipeline_final 重建 ──
+        if not has_valid_result:
+            pf = getattr(self, '_last_pipeline_final', None)
+            if isinstance(pf, dict) and pf:
+                try:
+                    rebuilt = self._build_prediction_clipboard(pf)
+                    if rebuilt and rebuilt.strip():
+                        clip = rebuilt
+                        has_valid_result = True
+                        # 同步持久化，避免下次点击仍需重建
+                        self._prediction_clipboard = clip
+                        self._clipboard_meta = {
+                            'target_issue': pf.get('target_issue') or pf.get('next_issue') or '',
+                            'conf': '',
+                            'high_conf': '',
+                            'main_combo': '',
+                        }
+                        try:
+                            _log.warning('COPY_REBUILT: 从 _last_pipeline_final 重建剪贴板，长度=%d', len(clip))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        # v3.62 兜底：若标准缓存为空但存在未渲染缓冲的 final_report，
+        # 现场拼一份可复制文本。覆盖竞态场景（仪表盘 after(0) 还未轮到执行）。
+        if not has_valid_result:
+            fallback_clip = self._build_copy_from_cached_results()
+            if fallback_clip and fallback_clip.strip():
+                clip = fallback_clip
+                has_valid_result = True
+                try:
+                    _log.warning(
+                        'COPY_FALLBACK_USED: 主缓存为空，使用未渲染缓冲拼出预测摘要，'
+                        '长度=%d', len(clip))
+                except Exception:
+                    pass
+
+        # v3.59 兜底：上述全部缓存都为空时，从数据库最近一条预测记录写入。
+        # 覆盖场景：本次智能分析被中途取消（用户案例）或早期异常退出，
+        # 三个 _last_*_final 全为 None 但数据库仍有最近一次成功预测记录。
+        if not has_valid_result:
+            try:
+                self._populate_clipboard_from_db_fallback()
+                clip = getattr(self, '_prediction_clipboard', '')
+                if clip and clip.strip():
+                    has_valid_result = True
+                    _log.warning(
+                        'COPY_DB_FALLBACK_USED: 主缓存与未渲染缓冲均空，从数据库最近预测记录兜底，'
+                        '长度=%d', len(clip))
+            except Exception:
+                pass
+
+        if not has_valid_result:
+            try:
+                _log.warning('COPY_BLOCKED_NO_RESULT: 无有效预测结果（clip空=%s, meta=%s）',
+                             not bool(clip.strip()), meta)
+            except Exception:
+                pass
+            messagebox.showinfo(
+                "暂无预测结果",
+                "当前没有可复制的预测号码数据。\n\n"
+                "原因说明：\n"
+                "  • 尚未运行分析：请先点击左侧「开始分析」生成预测结果\n"
+                "  • 分析未完成：请等待分析流程全部结束后再操作\n"
+                "  • 数据不足：历史样本少于 61 期时无法生成可靠预测\n"
+                "  • 数据库暂无历史预测记录\n\n"
+                "解决步骤：\n"
+                "  1. 点击「开始分析」按钮启动完整预测流程\n"
+                "  2. 等待六阶段流水线全部完成（状态栏显示「已完成」）\n"
+                "  3. 结果仪表盘出现后，点击「复制预测号码」即可")
             return
 
         # 微信格式优化处理
@@ -2472,7 +2696,16 @@ class LotteryGUI:
                 parts.append(f"综合一致性置信度 {conf}%{lvl}")
             msg = " 已复制 " + " · ".join(parts) if parts else " 预测号码已复制到剪贴板"
             self._show_toast(msg, COLORS['success'])
+            try:
+                _log.info('COPY_SUCCESS: issue=%s combo=%s conf=%s high_conf=%s',
+                          issue, combo, conf, high)
+            except Exception:
+                pass
         except Exception as e:
+            try:
+                _log.error('COPY_FAILED: %s', e, exc_info=True)
+            except Exception:
+                pass
             messagebox.showerror("复制失败", f"复制到剪贴板出错:\n{e}")
 
     def _format_for_wechat(self, text: str) -> str:
@@ -2525,9 +2758,6 @@ class LotteryGUI:
             formatted_lines.append(line)
 
         return '\n'.join(formatted_lines)
-
-    def _build_prediction_clipboard(self, final_report):
-        """根据四步流水线 final_report 生成结构化的可复制预测摘要（微信兼容版）"""
 
     def _show_export_menu(self):
         """在「导出」按钮处弹出菜单：导出文本 / 导出图片。"""
@@ -2677,6 +2907,43 @@ class LotteryGUI:
                     probs = ", ".join(f"{k}({float(v):.3f})" for k, v in top3)
                     lines.append(f"  {_pos_names_full[i]}: {probs}")
 
+        return "\n".join(lines)
+
+    def _direct_extract_clipboard(self, final_report):
+        """直接从 final_report 提取可复制文本，作为 _compute_dashboard_aggregates 兜底使用。
+        
+        当 _compute_dashboard_aggregates 因结构不匹配而未能设置 clipboard/meta时，
+        此方法直接提取 trend_prediction 和 recommended_combinations 等关键字段。
+        """
+        if not isinstance(final_report, dict):
+            return ""
+        
+        lines = ["【排列5 预测号码】",
+                 f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
+        
+        # 1. 走势图数据预测
+        trend = final_report.get('trend_prediction', {})
+        if isinstance(trend, dict) and trend:
+            lines.append("一、走势图数据预测 (Top 候选)")
+            pos_keys = DISPLAY_POS_KEYS
+            pos_names = DISPLAY_POS_NAMES
+            for pos_key, pos_name in zip(pos_keys, pos_names):
+                nums = trend.get(pos_key, {}).get('numbers', [])
+                if nums:
+                    lines.append(f"  {pos_name}: {' '.join(str(n) for n in nums)}")
+            combos = final_report.get('recommended_combinations', [])
+            if isinstance(combos, list) and combos:
+                lines.append("  推荐组合:")
+                for i, c in enumerate(combos[:10], 1):
+                    if isinstance(c, dict):
+                        _comb = compress_combo(c.get('combination', ''))
+                        _reason = c.get('reason', '')
+                        _line = f"    {i}. {_comb}"
+                        if _reason:
+                            _line += f"  — {_reason}"
+                        lines.append(_line)
+            lines.append("")
+        
         return "\n".join(lines)
 
     def _flash_status(self, text, color=COLORS['success']):
@@ -2840,6 +3107,9 @@ class LotteryGUI:
         """批量设置所有操作按钮的启用/禁用状态"""
         for btn in self._buttons:
             btn.config(state=state)
+        # 结果区「复制预测号码」按钮独立控制：分析进行中禁用，完成或无数据时恢复
+        if hasattr(self, '_result_copy_btn') and self._result_copy_btn is not None:
+            self._result_copy_btn.config(state=state)
 
     # ============================================================
     # 业务任务 - 系统操作
@@ -3392,14 +3662,12 @@ class LotteryGUI:
             task_mgr.log(f"     • 预测覆盖: Top-3 (每位置3个候选, 覆盖率30%)")
             task_mgr.log(f"     • 容错匹配: 允许偏差±1也算命中")
             task_mgr.log(f"     • 独立报告: 专家报告+走势图报告分离")
-            task_mgr.log(f"     • 数据期数: 当前分析窗口=40期 (用户要求由120期缩减)")
+            task_mgr.log(f"     • 数据期数: 当前分析窗口=60期")
             task_mgr.log(f"\n 本版本集成功能:")
             task_mgr.log(f"     • 自动预测验证 + 在线学习")
             task_mgr.log(f"     • 可选历史回测 + 特征分析")
             task_mgr.log(f"     • 两份独立报告自动生成")
             task_mgr.log(f"  {"─" * 60}")
-
-            from modules.pipeline import run_four_step_pipeline
 
             # P1 优化: 预建立数据库连接，供流水线内部复用
             db = P5Database()
@@ -3466,7 +3734,8 @@ class LotteryGUI:
             result = run_four_step_pipeline(target_issue=target_issue, data_limit=60,
                                              progress_callback=self._pipeline_callback,
                                              max_bayes_aux_calls=self._BACKTEST_AI_AUX_CAP,
-                                             log_callback=task_mgr.log)
+                                             log_callback=task_mgr.log,
+                                             cancel_event=cancel_event)
 
             # P1: 流水线完成后断开数据库连接
             try:
@@ -3483,6 +3752,15 @@ class LotteryGUI:
                 task_mgr.log(" 任务在预测完成后被取消，跳过结果渲染并恢复界面")
                 task_mgr.progress(0, "已取消")
                 return
+
+            # v3.60：v3.60 流水线取消响应 —— 即使 cancel 期间步骤4 已生成 final_report，
+            # 流水线 result 仍带 cancelled=True。本分支让出"已生成部分结果但被取消"场景：
+            # 最终预测已成功入库（success=True）→ 仍走渲染 / 写入 clipboard 路径，
+            # 仪表盘展示本次预测，附加步骤（回测等）的缺失会在 _pipeline_callback 里说明。
+            if result.get('cancelled') and result.get('success'):
+                task_mgr.log(f" ⚠ 流水线在阶段4 之后被取消，但最终预测已生成（{result.get('report_uuid', '?')}）")
+                task_mgr.log(f"   附加步骤（回测/特征分析）未执行；预测号码仍可用，可复制。")
+                # 不 return —— 继续走下方 success 分支正常渲染
 
             if result.get('success'):
                 task_mgr.progress(100, "流水线完成")
@@ -3808,6 +4086,15 @@ class LotteryGUI:
 
                     # 缓存结构化预测摘要，供" 复制预测号码"一键复制
                     self._prediction_clipboard = self._build_prediction_clipboard(final_report)
+                    # v3.62 修复：同步设置 _clipboard_meta，否则 _copy_prediction 因 meta 为空而误判无数据
+                    # final_report 使用 next_issue 键（非 target_issue），需兼容两者
+                    _target_issue_4step = final_report.get('target_issue') or final_report.get('next_issue') or final_report.get('issue', '')
+                    self._clipboard_meta = {
+                        'target_issue': _target_issue_4step,
+                        'conf': final_report.get('confidence', ''),
+                        'high_conf': '',
+                        'main_combo': '',
+                    }
 
                     # 结果仪表盘：在结果面板顶部结构化展示本次预测（合并视图）
                     self._show_result_dashboard(pipeline_final=final_report)
@@ -3823,6 +4110,13 @@ class LotteryGUI:
             task_mgr.log(f"\n 四步流水线异常: {str(e)}")
             task_mgr.log(f"\n错误详情:\n{error_detail}")
             task_mgr.progress(0, "异常终止")
+            # 异常时断开数据库连接，防止连接泄漏
+            try:
+                db.disconnect()
+            except Exception:
+                pass
+            # 恢复按钮状态，避免界面永久卡死
+            self._on_task_finished()
 
     # ============ 历史命中率常驻面板 (P1 加价值: 真实数据一等公民) ============
     def _on_hit_rate_tab_selected(self, event):
@@ -4447,12 +4741,12 @@ class LotteryGUI:
             try:
                 task_mgr.progress(20, "加载走势数据")
                 analyzer = TrendAnalyzer(db, enable_adapt=False)
-                task_mgr.log(f"  数据窗口: 近40期 | 信号源: 频率·遗漏·动量·升平降·和值·贝叶斯")
+                task_mgr.log(f"  数据窗口: 近60期 | 信号源: 频率·遗漏·动量·升平降·和值·贝叶斯")
                 task_mgr.log(f"  自适应模式: 关闭（使用常量权重，回测证实价值有限）")
                 task_mgr.log("")
 
                 task_mgr.progress(40, "信号融合计算")
-                result = analyzer.predict(target_issue='', period=40)
+                result = analyzer.predict(target_issue='', period=60)
             finally:
                 db.disconnect()
 
@@ -4578,6 +4872,11 @@ class LotteryGUI:
 
         # ── 联动：通知自我进化引擎暂停自动调度，避免资源竞争 ──
         eng = getattr(self, 'evolution', None)
+        # v3.57：不论后续流程是否被取消 / 异常，finally 块一定恢复引擎调度。
+        # 此前各取消分支（行 4882 / 4888 / 4895 / 4901）漏调 notify_analysis_done，
+        # 配合 evolution_link_state.json 持久化 analysis_running=True，会导致
+        # 引擎被永久卡在「联动暂停」分支。
+        _analysis_done_called = False
         if eng is not None:
             try:
                 eng.notify_analysis_started()
@@ -4593,45 +4892,52 @@ class LotteryGUI:
             except Exception as e:  # noqa: BLE001
                 task_mgr.append_warning(f' 联动通知引擎暂停调度失败（不影响分析流程）：{e}')
 
-        # 1) 四步流水线预测（主预测，注册 pending 预测记录；内部含验证→学习闭环）
-        self._execute_four_step_pipeline(task_mgr)
-        if _cancelled():
-            task_mgr.append_warning(" 用户已取消，智能分析提前结束")
-            # 联动：分析被取消，恢复引擎调度
-            if eng is not None:
+        try:
+            # 1) 四步流水线预测（主预测，注册 pending 预测记录；内部含验证→学习闭环）
+            # v3.60：透传 cancel_event，让四步流水线（特别是回测）能响应取消。
+            self._execute_four_step_pipeline(task_mgr, cancel_event=cancel_event)
+            if _cancelled():
+                task_mgr.append_warning(" 用户已取消，智能分析提前结束")
+                return
+
+            # 2) 走势引擎分解（信号源 Top-3 辅助）
+            self._execute_trend_analysis(task_mgr)
+            if _cancelled():
+                task_mgr.append_warning(" 用户已取消，智能分析提前结束")
+                return
+
+            # 3) 快速预测（纯统计预测）——同时把结果留给阶段 ④ 复用，避免重复 predict
+            self._run_quick_predict_core(task_mgr, 'optimized')
+            if _cancelled():
+                task_mgr.append_warning(" 用户已取消，智能分析提前结束")
+                return
+
+            # 4) 命中率优化（原「命中率优化引擎」卡片，v3.42 融合）
+            # 复用阶段 ③ 已算出的融合概率，不再额外跑一次 predict。
+            self._run_hitrate_optimization_stage(task_mgr)
+            if _cancelled():
+                task_mgr.append_warning(" 用户已取消，智能分析提前结束")
+                return
+
+            # 5) 在线学习闭环（原「在线学习引擎」卡片，v3.42 融合）
+            self._run_online_learning_stage(task_mgr)
+            if _cancelled():
+                task_mgr.append_warning(" 用户已取消，智能分析提前结束")
+                return
+
+            # 6) AI 辅助分析与预测解读
+            self._run_ai_assisted_stage(task_mgr)
+        finally:
+            # v3.57 修复：联动清理统一在 finally 中兜底，无论分析是正常完成、
+            # 被用户取消，还是中途异常，都确保引擎调度被恢复，
+            # evolution_link_state.json 中 analysis_running 不会被残留为 True。
+            # 主流程末尾的 notify_analysis_done() 仍会再调一次，幂等安全。
+            if eng is not None and not _analysis_done_called:
                 try:
                     eng.notify_analysis_done()
+                    _analysis_done_called = True
                 except Exception:  # noqa: BLE001
                     pass
-            return
-
-        # 2) 走势引擎分解（信号源 Top-3 辅助）
-        self._execute_trend_analysis(task_mgr)
-        if _cancelled():
-            task_mgr.append_warning(" 用户已取消，智能分析提前结束")
-            return
-
-        # 3) 快速预测（纯统计预测）——同时把结果留给阶段 ④ 复用，避免重复 predict
-        self._run_quick_predict_core(task_mgr, 'optimized')
-        if _cancelled():
-            task_mgr.append_warning(" 用户已取消，智能分析提前结束")
-            return
-
-        # 4) 命中率优化（原「命中率优化引擎」卡片，v3.42 融合）
-        # 复用阶段 ③ 已算出的融合概率，不再额外跑一次 predict。
-        self._run_hitrate_optimization_stage(task_mgr)
-        if _cancelled():
-            task_mgr.append_warning(" 用户已取消，智能分析提前结束")
-            return
-
-        # 5) 在线学习闭环（原「在线学习引擎」卡片，v3.42 融合）
-        self._run_online_learning_stage(task_mgr)
-        if _cancelled():
-            task_mgr.append_warning(" 用户已取消，智能分析提前结束")
-            return
-
-        # 6) AI 辅助分析与预测解读
-        self._run_ai_assisted_stage(task_mgr)
 
         # 合并视图：用已保存的各来源产物统一渲染仪表盘
         try:
@@ -4741,6 +5047,13 @@ class LotteryGUI:
             }
 
             self._prediction_clipboard = self._build_prediction_clipboard(final)
+            # v3.62 修复：同步设置 _clipboard_meta，否则 _copy_prediction 因 meta 为空而误判无数据
+            self._clipboard_meta = {
+                'target_issue': final.get('target_issue') or final.get('issue', ''),
+                'conf': final.get('confidence', ''),
+                'high_conf': '',
+                'main_combo': '',
+            }
             self._show_result_dashboard(quick_final=final)
             task_mgr.progress(100, "完成")
 
@@ -4849,6 +5162,262 @@ class LotteryGUI:
                     chosen = tied[0]
             consensus[pk], agree[pk] = chosen, maxc
         return consensus, agree
+
+    def _restore_clipboard_from_finals(self, pf, tr, qf):
+        """从各来源产物恢复 _prediction_clipboard / _clipboard_meta。
+
+        在 _compute_dashboard_aggregates 失败时调用，确保仪表盘隐藏后
+        「复制预测号码」按钮仍能找到可复制的数据，不报"无数据"误判。
+        优先级：pipeline > quick > trend（四步流水线结果最完整）。
+        """
+        candidates = [(pf, 'pipeline'), (qf, 'quick'), (tr, 'trend')]
+        for cand, src_name in candidates:
+            if not isinstance(cand, dict):
+                continue
+            # 优先用 _build_prediction_clipboard（格式与阶段 ①/③ 一致）
+            clip = self._build_prediction_clipboard(cand)
+            if clip and clip.strip():
+                issue = cand.get('target_issue') or cand.get('next_issue') or ''
+                self._prediction_clipboard = clip
+                self._clipboard_meta = {
+                    'target_issue': str(issue),
+                    'conf': '',
+                    'high_conf': '',
+                    'main_combo': '',
+                }
+                return
+            # 退一步：用 _direct_extract_clipboard 提取
+            direct = self._direct_extract_clipboard(cand)
+            if direct and direct.strip():
+                issue = cand.get('target_issue') or cand.get('next_issue') or ''
+                self._prediction_clipboard = direct
+                self._clipboard_meta = {
+                    'target_issue': str(issue),
+                    'conf': '',
+                    'high_conf': '',
+                    'main_combo': '',
+                }
+                return
+
+    def _populate_clipboard_from_db_fallback(self):
+        """v3.59 数据库兜底：三个 final 全为空时，从数据库读取最近一条预测记录写入 clipboard。
+
+        适用场景：
+          - 用户点击「开始分析」后中途取消（最常见）；
+          - 流水线早期异常（数据库连接失败、无历史数据等）；
+          - 第一次启动还没跑过分析。
+
+        数据源：``p5_prediction_record`` 表中最新一条 ``verification_status='pending'`` 的预测记录
+        （即最近一次有产出的分析结果），取其 ``target_issue`` / ``predicted_numbers`` /
+        ``predicted_combinations`` 渲染为微信兼容文本。
+
+        写入规则：
+          - 任何异常静默吞掉（兜底链不应让用户看到技术错误）；
+          - 写入 ``_prediction_clipboard`` 和 ``_clipboard_meta`` 两个字段，确保
+            ``_copy_prediction`` 兜底链能命中；
+          - 若数据库也无可用记录，仍写入一条最小化提示（避免 clipboard 永远空字符串）。
+        """
+        try:
+            import json as _json
+            db = P5Database()
+            if not db.connect():
+                return
+            try:
+                db.cursor.execute(
+                    "SELECT target_issue, predicted_numbers, predicted_combinations, "
+                    "confidence_scores, created_at FROM p5_prediction_record "
+                    "ORDER BY target_issue DESC LIMIT 1"
+                )
+                row = db.cursor.fetchone()
+            finally:
+                try:
+                    db.disconnect()
+                except Exception:
+                    pass
+
+            from datetime import datetime as _dt
+
+            if not row:
+                # 数据库也无预测记录：写最小化提示
+                self._prediction_clipboard = (
+                    "【排列5 预测号码】\n"
+                    f"生成时间: {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    "提示：本次智能分析未产出预测结果，且数据库中暂无历史预测记录。\n"
+                    "请重新点击「开始分析」启动一次完整分析（耗时约 1~3 分钟），\n"
+                    "或先点击「增量爬取数据」确保历史数据 ≥ 61 期。"
+                )
+                self._clipboard_meta = {
+                    'target_issue': '',
+                    'conf': '',
+                    'high_conf': '',
+                    'main_combo': '',
+                }
+                return
+
+            target_issue = row.get('target_issue', '') or ''
+            try:
+                predicted_numbers = _json.loads(row.get('predicted_numbers') or '{}')
+            except Exception:
+                predicted_numbers = {}
+            try:
+                predicted_combinations = _json.loads(row.get('predicted_combinations') or '[]')
+            except Exception:
+                predicted_combinations = []
+
+            pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+            pos_names = ['万位', '千位', '百位', '十位', '个位']
+            lines = [
+                "【排列5 预测号码（最近一次分析结果）】",
+                f"生成时间: {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"预测期号: {target_issue}",
+                "来源: 数据库最近一条预测记录（本次分析未产出新结果）",
+                "",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "各位置 Top-3 候选:",
+            ]
+            for pk, pn in zip(pos_keys, pos_names):
+                nums = predicted_numbers.get(pk, []) if isinstance(predicted_numbers, dict) else []
+                if isinstance(nums, list) and nums:
+                    lines.append(f"  {pn}: {' '.join(str(int(n)) for n in nums)}")
+            lines.append("")
+            if predicted_combinations:
+                lines.append("推荐组合 (Top 5):")
+                for i, c in enumerate(predicted_combinations[:5], 1):
+                    if isinstance(c, dict):
+                        combo = c.get('combination', '')
+                        conf = c.get('confidence', 0)
+                        reason = c.get('reason', '')
+                        line = f"  {i}. {combo}"
+                        if conf:
+                            line += f"  (一致度 {conf:.1f})"
+                        if reason:
+                            line += f"  — {reason}"
+                        lines.append(line)
+                lines.append("")
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            lines.append("提示：本次分析未产出新预测号码，本次复制为数据库中最近一次的预测记录。")
+            lines.append("建议重新点击「开始分析」获取最新结果。")
+
+            clip = "\n".join(lines)
+            self._prediction_clipboard = clip
+            # 主推组合（取 predicted_combinations 第一条）
+            main_combo = ''
+            if predicted_combinations and isinstance(predicted_combinations[0], dict):
+                main_combo = str(predicted_combinations[0].get('combination', ''))
+            self._clipboard_meta = {
+                'target_issue': str(target_issue),
+                'conf': '',
+                'high_conf': '',
+                'main_combo': main_combo,
+            }
+            try:
+                import logging as _lg
+                _lg.getLogger('kplucky.debug').info(
+                    'COPY_DB_FALLBACK: 从数据库最近预测记录兜底写入，期号=%s，长度=%d',
+                    target_issue, len(clip))
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                import logging as _lg
+                _lg.getLogger('kplucky.debug').warning(
+                    'COPY_DB_FALLBACK_ERROR: %s', e, exc_info=True)
+            except Exception:
+                pass
+
+    def _compute_dashboard_aggregates(self, pf, tr, qf):
+        """聚合计算纯函数：从三个来源产物统一算出渲染所需的全部数据。
+
+        同时**同步写入** self._prediction_clipboard 与 self._clipboard_meta，
+        让用户即便在主线程仪表盘 after(0) 队列尚未轮到时点击复制按钮，
+        也能立刻拿到可复制的预测摘要。
+
+        Returns:
+            dict 或 None —— None 表示无可聚合数据
+            包含: picks / top5 / combos / target_issue / consensus / agree /
+                   main_combo / main_combo_disp / conf / high_conf / total_sources
+        """
+        if not (pf or tr or qf):
+            return None
+        try:
+            picks, top5, combos, target_issue = self._extract_source_data(pf, tr, qf)
+            consensus, agree = self._aggregate_recommendation(picks)
+
+            pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+            total_sources = len({s for pk in pos_keys for s in picks[pk]})
+            # 主推荐组合（完整5位）
+            main_combo = ''.join(str(consensus[pk]) for pk in pos_keys if consensus[pk] is not None)
+            # 综合一致性置信度（仅当多源可用）
+            pos_n = {pk: len(picks[pk]) for pk in pos_keys}
+            ratios = [agree[pk] / pos_n[pk] for pk in pos_keys
+                      if consensus[pk] is not None and pos_n[pk] > 0]
+            conf = int(round(sum(ratios) / len(ratios) * 100)) if (total_sources >= 2 and ratios) else None
+            # 两主预测逐位主推完全一致 → 高置信度
+            raw_p = ''.join(str(picks[pk].get('pipeline')) for pk in pos_keys if 'pipeline' in picks[pk])
+            raw_q = ''.join(str(picks[pk].get('quick')) for pk in pos_keys if 'quick' in picks[pk])
+            high_conf = bool(raw_p and raw_q and raw_p == raw_q and total_sources >= 2)
+            # 展示层压缩为4位
+            main_combo_disp = compress_combo(main_combo)
+
+            # 关键：聚合一旦算出有效主推荐，立即同步写好 clipboard 与 meta。
+            # 这样复制按钮在主线程任何时刻被点击都能命中可复制数据。
+            if main_combo_disp:
+                self._prediction_clipboard = self._build_aggregated_clipboard(
+                    target_issue, main_combo_disp, conf, high_conf, combos, picks, top5)
+                self._clipboard_meta = {
+                    'target_issue': target_issue,
+                    'conf': conf,
+                    'high_conf': high_conf,
+                    'main_combo': main_combo_disp,
+                }
+            else:
+                # v3.63 修复：即使无法聚合出主推荐组合，只要 final_report 存在有效
+                # trend_prediction 数据，也要写入 clipboard/meta，避免复制按钮误报"无数据"
+                _direct = self._direct_extract_clipboard(pf)
+                if not (_direct and _direct.strip()):
+                    # 兜底再试用完整构建函数，确保至少有头部信息可复制
+                    _direct = self._build_prediction_clipboard(pf) if isinstance(pf, dict) else ''
+                if _direct and _direct.strip():
+                    _iss = pf.get('next_issue') or pf.get('current_issue', '') or target_issue
+                    self._prediction_clipboard = _direct
+                    self._clipboard_meta = {
+                        'target_issue': str(_iss),
+                        'conf': '',
+                        'high_conf': '',
+                        'main_combo': '',
+                    }
+                else:
+                    # 最终兜底：即使无数据也写入最小化提示，避免复制按钮误报无数据
+                    self._prediction_clipboard = f"【排列5 预测号码】\n生成时间: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n期号: {_iss or '—'}\n提示: 未生成有效预测号码，请检查历史数据是否≥61期。"
+                    self._clipboard_meta = {
+                        'target_issue': str(_iss),
+                        'conf': '',
+                        'high_conf': '',
+                        'main_combo': '',
+                    }
+
+            return {
+                'picks': picks,
+                'top5': top5,
+                'combos': combos,
+                'target_issue': target_issue,
+                'consensus': consensus,
+                'agree': agree,
+                'main_combo': main_combo,
+                'main_combo_disp': main_combo_disp,
+                'conf': conf,
+                'high_conf': high_conf,
+                'total_sources': total_sources,
+            }
+        except Exception as e:
+            try:
+                import logging
+                logging.getLogger('kplucky.debug').error(
+                    'COMPUTE_DASHBOARD_AGGREGATES_ERROR: %s', e, exc_info=True)
+            except Exception:
+                pass
+            # v3.64 修复：异常时保留已有 clipboard，不覆盖为 None/空
+            return None
 
     def _build_position_candidates(self, picks, top5):
         """聚合多源候选, 输出每个展示位(万/千/百/十)的 4 个候选数字。
@@ -5086,7 +5655,7 @@ class LotteryGUI:
                  ).pack(anchor=tk.W, padx=8, pady=(6, 4))
         logic = {
             'pipeline': '四步流水线：八算法融合流水线（频率0.68+监督学习0.14+贝叶斯0.10+遗漏0.06+趋势/马尔可夫/形态/特征），'
-                        '多源40期走势融合，系统旗舰预测。',
+                        '多源60期走势融合，系统旗舰预测。',
             'quick': '快速预测：P5Predictor 八算法融合模型（含ml_supervised监督学习），',
             'trend': '走势引擎：6信号源（频率·遗漏·动量·升平降·和值重心·贝叶斯）相对热度打分，'
                      '输出各位置 Top-4。',
@@ -5213,6 +5782,15 @@ class LotteryGUI:
         v3.54 线程安全：若在非主线程调用，通过 root.after(0, ...) 投递回主线程执行，
         避免后台线程直接操作 Tkinter 控件导致仪表盘无法显示或控件失效。
         """
+        # 立即保存最新结果，确保后台线程调用时也能被 _copy_prediction 兜底读取
+        # 这些属性的写入不涉及 Tkinter，是线程安全的
+        if pipeline_final is not None:
+            self._last_pipeline_final = pipeline_final
+        if trend_result is not None:
+            self._last_trend_result = trend_result
+        if quick_final is not None:
+            self._last_quick_final = quick_final
+
         # 线程安全检查：Tkinter 控件只能在主线程创建/更新
         if threading.current_thread() is not threading.main_thread():
             self.root.after(0, lambda: self._show_result_dashboard(
@@ -5226,22 +5804,33 @@ class LotteryGUI:
                       bool(pipeline_final), bool(trend_result), bool(quick_final))
         except Exception:
             pass
-        if pipeline_final is not None:
-            self._last_pipeline_final = pipeline_final
-        if trend_result is not None:
-            self._last_trend_result = trend_result
-        if quick_final is not None:
-            self._last_quick_final = quick_final
 
         pf = self._last_pipeline_final
         tr = self._last_trend_result
         qf = self._last_quick_final
         if not (pf or tr or qf):
+            # v3.59：三个 final 都为空（本次分析被取消 / 早期异常 / 流水线尚未产出任何结果）
+            # 也要把数据库里最近的预测记录写入 _prediction_clipboard，
+            # 让「复制预测号码」按钮能给出有意义内容，而不是「无数据」误判。
+            self._populate_clipboard_from_db_fallback()
             self._hide_result_dashboard()
             return
 
-        picks, top5, combos, target_issue = self._extract_source_data(pf, tr, qf)
-        consensus, agree = self._aggregate_recommendation(picks)
+        # v3.62：聚合计算抽到纯函数 _compute_dashboard_aggregates，
+        # 后台线程也可直接调用同步写 _prediction_clipboard，避开 after(0) 时序竞态。
+        agg = self._compute_dashboard_aggregates(pf, tr, qf)
+        if not agg:
+            # v3.64 修复：聚合失败时不直接返回，先尝试从各来源产物恢复 clipboard，
+            # 防止仪表盘隐藏后复制按钮仍报"无数据"。
+            self._restore_clipboard_from_finals(pf, tr, qf)
+            self._hide_result_dashboard()
+            return
+        picks, top5, combos, target_issue = agg['picks'], agg['top5'], agg['combos'], agg['target_issue']
+        consensus = agg['consensus']
+        main_combo_disp = agg['main_combo_disp']
+        conf = agg['conf']
+        high_conf = agg['high_conf']
+        main_combo = agg['main_combo']
 
         # 核心计算仍使用完整5位（万/千/百/十/个），保证算法与数据处理不受影响
 # [DEBUG v3.54] 渲染参数日志
@@ -5261,21 +5850,7 @@ class LotteryGUI:
         pos_names = ['万位', '千位', '百位', '十位', '个位']
 
         # 可用信号源数（并集，用于措辞）
-        total_sources = len({s for pk in pos_keys for s in picks[pk]})
-        # 主推荐组合（完整5位，供核心逻辑/对比使用）
-        main_combo = ''.join(str(consensus[pk]) for pk in pos_keys if consensus[pk] is not None)
-        # 综合一致性置信度（仅当多源可用）
-        pos_n = {pk: len(picks[pk]) for pk in pos_keys}
-        ratios = [agree[pk] / pos_n[pk] for pk in pos_keys
-                  if consensus[pk] is not None and pos_n[pk] > 0]
-        conf = int(round(sum(ratios) / len(ratios) * 100)) if (total_sources >= 2 and ratios) else None
-        # 两主预测（四步流水线 / 快速预测）逐位主推是否完全一致 → 高置信度
-        raw_p = ''.join(str(picks[pk].get('pipeline')) for pk in pos_keys if 'pipeline' in picks[pk])
-        raw_q = ''.join(str(picks[pk].get('quick')) for pk in pos_keys if 'quick' in picks[pk])
-        high_conf = bool(raw_p and raw_q and raw_p == raw_q and total_sources >= 2)
-
-        # 展示层压缩为4位（保留 万/千/百/十，去个位）——核心数据与算法不受影响
-        main_combo_disp = compress_combo(main_combo)
+        total_sources = agg['total_sources']
 
         # 渲染去重——内容与上次渲染完全一致时跳过全量重建，仅确保可见，
         # 避免重复点击「开始分析」或缓存命中时不必要的控件销毁/重建，提升响应速度
@@ -5294,16 +5869,8 @@ class LotteryGUI:
         for w in self.result_dash.winfo_children():
             w.destroy()
 
-        # 更新复制缓冲（主推荐 + 备选）
-        self._prediction_clipboard = self._build_aggregated_clipboard(
-            target_issue, main_combo_disp, conf, high_conf, combos, picks, top5)
-        # 保存复制元数据（供复制成功提示展示 期数/置信度/号码）
-        self._clipboard_meta = {
-            'target_issue': target_issue,
-            'conf': conf,
-            'high_conf': high_conf,
-            'main_combo': main_combo_disp,
-        }
+        # v3.62：clipboard 已在 _compute_dashboard_aggregates 中同步写好，
+        # 这里仅做记录本次分析生成时间（保留原有逻辑），不再二次覆盖。
         # 记录本次分析生成时间（供「最近一次分析时间」标记展示）
         self._last_analysis_time = datetime.now()
 
@@ -5472,9 +6039,46 @@ class LotteryGUI:
 
     def _render_unified_dashboard(self, task_mgr):
         """统一分析结束时，用已保存的各来源产物集中渲染仪表盘"""
+        # v3.62 修复：后台线程中先同步计算聚合，把 _prediction_clipboard /
+        # _clipboard_meta 立即写入主线程可见属性，避免 _copy_prediction 被
+        # 点击时主线程 after(0) 仪表盘渲染还没轮到导致「无数据」误判。
+        try:
+            pf = getattr(self, '_last_pipeline_final', None)
+            qf = getattr(self, '_last_quick_final', None)
+            tr = getattr(self, '_last_trend_result', None)
+            self._compute_dashboard_aggregates(pf, tr, qf)
+        except Exception as e:
+            try:
+                import logging
+                logging.getLogger('kplucky.debug').error(
+                    'RENDER_UNIFIED_PRECOMPUTE_ERROR: %s', e, exc_info=True)
+            except Exception:
+                pass
         # 记录本次调用指纹，供兜底 watchdog 检测渲染是否生效
         _pre_key = getattr(self, '_last_dashboard_key', None)
         self._show_result_dashboard()
+        # 强制刷新剪贴板，确保复制按钮立即可用（兜底）
+        try:
+            pf = getattr(self, '_last_pipeline_final', None)
+            if isinstance(pf, dict) and pf:
+                clip = self._build_prediction_clipboard(pf)
+                if clip and clip.strip():
+                    self._prediction_clipboard = clip
+                    self._clipboard_meta = {
+                        'target_issue': pf.get('target_issue') or pf.get('next_issue') or '',
+                        'conf': '',
+                        'high_conf': '',
+                        'main_combo': '',
+                    }
+        except Exception:
+            pass
+        # v3.59：兜底数据库写入。若本次分析全程未产出结果（_last_*_final 全为 None），
+        # 从数据库最近一条预测记录写入 clipboard，避免复制按钮误报「无数据」。
+        try:
+            if not getattr(self, '_prediction_clipboard', ''):
+                self._populate_clipboard_from_db_fallback()
+        except Exception:
+            pass
         # 兜底：若 2 秒后 _last_dashboard_key 未更新（说明渲染被吞或控件创建失败），强制再跑一次
         def _watchdog():
             if getattr(self, '_last_dashboard_key', None) == _pre_key:

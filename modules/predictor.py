@@ -176,6 +176,8 @@ class AdaptiveWeightManager:
 
         # 护栏用: 快照默认权重(先验)。初值 ewma 即等于 DEFAULT_CONFIG 冻结权重,
         # 归一化后作为收缩目标 prior, 与后续学习产生的 EWMA 解耦。
+        # 注意：initial_ewma 应使用 v3.48 之后的冻结权重(0.68/0.06/0.01/0.005/0.003/0.10/0.002)
+        # 而非 v3.12 旧权重(0.54/0.34/...)，避免自适应学习初期偏离预期基线。
         _init_prior = {k: v.get('ewma', 0.0) for k, v in self.algo_hit_rates.items()}
         _prior_total = sum(_init_prior.values()) or 1.0
         self.default_weights = {k: v / _prior_total for k, v in _init_prior.items()}
@@ -743,6 +745,10 @@ class P5PredictorConfig:
     def get_global_param(self, key: str, default=None):
         """获取全局参数"""
         return self.config['global'].get(key, default)
+
+    def set_global_param(self, key: str, value):
+        """设置全局参数（深度调优用，临时覆盖 lookback 等）"""
+        self.config['global'][key] = value
 
     @classmethod
     def baseline_v21(cls) -> 'P5PredictorConfig':
@@ -1558,6 +1564,29 @@ class P5Predictor:
         # }
 
         return results
+
+    def extract_components(self, sorted_data: List[Dict], lookback: int = None) -> Dict[str, List[Dict[int, float]]]:
+        """
+        提取权重无关的算法分量（深度调优用）。
+
+        v3.60 新增：专供 DeepTuner 组件缓存使用，与 _run_algorithms 功能等价，
+        但不读取自适应权重，始终返回原始权重配置的分量。
+
+        Args:
+            sorted_data: 按 issue 正序的历史数据。
+            lookback: 覆盖 config.global.lookback（可选）。
+
+        Returns:
+            algorithm_probs 字典，结构与 _run_algorithms 返回值一致。
+        """
+        if lookback is not None:
+            saved = self.config.get_global_param('lookback')
+            try:
+                self.config.set_global_param('lookback', lookback)
+                return self._run_algorithms(sorted_data, progress_callback=None)
+            finally:
+                self.config.set_global_param('lookback', saved)
+        return self._run_algorithms(sorted_data, progress_callback=None)
 
     def _algo_frequency_weighted(self, data: List[Dict]) -> List[Dict[int, float]]:
         """

@@ -42,11 +42,94 @@ from contextlib import contextmanager
 
 from paths import LOGS_DIR
 
+
+class ThreadSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """线程安全的 RotatingFileHandler：避免并发线程 rollover 时报 WinError 32。
+
+    背景：
+        标准 ``RotatingFileHandler.doRollover`` 内部用 ``os.rename`` 重命名日志文件。
+        在 Windows 上，只要任何线程仍持有原文件的写入句柄，rename 就会被系统拒绝
+        (WinError 32: 另一个程序正在使用此文件)。当 ML 训练等后台线程持续写日志时，
+        rollover 几乎必然失败；每次失败还会抛一条 ``--- Logging error ---`` traceback，
+        进一步污染日志文件。
+
+    修复策略（无需新增第三方依赖）：
+        1. 使用 ``RLock`` 串行化 ``emit`` / ``doRollover``：单进程内任意时刻只有一个线程
+           能进入关键区，避免后台线程和主线程并发触发 rollover。
+        2. ``doRollover`` 失败时**静默重试 3 次**（带 50ms 退避），最后一次仍失败则
+           不抛异常（只走 debug 日志），保证日志系统永不因 rollover 失败而中断业务。
+        3. 每次 emit 后立刻 ``flush``，缩短其它线程持有文件句柄的窗口。
+        4. ``shouldRollover`` 在锁定状态下检查，避免并发判定导致重复 rollover。
+
+    使用：
+        替换 ``logging.handlers.RotatingFileHandler(...)`` 即可，参数与原 handler 兼容。
+    """
+
+    # ---------- 可调参数（类级常量，方便后续微调） ----------
+    _ROLLOVER_RETRY_TIMES = 3   # rollover 失败重试次数
+    _ROLLOVER_RETRY_SLEEP = 0.05  # 单次重试间隔（秒）
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 用 RLock：同一线程可重入；不同线程互斥。
+        self._lock = threading.RLock()
+
+    # --- 关键：emit 时持锁 + 立即 flush ---
+    def emit(self, record):
+        with self._lock:
+            try:
+                super().emit(record)
+                # 缩短文件句柄被持有的窗口，降低 rollover 时被占用的概率
+                try:
+                    self.flush()
+                except Exception:
+                    pass
+            except Exception:
+                # 记录日志时发生异常，调用父类默认 handler 防止静默吞错
+                self.handleError(record)
+
+    # --- 关键：shouldRollover 也在锁内判定 ---
+    def shouldRollover(self, record):
+        with self._lock:
+            return super().shouldRollover(record)
+
+    # --- 关键：doRollover 失败重试 + 永不抛异常 ---
+    def doRollover(self):
+        last_err = None
+        for attempt in range(1, self._ROLLOVER_RETRY_TIMES + 1):
+            try:
+                with self._lock:
+                    super().doRollover()
+                return  # 成功
+            except (PermissionError, OSError) as e:
+                # WinError 32 / Linux EBUSY：文件被占用
+                last_err = e
+                if attempt < self._ROLLOVER_RETRY_TIMES:
+                    time.sleep(self._ROLLOVER_RETRY_SLEEP * attempt)
+            except Exception as e:
+                # 其他异常：仍要兜底，避免日志系统崩溃
+                last_err = e
+                break
+
+        # 所有重试都失败：走 stderr 提示 + debug 日志，绝不抛异常上抛
+        # （关键点：标准库 RotatingFileHandler 在 doRollover 抛异常时会触发
+        #  ``--- Logging error ---`` traceback 链，淹没真实日志）
+        if last_err is not None:
+            try:
+                sys.stderr.write(
+                    f"[logging] rollover failed after "
+                    f"{self._ROLLOVER_RETRY_TIMES} attempts: "
+                    f"{type(last_err).__name__}: {last_err}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+
 # 版本号从 version.py 统一获取
 try:
     from version import APP_VERSION as _APP_VERSION
 except Exception:
-    _APP_VERSION = 'v3.59'
+    _APP_VERSION = 'v3.60'
 
 
 # ============ 线程上下文存储 ============
@@ -290,7 +373,7 @@ def configure_logging(
     
     # 文件 handler (JSON)
     if file_output and json_output:
-        json_handler = logging.handlers.RotatingFileHandler(
+        json_handler = ThreadSafeRotatingFileHandler(
             log_dir / 'app.json.log',
             maxBytes=max_bytes,
             backupCount=backup_count,
@@ -302,10 +385,10 @@ def configure_logging(
             **static_fields
         ))
         root_logger.addHandler(json_handler)
-    
+
     # 文件 handler (人类可读)
     if file_output and not json_output:
-        text_handler = logging.handlers.RotatingFileHandler(
+        text_handler = ThreadSafeRotatingFileHandler(
             log_dir / 'app.log',
             maxBytes=max_bytes,
             backupCount=backup_count,

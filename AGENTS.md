@@ -9,7 +9,7 @@
   - 双击运行或命令行执行 `python main.py`
   - 四个功能卡片：数据爬取 / 智能分析中心 / 智能分析与验证
   - ★「开始分析」（智能分析中心内）六阶段统一编排：开始分析（两步流水线）+ 走势引擎 + 快速预测 + 命中率优化 + 在线学习闭环 + AI 辅助解读（v3.42 将原独立的「在线学习引擎」「命中率优化引擎」卡片融合进来）
-  - 当前版本：**v3.59**（版本号唯一来源 `version.py` 的 `APP_VERSION` / `CHANGELOG`）
+  - 当前版本：**v3.62**（版本号唯一来源 `version.py` 的 `APP_VERSION` / `CHANGELOG`）
 
 ## 关键配置
 - `D:\PythonProject\KPLuckyNumber\config.py`

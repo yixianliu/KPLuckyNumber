@@ -152,7 +152,8 @@ class Backtester:
                      enable_ai: bool = False,
                      max_bayes_aux_calls: int = 10,
                      resume: bool = True,
-                     log_callback: Optional[callable] = None) -> Dict[str, Any]:
+                     log_callback: Optional[callable] = None,
+                     cancel_event=None) -> Dict[str, Any]:
         """
         执行历史回测（Walk-Forward / 滚动窗口验证）
 
@@ -218,6 +219,13 @@ class Backtester:
         logger.info(f'开始历史回测: start_index={start_index}, test_count={test_count}, '
                     f'eval_mode={eval_mode}, enable_ai={enable_ai}')
 
+        # v3.60：取消信号贯穿回测循环（之前 50 期回测零处 cancel 检查，
+        # 用户取消时仍跑完 17+ 分钟）。cancel_event 为 None 时表示批处理模式，
+        # 不响应取消。逐期检查粒度为每 10 期一次（单期 predict 已耗时 30s+，
+        # 每次循环都查 cancel_event 性能开销可忽略，但语义上保持「10 期一次」
+        # 简洁明了，且确保 _aux_allowed=False 那些期也能被中断）。
+        self._cancel_event = cancel_event
+
         # 加载历史数据
         db = self._get_db()
         if not db.connect():
@@ -277,6 +285,26 @@ class Backtester:
 
             for _idx, i in enumerate(range(eval_start, eval_start + test_count)):
                 target_issue = history_data[i]['issue']
+
+                # v3.60：每期循环开始检查取消（轻量级 .is_set() 调用，
+                # 在 predict 内部的 30s+ 耗时背景下可忽略）。
+                # 检测到取消时立即 break，已完成的逐期结果保留在 backtest_results，
+                # 返回 dict 的 status='cancelled' 让上层区分「回测完成」vs「被取消」。
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    _done = len(backtest_results)
+                    logger.warning(
+                        f'回测在第 {_idx + 1}/{test_count} 期检测到取消信号，'
+                        f'已回测 {_done} 期，结果保留并返回 cancelled 状态')
+                    self._blog(f' ⚠ 回测被用户取消（已回测 {_done} 期）')
+                    return {
+                        'status': 'cancelled',
+                        'cancelled': True,
+                        'message': f'回测被取消（已完成 {_done}/{test_count} 期）',
+                        'results': backtest_results,
+                        'overall_stats': self._calculate_overall_stats(backtest_results),
+                        'completed_count': _done,
+                        'total_count': test_count,
+                    }
 
                 # —— 断点恢复：已完成期直接复用缓存，跳过预测与AI调用 ——
                 if resume and target_issue in _cache:
