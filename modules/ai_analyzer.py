@@ -10,10 +10,12 @@
 3. 报告生成 - 生成包含预测结果、置信度、趋势分析的结构化报告
 4. 数据库存储 - 将报告存入 p5_ai_report 表
 
-参考接口规范：
-- API端点：https://api.agnes-ai.cn/v1/chat/completions
-- 模型：agnes-2.5-flash
-- 认证方式：Bearer Token
+参考接口规范（见 D:\\PythonProject\\api\\api.txt）：
+- API 端点：https://api.agnes-ai.cn/v1/chat/completions
+- 默认模型：agnes-3.0-flash（v3.68 起升级；可通过 AGNES_MODEL_NAME 覆盖）
+- 认证方式：Authorization: Bearer <token>
+- 请求体字段：model / messages / max_tokens / temperature / tools / stream / top_p
+- 工具调用（function call）：tools=[{"type":"function","function":{...}}]
 """
 
 import logging
@@ -44,6 +46,75 @@ if not logger.handlers:
 
 # 说明：本模块负责调用 AI 并生成结构化报告。AI 配置从 config.py 的 AGNES_API_CONFIG 加载。
 
+# ---------------------------------------------------------------------------
+# 模块级 Session 复用（v3.68 新增）
+# 说明：
+#   - 每次调用新建 Session 会重复建立 TLS 握手与 HTTP 连接，浪费 CPU 与内存。
+#   - 此处持有进程级 Session，通过 HTTPAdapter 的 pool_connections / pool_maxsize
+#     启用连接池复用（TCP Keep-Alive），显著降低多次调用时的握手开销。
+#   - Session 构造失败不影响主流程（异常已在工厂函数内消化）。
+# ---------------------------------------------------------------------------
+_MODULE_SESSION = None
+_MODULE_SESSION_LOCK = __import__('threading').Lock()
+
+
+def _get_module_session(pool_connections: int = 5,
+                        pool_maxsize: int = 10,
+                        max_retries: int = 3,
+                        backoff_factor: float = 0.5) -> requests.Session:
+    """获取进程级复用的 requests.Session（线程安全，惰性初始化）。
+
+    Args:
+        pool_connections: HTTPAdapter 连接池数量（默认 5）
+        pool_maxsize: 单个连接池最大连接数（默认 10）
+        max_retries: urllib3 Retry 总次数（默认 3）
+        backoff_factor: Retry 退避因子（默认 0.5，重试间隔序列 0s / 1s / 2s）
+
+    Returns:
+        requests.Session 实例（已挂载 Retry 策略）
+    """
+    global _MODULE_SESSION
+    if _MODULE_SESSION is None:
+        with _MODULE_SESSION_LOCK:
+            if _MODULE_SESSION is None:
+                session = requests.Session()
+                retry = Retry(
+                    total=max_retries,
+                    connect=max_retries,
+                    read=max_retries,
+                    backoff_factor=backoff_factor,
+                    status_forcelist=(429, 500, 502, 503, 504),
+                    allowed_methods=frozenset(['POST', 'GET']),
+                    raise_on_status=False,
+                    respect_retry_after_header=True,
+                )
+                adapter = HTTPAdapter(
+                    max_retries=retry,
+                    pool_connections=pool_connections,
+                    pool_maxsize=pool_maxsize,
+                    pool_block=False,
+                )
+                session.mount('https://', adapter)
+                session.mount('http://', adapter)
+                _MODULE_SESSION = session
+                logger.info(
+                    f'AI Session 初始化完成: pool={pool_connections}/{pool_maxsize}, '
+                    f'retries={max_retries}, backoff={backoff_factor}'
+                )
+    return _MODULE_SESSION
+
+
+def reset_module_session() -> None:
+    """清空全局 Session 单例（供测试 / 密钥切换时调用，避免复用过期连接）。"""
+    global _MODULE_SESSION
+    with _MODULE_SESSION_LOCK:
+        if _MODULE_SESSION is not None:
+            try:
+                _MODULE_SESSION.close()
+            except Exception:
+                pass
+            _MODULE_SESSION = None
+
 
 class AIAnalyzer:
     """
@@ -65,75 +136,132 @@ class AIAnalyzer:
         self.position_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
 
     def _init_ai_config(self):
-        """初始化AI模型配置（从config.py读取AGNES配置）"""
-        try:
-            # 尝试从config.py加载配置（使用模块导入以避免在except路径中出现未定义名警告）
-            import config as cfg
-            self.api_config = getattr(cfg, 'AGNES_API_CONFIG', {}) or {}
-            self.api_url = self.api_config.get('api_url', "https://api.agnes-ai.cn/v1/chat/completions")
-            self.api_key = self.api_config.get('api_key', '')
-            self.model_name = self.api_config.get('model_name', 'agnes-2.5-flash')
-            self.ai_available = bool(self.api_key)
+        """初始化AI模型配置（对齐 api.txt 官方规范，参数从 config.py 的 AGNES_API_CONFIG 读取）。
 
-            if self.ai_available:
-                self.headers = {
-                    'Content-Type': 'application/json',
-                    'Authorization': f'Bearer {self.api_key}'
-                }
-                logger.info(f'从config.py加载API配置: {self.model_name}')
-            else:
-                logger.warning('config.py中未配置API密钥')
+        说明：
+            - model_name 默认升级为 agnes-3.0-flash（api.txt 推荐版本）；
+            - 所有可调参数（timeout / max_tokens / temperature / top_p / stream 等）均从配置读取，
+              调用方可按需 override，无需修改代码。
+            - 备份模型（backup_model）用于主模型被限流/404 时的自动降级。
+        """
+        defaults = {
+            'api_url': "https://api.agnes-ai.cn/v1/chat/completions",
+            'api_key': '',
+            'model_name': 'agnes-3.0-flash',
+            'backup_model': 'agnes-2.5-flash',
+            'timeout': 60,
+            'max_tokens': 2048,
+            'temperature': 0.7,
+            'top_p': 1.0,
+            'stream': False,
+            'max_retries': 3,
+            'retry_backoff_factor': 0.5,
+            'pool_connections': 5,
+            'pool_maxsize': 10,
+            'response_format': 'json_object',
+        }
+        try:
+            import config as cfg
+            self.api_config = {**defaults, **(getattr(cfg, 'AGNES_API_CONFIG', {}) or {})}
         except Exception:
-            # 如果无法导入config模块，使用空配置继续
-            self.api_config = {}
-            self.api_url = "https://api.agnes-ai.cn/v1/chat/completions"
-            self.api_key = ''
-            self.model_name = 'agnes-2.5-flash'
-            self.ai_available = False
-            logger.info('未能从config.py加载配置')
+            self.api_config = dict(defaults)
+            logger.info('未能从config.py加载配置，使用默认值')
+
+        self.api_url = self.api_config.get('api_url', defaults['api_url'])
+        self.api_key = self.api_config.get('api_key', '')
+        self.model_name = self.api_config.get('model_name', defaults['model_name'])
+        self.backup_model = self.api_config.get('backup_model', defaults['backup_model'])
+        self.timeout = int(self.api_config.get('timeout', 60))
+        self.default_max_tokens = int(self.api_config.get('max_tokens', 2048))
+        self.default_temperature = float(self.api_config.get('temperature', 0.7))
+        self.top_p = float(self.api_config.get('top_p', 1.0))
+        self.stream = bool(self.api_config.get('stream', False))
+        self.max_retries = int(self.api_config.get('max_retries', 3))
+        self.retry_backoff_factor = float(self.api_config.get('retry_backoff_factor', 0.5))
+        self.pool_connections = int(self.api_config.get('pool_connections', 5))
+        self.pool_maxsize = int(self.api_config.get('pool_maxsize', 10))
+        self.response_format = self.api_config.get('response_format', 'json_object')
+        self.ai_available = bool(self.api_key)
+
+        if self.ai_available:
+            self.headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {self.api_key}',
+            }
+            logger.info(
+                f'从config.py加载API配置: model={self.model_name}, '
+                f'backup={self.backup_model}, timeout={self.timeout}s, '
+                f'max_tokens={self.default_max_tokens}'
+            )
+        else:
+            logger.warning('config.py中未配置API密钥，AI功能将跳过')
 
     def _call_ai_model(self, messages: List[Dict[str, Any]],
-                       max_tokens: int = 8000,
-                       temperature: float = 0.7) -> Optional[str]:
-        """
-        调用 AGNES AI 模型
+                       max_tokens: Optional[int] = None,
+                       temperature: Optional[float] = None,
+                       tools: Optional[List[Dict[str, Any]]] = None,
+                       response_format: Optional[str] = None,
+                       model: Optional[str] = None,
+                       _fallback_used: bool = False) -> Optional[str]:
+        """调用 AGNES AI 模型（对齐 api.txt 官方接口规范）。
 
-        参考接口规范：
-        - POST https://api.agnes-ai.cn/v1/chat/completions
-        - Content-Type: application/json
-        - Authorization: Bearer <token>
+        请求契约（api.txt §基础请求 / §工具调用请求）:
+            POST {api_url}
+            Headers: Authorization: Bearer <key>, Content-Type: application/json
+            Body:   {"model":..., "messages":[...], "max_tokens":N, "temperature":T}
+                    可选字段: tools / response_format / stream / top_p
 
         Args:
-            messages: 消息列表，包含system、user角色
-            max_tokens: 最大输出token数
-            temperature: 温度参数
+            messages: 消息列表，包含 system / user 角色
+            max_tokens: 最大输出 token 数（None 时用配置默认值）
+            temperature: 温度参数（None 时用配置默认值）
+            tools: OpenAI 兼容的 function call 声明；非空时透传至 payload.tools
+            response_format: JSON 输出模式（默认 'json_object'；传 False 关闭）
+            model: 覆盖本次调用的模型名（None 用 self.model_name）
+            _fallback_used: 内部标记，主模型失败后是否已切到备份模型
 
         Returns:
-            AI模型返回的内容，失败返回None
+            AI 返回的内容字符串；调用失败返回 None。
         """
         if not self.ai_available:
             logger.warning('AI模型不可用（未配置API密钥）')
             return None
 
-        logger.info(f'=== 开始调用AI模型: {self.model_name} ===')
+        use_model = model or self.model_name
+        max_tokens = int(max_tokens if max_tokens is not None else self.default_max_tokens)
+        temperature = float(temperature if temperature is not None else self.default_temperature)
+        rf = self.response_format if response_format is None else response_format
 
-        # 构建请求payload，参考function call接口规范
-        # 注意：payload 尽量保持简洁，response 可能包含非严格 JSON 的文本，因此解析需增加容错。
-        payload = {
-            "model": self.model_name,
+        logger.info(
+            f'=== 开始调用AI模型: {use_model} | max_tokens={max_tokens} | '
+            f'temperature={temperature} | tools={len(tools) if tools else 0} ==='
+        )
+
+        # 构建请求 payload（仅包含非空/非默认字段，保持请求体精简）
+        payload: Dict[str, Any] = {
+            "model": use_model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "stream": False
+            "stream": bool(self.stream),
         }
+        if self.top_p is not None and self.top_p != 1.0:
+            payload["top_p"] = self.top_p
+        if tools:
+            payload["tools"] = tools
+        if rf and rf not in (False, 'false', 'False'):
+            payload["response_format"] = {"type": rf}
 
-        # 构建带自动重试的 Session, 应对瞬时网络/SSL错误:
-        # - SSLEOFError / 连接中断 等会被 requests 归类为 RequestException, 由下方方法级重试捕获
-        # - 5xx / 429 由 urllib3 Retry 适配器自动重试
-        session = self._build_ai_session()
+        # 复用进程级 Session（连接池 + Retry），避免每次调用重新建立 TLS 握手
+        session = _get_module_session(
+            pool_connections=self.pool_connections,
+            pool_maxsize=self.pool_maxsize,
+            max_retries=self.max_retries,
+            backoff_factor=self.retry_backoff_factor,
+        )
 
-        last_err = None
-        max_attempts = 4
+        last_err: Optional[BaseException] = None
+        max_attempts = 4  # 方法层重试；urllib3 内部 Retry 会先行拦截瞬时 5xx
         for attempt in range(max_attempts):
             try:
                 response = session.request(
@@ -141,23 +269,64 @@ class AIAnalyzer:
                     self.api_url,
                     headers=self.headers,
                     data=json.dumps(payload),
-                    timeout=60
+                    timeout=self.timeout,
                 )
                 response.raise_for_status()
 
                 result = response.json()
 
                 if 'choices' in result and len(result['choices']) > 0:
-                    content = result['choices'][0]['message']['content']
-                    logger.info(f'AI模型调用成功(第{attempt + 1}次), 返回长度: {len(content)}')
-                    return content
+                    choice = result['choices'][0]
+                    content = choice.get('message', {}).get('content')
+                    if content:
+                        usage = result.get('usage', {})
+                        logger.info(
+                            f'AI模型调用成功(第{attempt + 1}次), 长度={len(content)}, '
+                            f'usage={usage}, finish_reason={choice.get("finish_reason")}'
+                        )
+                        return content
+
+                # 主模型不可用（404 / 502 / 429 且重试耗尽）时自动降级到备份模型
+                if not _fallback_used and use_model != self.backup_model and self.backup_model:
+                    logger.warning(
+                        f'AI模型 {use_model} 返回异常，尝试降级到备份模型 {self.backup_model}'
+                    )
+                    return self._call_ai_model(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        tools=tools,
+                        response_format=response_format,
+                        model=self.backup_model,
+                        _fallback_used=True,
+                    )
 
                 logger.error(f'AI模型返回格式异常: {result}')
                 return None
 
+            except requests.exceptions.HTTPError as e:
+                last_err = e
+                status = e.response.status_code if e.response is not None else None
+                # 4xx（400/401/403/404）非重试，直接返回；避免浪费配额
+                if status is not None and 400 <= status < 500:
+                    logger.error(f'AI模型 HTTP {status} 错误（非重试）: {e}')
+                    # 404/410 模型不存在时，尝试降级到备份模型
+                    if status in (404, 410) and not _fallback_used and self.backup_model:
+                        logger.warning(f'模型 {use_model} 不存在，降级到 {self.backup_model}')
+                        return self._call_ai_model(
+                            messages=messages, max_tokens=max_tokens,
+                            temperature=temperature, tools=tools,
+                            response_format=response_format,
+                            model=self.backup_model, _fallback_used=True,
+                        )
+                    return None
+                wait = 0.8 * (2 ** attempt)
+                logger.warning(f'AI模型调用第{attempt + 1}次失败: {e}; {wait:.1f}s 后重试')
+                if attempt < max_attempts - 1:
+                    time.sleep(wait)
             except requests.exceptions.RequestException as e:
                 last_err = e
-                wait = 0.8 * (2 ** attempt)  # 指数退避: 0.8s, 1.6s, 3.2s
+                wait = 0.8 * (2 ** attempt)  # 指数退避: 0.8s / 1.6s / 3.2s
                 logger.warning(f'AI模型调用第{attempt + 1}次失败: {e}; {wait:.1f}s 后重试')
                 if attempt < max_attempts - 1:
                     time.sleep(wait)
@@ -173,19 +342,12 @@ class AIAnalyzer:
 
     @staticmethod
     def _build_ai_session() -> requests.Session:
-        """构建带重试策略的 requests Session, 应对 SSL EOF / 连接中断 / 5xx 等瞬时错误。"""
-        session = requests.Session()
-        retry = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=frozenset(['POST', 'GET']),
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=10)
-        session.mount('https://', adapter)
-        session.mount('http://', adapter)
-        return session
+        """兼容旧代码路径的 Session 工厂；内部委托到进程级 Session 单例。
+
+        说明：本方法保留仅为向后兼容（外部脚本可能直接调用），
+        实际请求路径已切换到 _get_module_session 的连接池实现。
+        """
+        return _get_module_session()
 
     def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
         """解析AI响应为JSON格式（鲁棒：兼容单引号/裸key/尾随逗号/代码块）"""

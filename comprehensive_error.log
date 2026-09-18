@@ -1,0 +1,78 @@
+21:34:38 | INFO     | root | 日志系统初始化完成: level=INFO, json=False
+21:34:38 | INFO     | modules.task_manager | TaskManager 初始化完成: workers=4, queue_size=100
+21:34:39 | INFO     | modules.self_evolution | [self_evolution] _run 主循环开始（线程=Thread-1 (_run)）
+21:34:39 | INFO     | modules.self_evolution | [self_evolution] 引擎已启动，后台线程 Thread-1 (_run) 开始执行
+21:34:39 | INFO     | __main__ | [GUI] 自我进化引擎已初始化并启动，注册轮询定时器
+21:34:39 | INFO     | modules.self_evolution | [self_evolution] 检查点状态: 已加载=True, 当前阶段=evolve, 检查点键=['phase', 'latest_issue', 'history_count', 'baseline']
+21:34:39 | INFO     | modules.self_evolution | [self_evolution] 将从索引 2 继续（总阶段数=6）
+21:34:39 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 2/5: evolve
+21:34:39 | INFO     | modules.self_evolution | [self_evolution] _phase_evolve 开始
+21:34:39 | INFO     | modules.self_evolution | [self_evolution] ML 子进程池创建成功（max_workers=2, timeout=60s）
+21:34:40 | INFO     | root | 日志系统初始化完成: level=INFO, json=False
+21:34:40 | INFO     | root | 日志系统初始化完成: level=INFO, json=False
+21:34:40 | INFO     | modules.database | MySQL连接池初始化成功 (min=2, max=10)
+21:34:40 | INFO     | modules.predictor | 预测配置已加载: 启用8个算法, 总权重1.00
+21:34:40 | INFO     | modules.predictor | 自适应权重: 回放 140 条权重历史产物完成
+21:34:40 | INFO     | modules.predictor | AI模型配置加载成功: agnes-2.5-flash
+21:34:40 | INFO     | modules.self_evolution | [self_evolution] 权重快照已采集: weights=None, lookback=None
+21:34:40 | INFO     | modules.self_evolution | [self_evolution] 样本量=1067, auto=True, auto_full=True, eval_periods=15
+21:34:40 | INFO     | modules.self_evolution | [self_evolution] 样本量充足，开始构造训练窗口（eval_periods=15）
+21:34:40 | INFO     | modules.self_evolution | [self_evolution] 窗口构造完成: 有效窗口数=7, 总样本=1067, 有效样本=1067
+21:34:40 | INFO     | modules.self_evolution | [self_evolution] 窗口构造完成: 有效窗口数=7, 数据质量={'total_rows': 1067, 'valid_rows': 1067, 'invalid_rows': 0}
+21:34:40 | INFO     | modules.predictor | 预测配置已加载: 启用8个算法, 总权重1.00
+21:34:40 | INFO     | modules.predictor | 自适应权重: 回放 140 条权重历史产物完成
+21:34:40 | INFO     | modules.predictor | AI模型配置加载成功: agnes-2.5-flash
+21:34:40 | INFO     | modules.self_evolution | [self_evolution] 当前统计权重: {'frequency_weighted': 0.68, 'omission_regression': 0.06, 'trend_momentum': 0.01, 'markov_transition': 0.005, 'pattern_continuation': 0.003, 'bayesian_inference': 0.1, 'feature_engineering': 0.002}
+21:34:40 | INFO     | modules.predictor | 预测配置已加载: 启用8个算法, 总权重1.00
+21:34:40 | INFO     | modules.predictor | 自适应权重: 回放 140 条权重历史产物完成
+21:34:40 | INFO     | modules.predictor | AI模型配置加载成功: agnes-2.5-flash
+21:34:40 | INFO     | modules.self_evolution | [self_evolution] 调优预测器构造成功，开始坐标下降搜索
+21:34:40 | INFO     | modules.evolution_tuner | [DeepTuner] 开始调优: windows=7, base_lookback=60, max_rounds=6
+21:34:40 | INFO     | modules.evolution_tuner | [DeepTuner] 当前权重: {'frequency_weighted': 0.7906976744186046, 'omission_regression': 0.0697674418604651, 'trend_momentum': 0.011627906976744184, 'markov_transition': 0.005813953488372092, 'pattern_continuation': 0.0034883720930232553, 'bayesian_inference': 0.11627906976744186, 'feature_engineering': 0.002325581395348837}
+21:34:41 | INFO     | modules.predictor | 从 p5_prediction_record 加载 1006 条验证记录
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.evolution_tuner | [DeepTuner] 基线评估完成: {'tested': 7, 'top1': 8.571, 'top3': 31.429, 'top5': 60.0}
+21:34:41 | INFO     | modules.evolution_tuner | [DeepTuner] 坐标下降完成: 候选=29, 最优指标={'tested': 7, 'top1': 8.571, 'top3': 34.286, 'top5': 57.143}
+21:34:41 | INFO     | modules.evolution_tuner | [DeepTuner] 开始 lookback 搜索: 候选=[40, 60, 80]
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.evolution_tuner | [DeepTuner]   lookback=40: {'tested': 7, 'top1': 8.571, 'top3': 34.286, 'top5': 57.143}
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+21:34:41 | INFO     | modules.evolution_tuner | [DeepTuner]   lookback=80: {'tested': 7, 'top1': 8.571, 'top3': 34.286, 'top5': 57.143}
+21:34:41 | INFO     | modules.evolution_tuner | [DeepTuner] 调优完成: 总候选=32, 缓存命中=140, 缓存未命中=21, 耗时=446.37ms, 优化=True
+21:34:41 | INFO     | modules.self_evolution | [self_evolution] 深度调优结果: 候选=32, 缓存命中=140, 耗时=446.37ms, improved=True, Top3=34.286%
+21:34:41 | INFO     | modules.self_evolution | [self_evolution] 开始 ML 单次重训评估（样本量=1067 >= 61）
+21:34:41 | INFO     | modules.ml_predictor | [ml_predictor] _parse_history 返回: issues=1066, digits 类型=dict, hezhi=1066
+21:34:41 | INFO     | modules.ml_predictor | [ml_predictor] wan 位: y_seq 类型=list, 长度=1066, 前5项=[8, 4, 2, 7, 5]
+21:34:51 | INFO     | modules.task_manager | TaskManager 正在关闭...
+21:34:56 | WARNING  | __main__ | TaskManager shutdown timed out, proceeding anyway
+Exception in thread Thread-8 (_readerthread):
+Traceback (most recent call last):
+  File "D:\anaconda3\Lib\threading.py", line 1043, in _bootstrap_inner
+    self.run()
+    ~~~~~~~~^^
+  File "D:\anaconda3\Lib\threading.py", line 994, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\anaconda3\Lib\subprocess.py", line 1615, in _readerthread
+    buffer.append(fh.read())
+                  ~~~~~~~^^
+  File "<frozen codecs>", line 325, in decode
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb4 in position 0: invalid start byte

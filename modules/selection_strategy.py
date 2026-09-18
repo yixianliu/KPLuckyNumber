@@ -69,6 +69,7 @@ STRATEGY_LABELS: Dict[str, str] = {
     'max_probability': '纯概率贪心',
     'hybrid': '混合（尖峰+覆盖）',
     'legacy_constrained': '传统形态约束（对照）',
+    'dynamic_slot': '动态槽位（遗漏加权）',
 }
 
 #: 策略标识 → 优化目标说明
@@ -78,6 +79,7 @@ STRATEGY_OBJECTIVES: Dict[str, str] = {
     'max_probability': '最大化单注精确全中概率',
     'hybrid': '保留最高概率组合，同时补足位覆盖',
     'legacy_constrained': '复现 v3.x 原有行为，仅供回归对照',
+    'dynamic_slot': '基于近期遗漏值动态调整各位置候选槽位权重',
 }
 
 DEFAULT_STRATEGY = 'weighted_coverage'
@@ -336,6 +338,88 @@ def _strategy_hybrid(fused_probs: List[Dict[int, float]], k: int,
     return out[:k]
 
 
+def _get_miss_adjusted_slots(miss_values: Optional[Sequence[Dict[int, int]]],
+                             decay_lambda: float = 0.1
+                             ) -> Optional[Dict[int, Dict[int, float]]]:
+    """
+    将原始遗漏期数数据转换为各位置、各号码的调整系数。
+
+    调整逻辑：
+        遗漏值越高 → 该号码"越冷"→ 给予轻度提升系数（>1.0），
+        体现"冷号回补"倾向（注意：公平摇号下冷号并不会更可能开出，
+        此调整仅为历史归纳的经验性参考，不影响真实随机性）。
+
+    调整系数公式：
+        factor = 1.0 + decay_lambda * min(miss, cap)
+        cap = 20（防止极端遗漏导致系数过大）
+
+    Args:
+        miss_values: 可选，List[Dict[int, int]]，长度 5，
+                     每位为 {号码(0-9): 遗漏期数}
+        decay_lambda: 衰减系数（越小调整越温和，默认 0.1）
+
+    Returns:
+        调整系数字典 {position_index: {number: factor}}，
+        若 miss_values 为 None 或空则返回 None
+    """
+    if not miss_values or len(miss_values) < POSITIONS:
+        return None
+
+    adjustments: Dict[int, Dict[int, float]] = {}
+    for pos in range(POSITIONS):
+        pos_miss = miss_values[pos] if pos < len(miss_values) else {}
+        adjustments[pos] = {}
+        for num in range(NUMBER_SPACE):
+            miss = int(pos_miss.get(num, 0))
+            capped = min(miss, 20)  # 封顶，防止极端值
+            adjustments[pos][num] = 1.0 + decay_lambda * capped
+    return adjustments
+
+
+def _strategy_dynamic_slot(fused_probs: List[Dict[int, float]], k: int,
+                          miss_adjustments: Optional[Dict[int, Dict[int, float]]] = None,
+                          position_top_n: int = 6,
+                          ) -> List[Tuple[int, ...]]:
+    """
+    动态槽位策略：基于遗漏值调整各位置候选槽位权重。
+    
+    如果提供了 miss_adjustments，则对各位置的分布进行调整，
+    以体现对近期遗漏号码的偏好或惩罚。调整后调用覆盖策略生成组合。
+    
+    Args:
+        fused_probs: 原始融合概率
+        k: 注数
+        miss_adjustments: {position_index: {number: adjustment_factor}}
+        position_top_n: 备用
+    
+    Returns:
+        组合列表
+    """
+    if not miss_adjustments:
+        # 如果没有提供遗漏调整数据，回退到标准的加权覆盖策略
+        return _strategy_coverage(fused_probs, k, min(k, NUMBER_SPACE), uniform_weight=0.2)
+    
+    adjusted_probs = []
+    for pos in range(POSITIONS):
+        base_probs = dict(fused_probs[pos])
+        adjustments = miss_adjustments.get(pos, {})
+        new_probs = {}
+        for num in range(NUMBER_SPACE):
+            factor = adjustments.get(num, 1.0)
+            p = base_probs.get(num, 0.0) * factor
+            new_probs[num] = p
+        
+        total = sum(new_probs.values())
+        if total > 0:
+            new_probs = {num: p / total for num, p in new_probs.items()}
+        else:
+            new_probs = {num: 1.0 / NUMBER_SPACE for num in range(NUMBER_SPACE)}
+        
+        adjusted_probs.append(new_probs)
+    
+    return _strategy_coverage(adjusted_probs, k, min(k, NUMBER_SPACE), uniform_weight=0.1)
+
+
 def _strategy_legacy(fused_probs: List[Dict[int, float]], k: int,
                      position_top_n: int, constraints: Dict[str, Any]
                      ) -> Tuple[List[Tuple[int, ...]], Dict[str, Any]]:
@@ -478,6 +562,67 @@ def evaluate_selection(combinations: Sequence[Sequence[int]],
     }
 
 
+def _jaccard_similarity(a: Sequence[int], b: Sequence[int]) -> float:
+    """
+    计算两个组合的 Jaccard 相似度。
+
+    Jaccard(A, B) = |A ∩ B| / |A ∪ B|
+
+    在 5 位组合场景下，数值越大代表两注越同质。
+    公平摇号下任意两注的期望 Jaccard ≈ 0.1（1/10）。
+    """
+    sa, sb = set(a), set(b)
+    union = sa | sb
+    return len(sa & sb) / len(union) if union else 0.0
+
+
+def _enforce_diversity(combinations: List[Tuple[int, ...]],
+                       max_jaccard: float = 0.3,
+                       k: int = 10,
+                       ) -> List[Tuple[int, ...]]:
+    """
+    多样性约束（1.8）：过滤 Jaccard 相似度 ≥ max_jaccard 的高同质组合。
+
+    贪心保留：按输入顺序逐个判断，若与已保留集合中任一组合
+    的 Jaccard 相似度超过阈值则剔除；不足 k 注时保留原集合（不过滤）。
+
+    Args:
+        combinations: 候选组合列表
+        max_jaccard: Jaccard 阈值（>= 该值视为高度同质），默认 0.3
+        k: 目标注数
+
+    Returns:
+        过滤后的组合列表（可能少于 k 注）
+    """
+    if not combinations:
+        return []
+
+    kept: List[Tuple[int, ...]] = []
+    for combo in combinations:
+        if len(kept) >= k:
+            break
+        # 检查与已保留组合的 Jaccard 相似度
+        too_similar = False
+        for prev in kept:
+            if _jaccard_similarity(combo, prev) >= max_jaccard:
+                too_similar = True
+                break
+        if not too_similar:
+            kept.append(combo)
+
+    # 过滤后不足 k 注时，把原始顺序中未被保留的组合补回来
+    if len(kept) < k:
+        kept_set = set(map(tuple, kept))
+        for combo in combinations:
+            if len(kept) >= k:
+                break
+            if tuple(combo) not in kept_set:
+                kept.append(combo)
+                kept_set.add(tuple(combo))
+
+    return kept[:k]
+
+
 def derive_position_recommendations(combinations: Sequence[Sequence[int]],
                                     fused_probs: List[Dict[int, float]],
                                     per_position: int = 5) -> Dict[str, List[int]]:
@@ -515,7 +660,9 @@ def generate_combinations(fused_probs: List[Dict[int, float]],
                           coverage_floor: Optional[int] = None,
                           position_top_n: int = 6,
                           anchor_count: int = 3,
-                          constraints: Optional[Dict[str, Any]] = None
+                          constraints: Optional[Dict[str, Any]] = None,
+                          miss_values: Optional[Sequence[Dict[int, int]]] = None,
+                          max_jaccard: Optional[float] = None,
                           ) -> Dict[str, Any]:
     """
     选号策略主入口。
@@ -528,6 +675,9 @@ def generate_combinations(fused_probs: List[Dict[int, float]],
         position_top_n: 概率类策略的每位候选数
         anchor_count: hybrid 策略保留的尖峰注数
         constraints: legacy_constrained 策略使用的形态约束参数
+        miss_values: 可选，List[Dict[int,int]]，每位遗漏期数，供 dynamic_slot 策略使用
+        max_jaccard: 可选，多样性阈值（0-1）。非 None 时启用 1.8 多样性约束，
+                     过滤 Jaccard ≥ 该阈值的组合；默认 None 表示不启用。
 
     Returns:
         {
@@ -557,6 +707,12 @@ def generate_combinations(fused_probs: List[Dict[int, float]],
         raw = _strategy_hybrid(fused_probs, k, coverage_floor, anchor_count, position_top_n)
     elif strategy == 'legacy_constrained':
         raw, diagnostics = _strategy_legacy(fused_probs, k, position_top_n, constraints or {})
+    elif strategy == 'dynamic_slot':
+        miss_adj = _get_miss_adjusted_slots(miss_values)
+        if miss_adj is None and miss_values is None:
+            # 无遗漏数据时给出 diagnostics 提示
+            diagnostics['dynamic_slot_note'] = '未提供 miss_values，已使用默认回退'
+        raw = _strategy_dynamic_slot(fused_probs, k, miss_adj, position_top_n)
     else:
         strategy = 'weighted_coverage'
         raw = _strategy_coverage(fused_probs, k, coverage_floor, uniform_weight=0.0)
@@ -565,6 +721,13 @@ def generate_combinations(fused_probs: List[Dict[int, float]],
         logger.warning('选号策略 %s 未产出组合，回退到纯概率贪心', strategy)
         raw = _strategy_max_probability(fused_probs, k, position_top_n)
         diagnostics['fallback'] = True
+
+    # 1.8 多样性约束：过滤 Jaccard 相似度超过阈值的组合
+    if max_jaccard is not None:
+        before_count = len(raw)
+        raw = _enforce_diversity(raw, max_jaccard=max_jaccard, k=k)
+        if len(raw) < before_count:
+            diagnostics['diversity_filtered'] = before_count - len(raw)
 
     # 统一封装为 predictor 兼容格式
     scored = []
@@ -619,7 +782,7 @@ def compare_strategies(fused_probs: List[Dict[int, float]], k: int = 10,
     """
     rows: List[Dict[str, Any]] = []
     for key in ('weighted_coverage', 'latin_coverage', 'hybrid',
-                'max_probability', 'legacy_constrained'):
+                'max_probability', 'legacy_constrained', 'dynamic_slot'):
         res = generate_combinations(fused_probs, k=k, strategy=key,
                                     position_top_n=position_top_n)
         m = res.get('metrics', {})
@@ -671,3 +834,206 @@ def format_strategy_comparison(comparison: Dict[str, Any]) -> str:
     lines.append(comparison.get('note', ''))
     lines.append('=' * 74)
     return '\n'.join(lines)
+
+
+# ============================================================
+# v3.70 (roadmap 1.9) 策略 A/B walk-forward 命中率对比框架
+# ============================================================
+# 设计意图：
+#   排列5 为公平摇号，策略 A/B 的"命中率"在精确全中口径下永远等价
+#   （= K/100000），差异只体现在"位覆盖命中"口径上。本框架通过
+#   walk-forward（滚动窗口）方式，在历史真实开奖数据上回放两个策略，
+#   统计各自"至少一注命中第 pos 位"的频率，作为可复现的离线对比指标。
+#
+#   结果通过 persist_selection_ab_result 持久化到新表 p5_selection_ab_test，
+#   供 GUI 端"策略对照"面板与回测报告消费。
+#
+# 诚实边界：
+#   公平摇号下，任何策略的精确全中命中率 ≈ 随机基线；本框架仅用于
+#   "位覆盖命中"口径的离线对比，不可作为"提升中奖概率"的依据。
+
+
+def run_strategy_ab_walk_forward(history: List[Dict],
+                                  strategy_a: str = 'weighted_coverage',
+                                  strategy_b: str = 'latin_coverage',
+                                  warmup: int = 60,
+                                  top_k: int = 3,
+                                  prob_window: int = 30) -> Dict[str, Any]:
+    """v3.70 (1.9): 在历史真实开奖上做 walk-forward 对比两个策略的位覆盖命中。
+
+    流程（严格无前视泄漏）：
+        1. 按 issue 正序排列 history，取前 warmup 期作为"历史特征基线"。
+        2. 对 i ∈ [warmup, len-1]：用前 prob_window 期开奖数字做等频频率
+           概率（最朴素的无偏基准，让对比不受特征工程污染），调用
+           generate_combinations 生成策略 A 与 B 的 top_k 注。
+        3. 用实际第 i 期的开奖数字作为 ground truth，统计
+           "K 注中至少 1 注命中第 pos 位"的频率（位覆盖命中口径）。
+        4. 对每个策略累计 5 位的命中次数，除以总期数得到命中率。
+        5. 同时统计 Top-1 命中口径（首注是否命中该位），用于精确对照。
+
+    Args:
+        history: [{'issue': str, 'numbers': [int]*5}, ...] 按 issue 正序排列
+        strategy_a / strategy_b: 要对比的两个策略标识
+        warmup: 特征基线所需最少历史期数（默认 60）
+        top_k: 每个策略生成的注数（默认 3，用于统计 K 注覆盖命中）
+        prob_window: 频率概率窗口（默认 30 期）
+
+    Returns:
+        {
+          'strategy_a': str, 'strategy_b': str,
+          'issue_range': str,  # 形如 '20260001-20260050'
+          'total_periods': int,
+          'top1_a': float, 'top1_b': float,  # Top-1 命中率（0-1）
+          'top3_a': float, 'top3_b': float,  # K 注覆盖命中率（0-1）
+          'positions_a': [float]*5, 'positions_b': [float]*5,
+          'note': str,  # 诚实边界说明
+        }
+    """
+    if not history or len(history) <= warmup + 1:
+        return {
+            'strategy_a': strategy_a, 'strategy_b': strategy_b,
+            'issue_range': '', 'total_periods': 0,
+            'top1_a': 0.0, 'top1_b': 0.0, 'top3_a': 0.0, 'top3_b': 0.0,
+            'positions_a': [0.0] * 5, 'positions_b': [0.0] * 5,
+            'note': '历史数据不足，无法做 walk-forward 对比',
+        }
+
+    # 构造等频概率（前 prob_window 期的频率）
+    def _freq_probs(start_idx: int) -> List[Dict[int, float]]:
+        s = max(0, start_idx - prob_window + 1)
+        window = history[s:start_idx + 1]
+        fused = []
+        for pos in range(POSITIONS):
+            counts = [0] * NUMBER_SPACE
+            for row in window:
+                nums = row.get('numbers', [])
+                if pos < len(nums):
+                    counts[int(nums[pos])] += 1
+            total = sum(counts) or 1
+            fused.append({d: counts[d] / total for d in range(NUMBER_SPACE)})
+        return fused
+
+    def _covered_positions(combos: List[str],
+                            actual: Tuple[int, ...]) -> List[int]:
+        """返回 K 注"位覆盖命中"指示向量（第 p 位是否被至少 1 注命中）。
+
+        注意：generate_combinations 输出的 combination 是字符串（如 '01525'），
+        需逐位转 int 再与 actual（int 元组）比较，否则比较恒为 False。
+        """
+        per_pos_hit: List[bool] = [False] * POSITIONS
+        for combo in combos:
+            for i in range(POSITIONS):
+                if i < len(combo) and i < len(actual) \
+                        and int(combo[i]) == actual[i]:
+                    per_pos_hit[i] = True
+        return [1 if h else 0 for h in per_pos_hit]
+
+    total_periods = 0
+    pos_first_a = [0] * POSITIONS
+    pos_first_b = [0] * POSITIONS
+    pos_covered_a = [0] * POSITIONS
+    pos_covered_b = [0] * POSITIONS
+
+    last_issue = ''
+    first_issue = ''
+    for i in range(warmup, len(history)):
+        row = history[i]
+        nums = tuple(int(x) for x in row.get('numbers', [])[:POSITIONS])
+        if len(nums) < POSITIONS:
+            continue
+        fused = _freq_probs(i)
+        res_a = generate_combinations(fused, k=top_k, strategy=strategy_a)
+        res_b = generate_combinations(fused, k=top_k, strategy=strategy_b)
+        combos_a = [c['combination'] for c in res_a.get('combinations', [])][:top_k]
+        combos_b = [c['combination'] for c in res_b.get('combinations', [])][:top_k]
+
+        cov_a = _covered_positions(combos_a, nums)
+        cov_b = _covered_positions(combos_b, nums)
+        first_a = _covered_positions([combos_a[0]], nums) if combos_a else [0] * POSITIONS
+        first_b = _covered_positions([combos_b[0]], nums) if combos_b else [0] * POSITIONS
+        for p in range(POSITIONS):
+            pos_first_a[p] += first_a[p]
+            pos_first_b[p] += first_b[p]
+            pos_covered_a[p] += cov_a[p]
+            pos_covered_b[p] += cov_b[p]
+
+        total_periods += 1
+        last_issue = str(row.get('issue', ''))
+        if total_periods == 1:
+            first_issue = str(row.get('issue', ''))
+
+    # 位覆盖命中率（每位命中次数 / 总期数），取值恒在 [0,1]
+    def _pos_rates(cov_list: List[int], total: int) -> List[float]:
+        return [round(c / total, 4) if total > 0 else 0.0 for c in cov_list]
+
+    return {
+        'strategy_a': strategy_a,
+        'strategy_b': strategy_b,
+        'issue_range': f"{first_issue}-{last_issue}" if total_periods > 0 else '',
+        'total_periods': total_periods,
+        # Top-1 口径：首注命中第 p 位的频率（5 位平均），取值 [0,1]
+        'top1_a': round(sum(_pos_rates(pos_first_a, total_periods)) / POSITIONS, 4),
+        'top1_b': round(sum(_pos_rates(pos_first_b, total_periods)) / POSITIONS, 4),
+        # K 注覆盖口径：K 注中至少 1 注命中第 p 位的频率（5 位平均），取值 [0,1]
+        'top3_a': round(sum(_pos_rates(pos_covered_a, total_periods)) / POSITIONS, 4),
+        'top3_b': round(sum(_pos_rates(pos_covered_b, total_periods)) / POSITIONS, 4),
+        # 每位位覆盖命中率（K 注口径），取值 [0,1]
+        'positions_a': _pos_rates(pos_covered_a, total_periods),
+        'positions_b': _pos_rates(pos_covered_b, total_periods),
+        'note': ('公平摇号下精确全中命中率恒为 K/100000，与策略无关；'
+                 '本框架的 top1_* 为"首注命中"口径（首注命中第 p 位的频率），'
+                 'top3_* 与 positions_* 为 K 注"位覆盖命中"口径'
+                 '（K 注中至少 1 注命中第 p 位的频率）。'
+                 '两者差异反映选号组合的"位覆盖"能力，而非"精确全中"预测力。'),
+    }
+
+
+def persist_selection_ab_result(result: Dict[str, Any],
+                                  db=None) -> Optional[int]:
+    """v3.70 (1.9): 将 walk-forward A/B 结果写入 p5_selection_ab_test。
+
+    Args:
+        result: run_strategy_ab_walk_forward 的返回值
+        db: 数据库连接（P5Database 实例或 None）。
+            db 为 None 时自动尝试连接；连接失败静默降级（降级保底原则），
+            仅记录 warning，不抛异常。
+
+    Returns:
+        新记录 ab_id（int），失败返回 None（不影响主流程）。
+    """
+    try:
+        if db is None:
+            db = _connect_db_for_ab()
+            if db is None:
+                return None
+        ab_id = db.insert_selection_ab_test(
+            strategy_a=result.get('strategy_a', ''),
+            strategy_b=result.get('strategy_b', ''),
+            issue_range=result.get('issue_range', ''),
+            top1_a=result.get('top1_a', 0.0),
+            top1_b=result.get('top1_b', 0.0),
+            top3_a=result.get('top3_a', 0.0),
+            top3_b=result.get('top3_b', 0.0),
+        )
+        return ab_id
+    except Exception as e:
+        logger.warning('persist_selection_ab_result 失败（降级保底，不影响主流程）: %s', e)
+        return None
+
+
+def _connect_db_for_ab():
+    """延迟连接数据库（避免模块 import 时强制依赖 DB）。失败返回 None。"""
+    try:
+        import sys
+        import os
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        from modules.database import P5Database
+        db = P5Database()
+        if db and db.connect():
+            return db
+        return None
+    except Exception as e:
+        logger.warning('策略A/B 数据库连接失败: %s', e)
+        return None

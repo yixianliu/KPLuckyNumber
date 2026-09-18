@@ -1,0 +1,9 @@
+15:20:21 | INFO     | root | 日志系统初始化完成: level=INFO, json=False
+15:20:22 | INFO     | modules.task_manager | TaskManager 初始化完成: workers=4, queue_size=100
+15:20:23 | INFO     | modules.self_evolution | [self_evolution] _run 主循环开始（线程=Thread-1 (_run)）
+15:20:23 | INFO     | modules.self_evolution | [self_evolution] 引擎已启动，后台线程 Thread-1 (_run) 开始执行
+15:20:23 | INFO     | __main__ | [GUI] 自我进化引擎已初始化并启动，注册轮询定时器
+15:20:23 | INFO     | modules.self_evolution | [self_evolution] 检查点状态: 已加载=False, 当前阶段=collect, 检查点键=无
+15:20:23 | INFO     | modules.self_evolution | [self_evolution] 将从索引 0 继续（总阶段数=6）
+15:20:23 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 0/5: collect
+15:20:23 | INFO     | modules.self_evolution | [self_evolution] _phase_collect 开始

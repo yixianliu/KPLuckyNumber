@@ -28,8 +28,8 @@ import importlib
 # 基础版本信息
 # ---------------------------------------------------------------------------
 APP_NAME = "排列5 AI智能分析系统"
-APP_VERSION = "v3.64"
-APP_RELEASE_DATE = "2026-09-02"
+APP_VERSION = "v3.70"
+APP_RELEASE_DATE = "2026-09-18"
 
 # ---------------------------------------------------------------------------
 # 变更日志（从新到旧）
@@ -41,6 +41,111 @@ APP_RELEASE_DATE = "2026-09-02"
 #   fixes    : 已知问题修复列表
 # ---------------------------------------------------------------------------
 CHANGELOG = [
+    {
+        "version": "v3.70",
+        "date": "2026-09-18",
+        "summary": "Phase 1 全量交付：特征工程增强 + sklearn 条件激活 + SHAP 筛选 + 按位置独立校准 + 动态槽位 + 多样性约束 + 策略 A/B walk-forward + 缓存键修复 + 权重回写",
+        "features": [
+            "features.py 1.1 位置交叉关联特征：新增相邻位数字关联（升/降/平/跨位差）特征组，扩展特征维度。",
+            "features.py 1.2 近期形态标记特征：新增最近 N 期形态（连号/对子/豹子/顺子）标记，强化形态信号。",
+            "ml_predictor.py 1.3 sklearn 条件激活：默认纯 numpy 加权滑动频率路径；sklearn 可用时优先走 GradientBoostingClassifier，缺失/异常自动降级并记录降级日志，不阻塞预测链路。",
+            "ml_predictor.py 1.4 SHAP 特征筛选：shap.TreeExplainer → sklearn.feature_importances_ → 基于方差的纯 numpy 回退三级降级，SHAP 不可用时自动切换，Top-K=60 默认。",
+            "calibration.py 1.5 按位置独立 ε：各位置校准参数独立学习，不再全局共用单一 ε。",
+            "calibration.py 1.6 Platt Scaling：新增 Platt Scaling 校准层（logistic 回归拟合后验概率），保留三闸门 keep_baseline 降级路径。",
+            "selection_strategy.py 1.7 动态槽位分配：各位置候选槽位数按概率分布熵动态分配，集中概率时减少槽位、分散时增加槽位。",
+            "selection_strategy.py 1.8 多样性约束：组合生成增加数字多样性惩罚，抑制相邻位数字过度集中。",
+            "pipeline.py + selection_strategy.py 1.9 策略 A/B walk-forward 框架：新增 run_strategy_ab_walk_forward，用前 prob_window 期等频频率做无偏基准，回放 [warmup, len) 期统计位覆盖命中；新表 p5_selection_ab_test 持久化 A/B 对照结果（database.py DDL + CRUD 已同步）。",
+            "smart_cache.py 1.10 缓存键修复：归一化后统一生成缓存键，修复 raw/normalized 键不一致导致缓存永不命中的遗留 BUG。",
+            "online_learner.py 1.11 权重回写 + feature flag：新增 ONLINE_LEARNER_WRITEBACK 配置开关（默认关闭），开启时将建议权重回写至 p5_weight_history + Redis kpluckynumber:pl5:adaptive_weights:latest。",
+        ],
+        "fixes": [
+            "修复 selection_strategy.run_strategy_ab_walk_forward 中 POS 常量未定义（应为 POSITIONS）导致的 4 项 NameError。",
+            "修复位覆盖命中指标恒为 0 的根因：generate_combinations 输出的 combination 是字符串（如 '01525'），原代码用单个字符与 int 值比较恒 False；改为逐位 int(combo[i]) == actual[i]。",
+            "修复 issue_range 始终取 last_issue 的赋值逻辑错误：first_issue 改为 total_periods==1 时从当前 row 取。",
+            "修复 top1_a/top1_b 超出 [0,1] 区间：原按命中位数累计（每 0-5 位），改为按位置追踪首注命中率，取值恒在 [0,1]。",
+            "移除 selection_strategy.py 中未使用的模块级 _hit_positions 函数。",
+        ],
+        "notes": [
+            "诚实边界不变：排列5 为公平摇号，独立抽取，精确全中概率恒为 K/100000 不可提升；本版本所有改动不改变融合权重冻结基线，Top-1≈10% / Top-3≈30% / Top-5≈50% 随机基线不可突破。",
+            "策略 A/B walk-forward 使用位覆盖命中口径（每位是否被至少 1 注命中），非精确全中口径；A/B 差异仅体现位覆盖分布，不可作为提升中奖概率依据。",
+            "ONLINE_LEARNER_WRITEBACK 默认关闭，不改变现有预测行为；开启前需确认 p5_weight_history 表结构已就绪。",
+            "全量回归：python -m pytest tests/ -q --ignore=tests/test_predictor.py 结果 356 passed（2 个 PytestReturnNotNoneWarning 为 test_db_fix/test_db_fix2 既有遗留，非本轮改动）。",
+        ],
+    },
+    {
+        "version": "v3.68",
+        "date": "2026-09-16",
+        "summary": "AI 模型配置对齐 api.txt 官方规范：模型升级到 agnes-3.0-flash + Session 连接池复用 + 备份模型自动降级",
+        "features": [
+            "config.py 中 AGNES_API_CONFIG 由 6 字段扩展至 13 字段：新增 backup_model / top_p / stream / max_retries / retry_backoff_factor / pool_connections / pool_maxsize / response_format，全部支持通过 AGNES_* 环境变量覆盖。",
+            "ai_analyzer.py 引入模块级 Session 单例（_MODULE_SESSION + 线程锁 + HTTPAdapter 连接池 + urllib3 Retry），全进程复用同一 HTTP 连接池，避免每次调用重建 TLS 握手；提供 reset_module_session() 供测试与密钥切换。",
+            "ai_analyzer._call_ai_model 签名扩展：新增 tools / response_format / model / _fallback_used 参数，支持 OpenAI 兼容 function call 声明与 response_format={type:'json_object'} 强制 JSON 输出。",
+            "predictor._call_ai_model 同步升级：签名扩展 tools / model 参数，默认 max_tokens 由硬编码 8000 改为配置项 self.default_max_tokens（默认 2048），保持原 force 语义（回测期间贝叶斯AI辅助仍可调）。",
+            "predictor._build_ai_session 优先复用 ai_analyzer._get_module_session() 单例 Session，异常时回退到本地构造，保持向后兼容。",
+            "主模型 404/410 自动降级到 backup_model（默认 agnes-2.5-flash）：4xx 非重试直接返回，避免浪费配额；5xx/超时走 urllib3 Retry + 方法层指数退避（0.8/1.6/3.2s）。",
+            ".env.example 补齐全部新增 AGNES_* 环境变量注释（BACKUP_MODEL / TOP_P / STREAM / MAX_RETRIES / RETRY_BACKOFF / POOL_CONNECTIONS / POOL_MAXSIZE / RESPONSE_FORMAT）。",
+        ],
+        "fixes": [
+            "修复 Session 每次调用重建导致的 TLS 握手浪费：全进程复用同一 Session，池化连接由 pool_connections=5 / pool_maxsize=10 控制。",
+            "修复 predictor._call_ai_model 硬编码 max_tokens=8000 与 AGNES 服务默认预算不一致问题：改为读取配置项，与 ai_analyzer 口径统一。",
+            "修复 ai_analyzer.py 顶部 docstring 中 D:\\PythonProject\\api\\api.txt 路径导致的 SyntaxWarning：转义反斜杠。",
+        ],
+        "notes": [
+            "严格对齐 D:\\PythonProject\\api\\api.txt 官方规范：模型名 agnes-3.0-flash、Bearer Token、请求体字段 model/messages/max_tokens/temperature/tools/stream/top_p/response_format。",
+            "诚实边界不变：排列5为公平摇号，无法稳定超越随机基线（Top-1≈10%/Top-3≈30%/Top-5≈50%）；本次改造不调整 predictor 融合权重与任何预测算法。",
+            "回归验证：python -m py_compile config.py modules/ai_analyzer.py modules/predictor.py version.py 全部通过；_call_ai_model 三处调用点（main.py:7137 / pipeline.py:521 / predictor.py:1327,2376）签名向后兼容。",
+        ],
+    },
+    {
+        "version": "v3.67",
+        "date": "2026-09-15",
+        "summary": "命中率口径修正：新增 Top-1 真实预测力指标，消除「集合包含+±1容错」虚高",
+        "features": [
+            "p5_prediction_record 新增 top1_match_count / top1_accuracy_rate 两列（含建表DDL与旧库自动迁移），记录「首推号精确命中」真实预测力口径。",
+            "get_verification_stats 同步暴露 top1_* 系列字段（含向后兼容 strict_* 别名），双口径并存。",
+            "命中率统计报告 GUI 新增「★ Top-1 真实预测力」区块与「随机基线对照」区块，直观量化系统是否超越随机基线。",
+            "历史 414 条含 detail 明细的验证记录完成 Top-1 命中回填。",
+            "online_learner._calculate_hits 拆分 partial_hits（覆盖口径）与 top1_hits（真实口径），recommendation_quality 改用 Top-1 评级，消除学习闭环被宽松口径自强化误判；学习统计新增 random_baseline_top1=0.10 对照。",
+        ],
+        "fixes": [
+            "修正 _calculate_strict_hit_rates 旧实现误用『集合包含 actual in pred[pos]』（候选~5）却命名 strict 的问题，改为 Top-1 精确匹配 pred[pos][0]==actual。",
+            "坐实命中率「几乎为零」的真相：Top-1 各位置命中 7.8%~10.2%（平均≈9.2%），与随机基线10%一致；旧展示值 81%~84% 为宽松口径虚高。",
+        ],
+        "notes": [
+            "诚实边界不变：排列5为公平摇号，无法稳定超越随机基线（Top-1≈10%/Top-3≈30%/Top-5≈50%）。",
+            "本次为纯增量口径修正，不改变预测引擎任何权重/算法，仅让「真实预测力」与「宽松参考」两口径分离展示。",
+            "分三阶段落地：Phase1 口径分离 + 双列入库；Phase2 学习闭环 Top-1 评级；Phase3 随机基线对照固化。",
+            "端到端回归验证：scripts/verify_e2e_db.py 抽样 20 条 0 命中记录，物理列 top1_match_count 与重算口径 100% 一致；1192 条 verified 记录全含 predicted_numbers+actual_numbers，_calculate_strict_hit_rates 重算路径完整可用。",
+        ],
+    },
+    {
+        "version": "v3.66",
+        "date": "2026-09-10",
+        "summary": "修复复制只有TOP3无TOP4 + 关闭白屏卡顿",
+        "features": [],
+        "fixes": [
+            "修复「复制预测号码」只有TOP3数据无TOP4：pipeline.py 中贝叶斯路径和降级路径硬编码 [:3] 改为 [:4]，确保每位产出4个候选数字，与仪表盘展示口径一致。",
+            "修复点击窗口右上角关闭按钮后白屏卡死：_confirm_close 增加 cancel _update_time 定时器（时钟每秒调度），并在 destroy() 前调用 update_idletasks() 清空所有待执行 after 回调，彻底阻断 destroy 后 Tcl 回调继续调度。",
+        ],
+        "notes": [
+            "诚实边界不变：排列5为公平摇号，无法稳定超越随机基线（Top-1≈10%/Top-3≈30%/Top-5≈50%）。",
+        ],
+    },
+    {
+        "version": "v3.64",
+        "date": "2026-09-04",
+        "summary": "修复关闭白屏卡死 + TOP3→TOP5（含个位）号码段展示",
+        "features": [
+            "预测号码段展示由4位（万/千/百/十）扩展为5位全展示（含个位），DISPLAY_POS_KEYS/NAMES 同步更新，compress_combo 保留完整5位。",
+        ],
+        "fixes": [
+            "修复点击窗口右上角关闭按钮后白屏卡死：_confirm_close 先设置 _poll_evolution_cancelled 标志并 after_cancel _poll_evolution 定时器，防止 root.destroy() 后 Tcl 回调继续调度导致白屏。",
+            "_poll_evolution 循环加入取消标志检查，关闭时立即终止递归 after 调度。",
+        ],
+        "notes": [
+            "诚实边界不变：排列5为公平摇号，无法稳定超越随机基线（Top-1≈10%/Top-3≈30%/Top-5≈50%）。",
+        ],
+    },
     {
         "version": "v3.64",
         "date": "2026-09-02",

@@ -27,6 +27,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+# 控制台仅输出 WARNING 及以上级别（INFO/DEBUG 仅写入文件），减少终端噪音
+logging.getLogger().setLevel(logging.WARNING)
+for _h in logging.getLogger().handlers:
+    if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+        _h.setLevel(logging.WARNING)
+
 try:
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
@@ -223,7 +229,9 @@ class ThemeManager:
                         return 'light' if value == 1 else 'dark'
                 except (OSError, winreg.error):
                     pass
-            # macOS 主题检测
+        
+        
+            
             elif platform.system() == 'Darwin':
                 try:
                     import subprocess
@@ -234,7 +242,7 @@ class ThemeManager:
                     return 'dark' if result.stdout.strip() == 'Dark' else 'light'
                 except Exception:
                     pass
-            # Linux GTK 主题检测
+            
             elif platform.system() == 'Linux':
                 try:
                     import subprocess
@@ -271,22 +279,23 @@ COLORS = ThemeManager.get_theme()
 
 
     # ============================================================
-# 预测号码「展示层」压缩配置
-# 仅影响「预测号码段」的展示与复制：保留 万/千/百/十 四位，去除个位(ge)。
+# 预测号码「展示层」配置（v3.64：扩展为5位全展示，含个位）
+# 预测号码段、复制摘要、仪表盘均使用完整5位（万/千/百/十/个）。
 # 核心算法、数据存储、命中率分析等仍使用完整 5 位，不受影响。
     # ============================================================
-DISPLAY_POS_KEYS = ['wan', 'qian', 'bai', 'shi']
-DISPLAY_POS_NAMES = ['万位', '千位', '百位', '十位']
+DISPLAY_POS_KEYS = ['wan', 'qian', 'bai', 'shi', 'ge']
+DISPLAY_POS_NAMES = ['万位', '千位', '百位', '十位', '个位']
 
 
 def compress_combo(combo):
-    """将 5 位预测组合压缩为 4 位显示串（去除个位）。
+    """将 5 位预测组合返回为显示串（v3.64：保留完整5位）。
 
-    核心数据不动，仅用于展示/复制层。幂等：对已是 4 位的串无副作用。
+    核心数据不动，仅用于展示/复制层。幂等：对已是5位的串无副作用。
     """
     if not combo:
         return ''
-    return str(combo)[:4]
+    s = str(combo)
+    return s[:5] if len(s) >= 5 else s
 
 
 class LotteryGUI:
@@ -340,6 +349,9 @@ class LotteryGUI:
         self._alt_content = None    # 备选号码折叠区
         self._alt_visible = False
         self.evolution = None       # 自我进化引擎句柄（启动后自动初始化）
+        self._poll_evolution_handle = None  # _poll_evolution after 定时器句柄（用于关闭时精确 cancel）
+        self._liveness_watchdog_handle = None  # _liveness_watchdog after 定时器句柄（用于关闭时精确 cancel）
+        self._update_time_handle = None  # _update_time after 定时器句柄（用于关闭时精确 cancel）
         # 进度节流状态
         self._last_progress_value = -1
         # 行号更新节流
@@ -495,7 +507,7 @@ class LotteryGUI:
     def _update_time(self):
         """每秒更新顶部时钟显示"""
         self.time_label.config(text=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-        self.root.after(1000, self._update_time)
+        self._update_time_handle = self.root.after(1000, self._update_time)
 
     # 主题管理
     _current_theme = 'dark'  # 记录当前主题状态
@@ -1340,6 +1352,16 @@ class LotteryGUI:
 
     def _poll_evolution(self):
         """轮询自我进化引擎消息队列（每 200ms），实时刷新 UI（主线程安全）。"""
+        # v3.64: 关闭时不再继续调度，防止 destroy() 后 TclError 白屏
+        if getattr(self, '_poll_evolution_cancelled', False):
+            self._poll_evolution_handle = None
+            return
+        # v3.65: 窗口已销毁则直接退出，防止访问已释放的 Tcl 资源
+        try:
+            _ = self.root.winfo_exists()
+        except Exception:
+            self._poll_evolution_handle = None
+            return
         eng = getattr(self, 'evolution', None)
         if eng is not None:
             try:
@@ -1350,7 +1372,8 @@ class LotteryGUI:
                 pass
             except Exception as e:
                 logger.warning('[GUI] _poll_evolution 消费消息时异常: %s', e)
-        self.root.after(200, self._poll_evolution)
+        # 保存句柄以便关闭时精确 cancel
+        self._poll_evolution_handle = self.root.after(200, self._poll_evolution)
 
     def _handle_evolution_msg(self, m):
         """将引擎消息渲染到自我进化标签页（v3.55 增强版：支持 metrics/phase 消息）。"""
@@ -2274,7 +2297,7 @@ class LotteryGUI:
             return  # 任务已结束，看门狗自动退役（不再续排）
         if time.time() - self.task_mgr._last_activity <= LIVENESS_LIMIT:
             # 仍在正常推进，续排下一轮自检
-            self.root.after(60 * 1000, self._liveness_watchdog)
+            self._liveness_watchdog_handle = self.root.after(60 * 1000, self._liveness_watchdog)
             return
         # —— 判定为卡死：终止并恢复 UI ——
         _name = self._current_task_name
@@ -2851,7 +2874,7 @@ class LotteryGUI:
         """根据四步流水线 final_report 生成结构化的可复制预测摘要"""
         if not isinstance(final_report, dict):
             return ""
-        # 预测号码段展示压缩为4位（保留万/千/百/十，去个位），仅展示层
+        # 预测号码段展示使用完整5位（v3.64），仅展示层
         pos_keys = DISPLAY_POS_KEYS
         pos_names = DISPLAY_POS_NAMES
         _pos_names_full = ['万位', '千位', '百位', '十位', '个位']  # 贝叶斯分段按位索引用(保留5位分析)
@@ -2896,15 +2919,15 @@ class LotteryGUI:
                                      f"(共识度: {c.get('consensus_degree', 0):.2f})")
             lines.append("")
 
-        # 3. 贝叶斯后验概率 Top-3
+        # 3. 贝叶斯后验概率 Top-4
         bi = final_report.get('bayesian_inference')
         if isinstance(bi, list) and bi:
-            lines.append("三、贝叶斯后验概率 Top-3")
+            lines.append("三、贝叶斯后验概率 Top-4")
             for i, pos_dict in enumerate(bi[:5]):
                 if isinstance(pos_dict, dict) and pos_dict:
-                    top3 = sorted(pos_dict.items(),
-                                  key=lambda x: float(x[1]), reverse=True)[:3]
-                    probs = ", ".join(f"{k}({float(v):.3f})" for k, v in top3)
+                    top_nums = sorted(pos_dict.items(),
+                                      key=lambda x: float(x[1]), reverse=True)[:4]
+                    probs = ", ".join(f"{k}({float(v):.3f})" for k, v in top_nums)
                     lines.append(f"  {_pos_names_full[i]}: {probs}")
 
         return "\n".join(lines)
@@ -3042,7 +3065,14 @@ class LotteryGUI:
         self._flash_status(text, bg)
 
     def _confirm_close(self):
-        """窗口关闭请求处理（v3.25）：有任务运行时先警示确认，避免误关中断分析。
+        """窗口关闭请求处理（v3.25/v3.64/v3.65）：有任务运行时先警示确认，避免误关中断分析。
+
+        v3.64 修复：关闭前先 cancel _poll_evolution 的 after 定时器，防止 destroy() 后
+        仍有 Tcl 回调在调度导致白屏卡死。
+        v3.65 修复：
+          1. 保存并 cancel 所有 after 定时器句柄（_poll_evolution / _liveness_watchdog）
+          2. destroy() 前等待 self_evolution 守护线程真正退出，防止 TclError 白屏
+          3. cancel 顺序：标记 → 取消定时器 → 关闭线程池 → 等待线程退出 → destroy
 
         Returns:
             bool: True 表示已执行关闭；False 表示用户取消、窗口保留。
@@ -3062,19 +3092,83 @@ class LotteryGUI:
         except Exception as e:
             # 状态检查/弹窗异常不应阻止用户关闭窗口
             logger.debug(f"关闭确认检查失败(直接放行): {e}")
+        
+        # 更新状态栏：开始关闭
+        self._update_status_ui("正在关闭...", COLORS['text_secondary'])
+
+        # ===== 第一步：标记取消，阻断所有 after 定时器继续调度 =====
+        self._poll_evolution_cancelled = True
+
+        # cancel _update_time 定时器（v3.66：防止 destroy() 后时钟回调继续调度）
+        _ut_handle = getattr(self, '_update_time_handle', None)
+        if _ut_handle is not None:
+            try:
+                self.root.after_cancel(_ut_handle)
+            except Exception:
+                pass
+            self._update_time_handle = None
+
+        # cancel _poll_evolution 定时器（v3.65：使用保存的句柄）
+        handle = getattr(self, '_poll_evolution_handle', None)
+        if handle is not None:
+            try:
+                self.root.after_cancel(handle)
+            except Exception:
+                pass
+            self._poll_evolution_handle = None
+
+        # cancel _liveness_watchdog 定时器（v3.65）
+        lw_handle = getattr(self, '_liveness_watchdog_handle', None)
+        if lw_handle is not None:
+            try:
+                self.root.after_cancel(lw_handle)
+            except Exception:
+                pass
+            self._liveness_watchdog_handle = None
+        
+        # 更新状态栏：停止后台任务
+        self._update_status_ui("停止后台任务...", COLORS['text_secondary'])
+
+        # ===== 第二步：关闭任务线程池 =====
         try:
-            self.task_mgr.shutdown()
+            # Shutdown task manager in a separate thread to avoid blocking GUI
+            def shutdown_task_manager():
+                self.task_mgr.shutdown()
+            
+            shutdown_thread = threading.Thread(target=shutdown_task_manager, daemon=True)
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=5.0)  # Wait up to 5 seconds for shutdown
+            if shutdown_thread.is_alive():
+                logger.warning("TaskManager shutdown timed out, proceeding anyway")
         except Exception:
             pass
-        # 优雅关闭自我进化引擎（含 ML 子进程池），防止 SpawnPoolWorker 残留进程
+
+        # ===== 第三步：优雅关闭自我进化引擎 =====
         eng = getattr(self, 'evolution', None)
         if eng is not None:
             try:
                 eng.shutdown()
             except Exception:
                 pass
+            # v3.65：等待后台线程真正退出，防止 destroy() 后 TclError 白屏
+            if eng._thread is not None and eng._thread.is_alive():
+                try:
+                    eng._thread.join(timeout=3.0)
+                except Exception:
+                    pass
+
+        # ===== 第四步：销毁窗口（所有定时器已取消，后台线程已退出）=====
+        # v3.66: 先强制处理所有待执行的 after 回调，再销毁窗口，防止白屏
         try:
-            self.root.destroy()
+            # 等待所有 pending 的 after(0) 回调执行完毕
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+        # v3.65: destroy 前做最终窗口有效性检查，防止在 after 回调嵌套执行时重复 destroy
+        try:
+            if self.root.winfo_exists():
+                self.root.destroy()
         except Exception:
             pass
         return True
@@ -3389,8 +3483,38 @@ class LotteryGUI:
                 task_mgr.log(f"完全命中:   0 期 (0.0%)")
             task_mgr.log(f"平均命中位数: {avg_match:.2f}/5")
             task_mgr.log(f"平均准确率: {avg_accuracy:.2f}%")
+            task_mgr.log("  ↑ 以上为「集合包含+±1容错」宽松口径（候选集~5个，天然虚高）")
             
-            task_mgr.append_section_header(" 各位置命中率")
+            # ── Top-1 真实预测力口径（v3.67）──
+            task_mgr.append_section_header(" ★ Top-1 真实预测力（首推号精确命中）")
+            task_mgr.log("-" * 60)
+            top1_wan = stats.get('top1_wan_accuracy', stats.get('strict_wan_accuracy', 0)) or 0
+            top1_qian = stats.get('top1_qian_accuracy', stats.get('strict_qian_accuracy', 0)) or 0
+            top1_bai = stats.get('top1_bai_accuracy', stats.get('strict_bai_accuracy', 0)) or 0
+            top1_shi = stats.get('top1_shi_accuracy', stats.get('strict_shi_accuracy', 0)) or 0
+            top1_ge = stats.get('top1_ge_accuracy', stats.get('strict_ge_accuracy', 0)) or 0
+            top1_avg = stats.get('top1_avg_accuracy', stats.get('strict_avg_accuracy', 0)) or 0
+            top1_full = stats.get('top1_full_matches', stats.get('strict_full_matches', 0)) or 0
+            task_mgr.log(f"  各位置 Top-1 命中率（随机基线=10%）:")
+            task_mgr.log(f"    万位: {top1_wan:6.2f}%    千位: {top1_qian:6.2f}%    百位: {top1_bai:6.2f}%")
+            task_mgr.log(f"    十位: {top1_shi:6.2f}%    个位: {top1_ge:6.2f}%")
+            task_mgr.log(f"  平均 Top-1 准确率: {top1_avg:.2f}%   全5位 Top-1 命中: {top1_full} 期")
+            task_mgr.log("  ↑ 这是真实预测力指标。排列5公平摇号，Top-1理论上限≈10%")
+            
+            # ── 随机基线对照（v3.67 Phase3）──
+            task_mgr.append_section_header(" 随机基线对照（系统是否超越随机？）")
+            task_mgr.log("-" * 60)
+            _r1 = top1_avg / 100.0
+            _r_base = 0.10
+            _delta_pp = (_r1 - _r_base) * 100
+            _verdict = "略高于" if _delta_pp > 0 else ("接近" if abs(_delta_pp) <= 1.0 else "低于")
+            task_mgr.log(f"  系统 Top-1 命中率 : {top1_avg:6.2f}%")
+            task_mgr.log(f"  随机基线 Top-1     : {_r_base*100:6.2f}%   (排列5 每位随机期望=10%)")
+            task_mgr.log(f"  超出/低于随机      : {_delta_pp:+.2f} 个百分点  →  {_verdict} 随机水平")
+            task_mgr.log("  结论: 排列5 为公平摇号, 历史统计规律无法事前预测未来开奖")
+            task_mgr.log("        Top-1 命中率趋近 10% 即「无超越随机」, 属正常且诚实的结果")
+            
+            task_mgr.append_section_header(" 各位置命中率（宽松口径·候选集包含）")
             task_mgr.log("-" * 60)
             
             position_rates = [
@@ -4330,28 +4454,34 @@ class LotteryGUI:
             self._hr_merged_duplicates = merged
             merge_txt = f" | 已合并重复记录 {merged} 条" if merged else ""
 
-            # 严格命中率（主指标）
-            strict_avg = float(stats.get('strict_avg_accuracy', 0) or 0)
-            strict_full = int(stats.get('strict_full_matches', 0) or 0)  # 完全命中5位的期数
-            strict_total = int(stats.get('strict_total_matched', 0) or 0)  # 位置命中总次数
+            # Top-1 真实口径（首推号精确命中, v3.67: strict_* 已改为真实预测力指标）
+            # 随机基线: 排列5 公平摇号, 每位 Top-1 理论 = 10%, 系统无法稳定超越
+            top1_avg = float(stats.get('top1_avg_accuracy', stats.get('strict_avg_accuracy', 0)) or 0)
+            top1_full = int(stats.get('top1_full_matches', stats.get('strict_full_matches', 0)) or 0)
+            top1_total = int(stats.get('top1_total_matched', stats.get('strict_total_matched', 0)) or 0)
 
-            # 容错命中率（参考）
-            tol_avg = float(stats.get('avg_accuracy', 0) or 0)
-            tol_matched = int(stats.get('total_matched', 0) or 0)
+            # 集合包含参考口径（候选集~5, 宽松, 仅作对照, 非真实预测力）
+            loose_avg = float(stats.get('avg_accuracy', 0) or 0)
+            loose_matched = int(stats.get('total_matched', 0) or 0)
+
+            # 随机基线对照
+            _delta_pp = top1_avg - 10.0
+            _verdict = "略高于随机" if _delta_pp > 0 else ("接近随机" if abs(_delta_pp) <= 1.0 else "低于随机")
 
             self.hr_summary_var.set(
                 f"已验证 {total} 期（按期号去重）\n"
-                f"严格命中: 完全命中 {strict_full} 期 | 平均 {strict_avg:.1f}%\n"
-                f"容错命中: 完全命中 {tol_matched} 期 | 平均 {tol_avg:.1f}%"
+                f"★ Top-1 真实命中（首推号精确）: 全中 {top1_full} 期 | 平均 {top1_avg:.1f}%\n"
+                f"   随机基线 = 10% → 系统{_verdict}（Δ{_delta_pp:+.1f}pp）\n"
+                f"集合包含参考（宽松口径·非预测力）: 全中 {loose_matched} 期 | 平均 {loose_avg:.1f}%"
                 f"{merge_txt}"
             )
 
-            # 更新进度条：显示严格命中率
-            strict_keys = ('strict_wan_accuracy', 'strict_qian_accuracy', 'strict_bai_accuracy',
-                          'strict_shi_accuracy', 'strict_ge_accuracy')
-            for key in strict_keys:
-                rate = float(stats.get(key, 0) or 0)
-                pos_name = key.replace('strict_', '').replace('_accuracy', '')
+            # 更新进度条：显示 Top-1 真实命中率
+            top1_keys = ('top1_wan_accuracy', 'top1_qian_accuracy', 'top1_bai_accuracy',
+                        'top1_shi_accuracy', 'top1_ge_accuracy')
+            for key in top1_keys:
+                rate = float(stats.get(key, stats.get(key.replace('top1_', 'strict_'), 0)) or 0)
+                pos_name = key.replace('top1_', '').replace('_accuracy', '')
                 var_key = f'{pos_name}_accuracy'
                 if var_key in self.hr_pos_vars:
                     self.hr_pos_vars[var_key].set(f"{rate:.1f}%")
@@ -4384,10 +4514,11 @@ class LotteryGUI:
                 self.root.after(0, lambda: self._update_chart_image(None))
                 return
             
-            # 准备数据：5个位置的命中率
-            pos_keys = ['wan_accuracy', 'qian_accuracy', 'bai_accuracy', 'shi_accuracy', 'ge_accuracy']
+            # 准备数据：5个位置的 Top-1 真实命中率（首推号精确, 随机基线=10%）
+            pos_keys = ['top1_wan_accuracy', 'top1_qian_accuracy', 'top1_bai_accuracy',
+                        'top1_shi_accuracy', 'top1_ge_accuracy']
             pos_names = ['万位', '千位', '百位', '十位', '个位']
-            values = [float(stats.get(k, 0) or 0) for k in pos_keys]
+            values = [float(stats.get(k, stats.get(k.replace('top1_', 'strict_'), 0) or 0)) for k in pos_keys]
             
             # 使用 matplotlib Agg 后端生成柱状图
             import matplotlib
@@ -4409,7 +4540,7 @@ class LotteryGUI:
             bars = ax.bar(pos_names, values, color=['#059669', '#10b981', '#34d399', '#6ee7b7', '#34d399'])
             ax.set_ylim(0, 100)
             ax.set_ylabel('命中率 (%)', fontsize=10, color=fg)
-            ax.set_title('各位置命中率对比（容错匹配±1）', fontsize=11, fontweight='bold', color=fg)
+            ax.set_title('各位置 Top-1 真实命中率（首推号精确·随机基线=10%）', fontsize=11, fontweight='bold', color=fg)
             ax.tick_params(colors=fg, labelsize=9)
             for spine in ax.spines.values():
                 spine.set_color(COLORS['border'])
@@ -4777,7 +4908,7 @@ class LotteryGUI:
                 breakdown = pdata.get('signal_breakdown', {})
                 features = pdata.get('features', {})
 
-                task_mgr.append_info(f"  【{pname}】 Top-3: {' '.join(str(d) for d in top5)}")
+                task_mgr.append_info(f"  【{pname}】 Top-4: {' '.join(str(d) for d in top5)}")
 
                 # 相对热度
                 hot_str = " | ".join(f"{d}→{hotness.get(str(d), hotness.get(d, 0)):.0f}" for d in top5)
@@ -4844,7 +4975,7 @@ class LotteryGUI:
 
         v3.42 起，本方法是全系统唯一的分析入口，依次运行六个阶段：
           ① 四步流水线预测   — 主预测，注册 pending 记录，内部已含验证闭环 + 权重自适应
-          ② 走势引擎分解     — 信号源 Top-3 辅助
+          ② 走势引擎分解     — 信号源 Top-4 辅助
           ③ 快速预测         — 纯统计 P5Predictor
           ④ 命中率优化       — 选号策略对照 / 概率校准状态 / 三闸门调参结论（原独立卡片）
           ⑤ 在线学习闭环     — 验证统计 / 自适应权重调度 / 归因覆盖率（原独立卡片）
@@ -4900,7 +5031,7 @@ class LotteryGUI:
                 task_mgr.append_warning(" 用户已取消，智能分析提前结束")
                 return
 
-            # 2) 走势引擎分解（信号源 Top-3 辅助）
+            # 2) 走势引擎分解（信号源 Top-4 辅助）
             self._execute_trend_analysis(task_mgr)
             if _cancelled():
                 task_mgr.append_warning(" 用户已取消，智能分析提前结束")
@@ -5022,7 +5153,7 @@ class LotteryGUI:
             }
             for i, pk in enumerate(pos_keys):
                 probs = result['fused_probabilities'][i]
-                top = sorted(probs.items(), key=lambda x: float(x[1]), reverse=True)[:3]
+                top = sorted(probs.items(), key=lambda x: float(x[1]), reverse=True)[:4]
                 final['trend_prediction'][pk] = {'numbers': [int(n) for n, _ in top]}
             for combo in result.get('top_combinations', [])[:5]:
                 if isinstance(combo, dict):
@@ -5089,7 +5220,7 @@ class LotteryGUI:
                     nums = (cell.get('numbers', []) if isinstance(cell, dict) else []) or []
                     if nums:
                         picks[pk]['pipeline'] = int(nums[0])
-                        top5[pk]['pipeline'] = [int(x) for x in nums[:4]]
+                        top5[pk]['pipeline'] = [int(x) for x in nums[:5]]
             rc = pf.get('recommended_combinations') or []
             if rc and isinstance(rc[0], dict) and rc[0].get('combination'):
                 combos['pipeline'] = str(rc[0]['combination'])
@@ -5104,7 +5235,7 @@ class LotteryGUI:
                     nums = (cell.get('numbers', []) if isinstance(cell, dict) else []) or []
                     if nums:
                         picks[pk]['quick'] = int(nums[0])
-                        top5[pk]['quick'] = [int(x) for x in nums[:4]]
+                        top5[pk]['quick'] = [int(x) for x in nums[:5]]
             rc = qf.get('recommended_combinations') or []
             if rc and isinstance(rc[0], dict) and rc[0].get('combination'):
                 combos['quick'] = str(rc[0]['combination'])
@@ -5273,7 +5404,7 @@ class LotteryGUI:
                 "来源: 数据库最近一条预测记录（本次分析未产出新结果）",
                 "",
                 "━━━━━━━━━━━━━━━━━━━━",
-                "各位置 Top-3 候选:",
+                "各位置 Top-4 候选:",
             ]
             for pk, pn in zip(pos_keys, pos_names):
                 nums = predicted_numbers.get(pk, []) if isinstance(predicted_numbers, dict) else []
@@ -5356,7 +5487,7 @@ class LotteryGUI:
             raw_p = ''.join(str(picks[pk].get('pipeline')) for pk in pos_keys if 'pipeline' in picks[pk])
             raw_q = ''.join(str(picks[pk].get('quick')) for pk in pos_keys if 'quick' in picks[pk])
             high_conf = bool(raw_p and raw_q and raw_p == raw_q and total_sources >= 2)
-            # 展示层压缩为4位
+            # 展示层使用完整5位（v3.64）
             main_combo_disp = compress_combo(main_combo)
 
             # 关键：聚合一旦算出有效主推荐，立即同步写好 clipboard 与 meta。
@@ -5420,7 +5551,7 @@ class LotteryGUI:
             return None
 
     def _build_position_candidates(self, picks, top5):
-        """聚合多源候选, 输出每个展示位(万/千/百/十)的 4 个候选数字。
+        """聚合多源候选, 输出每个展示位的 4 个候选数字（Top-4 展示）。
 
         优先级: 主推(consensus 首选) → 多源 top 列表去重追加 → 不足 4 个时按 0-9 顺序补足。
         返回 {pos_key: [int, int, int, int]}, pos_key ∈ DISPLAY_POS_KEYS。
@@ -5473,22 +5604,22 @@ class LotteryGUI:
 
     def _build_aggregated_clipboard(self, target_issue, main_combo, conf, high_conf, combos, picks, top5=None):
         """生成可复制的结构化摘要（主推荐 + 备选），确保复制的是算法预测结果
-        
+
         算法预测流程：
         1. 多源数据采集：四步流水线、快速预测、走势引擎
         2. 逐位聚合：多数投票 + 平票优先四步流水线
         3. 置信度计算：多源信号重合度百分比
-        4. 最终输出：综合推荐组合
+        4. 最终输出：综合推荐组合（每位 Top-4 候选）
         """
-        # 展示层压缩为4位（保留万/千/百/十，去个位），核心数据仍为完整5位
+        # 展示层使用完整5位（v3.64）
         pos_keys = DISPLAY_POS_KEYS
         pos_names = DISPLAY_POS_NAMES
         top5 = top5 or {}
         
-        # 获取各位置所有候选号码（从top5中提取所有来源的Top5号码）
+        # 获取各位置所有候选号码（从top5中提取所有来源的Top-4号码）
         all_candidates = {}
         for pk, pn in zip(pos_keys, pos_names):
-            # 收集所有来源的Top5号码
+            # 收集所有来源的Top-4号码
             all_digits = []
             seen = set()
             
@@ -5510,15 +5641,15 @@ class LotteryGUI:
                             all_digits.append(val)
                             seen.add(val)
             
-            # 确保每个位置有5个候选号码
-            if len(all_digits) < 5:
+            # 确保每个位置有4个候选号码
+            if len(all_digits) < 4:
                 for d in range(10):
                     if d not in seen:
                         all_digits.append(d)
                         seen.add(d)
-                        if len(all_digits) >= 5:
+                        if len(all_digits) >= 4:
                             break
-            
+
             all_candidates[pk] = all_digits[:4]
         
         lines = [
@@ -5566,7 +5697,7 @@ class LotteryGUI:
         lines.append("")
         
         # 各分析源原始结果
-        # 各分析源组合同步压缩为4位展示
+        # 各分析源组合同步使用完整5位展示（v3.64）
         _combos_disp = {k: compress_combo(v) for k, v in (combos or {}).items()}
         _main_disp = compress_combo(main_combo)
         lines.append(" 各分析源结果（参考）:")
@@ -5620,7 +5751,7 @@ class LotteryGUI:
 
         toggle_btn.config(command=_toggle)
 
-        # 备选组合压缩为4位展示（去个位），与最终预测一致
+        # 备选组合使用完整5位展示（v3.64），与最终预测一致
         _main_disp = compress_combo(main_combo)
         for key, name in [('pipeline', '四步流水线'), ('quick', '快速预测'), ('trend', '走势引擎')]:
             c = combos.get(key)
@@ -5934,7 +6065,7 @@ class LotteryGUI:
         tk.Label(body, text=f"分析来源：{' + '.join(used) if used else '本季无有效来源'}", font=('微软雅黑', 9),
                  bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']).pack(anchor=tk.W)
 
-        # 3) 预测结果（号码段）— 逐位分区展示 4 个候选数字，清晰分区
+        # 3) 预测结果（号码段）— 逐位分区展示 4 个候选数字，清晰分区（Top-4）
         cand_by_pos = self._build_position_candidates(picks, top5)
         num_frame = tk.Frame(body, bg=COLORS['bg_secondary'])
         num_frame.pack(fill=tk.X, pady=(6, 2))
@@ -6986,7 +7117,7 @@ class LotteryGUI:
         target_issue = target_issue or meta.get('target_issue') or '下一期'
 
         prompt = (
-            f"以下是排列5第 {target_issue} 期的多算法候选号码（每位 Top5，按位列出）：\n"
+            f"以下是排列5第 {target_issue} 期的多算法候选号码（每位 Top-4，按位列出）：\n"
             + "\n".join(lines)
             + "\n\n请用中文给出不超过 150 字的简短解读，包含："
               "①各位候选的分布特征（如集中/分散、奇偶与大小倾向）；"

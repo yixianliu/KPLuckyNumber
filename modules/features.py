@@ -737,6 +737,217 @@ class P5Features:
             'current_span': spans[-1] if spans else None
         }
 
+    # ==================== 4.5 位置链特征（v3.70） ====================
+
+    def calculate_position_chain_features(self, data: List[Dict], window: Optional[int] = None) -> Dict[str, Any]:
+        """
+        计算位置链特征（v3.70 新增）
+
+        提取相邻/跨位位置对（如 万→千、百→个）的滞后关联特征：
+        - diff_dist_lag{L}：两位置在滞后 L 期后数字差 |差| 落在 0-2 的比率
+        - diff_close_rate：L∈{2,5,10} 的 diff_dist 均值
+        - move_same_rate：L∈{2,5,10} 内「升升/降降」同向移动比率均值
+        - 末两位（十→个）的近期转移矩阵（最近 50 期，供 ml_supervised 输入）
+
+        注意：排列5开奖为独立随机事件，本特征仅为历史归纳，无预测能力。
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            window: 滑动窗口大小，None表示使用全部数据
+
+        Returns:
+            位置链特征字典
+        """
+        use_data = data[-window:] if window else data
+        total = len(use_data)
+
+        if total == 0:
+            return {'error': '数据为空'}
+
+        # 定义位置链：相邻链(万→千、千→百、百→十、十→个) + 跨位链(万→百、千→个)
+        chain_pairs = [
+            (0, 1, '万→千'),
+            (1, 2, '千→百'),
+            (2, 3, '百→十'),
+            (3, 4, '十→个'),
+            (0, 2, '万→百'),
+            (1, 4, '千→个')
+        ]
+        lags = [2, 5, 10]
+
+        # 提取合法序列
+        seq = []
+        for item in use_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                seq.append([int(n) for n in numbers])
+
+        chain_features: Dict[str, Any] = {}
+        for pos_i, pos_j, label in chain_pairs:
+            pair_features: Dict[str, Any] = {}
+
+            # 滞后 diff_dist 统计：|t期位置i数字 - t-L期位置j数字| 落在 0-2 的比率
+            diff_dist_rates = {}
+            for lag in lags:
+                pairs = [(row[pos_i], prev[pos_j])
+                         for row, prev in zip(seq[lag:], seq[:-lag])]
+                if pairs:
+                    hit = sum(1 for a, b in pairs if abs(a - b) <= 2)
+                    diff_dist_rates[f'diff_dist_lag{lag}'] = round(hit / len(pairs), 4)
+                else:
+                    diff_dist_rates[f'diff_dist_lag{lag}'] = 0.0
+
+            pair_features.update(diff_dist_rates)
+            # diff_close_rate：多滞后 diff_dist 均值（反映位置对数值接近程度）
+            pair_features['diff_close_rate'] = round(
+                sum(diff_dist_rates.values()) / len(diff_dist_rates), 4)
+
+            # move_same_rate：相邻期同向移动比率（升升/降降）
+            move_same_rates = {}
+            for lag in lags:
+                triples = [(prev[pos_i], row[pos_i], prev[pos_j], row[pos_j])
+                           for row, prev in zip(seq[lag:], seq[:-lag])]
+                if triples:
+                    same_dir = sum(
+                        1 for a_i, b_i, a_j, b_j in triples
+                        if ((a_i - b_i) > 0 and (a_j - b_j) > 0)
+                        or ((a_i - b_i) < 0 and (a_j - b_j) < 0)
+                    )
+                    move_same_rates[f'move_same_rate_lag{lag}'] = round(
+                        same_dir / len(triples), 4)
+                else:
+                    move_same_rates[f'move_same_rate_lag{lag}'] = 0.0
+
+            pair_features.update(move_same_rates)
+            pair_features['move_same_rate'] = round(
+                sum(move_same_rates.values()) / len(move_same_rates), 4)
+
+            chain_features[label] = pair_features
+
+        # 末两位（十→个）近期转移矩阵：近 50 期 十位数字 → 个位数字 的条件频率
+        recent_window = min(50, len(seq))
+        trans_matrix: Dict[str, Dict[str, float]] = {}
+        for src in range(10):
+            for dst in range(10):
+                # 统计 十位=src 且 下一期个位=dst 的相邻期对数
+                cnt = 0
+                denom = 0
+                for k in range(len(seq) - recent_window - 1, len(seq) - 1):
+                    if seq[k][3] == src:
+                        denom += 1
+                        if seq[k + 1][4] == dst:
+                            cnt += 1
+                if denom > 0:
+                    trans_matrix[f'{src}->{dst}'] = round(cnt / denom, 4)
+
+        chain_features['recent_shi_ge_transition'] = trans_matrix
+        chain_features['sample_count'] = total
+
+        return chain_features
+
+    # ==================== 4.6 形态标记特征（v3.70） ====================
+
+    def calculate_recent_form_features(self, data: List[Dict], lookback: int = 30) -> Dict[str, Any]:
+        """
+        计算近期形态标记特征（v3.70 新增）
+
+        基于最近 30 期窗口，统计整期形态（对子/顺子/豹子）最近出现的滞后期数：
+        - lag_2pairs：最近 30 期内「含对子（两位置同数字）」形态的滞后期数
+        - lag_3seq：最近 30 期内「含三连顺（相邻3位连号）」形态的滞后期数
+        - lag_4quad：最近 30 期内「四连顺（相邻4位连号）」形态的滞后期数
+        - window_2pairs_rate / window_3seq_rate / window_4quad_rate：窗口内形态占比
+
+        形态判定规则：
+        - 对子：某期5个数字中存在任意两位置数字相同
+        - 三连顺：存在相邻3位按 ±1 递增/递减排列（如 3-4-5）
+        - 四连顺：存在相邻4位按 ±1 递增/递减排列
+
+        注意：排列5开奖为独立随机事件，形态滞后期数仅为历史归纳指标，无预测能力。
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            lookback: 回溯窗口期数（默认30期）
+
+        Returns:
+            形态标记特征字典；数据不足时返回全 None 占位
+        """
+        window = data[-lookback:] if lookback else data
+        n = len(window)
+
+        if n == 0:
+            return {'error': '数据为空'}
+
+        # 逐期判定形态
+        has_2pairs: List[bool] = []
+        has_3seq: List[bool] = []
+        has_4seq: List[bool] = []
+
+        for item in window:
+            numbers = item.get('numbers', [])
+            if len(numbers) != self.positions:
+                # 数据不完整，标记为无形态
+                has_2pairs.append(False)
+                has_3seq.append(False)
+                has_4seq.append(False)
+                continue
+
+            nums = [int(x) for x in numbers]
+
+            # 对子：任意两位置数字相同
+            pair_found = False
+            for i in range(5):
+                for j in range(i + 1, 5):
+                    if nums[i] == nums[j]:
+                        pair_found = True
+                        break
+                if pair_found:
+                    break
+            has_2pairs.append(pair_found)
+
+            # 三连顺 / 四连顺：相邻位置按 ±1 递进
+            seq3_found = False
+            seq4_found = False
+            for start in range(5):
+                # 检查 start 起 3 位是否形成连号
+                if start + 3 <= 5:
+                    seg3 = nums[start:start + 3]
+                    if all(seg3[k + 1] - seg3[k] in (1, -1) for k in range(2)):
+                        seq3_found = True
+                if start + 4 <= 5:
+                    seg4 = nums[start:start + 4]
+                    if all(seg4[k + 1] - seg4[k] in (1, -1) for k in range(3)):
+                        seq4_found = True
+
+            has_3seq.append(seq3_found)
+            has_4seq.append(seq4_found)
+
+        # 滞后期数：窗口内最后一次出现的滞后（0=最近一期出现，None=窗口内未出现）
+        def _last_lag(flags: List[bool]) -> Optional[int]:
+            for idx in range(len(flags) - 1, -1, -1):
+                if flags[idx]:
+                    return len(flags) - 1 - idx
+            return None
+
+        lag_2pairs = _last_lag(has_2pairs)
+        lag_3seq = _last_lag(has_3seq)
+        lag_4quad = _last_lag(has_4seq)
+
+        # 窗口内形态占比
+        window_2pairs_rate = round(sum(has_2pairs) / n, 4)
+        window_3seq_rate = round(sum(has_3seq) / n, 4)
+        window_4quad_rate = round(sum(has_4seq) / n, 4)
+
+        return {
+            'lag_2pairs': lag_2pairs,
+            'lag_3seq': lag_3seq,
+            'lag_4quad': lag_4quad,
+            'window_2pairs_rate': window_2pairs_rate,
+            'window_3seq_rate': window_3seq_rate,
+            'window_4quad_rate': window_4quad_rate,
+            'sample_count': n,
+            'lookback': lookback
+        }
+
     # ==================== 5. 综合特征提取 ====================
 
     def extract_all_features(self, data: List[Dict], windows: List[int] = [5, 10, 20, 50]) -> Dict[str, Any]:
@@ -778,6 +989,14 @@ class P5Features:
         logger.info('提取交叉特征...')
         all_features['cross_position'] = self.calculate_cross_position_features(data)
         all_features['sum_span'] = self.calculate_sum_span_features(data)
+
+        # 4.5. 位置链特征（v3.70）
+        logger.info('提取位置链特征...')
+        all_features['position_chain'] = self.calculate_position_chain_features(data)
+
+        # 4.6. 形态标记特征（v3.70）
+        logger.info('提取形态标记特征...')
+        all_features['recent_form'] = self.calculate_recent_form_features(data)
 
         logger.info('特征提取完成')
         return all_features

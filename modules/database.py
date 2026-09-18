@@ -650,7 +650,9 @@ class P5Database:
                 actual_numbers TEXT NULL DEFAULT NULL COMMENT '实际开奖号码(JSON)',
                 actual_issue VARCHAR(20) NULL DEFAULT NULL COMMENT '实际开奖期号',
                 is_matched TINYINT(1) NULL DEFAULT NULL COMMENT '是否完全猜中(1=是,0=否)',
-                match_count INT NULL DEFAULT 0 COMMENT '命中位数(0-5)',
+                match_count INT NULL DEFAULT 0 COMMENT '命中位数(0-5，候选集包含+±1容错宽松口径)',
+                top1_match_count INT NULL DEFAULT 0 COMMENT 'Top-1命中位数(0-5，首推号精确命中真实预测力口径)',
+                top1_accuracy_rate DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT 'Top-1准确率(Top-1命中位数/5*100)',
                 match_details TEXT NULL DEFAULT NULL COMMENT '各位置命中详情(JSON)',
                 wan_match TINYINT(1) NULL DEFAULT 0 COMMENT '万位是否命中',
                 qian_match TINYINT(1) NULL DEFAULT 0 COMMENT '千位是否命中',
@@ -1133,6 +1135,23 @@ class P5Database:
                 if getattr(e, 'args', (None,))[0] != 1061:
                     logger.warning(f'添加 p5_prediction_record.idx_status_issue 索引跳过: {e}')
 
+            # 向后兼容: 为 p5_prediction_record 添加 Top-1 命中口径列（真实预测力指标，
+            # 区别于 match_count 的候选集包含宽松口径）
+            for _col, _ddl in [
+                ("top1_match_count", "ALTER TABLE p5_prediction_record ADD COLUMN top1_match_count INT NULL DEFAULT 0 COMMENT 'Top-1命中位数(0-5，首推号精确命中真实预测力口径)'"),
+                ("top1_accuracy_rate", "ALTER TABLE p5_prediction_record ADD COLUMN top1_accuracy_rate DECIMAL(5,2) NULL DEFAULT 0.00 COMMENT 'Top-1准确率(Top-1命中位数/5*100)'"),
+            ]:
+                try:
+                    self.cursor.execute(
+                        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='p5_prediction_record' AND COLUMN_NAME=%s",
+                        (_col,)
+                    )
+                    if not self.cursor.fetchone():
+                        self.cursor.execute(_ddl)
+                        logger.info(f"已为 p5_prediction_record 添加列 {_col}")
+                except Exception as _e:
+                    logger.warning(f"添加 p5_prediction_record.{_col} 列跳过: {_e}")
+
             # 自我进化版本表（专用表，替代原先混入 p5_artifact 的 evolution_version 产物，
             # 字段与 data/database.sql 导出结构保持一致，提升进化版本数据的可读性与一致性）
             sql_evolution_version = '''
@@ -1154,8 +1173,27 @@ class P5Database:
             '''
             self.cursor.execute(sql_evolution_version)
 
+            # v3.70 (roadmap 1.9): 策略 A/B walk-forward 命中率对比表
+            sql_selection_ab = '''
+            CREATE TABLE IF NOT EXISTS p5_selection_ab_test (
+                ab_id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+                strategy_a VARCHAR(40) NOT NULL COMMENT '策略A标识',
+                strategy_b VARCHAR(40) NOT NULL COMMENT '策略B标识',
+                issue_range VARCHAR(64) NULL DEFAULT NULL COMMENT '对比的期号范围(如 20260001-20260030)',
+                top1_a DECIMAL(6,4) NULL DEFAULT NULL COMMENT '策略A Top-1 命中率',
+                top1_b DECIMAL(6,4) NULL DEFAULT NULL COMMENT '策略B Top-1 命中率',
+                top3_a DECIMAL(6,4) NULL DEFAULT NULL COMMENT '策略A Top-3 命中率',
+                top3_b DECIMAL(6,4) NULL DEFAULT NULL COMMENT '策略B Top-3 命中率',
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                PRIMARY KEY (ab_id) USING BTREE,
+                INDEX idx_ab_created (created_at DESC) USING BTREE,
+                INDEX idx_ab_pair (strategy_a, strategy_b) USING BTREE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排列5选号策略A/B walk-forward 对比表';
+            '''
+            self.cursor.execute(sql_selection_ab)
+
             self.connection.commit()
-            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、验证明细、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐、权重历史、学习历史、运行时产物、自我进化版本）')
+            logger.info('排列5数据表创建成功（历史数据、走势数据、AI报告、预测验证、验证明细、性能统计、万位走势、千位走势、百位走势、十位走势、和尾走势、后三走势、专家推荐、权重历史、学习历史、运行时产物、自我进化版本、策略AB对比）')
             return True
         except Exception as e:
             logger.error(f'创建数据表失败: {e}')
@@ -1698,12 +1736,22 @@ class P5Database:
             is_matched = 1 if match_count == 5 else 0
             accuracy_rate = round(match_count / 5 * 100, 2)
             
+            # Top-1 口径: 仅当该位置推荐列表首号为精确命中(最高概率号)才计数
+            # 这是真实预测力指标, 区别于 match_count 的"候选集包含+±1容错"宽松口径
+            wan_top1 = 1 if predicted.get('wan') and int(predicted['wan'][0]) == int(actual_numbers[0]) else 0
+            qian_top1 = 1 if predicted.get('qian') and int(predicted['qian'][0]) == int(actual_numbers[1]) else 0
+            bai_top1 = 1 if predicted.get('bai') and int(predicted['bai'][0]) == int(actual_numbers[2]) else 0
+            shi_top1 = 1 if predicted.get('shi') and int(predicted['shi'][0]) == int(actual_numbers[3]) else 0
+            ge_top1 = 1 if predicted.get('ge') and int(predicted['ge'][0]) == int(actual_numbers[4]) else 0
+            top1_match_count = wan_top1 + qian_top1 + bai_top1 + shi_top1 + ge_top1
+            top1_accuracy_rate = round(top1_match_count / 5 * 100, 2)
+            
             match_details = {
-                'wan': {'predicted': predicted.get('wan', []), 'actual': actual_numbers[0], 'matched': wan_match},
-                'qian': {'predicted': predicted.get('qian', []), 'actual': actual_numbers[1], 'matched': qian_match},
-                'bai': {'predicted': predicted.get('bai', []), 'actual': actual_numbers[2], 'matched': bai_match},
-                'shi': {'predicted': predicted.get('shi', []), 'actual': actual_numbers[3], 'matched': shi_match},
-                'ge': {'predicted': predicted.get('ge', []), 'actual': actual_numbers[4], 'matched': ge_match}
+                'wan': {'predicted': predicted.get('wan', []), 'actual': actual_numbers[0], 'matched': wan_match, 'top1': wan_top1},
+                'qian': {'predicted': predicted.get('qian', []), 'actual': actual_numbers[1], 'matched': qian_match, 'top1': qian_top1},
+                'bai': {'predicted': predicted.get('bai', []), 'actual': actual_numbers[2], 'matched': bai_match, 'top1': bai_top1},
+                'shi': {'predicted': predicted.get('shi', []), 'actual': actual_numbers[3], 'matched': shi_match, 'top1': shi_top1},
+                'ge': {'predicted': predicted.get('ge', []), 'actual': actual_numbers[4], 'matched': ge_match, 'top1': ge_top1}
             }
             
             deviation = []
@@ -1751,6 +1799,8 @@ class P5Database:
                 actual_issue = %s,
                 is_matched = %s,
                 match_count = %s,
+                top1_match_count = %s,
+                top1_accuracy_rate = %s,
                 match_details = %s,
                 wan_match = %s,
                 qian_match = %s,
@@ -1769,6 +1819,8 @@ class P5Database:
                 actual_issue,
                 is_matched,
                 match_count,
+                top1_match_count,
+                top1_accuracy_rate,
                 json.dumps(match_details, ensure_ascii=False),
                 wan_match, qian_match, bai_match, shi_match, ge_match,
                 '; '.join(deviation) if deviation else '无偏差',
@@ -1777,12 +1829,14 @@ class P5Database:
             ))
             self.connection.commit()
             
-            logger.info(f'预测验证完成: {target_issue}, 命中{match_count}/5, 准确率{accuracy_rate}%')
+            logger.info(f'预测验证完成: {target_issue}, 命中{match_count}/5(宽松), Top-1命中{top1_match_count}/5, 准确率{accuracy_rate}%, Top-1准确率{top1_accuracy_rate}%')
             
             return {
                 'status': 'success',
                 'target_issue': target_issue,
                 'match_count': match_count,
+                'top1_match_count': top1_match_count,
+                'top1_accuracy_rate': top1_accuracy_rate,
                 'is_matched': is_matched,
                 'accuracy_rate': accuracy_rate,
                 'match_details': match_details
@@ -1885,7 +1939,19 @@ class P5Database:
                 'shi_accuracy': round((result.get('shi_hits', 0) or 0) / total * 100, 2),
                 'ge_accuracy': round((result.get('ge_hits', 0) or 0) / total * 100, 2),
                 'overall_accuracy': round((result.get('avg_accuracy', 0) or 0), 2),
-                # 严格命中率（无容错）
+                # ── Top-1 口径（v3.67 修复：strict_* 现为"首推号精确命中"真实预测力指标）──
+                # 随机基线：排列5 公平摇号，单位置 Top-1 理论命中率 = 10%，系统无法稳定超越。
+                # 旧口径（集合包含+±1容错）见上方 *_accuracy / avg_accuracy，仅供宽松参考。
+                'top1_total_matched': strict_stats.get('total_matched', 0),
+                'top1_full_matches': strict_stats.get('full_matches', 0),
+                'top1_avg_match': strict_stats.get('avg_match', 0),
+                'top1_avg_accuracy': strict_stats.get('avg_accuracy', 0),
+                'top1_wan_accuracy': strict_stats.get('wan_accuracy', 0),
+                'top1_qian_accuracy': strict_stats.get('qian_accuracy', 0),
+                'top1_bai_accuracy': strict_stats.get('bai_accuracy', 0),
+                'top1_shi_accuracy': strict_stats.get('shi_accuracy', 0),
+                'top1_ge_accuracy': strict_stats.get('ge_accuracy', 0),
+                # ── 向后兼容：保留 strict_* 别名（现同 top1_*，v3.35 旧语义已修正）──
                 'strict_total_matched': strict_stats.get('total_matched', 0),
                 'strict_full_matches': strict_stats.get('full_matches', 0),  # 完全命中5位的期数
                 'strict_avg_match': strict_stats.get('avg_match', 0),
@@ -1902,10 +1968,14 @@ class P5Database:
             return {}
 
     def _calculate_strict_hit_rates(self, total: int) -> Dict[str, Any]:
-        """计算严格命中率（无容错匹配，精确命中）
+        """计算 Top-1 严格命中率（首推号精确匹配，无容错、无集合包含）
 
-        需要从 p5_prediction_record 表中读取 predicted_numbers 和 actual_numbers，
-        重新计算精确匹配结果。
+        口径说明（v3.67）：
+        - 旧实现误用 "actual in pred[pos]"（集合包含，候选数~5），命名虽叫 strict，
+          实为宽松口径，导致命中率虚高（位置命中 ~80%+）。
+        - 现改为 Top-1 口径：仅当 pred[pos][0] == actual 才计命中，反映真实预测力。
+          排列5 公平摇号，Top-1 理论基线 = 10%（随机期望），无法稳定超越。
+        - 需要从 p5_prediction_record 读取 predicted_numbers 和 actual_numbers 重算。
         """
         try:
             # 获取去重后的验证记录
@@ -1915,6 +1985,7 @@ class P5Database:
             if not records:
                 return {
                     'total_matched': 0,
+                    'full_matches': 0,
                     'avg_match': 0,
                     'avg_accuracy': 0,
                     'wan_accuracy': 0,
@@ -1936,10 +2007,11 @@ class P5Database:
                     pred = json.loads(r['predicted_numbers'])
                     actual = json.loads(r['actual_numbers'])
 
-                    # 严格匹配（精确匹配，无容错）
+                    # Top-1 精确匹配（仅首推号 pred[pos][0] == actual 才命中）
                     record_strict_match = 0
                     for i, pos in enumerate(positions):
-                        if actual[i] in pred.get(pos, []):
+                        pred_pos = pred.get(pos, [])
+                        if pred_pos and actual[i] == pred_pos[0]:
                             strict_pos_hits[pos] += 1
                             strict_match += 1
                             strict_total_matched += 1
@@ -1965,8 +2037,10 @@ class P5Database:
             }
         except Exception as e:
             logger.warning(f'计算严格命中率失败: {e}')
+            # fallback 键集与成功路径保持一致(含 full_matches), 避免调用方取键崩溃
             return {
                 'total_matched': 0,
+                'full_matches': 0,
                 'avg_match': 0,
                 'avg_accuracy': 0,
                 'wan_accuracy': 0,
@@ -3537,6 +3611,54 @@ class P5Database:
             logger.error(f'插入权重历史记录失败: {e}')
             return None
     
+    # ============================================================
+    # v3.70 (roadmap 1.9) 策略 A/B walk-forward 对比持久化
+    # ============================================================
+
+    def insert_selection_ab_test(self, strategy_a, strategy_b, issue_range,
+                                  top1_a, top1_b, top3_a, top3_b):
+        """插入一条策略 A/B 对比记录 (roadmap 1.9)。
+
+        Args:
+            strategy_a / strategy_b: 两个策略标识 (如 'weighted_coverage' / 'latin_coverage')
+            issue_range: 对比期号范围 (如 '20260001-20260030')
+            top1_a / top1_b: 各自 Top-1 命中率 (0-1)
+            top3_a / top3_b: 各自 Top-3 命中率 (0-1)
+
+        Returns:
+            新记录 ab_id (int), 失败返回 None。
+        """
+        try:
+            sql = '''
+            INSERT INTO p5_selection_ab_test
+            (strategy_a, strategy_b, issue_range, top1_a, top1_b, top3_a, top3_b)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            '''
+            self.cursor.execute(sql, (
+                strategy_a, strategy_b, issue_range,
+                top1_a, top1_b, top3_a, top3_b,
+            ))
+            self.connection.commit()
+            logger.info(f'策略A/B对比记录插入成功: A={strategy_a} B={strategy_b} range={issue_range} '
+                        f'top1_a={top1_a} top1_b={top1_b} top3_a={top3_a} top3_b={top3_b}')
+            return self.cursor.lastrowid
+        except Exception as e:
+            self.connection.rollback()
+            logger.error(f'插入策略A/B对比记录失败: {e}')
+            return None
+
+    def get_selection_ab_tests(self, limit=20):
+        """获取最近 N 条策略 A/B 对比记录 (按 created_at 降序)。"""
+        try:
+            sql = ('SELECT ab_id, strategy_a, strategy_b, issue_range, '
+                   'top1_a, top1_b, top3_a, top3_b, created_at '
+                   'FROM p5_selection_ab_test ORDER BY created_at DESC LIMIT %s')
+            result = self.execute_with_reconnect(sql, (limit,))
+            return result or []
+        except Exception as e:
+            logger.error(f'获取策略A/B对比记录失败: {e}')
+            return []
+
     def get_weight_history(self, algo_name=None, position=None, limit=100, days=30):
         """获取权重历史记录"""
         try:

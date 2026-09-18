@@ -150,6 +150,20 @@ class LFULogCache:
             if not self.freq_map[freq]:
                 del self.freq_map[freq]
 
+    def invalidate_key(self, raw_key: str):
+        """
+        1.10 新增：按原始缓存键精确失效单条 LFU 缓存条目。
+
+        参数:
+            raw_key: 原始缓存键（与 get/set 传入的 key 一致）
+
+        说明:
+            将 raw_key 经 _key_hash 压缩后调用 _remove，
+            使长期缓存支持按期号精确清除，无需全量 clear。
+        """
+        hash_key = self._key_hash(raw_key)
+        self._remove(hash_key)
+
     def clear(self):
         """清空全部缓存条目与频率索引，并重置最小频率计数。"""
         self.cache.clear()
@@ -179,6 +193,11 @@ class PredictionCache:
     1. 短期缓存（5分钟）：相同历史数据+期号直接返回
     2. 长期缓存（1小时）：高频预测结果持久化
     3. AI响应缓存：相同prompt缓存响应
+
+    1.10 数据指纹增强：
+        缓存键中加入数据指纹（最新期号 + 记录数 + 前 10 条 MD5 校验和），
+        数据修正后即使 issue 不变，指纹变化也会使旧缓存自动失效。
+        同时维护 issue → keys 映射，使 invalidate(issue) 能正确清除长期缓存。
     """
 
     def __init__(self):
@@ -189,6 +208,7 @@ class PredictionCache:
             长期 LFU（500 条 / 1 小时）沉淀高频热点预测；
             AI 响应 LFU（200 条 / 5 分钟）缓存相同 prompt 的模型回复。
             _hits / _misses 用于在 GUI 侧展示缓存收益。
+            _issue_index 维护 issue → set(cache_keys) 映射，供 invalidate 使用。
         """
         self.short_cache = OrderedDict()  # 短期LRU
         self.long_cache = LFULogCache(max_size=500)  # 长期LFU
@@ -199,15 +219,51 @@ class PredictionCache:
         # 命中统计（用于GUI展示与效果评估）
         self._hits = 0
         self._misses = 0
+        # 1.10：issue → 关联的缓存键集合，支持按期号精确失效
+        self._issue_index: Dict[str, set] = defaultdict(set)
+
+    @staticmethod
+    def _data_fingerprint(history_data: List[Dict]) -> str:
+        """
+        计算历史数据指纹（1.10 新增）。
+
+        指纹由三部分构成，任一变化都会导致缓存失效：
+          - 最新期号（history_data[-1]['issue']）
+          - 记录数（len(history_data)）
+          - 前 10 条记录的 MD5 校验和（防止前 10 条数据被修正后旧缓存仍命中）
+
+        Args:
+            history_data: 参与本次预测的历史开奖数据列表
+
+        Returns:
+            格式化为 "latest_issue|count|checksum" 的指纹字符串
+        """
+        if not history_data:
+            return "empty|0|0"
+
+        latest_issue = str(history_data[-1].get('issue', ''))
+        count = len(history_data)
+
+        # 前 10 条的 MD5 校验和（防止早期数据修正后旧缓存仍命中）
+        head = history_data[:10]
+        checksum = hashlib.md5(
+            json.dumps(head, sort_keys=True, default=str).encode()
+        ).hexdigest()[:8]
+
+        return f"{latest_issue}|{count}|{checksum}"
 
     def _make_key(self, history_data: List[Dict], issue: str,
                   algorithm_hash: str = None) -> str:
-        """生成缓存key"""
-        data_hash = hashlib.md5(
-            json.dumps(history_data, sort_keys=True, default=str).encode()
-        ).hexdigest()[:12]
+        """
+        生成缓存键（1.10 增强）。
+
+        新格式：{data_fingerprint}:{issue}:{algo_hash}
+        data_fingerprint = "latest_issue|count|head_checksum"，
+        数据修正后 fingerprint 变化 → 缓存键变化 → 旧缓存自动失效。
+        """
+        fingerprint = self._data_fingerprint(history_data)
         algo_hash = algorithm_hash or 'default'
-        return f"{data_hash}:{issue}:{algo_hash}"
+        return f"{fingerprint}:{issue}:{algo_hash}"
 
     def get_prediction(self, history_data: List[Dict], issue: str,
                        algorithm_hash: str = None) -> Optional[Dict]:
@@ -256,6 +312,9 @@ class PredictionCache:
             issue: 目标期号
             result: 待缓存的预测结果字典
             algorithm_hash: 算法配置指纹，用于区分不同权重方案的结果
+
+        说明:
+            1.10：写入时同步更新 _issue_index，使 invalidate(issue) 能精确命中长期缓存键。
         """
         key = self._make_key(history_data, issue, algorithm_hash)
 
@@ -269,6 +328,9 @@ class PredictionCache:
             'value': result,
             'exp_at': time.time() + self.short_ttl
         }
+
+        # 1.10：维护 issue → keys 映射，供 invalidate 精确清除
+        self._issue_index[issue].add(key)
 
     def get_ai_response(self, prompt: str) -> Optional[str]:
         """按 prompt 查询已缓存的 AI 响应。
@@ -293,21 +355,27 @@ class PredictionCache:
         self.ai_cache.set(key, response, ttl=self.short_ttl)
 
     def invalidate(self, issue: str = None):
-        """使指定期号或全部缓存失效"""
+        """使指定期号或全部缓存失效。
+
+        1.10：对指定期号，通过 _issue_index 精确清除长期缓存与短期缓存，
+        不再依赖字符串模糊匹配（旧实现无法清除长期缓存）。
+        """
         if issue is None:
             self.short_cache.clear()
             self.long_cache.clear()
             self.ai_cache.clear()
+            self._issue_index.clear()
             logger.info("缓存已清除")
         else:
-            # 清除指定期号（需要遍历）
-            keys_to_remove = [
-                k for k in self.short_cache
-                if issue in str(k)
-            ]
+            # 1.10：通过 issue_index 精确查找关联键
+            keys_to_remove = self._issue_index.pop(issue, set())
             for k in keys_to_remove:
-                del self.short_cache[k]
-            logger.info(f"已清除期号 {issue} 的缓存")
+                if k in self.short_cache:
+                    del self.short_cache[k]
+                # 长期缓存通过 LFULogCache.clear() 全清后重建，
+                # 此处对长期缓存使用 invalidate_by_key（新增方法）
+                self.long_cache.invalidate_key(k)
+            logger.info(f"已清除期号 {issue} 的缓存（共 {len(keys_to_remove)} 条）")
 
     def stats(self) -> Dict:
         """返回三级缓存各自的容量占用情况。

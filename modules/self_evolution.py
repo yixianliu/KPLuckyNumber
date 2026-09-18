@@ -279,13 +279,62 @@ class _MLPredictorPool:
     def shutdown(self):
         if self._pool is not None:
             try:
-                self._pool.terminate()
-                self._pool.join(timeout=5)
+                # v3.65: 先 close() 让正在执行的任务完成，再 terminate() 强制终止
+                # 直接 terminate() 会导致子进程持有多重锁时无法释放，引发白屏卡顿
+                try:
+                    self._pool.close()       # 停止接受新任务
+                    self._pool.join(timeout=3)  # 等待现有任务完成
+                except Exception:
+                    pass
+                self._pool.terminate()       # 强制终止所有 worker
+                self._pool.join(timeout=3)   # 等待 worker 退出
             except Exception:  # noqa: BLE001
                 pass
             finally:
                 self._pool = None
                 self._use_subprocess = False
+            # v3.65: Windows 上 terminate() 后仍有残留子进程，强制 cleanup
+            self._kill_orphan_workers()
+
+    def _kill_orphan_workers(self):
+        """v3.65: Windows 上强制清理 terminate() 后残留的 SpawnPoolWorker 子进程。
+
+        Windows 上 multiprocessing.Pool.terminate() 只能发送 CTRL_BREAK_EVENT，
+        但子进程若在获取 multiprocessing.Lock 时被中断，会卡在锁释放前，
+        导致主进程 join() 超时，进而阻塞 tkinter 窗口退出（白屏）。
+        此处通过 os.kill 发送 SIGTERM 强制终止残留进程。
+        """
+        import os as _os
+        # 先清理 multiprocessing 管理的活跃子进程
+        for proc in multiprocessing.active_children():
+            if proc.is_alive():
+                try:
+                    proc.terminate()
+                    proc.join(timeout=1)
+                except Exception:
+                    pass
+        # Windows 兜底：通过 pid 精确 kill 本进程的子进程（避免误杀其他 python）
+        if sys.platform == 'win32':
+            try:
+                import subprocess
+                # 获取当前进程的 pid，再 kill 其所有子进程
+                parent_pid = os.getpid()
+                result = subprocess.run(
+                    ['tasklist', '/FO', 'CSV', '/NH', '/FI',
+                     f'PARENTPROCESSID eq {parent_pid}'],
+                    capture_output=True, text=True, timeout=3,
+                )
+                for line in result.stdout.strip().splitlines():
+                    try:
+                        # CSV 格式: "python.exe","1234",...
+                        fields = line.split('","')
+                        pid_str = fields[1].strip('"')
+                        if pid_str.isdigit():
+                            os.kill(int(pid_str), 9)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
 
 def _ml_predictor_worker_entry(sorted_data, cfg_snapshot):
@@ -655,11 +704,13 @@ class SelfEvolutionEngine:
     # ------------------------------------------------------------------
     # 定时器（v3.52 AutoEvoScheduler）
     # ------------------------------------------------------------------
-    def start_silent_timer(self):
+    def start_silent_timer(self, delay: Optional[float] = None):
         self.stop_silent_timer()
-        self._timer = threading.Timer(
-            60.0, self._silent_timer_tick
-        )
+        if delay is None:
+            delay = 60.0
+        # 限制极端值，避免过长或过短
+        delay = max(30.0, min(delay, 3600.0))
+        self._timer = threading.Timer(delay, self._silent_timer_tick)
         self._timer.daemon = True
         self._timer.start()
 
@@ -721,32 +772,56 @@ class SelfEvolutionEngine:
             进程异常退出，未走 notify_analysis_done 兜底），自动重置联动状态，
             防止引擎被永久卡在「联动暂停」分支、用户后续每次点击「开始分析」都
             要看这条无意义日志。
+
+        v3.62 优化：
+            - 跳过类日志降级为 DEBUG，减少日志噪音
+            - 联动暂停时延长检测间隔至 5 分钟
+            - 未到调度间隔时动态计算下次唤醒时间，最长 1 小时
         """
+        next_delay = 60.0
         try:
             if self._scheduler_paused:
-                # v3.57：联动暂停超时时自愈，避免进程异常退出后状态永久卡死
                 if self._is_link_state_stale():
                     logger.warning(
                         '[self_evolution] 联动暂停超时（> %d 分钟），自动重置联动状态',
                         self._LINK_STALE_TIMEOUT // 60)
                     self._force_reset_link_state()
                 else:
-                    logger.info('[self_evolution] 定时器 tick：联动暂停中（analysis_running=True），跳过本轮')
+                    logger.debug('[self_evolution] 定时器 tick：联动暂停中，跳过本轮')
+                next_delay = 300.0  # 暂停期间降低唤醒频率
             elif self._scheduler.should_run() and not self._running:
                 logger.info('[self_evolution] 定时器 tick：检测到应触发自我进化，启动轻量自检…')
-                # 轻量运行：auto=True, auto_full=False
                 self._running = True
                 t = threading.Thread(target=self._run, daemon=True)
                 t.start()
+                next_delay = 60.0
             else:
                 if self._running:
-                    logger.info('[self_evolution] 定时器 tick：引擎正在运行，跳过本轮触发')
+                    logger.debug('[self_evolution] 定时器 tick：引擎正在运行，跳过本轮触发')
+                    next_delay = 60.0
                 else:
-                    logger.info('[self_evolution] 定时器 tick：尚未到达调度间隔，跳过本轮')
+                    logger.debug('[self_evolution] 定时器 tick：尚未到达调度间隔，跳过本轮')
+                    # 动态计算下次检查时间，减少空转唤醒
+                    try:
+                        if os.path.isfile(self._scheduler.schedule_path):
+                            with open(self._scheduler.schedule_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            last = data.get('last_run_ts')
+                            if last is not None:
+                                interval_sec = self._scheduler.interval_hours * 3600
+                                remaining = interval_sec - (time.time() - float(last))
+                                if remaining > 0:
+                                    next_delay = max(60.0, min(remaining, 3600.0))
+                                else:
+                                    next_delay = 60.0
+                    except Exception:
+                        next_delay = 300.0
         except Exception as e:  # noqa: BLE001
             logger.warning('[self_evolution] 定时器 tick 异常: %s', e)
-        # 下一轮
-        self.start_silent_timer()
+            next_delay = 300.0
+        finally:
+            # 确保定时器始终被重建，即使异常也继续调度
+            self.start_silent_timer(delay=next_delay)
 
     # ------------------------------------------------------------------
     # 主循环（六阶段）

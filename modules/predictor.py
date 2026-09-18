@@ -1,4 +1,7 @@
 """
+        # 取消检查辅助函数
+        def _is_cancelled():
+            return cancel_event is not None and cancel_event.is_set()
 排列5 预测模块
 
 基于多模型融合的彩票数据分析与预测，通过八种统计算法 + 概率融合 + 约束优化,
@@ -916,32 +919,63 @@ class P5Predictor:
         return result.get('combinations', []), meta
 
     def _init_ai_config(self):
-        """初始化AI模型配置"""
+        """初始化AI模型配置（对齐 api.txt 官方规范，参数从 config.py 的 AGNES_API_CONFIG 读取）。
+
+        默认模型升级为 agnes-3.0-flash（api.txt 推荐版本），
+        可通过环境变量 AGNES_MODEL_NAME 覆盖；主模型异常时自动降级到 AGNES_BACKUP_MODEL。
+        """
+        defaults = {
+            'api_url': "https://api.agnes-ai.cn/v1/chat/completions",
+            'api_key': '',
+            'model_name': 'agnes-3.0-flash',
+            'backup_model': 'agnes-2.5-flash',
+            'timeout': 60,
+            'max_tokens': 2048,
+            'temperature': 0.7,
+            'top_p': 1.0,
+            'stream': False,
+            'max_retries': 3,
+            'retry_backoff_factor': 0.5,
+            'pool_connections': 5,
+            'pool_maxsize': 10,
+            'response_format': 'json_object',
+        }
         try:
-            from config import AGNES_API_CONFIG
-            self.api_config = AGNES_API_CONFIG
-            self.api_url = self.api_config.get('api_url', "https://api.agnes-ai.cn/v1/chat/completions")
-            self.api_key = self.api_config.get('api_key', '')
-            self.model_name = self.api_config.get('model_name', 'agnes-2.5-flash')
-            self.ai_available = bool(self.api_key)
-            self.ai_auxiliary_available = bool(self.api_key)
-
-            if self.ai_available:
-                self.headers = {
-                    'Content-Type': 'application/json',
-                    'Authorization': f'Bearer {self.api_key}'
-                }
-                logger.info(f'AI模型配置加载成功: {self.model_name}')
-            else:
-                logger.warning('API密钥未配置，AI模型分析将被跳过')
+            import config as cfg
+            self.api_config = {**defaults, **(getattr(cfg, 'AGNES_API_CONFIG', {}) or {})}
         except ImportError:
-            self.api_config = {}
-            self.api_key = ''
-            self.ai_available = False
-            self.ai_auxiliary_available = False
-            logger.warning('无法加载config.py，AI模型分析将被跳过')
+            self.api_config = dict(defaults)
 
-        # 说明：AI部分为可选功能，若未配置 api_key 则会被优雅跳过，遵循 AGENTS.md 中的设计约定。
+        self.api_url = self.api_config.get('api_url', defaults['api_url'])
+        self.api_key = self.api_config.get('api_key', '')
+        self.model_name = self.api_config.get('model_name', defaults['model_name'])
+        self.backup_model = self.api_config.get('backup_model', defaults['backup_model'])
+        self.timeout = int(self.api_config.get('timeout', 60))
+        self.default_max_tokens = int(self.api_config.get('max_tokens', 2048))
+        self.default_temperature = float(self.api_config.get('temperature', 0.7))
+        self.top_p = float(self.api_config.get('top_p', 1.0))
+        self.stream = bool(self.api_config.get('stream', False))
+        self.max_retries = int(self.api_config.get('max_retries', 3))
+        self.retry_backoff_factor = float(self.api_config.get('retry_backoff_factor', 0.5))
+        self.pool_connections = int(self.api_config.get('pool_connections', 5))
+        self.pool_maxsize = int(self.api_config.get('pool_maxsize', 10))
+        self.response_format = self.api_config.get('response_format', 'json_object')
+        self.ai_available = bool(self.api_key)
+        self.ai_auxiliary_available = bool(self.api_key)
+
+        if self.ai_available:
+            self.headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {self.api_key}'
+            }
+            logger.info(
+                f'AI模型配置加载成功: model={self.model_name}, '
+                f'backup={self.backup_model}, timeout={self.timeout}s'
+            )
+        else:
+            logger.warning('API密钥未配置，AI模型分析将被跳过')
+
+        # 说明：AI 部分为可选功能，若未配置 api_key 则优雅跳过，遵循 AGENTS.md 中的设计约定。
 
     def _build_ai_prompt(self, history_data: List[Dict], current_issue: str,
                          stats_summary: str) -> str:
@@ -1008,13 +1042,18 @@ class P5Predictor:
 """
         return prompt
 
-    def _call_ai_model(self, prompt: str, max_tokens: int = 8000,
-                       temperature: float = 0.7, force: bool = False) -> Optional[str]:
-        """调用AI大语言模型
+    def _call_ai_model(self, prompt: str, max_tokens: Optional[int] = None,
+                       temperature: Optional[float] = None, force: bool = False,
+                       tools: Optional[List[Dict[str, Any]]] = None,
+                       model: Optional[str] = None) -> Optional[str]:
+        """调用AI大语言模型（对齐 api.txt 官方接口规范）。
 
-        force=True 时仅校验 api_key 是否存在(不要求 self.ai_available 为真)，
-        供「贝叶斯AI辅助」在回测期间(self.ai_available 被置 False)仍可调用的场景使用；
-        非 force 路径保持原行为(完整AI复包装仅在 ai_available 时调用)。
+        force=True 时仅校验 api_key 是否存在（不要求 self.ai_available 为真），
+        供「贝叶斯AI辅助」在回测期间（self.ai_available 被置 False）仍可调用的场景使用；
+        非 force 路径保持原行为（完整AI复包装仅在 ai_available 时调用）。
+
+        请求契约（api.txt）：POST {api_url}，Header 携带 Bearer Token，Body 含
+        model / messages / max_tokens / temperature / (可选)tools / stream / response_format。
         """
         if not self.api_key:
             logger.warning('AI模型不可用（未配置API密钥）')
@@ -1023,10 +1062,18 @@ class P5Predictor:
             logger.warning('AI模型不可用（未配置API密钥）')
             return None
 
-        logger.info(f'=== 开始调用AI模型: {self.model_name} ===')
+        use_model = model or self.model_name
+        mt = int(max_tokens if max_tokens is not None else self.default_max_tokens)
+        temp = float(temperature if temperature is not None else self.default_temperature)
+        rf = self.response_format
 
-        payload = json.dumps({
-            "model": self.model_name,
+        logger.info(
+            f'=== 开始调用AI模型: {use_model} | max_tokens={mt} | temperature={temp} | '
+            f'tools={len(tools) if tools else 0} ==='
+        )
+
+        payload: Dict[str, Any] = {
+            "model": use_model,
             "messages": [
                 {
                     "role": "system",
@@ -1037,16 +1084,20 @@ class P5Predictor:
                     "content": prompt
                 }
             ],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "response_format": {"type": "json_object"}
-        })
+            "max_tokens": mt,
+            "temperature": temp,
+            "stream": bool(self.stream),
+        }
+        if self.top_p is not None and self.top_p != 1.0:
+            payload["top_p"] = self.top_p
+        if tools:
+            payload["tools"] = tools
+        # 备注：response_format 期望返回JSON对象；服务端常返回带杂讯文本，
+        # 因此后续仍需使用 _parse_ai_response 做容错解析。
+        if rf and rf not in (False, 'false', 'False'):
+            payload["response_format"] = {"type": rf}
 
-        # 备注：payload 中使用 messages(system/user) 的结构与项目中其他调用 AI 模型的实现保持一致，
-        # 便于统一管理和解析。response_format 期望返回JSON对象，但服务端常常返回带杂讯的文本，
-        # 因此后续需使用 _parse_ai_response 做容错解析。
-
-        # 构建带自动重试的 Session, 应对 SSL EOF / 连接中断等瞬时错误
+        # 复用 ai_analyzer 的进程级 Session（连接池 + Retry），避免重复 TLS 握手
         session = self._build_ai_session()
 
         last_err = None
@@ -1054,23 +1105,47 @@ class P5Predictor:
         for attempt in range(max_attempts):
             try:
                 response = session.request(
-                    "POST", self.api_url, headers=self.headers, data=payload, timeout=60
+                    "POST", self.api_url, headers=self.headers,
+                    data=json.dumps(payload), timeout=self.timeout
                 )
                 response.raise_for_status()
 
                 result = response.json()
 
                 if 'choices' in result and len(result['choices']) > 0:
-                    content = result['choices'][0]['message']['content']
-                    logger.info(f'AI模型调用成功(第{attempt + 1}次), 返回长度: {len(content)}')
-                    return content
+                    choice = result['choices'][0]
+                    content = choice.get('message', {}).get('content')
+                    if content:
+                        usage = result.get('usage', {})
+                        logger.info(
+                            f'AI模型调用成功(第{attempt + 1}次), 长度={len(content)}, '
+                            f'usage={usage}, finish_reason={choice.get("finish_reason")}'
+                        )
+                        return content
 
                 logger.error(f'AI模型返回格式异常: {result}')
                 return None
 
+            except requests.exceptions.HTTPError as e:
+                last_err = e
+                status = e.response.status_code if e.response is not None else None
+                # 4xx 非重试，直接返回，避免浪费配额；404/410 尝试降级到备份模型
+                if status is not None and 400 <= status < 500:
+                    if status in (404, 410) and use_model != self.backup_model and self.backup_model:
+                        logger.warning(f'模型 {use_model} 不存在，降级到 {self.backup_model}')
+                        return self._call_ai_model(
+                            prompt, max_tokens=max_tokens, temperature=temperature,
+                            force=force, tools=tools, model=self.backup_model
+                        )
+                    logger.error(f'AI模型 HTTP {status} 错误（非重试）: {e}')
+                    return None
+                wait = 0.8 * (2 ** attempt)
+                logger.warning(f'AI模型调用第{attempt + 1}次失败: {e}; {wait:.1f}s 后重试')
+                if attempt < max_attempts - 1:
+                    time.sleep(wait)
             except requests.exceptions.RequestException as e:
                 last_err = e
-                wait = 0.8 * (2 ** attempt)  # 指数退避: 0.8s, 1.6s, 3.2s
+                wait = 0.8 * (2 ** attempt)  # 指数退避: 0.8s / 1.6s / 3.2s
                 logger.warning(f'AI模型调用第{attempt + 1}次失败: {e}; {wait:.1f}s 后重试')
                 if attempt < max_attempts - 1:
                     time.sleep(wait)
@@ -1086,19 +1161,28 @@ class P5Predictor:
 
     @staticmethod
     def _build_ai_session() -> requests.Session:
-        """构建带重试策略的 requests Session, 应对 SSL EOF / 连接中断 / 5xx 等瞬时错误。"""
-        session = requests.Session()
-        retry = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=frozenset(['POST', 'GET']),
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=10)
-        session.mount('https://', adapter)
-        session.mount('http://', adapter)
-        return session
+        """获取进程级复用的 AI Session（连接池 + Retry）。
+
+        说明：优先复用 ai_analyzer 模块维护的单例 Session（含 429/5xx 自动重试），
+        避免每次调用重新建立 TLS 握手；若 ai_analyzer 无法导入，则回退到本地构造。
+        """
+        try:
+            from modules.ai_analyzer import _get_module_session as _sess_factory
+            return _sess_factory()
+        except Exception:
+            # 回退：本地构造 Session（保持原实现）
+            session = requests.Session()
+            retry = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=frozenset(['POST', 'GET']),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=10)
+            session.mount('https://', adapter)
+            session.mount('http://', adapter)
+            return session
 
     def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
         """解析AI响应（鲁棒：兼容单引号/裸key/尾随逗号/代码块）"""
@@ -1146,7 +1230,8 @@ class P5Predictor:
         return '\n'.join(lines)
 
     def predict(self, history_data: List[Dict], current_issue: Optional[str] = None,
-                target_issue: Optional[str] = None, progress_callback=None) -> Dict[str, Any]:
+                target_issue: Optional[str] = None, progress_callback=None,
+                cancel_event=None) -> Dict[str, Any]:
         """
         执行下一期预测
 
@@ -1163,6 +1248,9 @@ class P5Predictor:
         Returns:
             预测结果字典，包含各位置概率分布、推荐组合、走势预测等
         """
+        # 取消检查辅助函数
+        def _is_cancelled():
+            return cancel_event is not None and cancel_event.is_set()
         if not history_data:
             return {'error': '历史数据为空，无法预测'}
 
@@ -1208,6 +1296,8 @@ class P5Predictor:
 
         # 执行各算法预测
         algorithm_probs = self._run_algorithms(sorted_data, progress_callback)
+        if _is_cancelled():
+            return {'success': False, 'error': '用户取消'}
 
         # 说明：algorithm_probs 的结构为 {算法名: [pos0_probs, pos1_probs, ..., pos4_probs]}
         # 每个 pos_probs 为 {号码: 概率} 的字典，后续将被融合为最终的 fused_probs。
@@ -1223,6 +1313,8 @@ class P5Predictor:
             fused_probs = self._apply_boundary_protection(fused_probs, sorted_data)
 
         # AI大模型分析（可选）
+        if _is_cancelled():
+            return {'success': False, 'error': '用户取消'}
         ai_result = {}
         ai_enabled = self.config.get_global_param('enable_ai_model', True)
         if ai_enabled and self.ai_available:
@@ -1242,6 +1334,8 @@ class P5Predictor:
                     logger.warning('AI模型调用失败，使用纯统计模型结果')
             except Exception as e:
                 logger.error(f'AI模型分析异常: {e}', exc_info=True)
+        if _is_cancelled():
+            return {'success': False, 'error': '用户取消'}
 
         # 概率校准：对已融合的概率分布施加校准变换。
         # 校准器由 self._get_calibrator() 懒加载；未拟合时返回恒等变换，
@@ -1349,6 +1443,8 @@ class P5Predictor:
                 cache.set_prediction(history_data, next_issue, result)
             except Exception as e:
                 logger.debug(f'缓存写入失败（非致命）: {e}')
+        if _is_cancelled():
+            return {'success': False, 'error': '用户取消'}
 
         return result
 

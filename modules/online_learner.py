@@ -349,12 +349,20 @@ class OnlineLearner:
             return _empty
 
     def _calculate_hits(self, prediction_record: Dict, actual_numbers: List[int]) -> Dict[str, Any]:
-        """计算基础命中统计"""
+        """计算基础命中统计（双口径分离）
+
+        口径说明（v3.67）：
+        - partial_hits : 覆盖口径（Top-3 集合包含），仅作"宽松参考"，保留旧语义
+        - top1_hits    : Top-1 真实口径（首推号精确命中），反映真实预测力
+        - recommendation_quality : 改由 Top-1 口径评级，避免被覆盖口径虚高污染
+          下游 _update_trend_knowledge_model / _update_hit_rate_statistics 自强化
+        """
         result = {
             'target_issue': prediction_record.get('target_issue'),
             'actual_numbers': actual_numbers,
             'exact_match': 0,  # 完全命中数
-            'partial_hits': 0,  # 部分命中数
+            'partial_hits': 0,  # 部分命中数（覆盖口径: Top-3 集合包含, 宽松参考）
+            'top1_hits': 0,  # Top-1 真实命中数（首推号精确命中, 0-5）
             'position_hits': {},  # 各位置命中情况
             'confidence_accuracy': 0,  # 置信度准确度
             'recommendation_quality': 'unknown'
@@ -374,14 +382,20 @@ class OnlineLearner:
             top_3 = [num for num, _ in sorted_nums[:3]]
             
             pos_hit = actual_num in top_3
+            # Top-1 真实口径: 实际号 == 该位置最高概率号(首推号)
+            pos_top1_hit = bool(sorted_nums) and sorted_nums[0][0] == actual_num
+            
             result['position_hits'][pos_name] = {
                 'hit': pos_hit,
+                'top1_hit': pos_top1_hit,
                 'predicted_rank': next((i+1 for i, (n, _) in enumerate(sorted_nums) if n == actual_num), 10),
                 'probability': pos_probs.get(actual_num, 0)
             }
             
             if pos_hit:
                 result['partial_hits'] += 1
+            if pos_top1_hit:
+                result['top1_hits'] += 1
         
         # 检查推荐组合
         for combo in top_combos[:5]:
@@ -392,12 +406,13 @@ class OnlineLearner:
             elif match_count >= 3:
                 result['partial_hits'] = max(result['partial_hits'], match_count)
         
-        # 评估推荐质量
+        # 评估推荐质量 —— 改用 Top-1 真实口径评级（覆盖口径虚高会误判为 good/fair）
+        # 排列5 公平摇号, Top-1 理论基线≈10%/位, exact_match 全中≈10^-5 级
         if result['exact_match'] > 0:
             result['recommendation_quality'] = 'excellent'
-        elif result['partial_hits'] >= 4:
+        elif result['top1_hits'] >= 4:
             result['recommendation_quality'] = 'good'
-        elif result['partial_hits'] >= 3:
+        elif result['top1_hits'] >= 3:
             result['recommendation_quality'] = 'fair'
         else:
             result['recommendation_quality'] = 'poor'
@@ -680,6 +695,10 @@ class OnlineLearner:
           2) 无 per-algo 数据时不再伪造调整, 只记 debug 并说明: 跨会话持久化的权重学习
              由 pipeline._update_weight_manager -> weight_history 制品通道负责。
           3) 保留专家信誉分更新(该部分本就有效)。
+          4) v3.70 (roadmap 1.11): 当 feature flag ONLINE_LEARNER_WRITEBACK 开启时,
+             将会话内学到的建议权重回写至 p5_weight_history + Redis,
+             使下次 P5PredictorConfig 会话可通过 _load_adaptive_weight_history 回放。
+             flag 默认关闭 (config.ONLINE_LEARNER_WRITEBACK), 避免不可控的权重漂移。
         """
         try:
             # --- 1) 真实的 per-algo 权重学习(替代死代码) ---
@@ -718,8 +737,121 @@ class OnlineLearner:
                     ttl_days=90
                 )
 
+            # --- 3) v3.70 (1.11): feature flag 开启时, 建议权重回写持久化 ---
+            self._writeback_suggested_weights(prediction_record, actual_numbers)
+
         except Exception as e:
             logger.error(f'增量更新权重失败: {e}', exc_info=True)
+
+    def _writeback_suggested_weights(self, prediction_record: Optional[Dict],
+                                     actual_numbers: Optional[List[int]]):
+        """v3.70 (roadmap 1.11): 将建议权重回写至 P5PredictorConfig 持久化通道。
+
+        设计意图:
+            会话内 _incremental_update_weights 已把 per-algo 命中喂给 weight_manager,
+            但只更新内存 —— 跨会话回放需把建议权重落到 p5_weight_history + Redis,
+            使下次 P5PredictorConfig 会话可通过 _load_adaptive_weight_history 读取。
+
+        回写条件 (全部满足才执行, 任一不满足记 debug 并跳过):
+            1. config.ONLINE_LEARNER_WRITEBACK == True (feature flag, 默认关闭)
+            2. weight_manager 累积了 >= MIN_WRITEBACK_SAMPLES 次有效验证记录
+               (小样本下回写只会追逐噪声, 故设下限)
+            3. prediction_record['target_issue'] 存在 (作为回写记录的期号溯源)
+
+        回写内容 (与 pipeline._persist_weight_update 同通道, 保证下游回放兼容):
+            - 数据库 p5_weight_history: 逐算法 insert_weight_history
+              (position='all', weight_type='adaptive', 关联 target_issue)
+            - Redis kpluckynumber:pl5:adaptive_weights:latest
+              (与 pipeline._load_adaptive_weights 读取键一致, source='online_learner')
+
+        Returns:
+            {'written': bool, 'weights': {...}, 'sample_count': int, 'reason': str}
+        """
+        result: Dict[str, Any] = {
+            'written': False,
+            'weights': {},
+            'sample_count': 0,
+            'reason': '',
+        }
+        try:
+            from config import ONLINE_LEARNER_WRITEBACK
+            if not ONLINE_LEARNER_WRITEBACK:
+                result['reason'] = 'flag_off'
+                logger.debug('在线学习回写跳过: ONLINE_LEARNER_WRITEBACK=False')
+                return result
+
+            # 取会话累积的总有效验证样本数 (hit_rate + top1_hit 双通道)
+            total_samples = 0
+            for _algo, _rec in self.weight_manager.algo_hit_rates.items():
+                total_samples += int(_rec.get('total', 0)) + int(_rec.get('t1_total', 0))
+            result['sample_count'] = total_samples
+
+            MIN_WRITEBACK_SAMPLES = 10
+            if total_samples < MIN_WRITEBACK_SAMPLES:
+                result['reason'] = f'insufficient_samples({total_samples}<{MIN_WRITEBACK_SAMPLES})'
+                logger.debug(f'在线学习回写跳过: 样本不足 {total_samples}<{MIN_WRITEBACK_SAMPLES}')
+                return result
+
+            suggested = self.weight_manager.get_adaptive_weights(metric='top1_hit')
+            if not suggested:
+                result['reason'] = 'no_suggested_weights'
+                logger.debug('在线学习回写跳过: 无建议权重')
+                return result
+
+            target_issue = (prediction_record or {}).get('target_issue')
+            if not target_issue:
+                result['reason'] = 'no_target_issue'
+                logger.debug('在线学习回写跳过: 缺 target_issue 溯源字段')
+                return result
+
+            # --- 回写 1: 数据库 p5_weight_history ---
+            db_ok = False
+            if self.db and getattr(self.db, 'insert_weight_history', None) is not None:
+                try:
+                    for algo_name, w in suggested.items():
+                        self.db.insert_weight_history(
+                            algo_name=algo_name,
+                            position='all',
+                            weight_value=round(float(w), 6),
+                            weight_type='adaptive',
+                        )
+                    db_ok = True
+                except Exception as e:
+                    logger.warning(f'在线学习回写数据库失败(不影响主流程): {e}')
+
+            # --- 回写 2: Redis kpluckynumber:pl5:adaptive_weights:latest ---
+            redis_ok = False
+            _redis_client = getattr(self.redis, 'client', None) if self.redis else None
+            if _redis_client is not None:
+                try:
+                    _redis_client.setex(
+                        'kpluckynumber:pl5:adaptive_weights:latest',
+                        timedelta(days=7),
+                        json.dumps({
+                            'version': 'v3.70_online_learner',
+                            'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'target_issue': target_issue,
+                            'weights': {k: round(float(v), 6) for k, v in suggested.items()},
+                            'sample_count': total_samples,
+                            'source': 'online_learner',
+                        }, ensure_ascii=False),
+                    )
+                    redis_ok = True
+                except Exception as e:
+                    logger.warning(f'在线学习回写 Redis 失败(不影响主流程): {e}')
+
+            result['written'] = db_ok or redis_ok
+            result['weights'] = {k: round(float(v), 6) for k, v in suggested.items()}
+            result['reason'] = 'written'
+            logger.info(
+                f'在线学习回写完成: issue={target_issue}, '
+                f'samples={total_samples}, db_ok={db_ok}, redis_ok={redis_ok}, '
+                f'weights={result["weights"]}'
+            )
+        except Exception as e:
+            logger.error(f'在线学习回写异常(不影响主流程): {e}', exc_info=True)
+            result['reason'] = f'error:{e}'
+        return result
 
     def _extract_algo_evaluations(self, prediction_record: Optional[Dict],
                                    actual_numbers: Optional[List[int]]) -> Dict[str, Dict[str, float]]:
@@ -793,6 +925,8 @@ class OnlineLearner:
                 'total_predictions': 1,
                 'full_hits': hit_tracking.get('exact_match', 0),
                 'partial_hits': hit_tracking.get('partial_hits', 0),
+                'top1_hits': hit_tracking.get('top1_hits', 0),
+                'top1_rate': round(hit_tracking.get('top1_hits', 0) / 5.0, 4),
                 'hit_rate_by_position': hit_tracking.get('position_hits', {}),
                 'expert_source_impact': [
                     {
@@ -802,6 +936,7 @@ class OnlineLearner:
                     for s in expert_tracking.get('source_tracking', [])
                 ],
                 'recommendation_quality': hit_tracking.get('recommendation_quality', 'unknown'),
+                'random_baseline_top1': 0.10,
                 'updated_at': datetime.now().isoformat()
             }
             

@@ -1446,7 +1446,7 @@ class Pipeline:
             if not nums:
                 nums = []
             prediction[p] = {
-                'numbers': list(nums)[:3],
+                'numbers': list(nums)[:4],
                 'confidence': [],
                 'reason': '走势图多源融合(降级: AI整合不可用, 沿用统计信号)'
             }
@@ -2155,8 +2155,8 @@ class Pipeline:
                                 if abs(d - prev_d) < 2:  # SSD惩罚
                                     scores[d] -= 0.15
                 
-                # Top-3 (用户要求浓缩到3个数字; 覆盖率50%→30%)
-                top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+                # Top-4 (每位展示4个候选数字, 覆盖率目标50%)
+                top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:4]
                 bayes_flag = " +贝叶斯" if _use_bayes else ""
                 expert_flag = " +专家约束" if _expert_constraints and p in _expert_constraints else ""
                 
@@ -2885,7 +2885,7 @@ class Pipeline:
                     # 降级: 沿用 P5Predictor 融合概率取 Top-3
                     _idx = pos_keys.index(_pk)
                     _pp = _fused[_idx] if _idx < len(_fused) else {}
-                    _sn = sorted(_pp.items(), key=lambda x: x[1], reverse=True)[:3]
+                    _sn = sorted(_pp.items(), key=lambda x: x[1], reverse=True)[:4]
                     # 降级路径: 从DB现算 frequency/omission 特征供 GUI 展示(真实历史, 非编造)
                     _feat = {'freq_pct': {}, 'omission': {}}
                     try:
