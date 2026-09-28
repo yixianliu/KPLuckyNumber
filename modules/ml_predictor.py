@@ -67,6 +67,17 @@ except Exception as _sk_err:  # pragma: no cover - 取决于运行环境是否�
     _SKLEARN_IMPORT_ERROR = f'{type(_sk_err).__name__}: {_sk_err}'
     _SKLEARN_AVAILABLE = False
 
+# v3.70 (roadmap 1.5) Optuna 超参数调优
+# ----------------------------------------------------------------------------
+_OPTUNA_AVAILABLE = False
+_OPTUNA_IMPORT_ERROR: Optional[str] = None
+try:
+    import optuna
+    _OPTUNA_AVAILABLE = True
+except Exception as _opt_err:
+    _OPTUNA_IMPORT_ERROR = f'{type(_opt_err).__name__}: {_opt_err}'
+    _OPTUNA_AVAILABLE = False
+
 
 def _sklearn_gbrt_predict(X: np.ndarray, y: np.ndarray,
                           n_estimators: int, learning_rate: float,
@@ -606,11 +617,30 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
         _get_logger().info(
             '[ml_predictor] %s 位: 特征筛选 %d -> %d 列', p, n_features, len(feat_idx))
 
-    # One-vs-Rest：对每个数字类训练 GBDT 二分类器
-    n_classes = 10
-    n_estimators = 30   # 树的数量
+    # v3.70 (1.5): Optuna 超参数自动调优（仅当数据充足且 Optuna 可用时）
+    n_estimators = 30
     learning_rate = 0.1
     max_depth = 3
+    if _OPTUNA_AVAILABLE and X.shape[0] >= 200:
+        try:
+            best_params = _optimize_params_optuna(X, y, n_trials=15)
+            if best_params:
+                n_estimators = int(best_params.get('n_estimators', 30))
+                learning_rate = float(best_params.get('learning_rate', 0.1))
+                max_depth = int(best_params.get('max_depth', 3))
+                _get_logger().info('[ml_predictor] %s 位 Optuna 调优成功: %s', p, best_params)
+            else:
+                _get_logger().info('[ml_predictor] %s 位 Optuna 调优无结果，使用默认值', p)
+        except Exception as e:
+            _get_logger().warning('[ml_predictor] %s 位 Optuna 调优失败，使用默认值: %s', p, e)
+    else:
+        if not _OPTUNA_AVAILABLE:
+            _get_logger().debug('[ml_predictor] %s 位 Optuna 不可用，使用默认超参数', p)
+        else:
+            _get_logger().debug('[ml_predictor] %s 位 样本不足(%d)，跳过 Optuna 调优', p, X.shape[0])
+
+    # One-vs-Rest：对每个数字类训练 GBDT 二分类器
+    n_classes = 10
     final_scores = np.zeros(n_classes)
 
     # v3.70 (1.3): 优先走 sklearn 路径，缺失/异常自动降级回纯 numpy 路径并记录降级日志
@@ -947,6 +977,61 @@ def _sklearn_imports_top_k(X: np.ndarray, y: np.ndarray, k: int,
         return None
     mean_imp /= n_used
     return np.sort(np.argsort(mean_imp)[::-1][:k])
+
+
+def _optimize_params_optuna(X: np.ndarray, y: np.ndarray, n_trials: int = 15) -> Optional[Dict]:
+    """v3.70 (1.5): 使用 Optuna 自动调优 GBRT 超参数。
+    
+    仅在 Optuna 可用且 sklearn 可用时执行，使用交叉验证评估。
+    返回最优参数字典，失败时返回 None。
+    """
+    if not _OPTUNA_AVAILABLE or not _SKLEARN_AVAILABLE:
+        return None
+    try:
+        import optuna
+        from sklearn.model_selection import cross_val_score
+        from sklearn.ensemble import GradientBoostingClassifier
+        
+        def objective(trial):
+            n_estimators = trial.suggest_int('n_estimators', 30, 200)
+            learning_rate = trial.suggest_float('learning_rate', 0.01, 0.3)
+            max_depth = trial.suggest_int('max_depth', 2, 6)
+            
+            # One-vs-Rest 平均交叉验证分数
+            scores = []
+            n_classes = int(y.max()) + 1
+            for c in range(n_classes):
+                y_bin = (y == c).astype(int)
+                if y_bin.sum() < 5:
+                    continue
+                clf = GradientBoostingClassifier(
+                    n_estimators=n_estimators,
+                    learning_rate=learning_rate,
+                    max_depth=max_depth,
+                    random_state=42
+                )
+                try:
+                    cv_score = cross_val_score(clf, X, y_bin, cv=3, scoring='accuracy')
+                    scores.append(float(cv_score.mean()))
+                except Exception:
+                    continue
+            if not scores:
+                return 0.0
+            return float(np.mean(scores))
+        
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        
+        if study.best_value and study.best_params:
+            params = {
+                'n_estimators': int(study.best_params['n_estimators']),
+                'learning_rate': float(study.best_params['learning_rate']),
+                'max_depth': int(study.best_params['max_depth'])
+            }
+            return params
+    except Exception as e:
+        _get_logger().warning('[ml_predictor] Optuna 优化异常: %s', e)
+    return None
 
 
 if __name__ == '__main__':

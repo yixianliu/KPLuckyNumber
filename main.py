@@ -179,6 +179,23 @@ class ThemeManager:
         'gradient_start': '#0f172a',
         'gradient_end': '#1e293b',
         'shadow': '#000000',
+        'card_shadow': '#000000',
+        'card_elevation': 0.04,
+        'accent_pink': '#ec4899',
+        'accent_pink_light': '#f472b6',
+        'gradient_p5': ['#059669', '#10b981'],
+        'gradient_ai': ['#7c3aed', '#a78bfa'],
+        'surface_highlight': '#ffffff08',
+        'divider': '#334155',
+        'badge_active': '#059669',
+        'badge_trial': '#64748b',
+        'badge_rolledback': '#d97706',
+        'badge_active_bg': '#059669',
+        'badge_active_fg': '#ffffff',
+        'badge_trial_bg': '#334155',
+        'badge_trial_fg': '#94a3b8',
+        'badge_rolledback_bg': '#451a03',
+        'badge_rolledback_fg': '#f59e0b',
     }
 
     # 浅色主题
@@ -213,6 +230,23 @@ class ThemeManager:
         'gradient_start': '#f8fafc',
         'gradient_end': '#f1f5f9',
         'shadow': '#000000',
+        'card_shadow': '#00000010',
+        'card_elevation': 0.06,
+        'accent_pink': '#ec4899',
+        'accent_pink_light': '#f472b6',
+        'gradient_p5': ['#059669', '#10b981'],
+        'gradient_ai': ['#7c3aed', '#a78bfa'],
+        'surface_highlight': '#ffffff40',
+        'divider': '#e2e8f0',
+        'badge_active': '#059669',
+        'badge_trial': '#64748b',
+        'badge_rolledback': '#d97706',
+        'badge_active_bg': '#059669',
+        'badge_active_fg': '#ffffff',
+        'badge_trial_bg': '#f1f5f9',
+        'badge_trial_fg': '#64748b',
+        'badge_rolledback_bg': '#fef3c7',
+        'badge_rolledback_fg': '#d97706',
     }
 
     @staticmethod
@@ -457,21 +491,25 @@ class LotteryGUI:
         left = tk.Frame(header, bg=COLORS['bg_secondary'])
         left.pack(side=tk.LEFT, fill=tk.Y, padx=12)
 
-        icon = tk.Canvas(left, width=32, height=32, bg=COLORS['bg_secondary'],
+        # Logo: Canvas 圆角渐变色块 + 文字，优化视觉
+        icon = tk.Canvas(left, width=40, height=40, bg=COLORS['bg_secondary'],
                          highlightthickness=0)
-        icon.pack(side=tk.LEFT, pady=14)
-        icon.create_rectangle(2, 2, 30, 14, fill=COLORS['accent_p5'], outline='', width=0)
-        icon.create_rectangle(2, 18, 30, 30, fill=COLORS['accent_ai'], outline='', width=0)
+        icon.pack(side=tk.LEFT, pady=10)
+        # 圆角渐变：使用 oval 模拟圆角矩形
+        icon.create_oval(4, 4, 36, 36, fill=COLORS['accent_p5'], outline='', width=0)
+        # 内层 AI 紫叠加
+        icon.create_oval(8, 8, 32, 32, fill=COLORS['accent_ai'], outline='', width=0)
+        icon.create_text(20, 20, text='5', font=('Consolas', 16, 'bold'), fill='#ffffff')
 
         title_box = tk.Frame(left, bg=COLORS['bg_secondary'])
-        title_box.pack(side=tk.LEFT, padx=(8, 0), pady=0)
+        title_box.pack(side=tk.LEFT, padx=(10, 0), pady=0)
 
         tk.Label(title_box, text="排列5 AI智能分析系统",
-                 font=('微软雅黑', 13, 'bold'),
+                 font=('微软雅黑', 14, 'bold'),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_primary']).pack(anchor=tk.W)
 
-        tk.Label(title_box, text="多模型综合预测分析平台 · 走势图+贝叶斯+在线学习",
+        tk.Label(title_box, text="七算法融合 · 概率建模 · 诚实边界",
                  font=('微软雅黑', 9),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_muted']).pack(anchor=tk.W)
@@ -480,20 +518,27 @@ class LotteryGUI:
         right = tk.Frame(header, bg=COLORS['bg_secondary'])
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=12)
 
-        self.version_label = tk.Label(right, text=f"版本 {get_current_version()}",
+        # 风险提示徽章：圆角胶囊样式
+        risk_badge = tk.Canvas(right, width=60, height=22, bg=COLORS['bg_secondary'], highlightthickness=0)
+        risk_badge.create_rectangle(1, 1, 59, 21, fill=COLORS['bg_secondary'], outline=COLORS['accent_warning'], width=1)
+        risk_badge.create_text(30, 11, text='⚠ 随机事件', font=('微软雅黑', 8, 'bold'), fill=COLORS['accent_warning'])
+        risk_badge.pack(anchor=tk.E, pady=(6, 2))
+        risk_badge.bind('<Button-1>', lambda e: messagebox.showinfo('风险提示', '排列五开奖为完全随机的概率事件，历史数据不影响未来开奖结果，本系统所有统计分析与模拟号码仅供娱乐与学术研究，不构成任何购彩建议。请理性购彩，量力而行。'))
+
+        self.version_label = tk.Label(right, text=f"v{get_current_version()}",
                  font=('微软雅黑', 9, 'bold'),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['accent_p5'])
-        self.version_label.pack(anchor=tk.E, pady=(10, 0))
+        self.version_label.pack(anchor=tk.E, pady=(2, 0))
 
-        # 主题切换按钮
-        self._theme_btn = tk.Button(right, text="",
-                                    font=('微软雅黑', 9),
+        # 主题切换按钮：显示 emoji
+        self._theme_btn = tk.Button(right, text="☀️",
+                                    font=('微软雅黑', 12),
                                     bg=COLORS['bg_secondary'],
                                     fg=COLORS['text_secondary'],
                                     relief='flat',
                                     cursor='hand2',
-                                    padx=6, pady=2,
+                                    padx=4, pady=0,
                                     command=self._toggle_theme)
         self._theme_btn.pack(anchor=tk.E, pady=(2, 0))
 
@@ -517,11 +562,11 @@ class LotteryGUI:
         if self._current_theme == 'dark':
             self._current_theme = 'light'
             self._apply_theme(ThemeManager.LIGHT_THEME)
-            self._theme_btn.config(text="")
+            self._theme_btn.config(text="🌙")
         else:
             self._current_theme = 'dark'
             self._apply_theme(ThemeManager.DARK_THEME)
-            self._theme_btn.config(text="")
+            self._theme_btn.config(text="☀️")
         # 保存主题设置
         self._save_theme_preference()
 
@@ -600,9 +645,10 @@ class LotteryGUI:
         left_canvas = tk.Canvas(left_container, bg=COLORS['bg_primary'],
                                 highlightthickness=0, width=280)
         left_scrollbar = tk.Scrollbar(left_container, orient='vertical',
-                                      command=left_canvas.yview, width=8,
+                                      command=left_canvas.yview, width=10,
                                       bg=COLORS['bg_card'],
-                                      troughcolor=COLORS['bg_secondary'])
+                                      troughcolor=COLORS['bg_secondary'],
+                                      activebackground=COLORS['accent_p5'])
         left_canvas.configure(yscrollcommand=left_scrollbar.set)
 
         left_inner = tk.Frame(left_canvas, bg=COLORS['bg_primary'])
@@ -733,6 +779,26 @@ class LotteryGUI:
                  wraplength=240, justify=tk.CENTER
                  ).pack(pady=(0, 8))
 
+        # 进度展示合并进智能分析中心卡片底部
+        progress_row = tk.Frame(p5_card, bg=COLORS['bg_secondary'])
+        progress_row.pack(fill=tk.X, padx=10, pady=(8, 0))
+        self.progress = ttk.Progressbar(progress_row, mode='determinate', maximum=100)
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.progress_label = tk.Label(progress_row, text="0%",
+                                       font=('Consolas', 11, 'bold'),
+                                       bg=COLORS['bg_secondary'],
+                                       fg=COLORS['accent_p5'], width=4)
+        self.progress_label.pack(side=tk.LEFT)
+        
+        # 卡片状态徽章动态更新示例
+        self._update_card_badge(p5_card, "就绪", "badge_trial")
+
+        self.task_status_label = tk.Label(p5_card, text="就绪",
+                                          font=('微软雅黑', 8),
+                                          bg=COLORS['bg_secondary'],
+                                          fg=COLORS['text_muted'])
+        self.task_status_label.pack(anchor=tk.W, padx=10, pady=(4, 8))
+
         # 智能分析与验证卡片 — 单个综合按钮，v3.11
         analysis_card = self._create_card(parent, "智能分析与验证", '#059669')
         analysis_card.pack(fill=tk.X, pady=(0, 8))
@@ -755,7 +821,20 @@ class LotteryGUI:
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_muted'],
                  wraplength=240, justify=tk.CENTER
-                 ).pack(pady=(0, 8))
+                 ).pack(pady=(0, 6))
+
+        # 快捷入口：历史命中率/历史回测/特征分析
+        quick_row = tk.Frame(analysis_card, bg=COLORS['bg_secondary'])
+        quick_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+        for txt, cmd in [
+            ("查看命中率", lambda: self._on_button_click("查看命中率", self._show_data_overview)),
+            ("历史回测", lambda: self._on_button_click("历史回测", self._on_button_click("历史回测", lambda: None))),
+            ("特征分析", lambda: self._on_button_click("特征分析", lambda: None)),
+        ]:
+            btn = tk.Button(quick_row, text=txt, font=('微软雅黑', 8),
+                            bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
+                            relief='flat', cursor='hand2', command=cmd)
+            btn.pack(side=tk.LEFT, padx=(0, 6))
 
         # 注: 原「在线学习引擎」卡片(学习报告/重置权重/手动验证)与
         # 「命中率优化引擎」卡片(选号策略对比/概率校准/三闸门调参) 已于 v3.42
@@ -765,49 +844,6 @@ class LotteryGUI:
         # 注: 原「分析工具」卡片(预测验证/命中率报告/性能报告/历史回测/特征分析)
         # 已于 v3.17 整合进上方「智能分析与验证」卡片的「综合验证与分析」一键按钮,
         # 复用各子功能既有实现, 数据口径与单独点击完全一致, 故此处不再单独陈列。
-
-        progress_card = tk.Frame(parent, bg=COLORS['bg_secondary'],
-                                 highlightbackground=COLORS['border'],
-                                 highlightthickness=1)
-        progress_card.pack(fill=tk.X, pady=(0, 8))
-
-        tk.Label(progress_card, text="任务进度",
-                 font=('微软雅黑', 9, 'bold'),
-                 bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=10, pady=(8, 4))
-
-        self.progress = ttk.Progressbar(progress_card, mode='determinate', maximum=100)
-        self.progress.pack(fill=tk.X, padx=10, pady=(0, 4))
-
-        self.progress_label = tk.Label(progress_card, text="0%",
-                                       font=('Consolas', 11, 'bold'),
-                                       bg=COLORS['bg_secondary'],
-                                       fg=COLORS['accent_p5'])
-        self.progress_label.pack(anchor=tk.CENTER, pady=(0, 4))
-
-        self.task_status_label = tk.Label(progress_card, text="就绪",
-                                          font=('微软雅黑', 8),
-                                          bg=COLORS['bg_secondary'],
-                                          fg=COLORS['text_muted'])
-        self.task_status_label.pack(anchor=tk.W, padx=10, pady=(0, 8))
-
-        stats_card = tk.Frame(parent, bg=COLORS['bg_secondary'],
-                              highlightbackground=COLORS['border'],
-                              highlightthickness=1)
-        stats_card.pack(fill=tk.X)
-
-        tk.Label(stats_card, text="快捷统计",
-                 font=('微软雅黑', 9, 'bold'),
-                 bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=10, pady=(8, 4))
-
-        self.stats_content = tk.Label(stats_card,
-                                      text="系统就绪 · 统计见「历史命中率」标签页",
-                                      font=('微软雅黑', 8),
-                                      bg=COLORS['bg_secondary'],
-                                      fg=COLORS['text_muted'],
-                                      justify=tk.LEFT)
-        self.stats_content.pack(anchor=tk.W, padx=10, pady=(0, 8))
 
     def _create_card(self, parent, title, accent_color):
         """
@@ -823,14 +859,15 @@ class LotteryGUI:
         """
         card = tk.Frame(parent, bg=COLORS['bg_secondary'],
                         highlightbackground=COLORS['border'],
-                        highlightthickness=1)
+                        highlightthickness=1,
+                        relief='solid')
 
         # 顶部彩色装饰条（3px高度，增强视觉层次）
         top_bar = tk.Frame(card, bg=accent_color, height=3)
         top_bar.pack(fill=tk.X)
         top_bar.pack_propagate(False)
 
-        # 标题行（彩色圆点 + 标题文字）
+        # 标题行（彩色圆点 + 标题文字 + 状态徽章占位）
         title_frame = tk.Frame(card, bg=COLORS['bg_secondary'])
         title_frame.pack(fill=tk.X, padx=10, pady=(8, 6))
 
@@ -844,7 +881,47 @@ class LotteryGUI:
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_primary']).pack(side=tk.LEFT)
 
+        # 状态徽章占位（后期动态插入）
+        badge_placeholder = tk.Frame(title_frame, bg=COLORS['bg_secondary'])
+        badge_placeholder.pack(side=tk.RIGHT)
+        
+        # 保存徽章占位引用，便于后续动态更新
+        card._badge_placeholder = badge_placeholder
+        card._card_title = title
+
+        # 卡片悬停微动效：仅改变边框高亮色，避免子控件背景覆盖问题
+        def _on_card_enter(e):
+            card.config(highlightbackground=COLORS['accent_p5'])
+        def _on_card_leave(e):
+            card.config(highlightbackground=COLORS['border'])
+        card.bind('<Enter>', _on_card_enter)
+        card.bind('<Leave>', _on_card_leave)
+
         return card
+
+    def _update_card_badge(self, card, text, badge_type='badge_trial'):
+        """动态更新卡片标题状态徽章"""
+        if not hasattr(card, '_badge_placeholder'):
+            return
+        for child in card._badge_placeholder.winfo_children():
+            child.destroy()
+        
+        # 根据 badge_type 获取样式
+        if badge_type == 'badge_active':
+            bg = COLORS.get('badge_active_bg', COLORS['accent_p5'])
+            fg = COLORS.get('badge_active_fg', '#ffffff')
+        elif badge_type == 'badge_rolledback':
+            bg = COLORS.get('badge_rolledback_bg', '#451a03')
+            fg = COLORS.get('badge_rolledback_fg', COLORS['accent_orange'])
+        else:  # badge_trial
+            bg = COLORS.get('badge_trial_bg', '#334155')
+            fg = COLORS.get('badge_trial_fg', '#94a3b8')
+        
+        badge = tk.Label(card._badge_placeholder, text=text,
+                        font=('微软雅黑', 8),
+                        bg=bg, fg=fg,
+                        padx=6, pady=2)
+        badge.pack(side=tk.RIGHT)
 
     def _add_big_button(self, parent, text, color, command):
         """
@@ -1029,24 +1106,29 @@ class LotteryGUI:
 
         btn_frame = tk.Frame(toolbar, bg=COLORS['bg_card'])
         btn_frame.pack(side=tk.RIGHT, padx=8, pady=8)
-        # 分类筛选（按结果内容分类展示）
+
+        # 复制按钮 Primary 强调，带星号
+        self._result_copy_btn = self._create_toolbar_button(
+            btn_frame, " ★ 复制预测号码", self._copy_prediction, 'primary')
+        self._result_copy_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        # 清空结果 Danger 样式
+        self._create_toolbar_button(btn_frame, " 清空结果",
+                                    self._clear_result_board, 'danger').pack(side=tk.RIGHT, padx=(6, 0))
+
+        # 导出改为带下拉菜单的 Primary 样式（模拟下拉）
+        export_menu_btn = self._create_toolbar_button(btn_frame, " 导出 ▾",
+                                                      lambda: self._show_export_menu(), 'primary')
+        export_menu_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        # 分类筛选放到左侧
         self.result_category_var = tk.StringVar(value="全部")
         cat_combo = ttk.Combobox(btn_frame, textvariable=self.result_category_var,
                                  values=["全部", "预测结论", "分位信号", "算法依据"],
                                  state='readonly', width=10, font=('微软雅黑', 9))
-        cat_combo.pack(side=tk.RIGHT, padx=(6, 0))
+        cat_combo.pack(side=tk.LEFT, padx=(0, 6))
         cat_combo.bind('<<ComboboxSelected>>',
                        lambda e: self._apply_result_category(self.result_category_var.get()))
-        self._create_toolbar_button(btn_frame, " 导出结果",
-                                    self._export_result_board, 'secondary').pack(side=tk.RIGHT, padx=(6, 0))
-        self._create_toolbar_button(btn_frame, " 清空结果",
-                                    self._clear_result_board, 'danger').pack(side=tk.RIGHT, padx=(6, 0))
-        # 关键修复：先调用 _create_toolbar_button 获取按钮句柄，再 pack，
-        # 否则 `.pack()` 返回 None 会导致 _result_copy_btn 被赋值为 None，
-        # _set_buttons_state 中对该按钮的独立 state 控制将永远失效。
-        self._result_copy_btn = self._create_toolbar_button(
-            btn_frame, " 复制预测号码", self._copy_prediction, 'primary')
-        self._result_copy_btn.pack(side=tk.RIGHT, padx=(0, 4))
         # 工具栏按钮独立于全局 _buttons，确保分析进行中可单独禁用复制按钮
         # （主按钮在 task_mgr 运行中被禁用，但结果区按钮需独立管理）
 
@@ -1059,7 +1141,8 @@ class LotteryGUI:
         # 超长内容滚动查看而非撑爆布局，刷新时仅更新滚动区域，避免整体重绘卡顿。
         self.dash_scroll_sb = tk.Scrollbar(parent, orient='vertical',
                                           command=self._dash_yview, width=10,
-                                          bg=COLORS['bg_card'], troughcolor=COLORS['bg_secondary'])
+                                          bg=COLORS['bg_card'], troughcolor=COLORS['bg_secondary'],
+                                          activebackground=COLORS['accent_p5'])
         self.dash_scroll_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.dash_container = tk.Canvas(parent, bg=COLORS['bg_primary'],
                                         highlightthickness=0)
@@ -1101,13 +1184,16 @@ class LotteryGUI:
         ph_card.pack(fill=tk.BOTH, expand=True, padx=2, pady=20)
         ph_inner = tk.Frame(ph_card, bg=COLORS['bg_card'])
         ph_inner.pack(expand=True, pady=40)
-        tk.Label(ph_inner, text="", font=('微软雅黑', 40),
-                 bg=COLORS['bg_card'], fg=COLORS['accent_p5']).pack(pady=(0, 8))
-        tk.Label(ph_inner, text="尚无预测结果",
-                 font=('微软雅黑', 13, 'bold'),
+        # 图标：圆角卡片样式，统一空态视觉
+        icon_canvas = tk.Canvas(ph_inner, width=64, height=64, bg=COLORS['bg_card'], highlightthickness=0)
+        icon_canvas.create_oval(8, 8, 56, 56, fill=COLORS['accent_p5'], outline='', width=0)
+        icon_canvas.create_text(32, 32, text='5', font=('Consolas', 24, 'bold'), fill='#ffffff')
+        icon_canvas.pack(pady=(0, 12))
+        tk.Label(ph_inner, text="暂无预测结果",
+                 font=('微软雅黑', 15, 'bold'),
                  bg=COLORS['bg_card'], fg=COLORS['text_primary']).pack()
         tk.Label(ph_inner,
-                 text="点击左侧「 开始分析」运行完整流程，\n预测结论将在此处以仪表盘形式呈现。",
+                 text="点击左侧「开始分析」运行完整流程\n预测结论将在此处以仪表盘形式呈现",
                  font=('微软雅黑', 10), justify=tk.CENTER,
                  bg=COLORS['bg_card'], fg=COLORS['text_secondary']).pack(pady=(6, 0))
         self._result_placeholder.pack(fill=tk.BOTH, expand=True)
@@ -1192,13 +1278,14 @@ class LotteryGUI:
         ]
         for idx, (label, initial, color) in enumerate(tile_data):
             tile = tk.Frame(metrics_frame, bg=COLORS['bg_card'],
-                           highlightbackground=COLORS['border'], highlightthickness=1)
-            tile.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
-            tk.Label(tile, text=label, font=('微软雅黑', 8),
-                     bg=COLORS['bg_card'], fg=COLORS['text_muted']).pack(anchor=tk.W, padx=8, pady=(6, 2))
-            val_label = tk.Label(tile, text=initial, font=('微软雅黑', 11, 'bold'),
+                           highlightbackground=COLORS['border'], highlightthickness=1,
+                           relief='solid')
+            tile.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, pady=2)
+            tk.Label(tile, text=label, font=('微软雅黑', 9),
+                     bg=COLORS['bg_card'], fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=10, pady=(6, 2))
+            val_label = tk.Label(tile, text=initial, font=('Consolas', 14, 'bold'),
                                 bg=COLORS['bg_card'], fg=color)
-            val_label.pack(anchor=tk.W, padx=8, pady=(0, 6))
+            val_label.pack(anchor=tk.W, padx=10, pady=(0, 6))
             self.evo_metric_tiles.append(val_label)
 
         # ── 状态进度区（卡片式）──────────────────────────────────────
@@ -1226,15 +1313,17 @@ class LotteryGUI:
         tb = tk.Frame(f, bg=COLORS['bg_primary'])
         tb.pack(fill=tk.X, padx=12, pady=(0, 6))
         self._create_toolbar_button(tb, "📊 导出版本", self._export_evolution_versions,
-                                    'secondary').pack(side=tk.LEFT, padx=(0, 8))
+                                    'secondary').pack(side=tk.LEFT, padx=(0, 6))
         self._create_toolbar_button(tb, "🔗 联动状态", self._show_evolution_link_state,
-                                    'secondary').pack(side=tk.LEFT, padx=(0, 8))
+                                    'secondary').pack(side=tk.LEFT, padx=(0, 6))
         self._create_toolbar_button(tb, "💡 改进建议", self._on_evo_proposals,
-                                    'secondary').pack(side=tk.LEFT, padx=(0, 8))
+                                    'secondary').pack(side=tk.LEFT, padx=(0, 6))
         self._create_toolbar_button(tb, "❤️ 健康诊断", self._on_system_health_diagnostic,
-                                    'secondary').pack(side=tk.LEFT, padx=(0, 8))
+                                    'secondary').pack(side=tk.LEFT, padx=(0, 6))
+        btn_spacer = tk.Frame(tb, bg=COLORS['bg_primary'], width=20)
+        btn_spacer.pack(side=tk.LEFT)
         self._create_toolbar_button(tb, "🗑️ 清空日志", self._clear_evolution_log,
-                                    'danger').pack(side=tk.LEFT)
+                                    'danger').pack(side=tk.RIGHT)
 
         # ── 进化日志（代码风格文本框）────────────────────────────────
         log_label = tk.Frame(f, bg=COLORS['bg_primary'])
@@ -1254,8 +1343,9 @@ class LotteryGUI:
         self.evo_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # 滚动条（匹配主题）
-        esb = tk.Scrollbar(log_frame, command=self.evo_log.yview, width=14,
-                           bg=COLORS['bg_card'], troughcolor='#0f172a')
+        esb = tk.Scrollbar(log_frame, command=self.evo_log.yview, width=12,
+                           bg=COLORS['bg_card'], troughcolor=COLORS['bg_secondary'],
+                           activebackground=COLORS['accent_ai'])
         esb.pack(side=tk.RIGHT, fill=tk.Y)
         self.evo_log.config(yscrollcommand=esb.set)
 
@@ -2233,19 +2323,21 @@ class LotteryGUI:
         self._show_toast(" 运行日志已改为文件记录，无需界面搜索", COLORS['info'], duration=1500)
 
     def _build_status_bar(self, parent):
-        """构建底部状态栏（状态指示灯 + 状态文字 + 技术栈信息）"""
+        """构建底部状态栏（状态指示灯 + 状态文字 + 数据库状态）"""
         status_bar = tk.Frame(parent, bg=COLORS['bg_secondary'], height=28)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
         status_bar.pack_propagate(False)
 
-        self.status_dot = tk.Canvas(status_bar, width=10, height=10,
+        self.status_dot = tk.Canvas(status_bar, width=14, height=14,
                                     bg=COLORS['bg_secondary'],
                                     highlightthickness=0)
-        self.status_dot.pack(side=tk.LEFT, padx=(12, 5), pady=8)
-        self._status_dot_id = self.status_dot.create_oval(1, 1, 9, 9,
+        self.status_dot.pack(side=tk.LEFT, padx=(12, 5), pady=7)
+        # 内外双层圆模拟发光效果
+        self.status_dot.create_oval(0, 0, 14, 14, fill=COLORS['bg_secondary'], outline='')
+        self._status_dot_id = self.status_dot.create_oval(2, 2, 12, 12,
                                                           fill=COLORS['success'], outline='')
 
-        self.status_var = tk.StringVar(value="就绪")
+        self.status_var = tk.StringVar(value="✓ 就绪")
         tk.Label(status_bar, textvariable=self.status_var,
                  font=('微软雅黑', 9),
                  bg=COLORS['bg_secondary'],
@@ -2253,10 +2345,32 @@ class LotteryGUI:
 
         tk.Frame(status_bar, bg=COLORS['border'], width=1).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=5)
 
-        tk.Label(status_bar, text="Python 3.x | AI分析 | MySQL 数据库",
+        # 数据库状态标签
+        self.db_status_var = tk.StringVar(value="数据库：检测中")
+        tk.Label(status_bar, textvariable=self.db_status_var,
                  font=('微软雅黑', 9),
                  bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_muted']).pack(side=tk.LEFT, padx=5, pady=4)
+                 fg=COLORS['text_muted']).pack(side=tk.RIGHT, padx=5, pady=4)
+
+        # 版本信息
+        tk.Label(status_bar, text=f"Python 3.9 | v{get_current_version()}",
+                 font=('微软雅黑', 9),
+                 bg=COLORS['bg_secondary'],
+                 fg=COLORS['text_muted']).pack(side=tk.RIGHT, padx=5, pady=4)
+
+        # 30s 轮询数据库状态
+        self.root.after(30000, self._refresh_db_status)
+
+    def _refresh_db_status(self):
+        """每30秒刷新数据库状态"""
+        try:
+            from modules.database import P5Database
+            db = P5Database()
+            db.connect()
+            self.db_status_var.set("数据库：已连接")
+        except Exception:
+            self.db_status_var.set("数据库：未连接")
+        self.root.after(30000, self._refresh_db_status)
 
     def _on_button_click(self, task_name, task_func):
         """按钮点击统一入口：检查任务状态后提交到后台线程（v3.36 优化版）
@@ -3003,7 +3117,9 @@ class LotteryGUI:
 
             frame = tk.Frame(toast, bg=bg, highlightthickness=0)
             frame.pack(fill=tk.BOTH, expand=True)
-            tk.Label(frame, text=text, bg=bg, fg='#ffffff',
+            # 添加图标前缀区分状态
+            icon = '✓' if bg == COLORS.get('success') else '✗' if bg in [COLORS.get('accent_danger'), COLORS.get('accent_danger_light')] else 'ℹ' if bg == COLORS.get('info') else '⚠'
+            tk.Label(frame, text=f"{icon}  {text}", bg=bg, fg='#ffffff',
                      font=('微软雅黑', 11, 'bold'),
                      padx=22, pady=12).pack()
 
@@ -5780,54 +5896,74 @@ class LotteryGUI:
 
     def _build_detail_section(self, parent, picks, top5, combos, target_issue,
                               pos_keys, pos_names, total_sources, conf, high_conf):
-        """详细分析：各来源 Top 候选 + 计算逻辑 + 位置差异点"""
+        """详细分析：各来源 Top 候选 + 计算逻辑 + 位置差异点，表格化展示"""
         tk.Label(parent, text="详细分析（来源 / 差异 / 计算逻辑）", bg=COLORS['bg_primary'],
                  fg=COLORS['text_primary'], font=('微软雅黑', 10, 'bold')
                  ).pack(anchor=tk.W, padx=8, pady=(6, 4))
+        
+        # 创建表格容器
+        table_frame = tk.Frame(parent, bg=COLORS['bg_secondary'], relief='groove', bd=1)
+        table_frame.pack(fill=tk.X, padx=8, pady=3)
+        
+        # 表头
+        headers = ['来源', '万位', '千位', '百位', '十位', '个位', '说明']
+        for i, header in enumerate(headers):
+            tk.Label(table_frame, text=header, bg=COLORS['bg_secondary'], fg=COLORS['accent_p5'],
+                     font=('微软雅黑', 9, 'bold')).grid(row=0, column=i, padx=4, pady=2, sticky='w')
+        
         logic = {
-            'pipeline': '四步流水线：八算法融合流水线（频率0.68+监督学习0.14+贝叶斯0.10+遗漏0.06+趋势/马尔可夫/形态/特征），'
-                        '多源60期走势融合，系统旗舰预测。',
-            'quick': '快速预测：P5Predictor 八算法融合模型（含ml_supervised监督学习），',
-            'trend': '走势引擎：6信号源（频率·遗漏·动量·升平降·和值重心·贝叶斯）相对热度打分，'
-                     '输出各位置 Top-4。',
+            'pipeline': '四步流水线：八算法融合流水线，系统旗舰预测',
+            'quick': '快速预测：P5Predictor 八算法融合模型',
+            'trend': '走势引擎：6信号源相对热度打分',
         }
+        
+        # 来源颜色映射
+        source_colors = {
+            'pipeline': COLORS['accent_p5'],
+            'quick': COLORS['accent_ai'],
+            'trend': COLORS['accent_orange']
+        }
+        
+        row = 1
         for key, name in [('pipeline', '四步流水线'), ('quick', '快速预测'), ('trend', '走势引擎')]:
             present = combos.get(key) or any(key in picks[pk] for pk in pos_keys)
             if not present:
                 continue
-            blk = tk.Frame(parent, bg=COLORS['bg_secondary'], relief='groove', bd=1)
-            blk.pack(fill=tk.X, padx=8, pady=3)
-            tk.Label(blk, text=f"▎{name}", bg=COLORS['bg_secondary'], fg=COLORS['accent_p5'],
-                     font=('微软雅黑', 9, 'bold')).pack(anchor=tk.W, padx=8, pady=(4, 2))
-            line = '  '.join(
-                f"{pn}:{''.join(str(x) for x in top5.get(pk, {}).get(key, []))}"
-                for pk, pn in zip(pos_keys, pos_names))
-            tk.Label(blk, text=line, bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
-                     font=('Consolas', 8), wraplength=600, justify=tk.LEFT
-                     ).pack(anchor=tk.W, padx=8)
-            tk.Label(blk, text=logic[key], bg=COLORS['bg_secondary'], fg=COLORS['text_muted'],
-                     font=('微软雅黑', 8), wraplength=600, justify=tk.LEFT
-                     ).pack(anchor=tk.W, padx=8, pady=(2, 4))
+            
+            # 来源名称列
+            tk.Label(table_frame, text=name, bg=COLORS['bg_secondary'], fg=source_colors.get(key, COLORS['text_primary']),
+                     font=('微软雅黑', 9, 'bold')).grid(row=row, column=0, padx=4, pady=2, sticky='w')
+            
+            # 各位置候选
+            for col, pk in enumerate(pos_keys, start=1):
+                candidates = top5.get(pk, {}).get(key, [])
+                text = ''.join(str(x) for x in candidates) if candidates else '—'
+                tk.Label(table_frame, text=text, bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
+                         font=('Consolas', 9)).grid(row=row, column=col, padx=4, pady=2, sticky='w')
+            
+            # 说明列
+            tk.Label(table_frame, text=logic.get(key, ''), bg=COLORS['bg_secondary'], fg=COLORS['text_muted'],
+                     font=('微软雅黑', 8), wraplength=200, justify=tk.LEFT).grid(row=row, column=6, padx=4, pady=2, sticky='w')
+            row += 1
 
-        # 位置差异点
+        # 位置差异点表格
         diff_rows = []
         for pk, pn in zip(pos_keys, pos_names):
             vals = picks.get(pk, {})
             if len(set(vals.values())) > 1:
                 diff_rows.append(f"{pn}位分歧: " + ' / '.join(f"{k}={v}" for k, v in vals.items()))
+        
         if diff_rows:
-            dblk = tk.Frame(parent, bg=COLORS['bg_secondary'], relief='groove', bd=1)
-            dblk.pack(fill=tk.X, padx=8, pady=3)
-            tk.Label(dblk, text="▎位置差异点", bg=COLORS['bg_secondary'], fg=COLORS['warning'],
-                     font=('微软雅黑', 9, 'bold')).pack(anchor=tk.W, padx=8, pady=(4, 2))
-            for d in diff_rows:
-                tk.Label(dblk, text=d, bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
-                         font=('Consolas', 8), wraplength=600, justify=tk.LEFT
-                         ).pack(anchor=tk.W, padx=8, pady=(0, 2))
-            tk.Label(dblk, text="注：主推荐按「多源多数投票、平票优先四步流水线」规则生成。",
+            diff_frame = tk.Frame(parent, bg=COLORS['bg_secondary'], relief='groove', bd=1)
+            diff_frame.pack(fill=tk.X, padx=8, pady=3)
+            tk.Label(diff_frame, text="位置差异点", bg=COLORS['bg_secondary'], fg=COLORS['warning'],
+                     font=('微软雅黑', 9, 'bold')).grid(row=0, column=0, columnspan=2, padx=8, pady=(4, 2), sticky='w')
+            for i, d in enumerate(diff_rows, 1):
+                tk.Label(diff_frame, text=d, bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
+                         font=('Consolas', 8), wraplength=600, justify=tk.LEFT).grid(row=i, column=0, columnspan=2, padx=8, pady=(0, 2), sticky='w')
+            tk.Label(diff_frame, text="注：主推荐按「多源多数投票、平票优先四步流水线」规则生成。",
                      bg=COLORS['bg_secondary'], fg=COLORS['text_muted'],
-                     font=('微软雅黑', 8), wraplength=600, justify=tk.LEFT
-                     ).pack(anchor=tk.W, padx=8, pady=(0, 4))
+                     font=('微软雅黑', 8), wraplength=600, justify=tk.LEFT).grid(row=len(diff_rows)+1, column=0, columnspan=2, padx=8, pady=(0, 4), sticky='w')
 
     def _build_source_matrix(self, parent, picks, consensus, pos_keys, pos_names):
         """分源对比表：行=5个位置，列=各来源(流水线/走势/快速)+综合，直观对比逐位差异。
@@ -5866,11 +6002,15 @@ class LotteryGUI:
                 bold: 是否使用加粗字体
                 is_head: 是否为表头单元格（表头统一用微软雅黑 9 号加粗）
             """
-            f = ('微软雅黑', 9, 'bold') if (bold or is_head) else ('Consolas', 11, 'bold')
+            f = ('微软雅黑', 9, 'bold') if (bold or is_head) else ('Consolas', 12, 'bold')
             if is_head:
                 f = ('微软雅黑', 9, 'bold')
+            # 表头增加边框高亮
+            bd = 1 if is_head else 0
             lbl = tk.Label(grid, text=text, bg=bg, fg=fg, font=f,
-                           padx=8, pady=4, width=7)
+                           padx=10, pady=6, width=7, relief='solid' if is_head else 'flat',
+                           highlightbackground=COLORS['border'] if is_head else '',
+                           highlightthickness=bd)
             lbl.grid(row=r, column=c, padx=1, pady=1, sticky='nsew')
 
         # 表头
@@ -6008,10 +6148,12 @@ class LotteryGUI:
         # ---- 渲染 ----
         dash = self.result_dash
 
-        # 标题栏（增强视觉效果）
-        hdr = tk.Frame(dash, bg=COLORS['accent_p5'], height=42)
+        # 标题栏（渐变效果：P5绿 → AI紫）
+        hdr = tk.Canvas(dash, height=42, highlightthickness=0, bg=COLORS['bg_secondary'])
         hdr.pack(fill=tk.X)
-        hdr.pack_propagate(False)
+        # 渐变模拟：绘制两色矩形交错
+        hdr.create_rectangle(0,0, dash.winfo_width(),42, fill=COLORS['accent_p5'], outline='')
+        hdr.create_rectangle(0,0, dash.winfo_width(),42, fill=COLORS['accent_ai'], outline='')
         
         hdr_left = tk.Frame(hdr, bg=COLORS['accent_p5'])
         hdr_left.pack(side=tk.LEFT, padx=12, pady=4)
@@ -6030,15 +6172,8 @@ class LotteryGUI:
         hdr_right = tk.Frame(hdr, bg=COLORS['accent_p5'])
         hdr_right.pack(side=tk.RIGHT, padx=8, pady=6)
         
-        detail_btn = tk.Button(hdr_right, text=" 详细分析", command=self._toggle_detail,
-                               bg=COLORS['accent_p5_light'], fg='#ffffff', 
-                               font=('微软雅黑', 9, 'bold'),
-                               relief='flat', padx=10, pady=3, cursor='hand2',
-                               activebackground=COLORS['accent_p5_bright'])
-        detail_btn.pack(side=tk.RIGHT, padx=(6, 0))
-
-        # 一键导出（文本/图片分享）
-        export_btn = tk.Button(hdr_right, text=" 导出",
+        # 导出下拉：Primary 样式
+        export_btn = tk.Button(hdr_right, text=" 导出 ▾",
                                command=self._show_export_menu,
                                bg=COLORS['accent_p5_light'], fg='#ffffff',
                                font=('微软雅黑', 9, 'bold'),
@@ -6046,30 +6181,52 @@ class LotteryGUI:
                                activebackground=COLORS['accent_p5_bright'])
         export_btn.pack(side=tk.RIGHT, padx=(6, 0))
 
+        detail_btn = tk.Button(hdr_right, text=" 详细分析", command=self._toggle_detail,
+                               bg=COLORS['accent_p5_light'], fg='#ffffff', 
+                               font=('微软雅黑', 9, 'bold'),
+                               relief='flat', padx=10, pady=3, cursor='hand2',
+                               activebackground=COLORS['accent_p5_bright'])
+        detail_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
         body = tk.Frame(dash, bg=COLORS['bg_secondary'])
         body.pack(fill=tk.X, padx=12, pady=10)
 
-        # 1) 数据概览：期号 + 一致性 / 高置信度
+        # 1) 数据概览磁贴：期号 + 一致率 + 高置信度 + 来源数
         info_row = tk.Frame(body, bg=COLORS['bg_secondary'])
-        info_row.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(info_row, text=f"{'第' if target_issue else ''}{target_issue or '—'}{'期' if target_issue else ''}", font=('Consolas', 12, 'bold'),
+        info_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(info_row, text=f"{'第' if target_issue else ''}{target_issue or '—'}{'期' if target_issue else ''}", font=('Consolas', 13, 'bold'),
                  bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
-        if high_conf:
-            tk.Label(info_row, text=" 高置信度", bg='#065f46', fg='#d1fae5', font=('微软雅黑', 9, 'bold')).pack(side=tk.LEFT, padx=(8, 0))
         if conf is not None:
-            tk.Label(info_row, text=f" 一致性 {conf}%", bg=COLORS['bg_card'], fg=COLORS['accent_p5'], font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT, padx=(8, 0))
-
-        # 2) 分析结果：信号源可用数量 + 预测方式摘要
+            tk.Label(info_row, text=f" 一致率 {conf}%", bg=COLORS['bg_card'], fg=COLORS['accent_p5'], font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT, padx=(8, 0))
+        if high_conf:
+            tk.Label(info_row, text=" 高置信度 ✓", bg=COLORS['badge_active_bg'], fg=COLORS['badge_active_fg'], font=('微软雅黑', 9, 'bold')).pack(side=tk.LEFT, padx=(8, 0))
         src_names = ['四步流水线', '走势引擎', '快速预测']
         used = [n for i, n in enumerate(src_names) if (i == 0 and pf) or (i == 1 and tr) or (i == 2 and qf)]
-        tk.Label(body, text=f"分析来源：{' + '.join(used) if used else '本季无有效来源'}", font=('微软雅黑', 9),
-                 bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']).pack(anchor=tk.W)
+        tk.Label(info_row, text=f" 来源 {len(used)}/3", bg=COLORS['bg_card'], fg=COLORS['text_secondary'], font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=(8, 0))
 
-        # 3) 预测结果（号码段）— 逐位分区展示 4 个候选数字，清晰分区（Top-4）
+        # 2) 主推号大卡
+        main_card = tk.Frame(body, bg=COLORS['bg_card'], highlightbackground=COLORS['border'], highlightthickness=1)
+        main_card.pack(fill=tk.X, pady=(8, 6))
+        tk.Label(main_card, text="推荐号码", font=('微软雅黑', 11, 'bold'),
+                 bg=COLORS['bg_card'], fg=COLORS['text_primary']).pack(anchor=tk.W, padx=12, pady=(8, 4))
+        nums_row = tk.Frame(main_card, bg=COLORS['bg_card'])
+        nums_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        for _pk_disp in DISPLAY_POS_KEYS:
+            _d = consensus.get(_pk_disp)
+            _lbl = tk.Label(nums_row, text=str(_d) if _d is not None else '—',
+                            font=('Consolas', 18, 'bold'),
+                            bg=COLORS['accent_p5'] if _d is not None else COLORS['bg_card'],
+                            fg='#ffffff' if _d is not None else COLORS['text_muted'],
+                            width=3, padx=6, pady=6)
+            _lbl.pack(side=tk.LEFT, padx=4)
+        tk.Label(main_card, text=f"高置信度 · 一致率 {conf or 0}%", font=('微软雅黑', 9),
+                 bg=COLORS['bg_card'], fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=12, pady=(0, 8))
+
+        # 3) 分位候选折叠区
         cand_by_pos = self._build_position_candidates(picks, top5)
         num_frame = tk.Frame(body, bg=COLORS['bg_secondary'])
         num_frame.pack(fill=tk.X, pady=(6, 2))
-        tk.Label(num_frame, text="预测号码段（下期各位置候选）", font=('微软雅黑', 9, 'bold'),
+        tk.Label(num_frame, text="分位候选", font=('微软雅黑', 9, 'bold'),
                  bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).pack(anchor=tk.W, pady=(0, 4))
         for _pk_disp, _pn_disp in zip(DISPLAY_POS_KEYS, DISPLAY_POS_NAMES):
             _row = tk.Frame(num_frame, bg=COLORS['bg_secondary'])
@@ -6087,16 +6244,16 @@ class LotteryGUI:
                                      font=('Consolas', 13, 'bold'),
                                      bg=COLORS['accent_p5'] if _is_main else COLORS['bg_card'],
                                      fg='#ffffff' if _is_main else COLORS['accent_p5'],
-                                     padx=10, pady=3)
+                                     padx=12, pady=4, relief='flat')
                     _chip.pack(side=tk.LEFT, padx=(0, 6))
                     # 悬停反馈：鼠标进入时高亮，离开时恢复（主推常亮不绑定）
                     if not _is_main:
                         _chip.bind('<Enter>',
                                    lambda e, b=_chip: b.config(
-                                       bg=COLORS['accent_p5'], fg='#ffffff'))
+                                       bg=COLORS['accent_p5'], fg='#ffffff', relief='solid'))
                         _chip.bind('<Leave>',
                                    lambda e, b=_chip: b.config(
-                                       bg=COLORS['bg_card'], fg=COLORS['accent_p5']))
+                                       bg=COLORS['bg_card'], fg=COLORS['accent_p5'], relief='flat'))
             else:
                 tk.Label(_row, text="— 暂无候选数据", font=('微软雅黑', 9),
                          bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']).pack(side=tk.LEFT)
@@ -6416,14 +6573,14 @@ class LotteryGUI:
             report_path = backtest_engine.generate_backtest_report(backtest_result)
             task_mgr.append_success(f"回测报告已保存: {report_path}")
 
-            # 更新统计面板
-            stats_text = (
-                f"回测期数: {backtest_result.get('total_tested', 0)}\n"
-                f"Top-1命中率: {top1_rate:.2f}%\n"
-                f"Top-3命中率: {top3_rate:.2f}%\n"
-                f"综合得分: {stats.get('avg_overall_score', 0):.2f}"
-            )
-            self.stats_content.config(text=stats_text, fg=COLORS['accent_ai'])
+            # 更新统计面板（快捷统计卡已移除）
+            # stats_text = (
+            #     f"回测期数: {backtest_result.get('total_tested', 0)}\n"
+            #     f"Top-1命中率: {top1_rate:.2f}%\n"
+            #     f"Top-3命中率: {top3_rate:.2f}%\n"
+            #     f"综合得分: {stats.get('avg_overall_score', 0):.2f}"
+            # )
+            # self.stats_content.config(text=stats_text, fg=COLORS['accent_ai'])
 
             task_mgr.progress(100, "任务完成")
             task_mgr.log("\n" + "=" * 70)
@@ -6548,14 +6705,14 @@ class LotteryGUI:
             except Exception as db_e:
                 task_mgr.log(f"\n 特征分析结果保存失败: {db_e}")
 
-            # 更新统计面板
-            stats_text = (
-                f"数据量: {len(history_data)} 条\n"
-                f"连号率: {consecutive_features.get('consecutive_rate', 0):.1%}\n"
-                f"重号率: {repeat_features.get('repeat_rate', 0):.1%}\n"
-                f"平均和值: {sum_span_features.get('avg_sum', 0):.1f}"
-            )
-            self.stats_content.config(text=stats_text, fg=COLORS['warning'])
+            # 更新统计面板（快捷统计卡已移除）
+            # stats_text = (
+            #     f"数据量: {len(history_data)} 条\n"
+            #     f"连号率: {consecutive_features.get('consecutive_rate', 0):.1%}\n"
+            #     f"重号率: {repeat_features.get('repeat_rate', 0):.1%}\n"
+            #     f"平均和值: {sum_span_features.get('avg_sum', 0):.1f}"
+            # )
+            # self.stats_content.config(text=stats_text, fg=COLORS['warning'])
 
             task_mgr.progress(100, "任务完成")
             task_mgr.log("\n 特征分析流程全部完成")
