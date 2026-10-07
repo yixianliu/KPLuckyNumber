@@ -6,6 +6,7 @@ reports
 .cleanup_trash_*/
 *.bak
 *.bak_*
+scripts/verify/_ov_test_home/
 api/ai_api.py
 ai_report_generator.py
 modules/ai_analyzer.py
