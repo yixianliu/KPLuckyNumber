@@ -1049,64 +1049,73 @@ class CodeQualityEvaluator(BaseEvaluator):
     category = '代码质量'
 
     def evaluate(self) -> EvalResult:
+        """代码质量 + 安全扫描（方案 §8.2.5）。
+
+        消费 ``modules.code_analyzer.CodeAnalyzer``（AST 实现）替代原先的文本
+        计数启发式——后者连裸 ``except:`` 都检测不到（它数的是合法的
+        ``except Exception:``），且完全没有安全规则。
+        """
         try:
+            from modules.code_analyzer import CodeAnalyzer  # 懒加载，保持 import 零副作用
+
             project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             modules_dir = os.path.join(project_root, 'modules')
 
-            score = 100
-            issues = []
-            warnings = []
-
-            # 扫描关键模块
             critical_modules = [
                 'predictor.py', 'pipeline.py', 'self_evolution.py',
                 'ml_predictor.py', 'online_learner.py', 'ai_analyzer.py',
             ]
 
+            analyzer = CodeAnalyzer()
+            missing: List[str] = []
+            found = []
             for mod_name in critical_modules:
                 fpath = os.path.join(modules_dir, mod_name)
                 if not os.path.isfile(fpath):
-                    issues.append(f'关键模块缺失: {mod_name}')
-                    score -= 20
+                    missing.append(f'关键模块缺失: {mod_name}')
                     continue
+                found.extend(analyzer.analyze_file(fpath, root=project_root))
 
-                try:
-                    with open(fpath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                except Exception:
-                    continue
+            summary = analyzer.summary(found)
+            sev = summary['by_severity']
+            p0, p1 = sev.get('P0', 0), sev.get('P1', 0)
+            p2, p3 = sev.get('P2', 0), sev.get('P3', 0)
 
-                # 检查异常处理模式
-                bare_except = content.count('except Exception:') - content.count('except Exception as e:')
-                if bare_except > 5:
-                    warnings.append(f'{mod_name}: 存在 {bare_except} 处裸 except（无变量绑定），建议改为 except Exception as e')
+            score = 100
+            score -= min(60, p0 * 20)          # P0 高危
+            score -= min(20, p1 * 5)           # P1 重要
+            score -= min(10, p2 // 50)         # P2 建议（按量级轻扣）
+            score -= 10 * len(missing)
+            score = max(0, score)
 
-                # 检查 TODO/FIXME 标记
-                todos = len([l for l in content.split('\n') if 'TODO' in l or 'FIXME' in l])
-                if todos > 0:
-                    warnings.append(f'{mod_name}: 有 {todos} 个 TODO/FIXME 标记待处理')
+            if p0 > 0 or missing:
+                status = 'critical'
+            elif p1 > 0 or score < 80:
+                status = 'warning'
+            else:
+                status = 'healthy'
 
-                # 检查魔法数字
-                import re
-                magic_nums = re.findall(r'(?<![\w.])(?:[0-9]+\.[0-9]+|[0-9]+)(?![\w.])', content)
-                # 过滤常见合法数字（如版本号、系数等）
-                suspicious = [n for n in magic_nums if not any(x in n for x in ['v3.', '2026', '0.68', '0.14', '0.10'])]
-                if len(suspicious) > 20:
-                    warnings.append(f'{mod_name}: 可能存在过多魔法数字，建议提取为常量')
+            # 只上报 P0/P1 明细（P2/P3 以计数呈现，避免报告被建议级刷屏）
+            top = [f'{i.severity} {i.file}:{i.line} {i.rule} — {i.message}'
+                   for i in sorted(found, key=lambda x: x.severity)[:8]]
+            recs = list(missing) + top
+            if p2 or p3:
+                recs.append(f'另有建议级 P2={p2} / 风格级 P3={p3} 条，详见 python -m modules.code_analyzer 报告')
 
-            status = 'healthy' if score >= 80 else ('warning' if score >= 50 else 'critical')
-            all_issues = issues + warnings
             return EvalResult(
                 name='代码质量',
                 category=self.category,
                 status=status,
-                score=max(0, score),
+                score=score,
                 details={
                     '检查模块数': len(critical_modules),
-                    '问题数': len(issues),
-                    '警告数': len(warnings),
+                    'P0高危': p0,
+                    'P1重要': p1,
+                    'P2建议': p2,
+                    'P3风格': p3,
+                    'CI闸门(P0=0)': '通过' if p0 == 0 else '未通过',
                 },
-                recommendations=all_issues if all_issues else ['代码质量良好'],
+                recommendations=recs if recs else ['代码质量良好'],
             )
         except Exception as e:
             logger.warning('[AutoEval] 代码质量评估失败: %s', e)

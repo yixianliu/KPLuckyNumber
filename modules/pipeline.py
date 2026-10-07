@@ -889,7 +889,10 @@ class Pipeline:
                 self.db_client.cursor.execute(
                     f'SELECT issue, {pos_abbr}_number, is_odd, is_big, is_prime, omission, hot_level, '
                     f'consecutive_count FROM p5_{pos_abbr}_trend_data '
-                    f'ORDER BY issue DESC LIMIT {data_limit}'
+                    # §8.2.5：LIMIT 值改用参数化占位（pos_abbr 仍为标识符，
+                    # 取值固定为 ['wan','qian','bai','shi','ge'] 枚举，非用户值）
+                    'ORDER BY issue DESC LIMIT %s',
+                    (data_limit,)
                 )
                 position_trends[f'{pos_abbr}_trend'] = self.db_client.cursor.fetchall()
 
@@ -1974,7 +1977,9 @@ class Pipeline:
             for p in pos_keys:
                 db.cursor.execute(
                     f'SELECT issue, {p}_number, omission, hot_level, is_big, is_odd, is_prime '
-                    f'FROM p5_{p}_trend_data ORDER BY issue DESC LIMIT {data_period}')
+                    # §8.2.5：LIMIT 值改用参数化占位（p 为 pos_keys 固定枚举标识符）
+                    f'FROM p5_{p}_trend_data ORDER BY issue DESC LIMIT %s',
+                    (data_period,))
                 pos_trends[p] = db.cursor.fetchall() or []
 
             if not history:

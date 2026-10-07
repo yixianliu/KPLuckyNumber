@@ -1309,7 +1309,7 @@ class P5Features:
                         corr = np.corrcoef(seq_i, seq_j)[0, 1]
                         if np.isnan(corr):
                             corr = 0.0
-                    except:
+                    except Exception:
                         corr = 0.0
                     
                     pair_correlations[pair_key] = round(corr, 4)
@@ -1823,7 +1823,7 @@ class P5Features:
                         # 处理可能的NaN值
                         if np.isnan(corr):
                             corr = 0.0
-                    except:
+                    except Exception:
                         corr = 0.0
                     
                     constraint_correlations[f'{name_i}_{name_j}'] = round(corr, 4)
@@ -1951,7 +1951,7 @@ class P5Features:
                             corr = np.corrcoef(seq_i, seq_j)[0, 1]
                             if np.isnan(corr):
                                 corr = 0.0
-                        except:
+                        except Exception:
                             corr = 0.0
                             
                         position_characteristic_correlations[f'{char_name}_{pos_i_name}_{pos_j_name}'] = round(corr, 4)
@@ -2168,7 +2168,7 @@ class P5Features:
                         pearson_corr = np.corrcoef(seq1, seq2)[0, 1]
                         if np.isnan(pearson_corr):
                             pearson_corr = 0.0
-                    except:
+                    except Exception:
                         pearson_corr = 0.0
                 
                 association_measures[key] = {
@@ -2348,7 +2348,7 @@ class P5Features:
                             corr = np.corrcoef(seq1, seq2)[0, 1]
                             if np.isnan(corr):
                                 corr = 0.0
-                        except:
+                        except Exception:
                             corr = 0.0
                         trend_associations[f'position_{pos1_name}_{pos2_name}'] = round(corr, 4)
         
@@ -2363,7 +2363,7 @@ class P5Features:
                             corr = np.corrcoef(pos_seq, other_seq)[0, 1]
                             if np.isnan(corr):
                                 corr = 0.0
-                        except:
+                        except Exception:
                             corr = 0.0
                         trend_associations[f'position_{pos_name}_{trend_name}'] = round(corr, 4)
         
@@ -2380,7 +2380,7 @@ class P5Features:
                         corr = np.corrcoef(seq_i, seq_j)[0, 1]
                         if np.isnan(corr):
                             corr = 0.0
-                    except:
+                    except Exception:
                         corr = 0.0
                     trend_associations[f'{name_i}_{name_j}'] = round(corr, 4)
 
@@ -2407,7 +2407,7 @@ class P5Features:
                                 direction = 'down'
                             else:
                                 direction = 'stable'
-                        except:
+                        except Exception:
                             direction = 'stable'
                     else:
                         direction = 'stable'
@@ -2433,7 +2433,7 @@ class P5Features:
                             direction = 'down'
                         else:
                             direction = 'stable'
-                    except:
+                    except Exception:
                         direction = 'stable'
                 else:
                     direction = 'stable'
@@ -2468,7 +2468,7 @@ class P5Features:
                         # 标准化：除以序列的标准差或均值
                         scale = np.std(position_series) if np.std(position_series) > 0 else np.mean(position_series) if np.mean(position_series) != 0 else 1
                         strength = abs(slope) / scale if scale != 0 else 0
-                    except:
+                    except Exception:
                         strength = 0
                     trend_strengths[f'position_{pos_name}'] = strength
                 else:
@@ -2487,7 +2487,7 @@ class P5Features:
                     # 标准化：除以序列的标准差或均值
                     scale = np.std(series) if np.std(series) > 0 else np.mean(series) if np.mean(series) != 0 else 1
                     strength = abs(slope) / scale if scale != 0 else 0
-                except:
+                except Exception:
                     strength = 0
                 trend_strengths[name] = strength
             else:
