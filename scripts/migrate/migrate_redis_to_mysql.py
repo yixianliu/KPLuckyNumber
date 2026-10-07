@@ -519,8 +519,8 @@ class RedisToMySQLMigrator:
                 try:
                     value = json.loads(sample['value_json'])
                     print(f"    值: {str(value)[:80]}...")
-                except:
-                    print(f"    值: {sample['value_json'][:80]}...")
+                except (json.JSONDecodeError, TypeError) as e:
+                    print(f"    值: {sample['value_json'][:80]}... (JSON 解析失败: {e})")
 
         except Exception as e:
             print(f"验证失败: {e}")

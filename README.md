@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![GUI](https://img.shields.io/badge/GUI-Tkinter-green)
-![Version](https://img.shields.io/badge/version-v3.70-orange)
+![Version](https://img.shields.io/badge/version-v4.0-orange)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 > **多算法融合 + AI 解读 + 全链路可解释的排列5数据分析平台**  
@@ -259,6 +259,10 @@ KPLuckyNumber/
 | `p5_hzzst_data` | 和值重心 | issue, hezhi, zx1-zx5 |
 
 > 完整建表 DDL 见 `modules/database.py` 的 `create_tables()` 方法。
+>
+> **诊断/监督学习用表（保留，不归档）**：`p5_trend_data` 及 `p5_{wan,qian,bai,shi,ge}_trend_data`、`p5_spjzs_data`、`p5_hzzst_data`、`p5_sum_end_trend_data`、`p5_back_three_trend_data` 被 `ml_predictor` / `trend_analyzer` 诊断读取，主融合不直接消费，属「诊断/监督学习用」。
+>
+> **数据坟场（已归档备案，v4.0 §4.6）**：`p5_expert_recommendation`（专家推荐，DB CRUD 方法零调用方、爬虫不入库）、`p5_selection_ab_test`（策略 A/B 对比，持久化方法零调用方）经三向扫描确认无主链路消费方，DDL 已备案至 `data/archive_schema.sql`（保留手动恢复能力；`create_tables` 仍保留 `CREATE TABLE IF NOT EXISTS` 幂等建表，不破坏既有数据）。
 
 ---
 

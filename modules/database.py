@@ -3294,95 +3294,8 @@ class P5Database:
     # 专家推荐数据操作
     # ============================================================
     
-    def insert_expert_recommendation(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
-        """
-        批量插入专家推荐数据（智能去重）
-        
-        Args:
-            data: 专家推荐数据列表
-        
-        Returns:
-            (成功条数, 跳过条数)
-        """
-        if not data:
-            return 0, 0
-        
-        success_count = 0
-        skip_count = 0
-        
-        try:
-            self.cursor.execute('SELECT user_id, issue_name FROM p5_expert_recommendation')
-            existing = {(row['user_id'], row['issue_name']) for row in self.cursor.fetchall()}
-            
-            sql = '''
-            INSERT INTO p5_expert_recommendation 
-            (user_id, nick_name, head_url, issue_name, issue_no, issue_end_time, 
-             issue_open_time, summary, intro, create_time, scheme_count, schemes_json,
-             hit_ratio, hit_count, serial_hit_count, detail_url, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                nick_name = VALUES(nick_name),
-                head_url = VALUES(head_url),
-                issue_no = VALUES(issue_no),
-                issue_end_time = VALUES(issue_end_time),
-                issue_open_time = VALUES(issue_open_time),
-                summary = VALUES(summary),
-                intro = VALUES(intro),
-                create_time = VALUES(create_time),
-                scheme_count = VALUES(scheme_count),
-                schemes_json = VALUES(schemes_json),
-                hit_ratio = VALUES(hit_ratio),
-                hit_count = VALUES(hit_count),
-                serial_hit_count = VALUES(serial_hit_count),
-                detail_url = VALUES(detail_url),
-                updated_at = NOW()
-            '''
-            
-            for item in data:
-                user_id = item.get('user_id', 0)
-                issue_name = item.get('issue_name', '')
-                
-                if not user_id or not issue_name:
-                    skip_count += 1
-                    continue
-                
-                if (user_id, issue_name) in existing:
-                    skip_count += 1
-                    continue
-                
-                schemes = item.get('schemes', [])
-                schemes_json = json.dumps(schemes, ensure_ascii=False)
-                scheme_count = len(schemes)
-                
-                expert_info = item.get('expert_info', {})
-                
-                self.cursor.execute(sql, (
-                    user_id,
-                    item.get('nick_name', ''),
-                    expert_info.get('head_url', '') or item.get('head_url', ''),
-                    issue_name,
-                    item.get('issue_no', ''),
-                    item.get('issue_end_time', ''),
-                    item.get('issue_open_time', ''),
-                    item.get('summary', ''),
-                    item.get('intro', ''),
-                    item.get('create_time', ''),
-                    scheme_count,
-                    schemes_json,
-                    expert_info.get('hit_ratio', '') or item.get('hit_ratio', ''),
-                    expert_info.get('hit_count', 0) or item.get('hit_count', 0),
-                    expert_info.get('serial_hit_count', 0) or item.get('serial_hit_count', 0),
-                    expert_info.get('detail_url', '') or item.get('detail_url', ''),
-                    item.get('source', 'china_lottery')
-                ))
-                success_count += 1
-            
-            self.connection.commit()
-            logger.info(f'专家推荐数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
-            return success_count, skip_count
-        except Exception as e:
-            logger.error(f'插入专家推荐数据失败: {e}')
-            return 0, len(data)
+    # ⚠ DELETED (v4.0)：insert_expert_recommendation 零调用方（p5_expert_recommendation
+    # 无主链路消费，爬虫不入库），DDL 已备案 data/archive_schema.sql。
     
     def _parse_schemes_json(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """解析记录中的schemes_json字段"""
@@ -3397,16 +3310,8 @@ class P5Database:
                 record['schemes'] = []
         return records
     
-    def get_expert_recommendation_by_user(self, user_id: int) -> List[Dict[str, Any]]:
-        """根据专家ID获取推荐记录"""
-        try:
-            sql = 'SELECT * FROM p5_expert_recommendation WHERE user_id = %s ORDER BY issue_name DESC'
-            self.cursor.execute(sql, (user_id,))
-            records = self.cursor.fetchall()
-            return self._parse_schemes_json(records)
-        except Exception as e:
-            logger.error(f'获取专家推荐记录失败: {e}')
-            return []
+    # ⚠ DELETED (v4.0)：get_expert_recommendation_by_user 零调用方
+    # （p5_expert_recommendation 无主链路消费），DDL 已备案 data/archive_schema.sql。
     
     def get_expert_recommendation_by_issue(self, issue_name: str) -> List[Dict[str, Any]]:
         """根据期号获取专家推荐记录"""
@@ -3647,18 +3552,9 @@ class P5Database:
             logger.error(f'插入策略A/B对比记录失败: {e}')
             return None
 
-    def get_selection_ab_tests(self, limit=20):
-        """获取最近 N 条策略 A/B 对比记录 (按 created_at 降序)。"""
-        try:
-            sql = ('SELECT ab_id, strategy_a, strategy_b, issue_range, '
-                   'top1_a, top1_b, top3_a, top3_b, created_at '
-                   'FROM p5_selection_ab_test ORDER BY created_at DESC LIMIT %s')
-            result = self.execute_with_reconnect(sql, (limit,))
-            return result or []
-        except Exception as e:
-            logger.error(f'获取策略A/B对比记录失败: {e}')
-            return []
-
+    # ⚠ DELETED (v4.0)：get_selection_ab_tests 零调用方（p5_selection_ab_test
+    # 无主链路消费），DDL 已备案 data/archive_schema.sql。
+    
     def get_weight_history(self, algo_name=None, position=None, limit=100, days=30):
         """获取权重历史记录"""
         try:

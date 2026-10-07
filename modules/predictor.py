@@ -63,6 +63,7 @@ import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from config import DATA_WINDOW_PERIOD
 
 from paths import LOGS_DIR, REPORTS_DIR
 
@@ -454,7 +455,7 @@ class P5PredictorConfig:
                 'weight': 0.68,  # v3.48 再平衡：频率=理论最优无偏主信号，原0.54被冷号偏差稀释；
                               # 实证(walk-forward 2060试验)显示冷号信号无超额，故上调频率至0.68
                 'params': {
-                    'lookback_periods': 60, # v3.14审计: 原None=全量(随历史增长→经验频率趋近均匀→主信号消失);
+                    'lookback_periods': DATA_WINDOW_PERIOD, # v3.14审计: 原None=全量(随历史增长→经验频率趋近均匀→主信号消失);
                                               # 截断近60期保持分布对近期走势的响应性(命中率无显著变化, 但避免长期退化)
                     'smoothing_factor': 0.1,   # 拉普拉斯平滑系数
                     'recency_weight': False, # v3.14审计落地实现(见 _algo_frequency_weighted); 3折验证中性偏负, 默认关。
@@ -464,8 +465,9 @@ class P5PredictorConfig:
             },
             'omission_regression': {
                 'enabled': True,
-                'weight': 0.06,  # v3.48 再平衡：编码赌徒谬误(冷号回补)，walk-forward 实证为噪声
-                              # (Top-1 9.71% 略低于频率 10.05%)，无特殊权重依据，降至微权重
+                'weight': 0.0,  # §2.4 v4.0：赌徒谬误反信号（exp(β·o) 冷号回补），walk-forward
+                              # 实证 Top-1 9.71% 低于随机基线，故直接置 0 并从融合移除。
+                              # 保留 enabled=True + 函数本体，避免下游引用 _algo_omission_regression 抛异常。
                 'params': {
                     'max_omission_cap': 50,          # 遗漏值上限
                     'regression_steepness': 0.018,   # 从0.020微调为0.018(60期数据更稳定)
@@ -505,7 +507,7 @@ class P5PredictorConfig:
                 'params': {
                     'prior_smooth': 0.10,       # 从0.08升至0.10(更均匀先验)
                     'posterior_weight': 0.92,   # 从0.85大幅提升至0.92(极强信任似然)
-                    'verification_window': 60,  # 保持60期
+                    'verification_window': DATA_WINDOW_PERIOD,  # 保持60期
                     'penalize_miss': 0.68,      # 从0.75降至0.68(强力惩罚)
                     'reward_hit': 1.40,         # 从1.25提升至1.40(强力奖励)
                     'decay_half_life': 10,      # 从15期缩短至10期(更重视近期)
@@ -519,7 +521,7 @@ class P5PredictorConfig:
                 'weight': 0.002,  # ↓ 与频率高度共线, 降至微权重避免重复计数(保留启用)
                 'params': {
                     'freq_weight': 0.30,
-                    'omission_weight': 0.25,
+                    'omission_weight': 0.0,  # §2.4 v4.0：遗漏子分量属赌徒谬误反信号，置 0 从融合移除
                     'road_weight': 0.15,
                     'repeat_weight': 0.15,
                     'consecutive_weight': 0.15,
@@ -892,15 +894,14 @@ class P5Predictor:
         anchor = self.config.get_global_param('selection_anchor_count', 3)
         position_top_n = self.config.get_global_param('position_top_n', 6)
 
-        # 形态约束参数：修正 v2 中 hezhi_min/max 被硬编码为 10/35、
-        # 完全无视配置的缺陷，改为一律从 global 读取。
+        # 形态约束参数：从 config.COMPOSITION_RULES 读取阈值（对应 BUG-05）
+        # 完全无视配置的缺陷，改为从统一配置读取。
         constraints = {
-            'hezhi_min': self.config.get_global_param('hezhi_min', 10),
-            'hezhi_max': self.config.get_global_param('hezhi_max', 35),
-            'span_min': self.config.get_global_param('span_min', 3),
-            'span_max': self.config.get_global_param('span_max', 8),
-            'sum_of_squares_penalty': self.config.get_global_param(
-                'sum_of_squares_penalty', True),
+            'hezhi_min': cfg.COMPOSITION_RULES['hezhi']['min'],
+            'hezhi_max': cfg.COMPOSITION_RULES['hezhi']['max'],
+            'span_min': cfg.COMPOSITION_RULES['spread']['min'],
+            'span_max': cfg.COMPOSITION_RULES['spread']['max'],
+            'sum_of_squares_penalty': True,  # 阈值已外置，保留开关默认开启
         }
 
         result = generate_combinations(
@@ -2085,7 +2086,7 @@ class P5Predictor:
         params = self.config.config['algorithms']['bayesian_inference']['params']
         prior_smooth = params.get('prior_smooth', 0.10)         # v3.2增强:增大平滑系数
         posterior_weight = params.get('posterior_weight', 0.92)  # v3.2增强:更强信任似然
-        verification_window = params.get('verification_window', 60)
+        verification_window = params.get('verification_window', DATA_WINDOW_PERIOD)
         penalize_miss = params.get('penalize_miss', 0.68)        # v3.2增强:加大惩罚力度
         reward_hit = params.get('reward_hit', 1.40)              # v3.2增强:加大奖励力度
         decay_half_life = params.get('decay_half_life', 10)      # v3.2增强:更重视近期数据

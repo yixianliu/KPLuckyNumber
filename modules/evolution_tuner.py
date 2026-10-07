@@ -213,27 +213,61 @@ def _eval_windows(weights: Dict[str, float], windows: List[Tuple[List[Dict], Lis
     }
 
 
-def _not_worse(candidate: Dict[str, float], baseline: Dict[str, float]) -> bool:
-    """诚实边界放宽版：候选在 Top1 或 Top3 任一显著优于基线即通过。
+# =====================================================================
+# Wilson 95% 置信区间 + CI 重叠闸门（诚实边界核心，与 self_evolution.py 保持一致）
+# =====================================================================
+import math
 
-    v3.60 调整：原「Top1/3/5 全不劣于基线」过于严苛，在随机基线附近波动时
-    永无候选通过，导致自我进化引擎空转。新规则允许在统计噪声范围内
-    找到微小正信号（Top-1 > 基线 + 0.3pp 或 Top-3 > 基线 + 0.5pp）。
+
+def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for binomial proportion."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = successes / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = (z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def ci_overlap(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    """Check if two CIs overlap."""
+    return not (a[1] < b[0] or b[1] < a[0])
+
+
+def _gate_pass(cand: Dict, base: Dict) -> bool:
+    """Wilson CI 严格闸门：候选 CI 整体高于基线 CI 且不重叠才通过。"""
+    c_top1_hits = int(cand.get('top1_hits', 0))
+    c_top3_hits = int(cand.get('top3_hits', 0))
+    c_top5_hits = int(cand.get('top5_hits', 0))
+    c_n = int(cand.get('tested', 0)) * 5
+
+    b_top1_hits = int(base.get('top1_hits', 0))
+    b_top3_hits = int(base.get('top3_hits', 0))
+    b_top5_hits = int(base.get('top5_hits', 0))
+    b_n = int(base.get('tested', 0)) * 5
+
+    if c_n == 0 or b_n == 0:
+        c_top1 = float(cand.get('top1', 0))
+        b_top1 = float(base.get('top1', 0))
+        return c_top1 > b_top1 + 1e-9
+
+    c_ci = wilson_ci(c_top1_hits, c_n)
+    b_ci = wilson_ci(b_top1_hits, b_n)
+
+    return (not ci_overlap(c_ci, b_ci)) and (c_ci[0] > b_ci[1])
+
+
+def _not_worse(candidate: Dict[str, float], baseline: Dict[str, float]) -> bool:
+    """Wilson 95% CI 严格闸门：候选 CI 整体高于基线 CI 且不重叠才通过。
+
+    诚实边界 v4.0：替代点估计比较，杜绝随机波动误判。
+    - 要求候选的 Top1 Wilson CI 下界 > 基线 Top1 Wilson CI 上界
+    - 自动兼容旧版本记录（无 hits/n 时回退点估计）
     """
-    c_top1 = float(candidate.get('top1', 0))
-    c_top3 = float(candidate.get('top3', 0))
-    b_top1 = float(baseline.get('top1', 0))
-    b_top3 = float(baseline.get('top3', 0))
-    # 任一指标显著改善即通过
-    if c_top1 >= b_top1 + 0.3 and c_top3 >= b_top3:
+    if not baseline:
         return True
-    if c_top3 >= b_top3 + 0.5 and c_top1 >= b_top1:
-        return True
-    # 全部不劣于基线仍算通过（宽松保留）
-    for k in ('top1', 'top3', 'top5'):
-        if float(candidate.get(k, 0)) < float(baseline.get(k, 0)) - 1e-6:
-            return False
-    return True
+    return _gate_pass(candidate, baseline)
 
 
 def _renormalize(weights: Dict[str, float]) -> Dict[str, float]:
@@ -276,6 +310,15 @@ def build_walkforward_windows(rows_asc: List[Dict[str, Any]],
     for idx in eval_idx:
         train = rows_asc[:start + idx]
         w = windows[idx]
+        # 防泄漏断言：训练集严格早于评估期
+        assert idx >= 1, "need at least 1 history row before eval"
+        eval_issue = w.get('issue')
+        if eval_issue is not None:
+            train_issues = {int(r['issue']) for r in train if r.get('issue') is not None}
+            if int(eval_issue) in train_issues:
+                raise AssertionError(f'LEAK: eval issue {eval_issue} in train set')
+            if train_issues and max(train_issues) >= int(eval_issue):
+                raise AssertionError(f'LEAK: future issue {max(train_issues)} >= eval {eval_issue} in train')
         nums = w.get('numbers') or [w.get('wan'), w.get('qian'),
                                     w.get('bai'), w.get('shi'), w.get('ge')]
         actual = [int(x) for x in nums]
@@ -299,6 +342,41 @@ def _row_to_sorted(rows):
         rr['numbers'] = [int(x) for x in nums]
         out.append(rr)
     return out
+
+
+def _evaluate_candidate(provider: ComponentProvider,
+                        windows: List[Tuple[List[Dict], List[int]]],
+                        weights: Dict[str, float],
+                        lookback: int,
+                        fixed_keys: Optional[Tuple[str, ...]] = None,
+                        baseline_metrics: Optional[Dict[str, float]] = None,
+                        eval_step: int = 0) -> Dict[str, Any]:
+    """遗传算法候选评估（与 DeepTuner 评估语义一致）。
+
+    GeneticAlgorithmTuner 在种群评估时会调用本函数替代底层
+    ``_eval_windows``，主要差别在于：
+
+    - 权重会自动 ``_renormalize``，避免 GA 交叉/变异引入的数值漂移。
+    - ``baseline_metrics`` 非空时先做 Wilson CI 闸门 ``_not_worse``，
+      未通过则回退基线指标，防止「随机更差的个体被误选为最优」
+      —— 与坐标下降阶段的准入条件保持一致。
+    - ``eval_step`` 为 0 时按窗口数自适应（窗口 > 5 取 ``n//5``，
+      否则全量评估），控制 GA 每代评估开销。
+
+    参数 ``fixed_keys`` 目前保留占位以保持调用契约稳定，实际权重冻结
+    由调用方在构造候选个体时保证。
+    """
+    if not windows:
+        return {'tested': 0, 'top1': 0.0, 'top3': 0.0, 'top5': 0.0}
+    cand_weights = _renormalize(weights)
+    n_windows = len(windows)
+    step = eval_step if eval_step and eval_step > 1 else max(1, n_windows // 5 if n_windows > 5 else 1)
+    metrics = _eval_windows(cand_weights, windows, provider, lookback, eval_step=step)
+    if baseline_metrics and metrics.get('tested', 0) > 0:
+        if not (_not_worse(metrics, baseline_metrics) and _score(metrics) > _score(baseline_metrics) + 1e-6):
+            # 候选未通过严格闸门：不采纳其指标，回退基线，避免污染 GA 选择
+            metrics = dict(baseline_metrics)
+    return metrics
 
 
 # =====================================================================
@@ -544,10 +622,13 @@ class CachedSyntheticProvider(SyntheticProvider):
 
 
 def _get_statistical_weights() -> Dict[str, float]:
-    """返回深度调优器参与搜索的统计类权重（排除冻结的 ml_supervised）。"""
+    """返回深度调优器参与搜索的统计类权重（排除冻结的 ml_supervised）。
+
+    v4.1 §2.4 同步：omission_regression 随 v4.0 清零（赌徒谬误反信号）。
+    """
     return {
         'frequency_weighted': 0.68,
-        'omission_regression': 0.06,
+        'omission_regression': 0.0,
         'bayesian_inference': 0.10,
         'trend_momentum': 0.01,
         'markov_transition': 0.005,

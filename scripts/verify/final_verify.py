@@ -92,8 +92,9 @@ try:
             if cnt == 0:
                 empty_tables.append(t)
                 print(f"  ⚠ {t}: 0 条记录（空表）")
-        except:
-            pass
+        except Exception as e:
+            # 表不存在/查询失败（如离线环境）属预期容错，静默跳过
+            print(f"  ⚠ {t}: 查询失败（{e.__class__.__name__}）")
     if not empty_tables:
         print("  ✓ 无空表")
 

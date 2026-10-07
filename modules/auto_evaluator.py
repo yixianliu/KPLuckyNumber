@@ -34,6 +34,7 @@ import threading
 import datetime
 import hashlib
 import traceback
+import uuid
 from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 from functools import wraps
@@ -83,8 +84,28 @@ class EvalResult:
         self.status = status  # 'healthy' / 'warning' / 'critical'
         self.score = score    # 0-100
         self.details = details or {}
-        self.recommendations = recommendations or []
+        # 为每条建议生成唯一ID并跟踪状态
+        self.recommendations = [] if recommendations is None else recommendations
+        self.recommendation_states = {}  # {rec_id: {'status': 'pending', 'implemented_at': None, 'validated_at': None, 'effectiveness': None}}
+        self._initialize_recommendation_states()
         self.timestamp = datetime.datetime.now().isoformat()
+
+    def _initialize_recommendation_states(self):
+        """为所有建议初始化状态跟踪"""
+        for i, rec in enumerate(self.recommendations):
+            rec_id = self._generate_recommendation_id(i)
+            self.recommendation_states[rec_id] = {
+                'text': rec,
+                'status': 'pending',  # pending, implemented, validated, rejected
+                'implemented_at': None,
+                'validated_at': None,
+                'effectiveness': None,  # -1到1之间的值，-1表示完全负面影响，0表示无影响，1表示完全正面影响
+                'validation_data': None  # 用于验证的数据快照
+            }
+
+    def _generate_recommendation_id(self, index: int) -> str:
+        """为建议生成唯一ID"""
+        return f"{self.name}_{self.category}_{index}_{uuid.uuid4().hex[:8]}"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -93,9 +114,38 @@ class EvalResult:
             'status': self.status,
             'score': self.score,
             'details': self.details,
-            'recommendations': self.recommendations,
+            'recommendations': [
+                {
+                    'id': rec_id,
+                    'text': state['text'],
+                    'status': state['status'],
+                    'implemented_at': state['implemented_at'],
+                    'validated_at': state['validated_at'],
+                    'effectiveness': state['effectiveness'],
+                    'validation_data': state['validation_data']
+                }
+                for rec_id, state in self.recommendation_states.items()
+            ],
             'timestamp': self.timestamp,
         }
+        
+    def mark_recommendation_implemented(self, rec_id: str) -> bool:
+        """标记建议为已实施"""
+        if rec_id in self.recommendation_states:
+            self.recommendation_states[rec_id]['status'] = 'implemented'
+            self.recommendation_states[rec_id]['implemented_at'] = datetime.datetime.now().isoformat()
+            return True
+        return False
+        
+    def mark_recommendation_validated(self, rec_id: str, effectiveness: float, validation_data: Dict[str, Any] = None) -> bool:
+        """标记建议为已验证，并提供效果评估"""
+        if rec_id in self.recommendation_states:
+            self.recommendation_states[rec_id]['status'] = 'validated'
+            self.recommendation_states[rec_id]['validated_at'] = datetime.datetime.now().isoformat()
+            self.recommendation_states[rec_id]['effectiveness'] = max(-1.0, min(1.0, effectiveness))  # 限制在-1到1之间
+            self.recommendation_states[rec_id]['validation_data'] = validation_data or {}
+            return True
+        return False
 
 
 class EvaluationReport:
@@ -116,6 +166,24 @@ class EvaluationReport:
         overall_score = (
             sum(r.score for r in self.results) / total if total > 0 else 0
         )
+        
+        # 计算建议统计
+        total_recommendations = 0
+        implemented_recommendations = 0
+        validated_recommendations = 0
+        positive_effect_recommendations = 0
+        
+        for result in self.results:
+            if hasattr(result, 'recommendation_states'):
+                for rec_state in result.recommendation_states.values():
+                    total_recommendations += 1
+                    if rec_state['status'] == 'implemented':
+                        implemented_recommendations += 1
+                    elif rec_state['status'] == 'validated':
+                        validated_recommendations += 1
+                        if rec_state['effectiveness'] is not None and rec_state['effectiveness'] > 0:
+                            positive_effect_recommendations += 1
+        
         return {
             'total_checks': total,
             'healthy': healthy,
@@ -123,6 +191,12 @@ class EvaluationReport:
             'critical': critical,
             'overall_score': round(overall_score, 1),
             'health_level': self._health_level(overall_score),
+            'recommendation_stats': {
+                'total': total_recommendations,
+                'implemented': implemented_recommendations,
+                'validated': validated_recommendations,
+                'positive_effect': positive_effect_recommendations
+            }
         }
 
     @staticmethod
@@ -154,8 +228,21 @@ class EvaluationReport:
             f'- **健康级别**: {self.summary["health_level"]}',
             f'- **检查项总数**: {self.summary["total_checks"]}',
             f'- 正常: {self.summary["healthy"]}  警告: {self.summary["warning"]}  严重: {self.summary["critical"]}',
-            '',
+            ''
         ]
+        
+        # 添加建议统计
+        if 'recommendation_stats' in self.summary:
+            stats = self.summary['recommendation_stats']
+            lines.extend([
+                '## 建议执行统计',
+                '',
+                f'- **建议总数**: {stats["total"]}',
+                f'- **已实施**: {stats["implemented"]}',
+                f'- **已验证**: {stats["validated"]}',
+                f'- **正面效果**: {stats["positive_effect"]}',
+                ''
+            ])
 
         # 按类别分组
         by_category = defaultdict(list)
@@ -175,28 +262,51 @@ class EvaluationReport:
                     for k, v in r.details.items():
                         lines.append(f'| {k} | {v} |')
                     lines.append('')
-                if r.recommendations:
-                    lines.append('**改进建议**:')
-                    for rec in r.recommendations:
-                        lines.append(f'- {rec}')
+                if hasattr(r, 'recommendation_states') and r.recommendation_states:
+                    lines.append('**改进建议及状态**:')
+                    for rec_id, state in r.recommendation_states.items():
+                        status_icon = {
+                            'pending': '⏳',
+                            'implemented': '🔧',
+                            'validated': '✅',
+                            'rejected': '❌'
+                        }.get(state['status'], '?')
+                        effectiveness_text = ""
+                        if state['effectiveness'] is not None:
+                            effectiveness_text = f" (效果: {state['effectiveness']:+.2f})"
+                        lines.append(f"- {status_icon} {state['text']}{effectiveness_text}")
                     lines.append('')
             lines.append('')
 
-        # 优先级排序的改进清单
-        all_recs = []
+        # 优先级排序的改进清单（包含验证结果）
+        all_recs_with_validation = []
         for r in self.results:
-            for rec in r.recommendations:
-                all_recs.append((r.status, r.name, rec))
-        all_recs.sort(key=lambda x: {'critical': 0, 'warning': 1, 'healthy': 2}.get(x[0], 2))
+            if hasattr(r, 'recommendation_states'):
+                for rec_id, state in r.recommendation_states.items():
+                    all_recs_with_validation.append((r.status, r.name, state['text'], state['status'], state['effectiveness']))
+        
+        # 按优先级和验证状态排序：critical > warning > healthy，然后未验证的优先于已验证的
+        all_recs_with_validation.sort(key=lambda x: (
+            {'critical': 0, 'warning': 1, 'healthy': 2}.get(x[0], 2),
+            0 if x[3] in ['pending', 'implemented'] else 1,  # 未验证的优先
+            -(x[4] if x[4] is not None else 0)  # 效果值高的优先
+        ))
 
-        if all_recs:
-            lines.append('## 优先级排序的改进清单')
+        if all_recs_with_validation:
+            lines.append('## 优先级排序的改进清单（含验证结果）')
             lines.append('')
-            lines.append('| 优先级 | 模块 | 建议 |')
-            lines.append('|--------|------|------|')
+            lines.append('| 优先级 | 模块 | 建议 | 状态 | 效果 |')
+            lines.append('|--------|------|------|------|------|')
             priority_map = {'critical': 'P0-紧急', 'warning': 'P1-重要', 'healthy': 'P2-可选'}
-            for status, name, rec in all_recs:
-                lines.append(f'| {priority_map.get(status, "?")}| {name} | {rec} |')
+            status_map = {
+                'pending': '待实施',
+                'implemented': '已实施',
+                'validated': '已验证',
+                'rejected': '已拒绝'
+            }
+            for status, name, rec, rec_status, effectiveness in all_recs_with_validation:
+                eff_text = f"{effectiveness:+.2f}" if effectiveness is not None else "未评估"
+                lines.append(f'| {priority_map.get(status, "?")}| {name} | {rec} | {status_map.get(rec_status, "未知")} | {eff_text} |')
             lines.append('')
 
         lines.append('---')
@@ -465,11 +575,12 @@ class AlgorithmWeightEvaluator(BaseEvaluator):
     category = '算法权重'
 
     # 冻结权重（v3.60 基线）
+    # v4.1 §2.4 同步：omission_regression 随 v4.0 清零（赌徒谬误反信号）
     FROZEN_WEIGHTS = {
         'frequency_weighted': 0.68,
         'ml_supervised': 0.14,
         'bayesian_inference': 0.10,
-        'omission_regression': 0.06,
+        'omission_regression': 0.0,
         'trend_momentum': 0.01,
         'markov_transition': 0.005,
         'pattern_continuation': 0.003,
@@ -1009,6 +1120,99 @@ class CodeQualityEvaluator(BaseEvaluator):
             )
 
 
+class ModelMonitorHealthEvaluator(BaseEvaluator):
+    """模型监控健康度评估（§3.4 监控数据 → §4.1 自诊断 / §4.4 优化建议）。
+
+    读取全局 ModelMonitor 单例的实时状态（命中率/置信度/响应时间滑窗 + 告警状态），
+    将监控数据纳入自动评估报告，使其在 GUI「自动评估」中可见并可给出优化建议。
+    无 DB 依赖，纯内存；监控尚未采集数据时优雅降级为「暂无数据」（初始态，不扣分）。
+    诚实边界：命中率仅对照随机基线标注波动，不声称超越随机基线（排列5为公平摇号）。
+    """
+    category = '模型监控'
+
+    def evaluate(self) -> EvalResult:
+        try:
+            from modules.model_monitor import get_model_monitor, RANDOM_BASELINE
+            status = get_model_monitor().get_current_status()
+        except Exception as e:
+            logger.warning('[AutoEval] 模型监控评估失败: %s', e)
+            return EvalResult(
+                name='模型监控', category=self.category, status='warning', score=70,
+                details={'error': str(e)},
+                recommendations=['检查 model_monitor 模块'],
+            )
+
+        data_points = status.get('data_points', {})
+        hit_points = data_points.get('hit_rates', 0)
+        latest = status.get('latest_values', {})
+        active_alerts = [m for m, on in status.get('alert_states', {}).items() if on]
+
+        # 监控尚未记录数据 → 处于「开始分析→验证」闭环之前的初始态，不扣分。
+        # 若「建议型回灌」已落盘过历史洞察（跨进程持久化），补一条复核入口，
+        # 让回灌数据在 GUI「自动评估」页可见（诚实标注，不宣称预测能力）。
+        if hit_points == 0:
+            extra_rec: List[str] = [
+                '监控数据将在「开始分析→验证」闭环后自动采集，当前无需处理']
+            details_extra: Dict[str, Any] = {'hit_rate_points': 0,
+                                            '说明': '监控尚未记录数据'}
+            try:
+                from modules.monitor_feedback import (get_recent_insights,
+                                                      load_insights_from_disk,
+                                                      feedback_jsonl_path)
+                insights = get_recent_insights(3) or load_insights_from_disk(3)
+                if insights:
+                    latest = insights[-1]
+                    details_extra['recent_insights'] = insights[-3:]
+                    details_extra['insights_source'] = feedback_jsonl_path()
+                    extra_rec.append(
+                        f'已有 {len(insights)} 条历史监控洞察（详见数据文件）；'
+                        f'最近一条：{latest.get("honest_note", "")} '
+                        f'—— 均为正常波动，不构成预测能力')
+                else:
+                    extra_rec.append(
+                        '建议型回灌已接线（data/model_monitor_feedback.jsonl），'
+                        '待验证闭环产生监控点后自动累积洞察')
+            except Exception as _fb_e:
+                logger.debug('[AutoEval] 读取模型监控回灌洞察跳过: %s', _fb_e)
+            return EvalResult(
+                name='模型监控', category=self.category,
+                status='healthy', score=100,
+                details=details_extra,
+                recommendations=extra_rec,
+            )
+
+        score = 100
+        recommendations: List[str] = []
+        for m in active_alerts:
+            score -= 20
+            recommendations.append(f'监控告警[{m}]：近期指标越限，详见 model_monitor 报告')
+
+        # 命中率诚实对照随机基线：偏低只标注"属正常波动、不构成预测能力"，
+        # 偏高亦不声称超额（排列5为公平摇号，系统诚实标注随机基线）。
+        hit_rate = latest.get('hit_rate')
+        if hit_rate is not None:
+            baseline = RANDOM_BASELINE['top1']
+            if hit_rate < baseline - 0.05:
+                recommendations.append(
+                    f'命中率 {hit_rate:.2f} 低于随机基线 {baseline:.2f}；属正常波动，'
+                    '不构成预测能力，请勿据此加码')
+
+        status_level = 'healthy' if score >= 80 else ('warning' if score >= 50 else 'critical')
+        if not recommendations:
+            recommendations = ['监控指标正常，无告警']
+
+        return EvalResult(
+            name='模型监控', category=self.category,
+            status=status_level, score=max(0, score),
+            details={
+                'hit_rate_points': hit_points,
+                'latest_hit_rate': hit_rate,
+                'active_alerts': active_alerts,
+            },
+            recommendations=recommendations,
+        )
+
+
 # =====================================================================
 # 主评估器
 # =====================================================================
@@ -1030,6 +1234,7 @@ class ProjectAutoEvaluator:
             ModuleDependencyEvaluator(self),
             AIModelEvaluator(self),
             CodeQualityEvaluator(self),
+            ModelMonitorHealthEvaluator(self),
         ]
         self._scan_history: List[Dict[str, Any]] = []
         self._schedule_thread: Optional[threading.Thread] = None
@@ -1042,6 +1247,106 @@ class ProjectAutoEvaluator:
             return APP_VERSION
         except Exception:
             return 'unknown'
+
+    def _validate_historical_recommendations(self, current_report: EvaluationReport) -> EvaluationReport:
+        """
+        通过与历史报告比较来验证之前的建议
+        
+        Args:
+            current_report: 当前的评估报告
+            
+        Returns:
+            带有验证结果的评估报告
+        """
+        if not self._scan_history:
+            # 没有历史数据（即无任何"before"基线）则无法验证，原样返回
+            return current_report
+
+        # 取最近一条历史报告作为"before"基线（单条即可用于对比得分变化）
+        latest_history = self._scan_history[-1]
+        
+        # 将历史报告转换回EvaluationResult对象（简化处理）
+        # 这里我们只做基本的验证：比较关键指标的变化
+        
+        try:
+            # 对当前报告中的每个结果，尝试匹配历史报告中的对应结果
+            for current_result in current_report.results:
+                # 查找历史报告中对应的结果
+                historical_result = None
+                for hist_result_dict in latest_history.get('results', []):
+                    if (hist_result_dict.get('name') == current_result.name and 
+                        hist_result_dict.get('category') == current_result.category):
+                        historical_result = hist_result_dict
+                        break
+                
+                if historical_result is None:
+                    continue
+                
+                # 如果当前结果有建议状态，尝试验证那些标记为已实施的建议
+                if hasattr(current_result, 'recommendation_states'):
+                    for rec_id, rec_state in current_result.recommendation_states.items():
+                        if rec_state['status'] == 'implemented' and rec_state['validated_at'] is None:
+                            # 建议已实施但尚未验证，尝试进行验证
+                            effectiveness = self._calculate_recommendation_effectiveness(
+                                historical_result, 
+                                {
+                                    'name': current_result.name,
+                                    'category': current_result.category,
+                                    'score': current_result.score,
+                                    'details': current_result.details
+                                },
+                                rec_state['text']
+                            )
+                            
+                            if effectiveness is not None:
+                                current_result.mark_recommendation_validated(
+                                    rec_id, 
+                                    effectiveness,
+                                    {
+                                        'historical_score': historical_result.get('score'),
+                                        'current_score': current_result.score,
+                                        'score_change': current_result.score - historical_result.get('score', 0),
+                                        'validation_method': 'score_improvement'
+                                    }
+                                )
+        except Exception as e:
+            logger.warning('[AutoEval] 验证历史建议时出错: %s', e)
+        
+        return current_report
+
+    def _calculate_recommendation_effectiveness(self, historical_data: Dict[str, Any], 
+                                              current_data: Dict[str, Any],
+                                              recommendation_text: str) -> Optional[float]:
+        """
+        根据历史数据和当前数据计算建议的有效性
+        
+        Args:
+            historical_data: 历史评估数据
+            current_data: 当前评估数据
+            recommendation_text: 建议文本
+            
+        Returns:
+            效果值（-1到1之间），如果无法计算则返回None
+        """
+        try:
+            # 简单实施：基于总体得分的变化来评估效果
+            # 在实际应用中，应该根据建议的具体内容选择合适的指标
+            hist_score = historical_data.get('score', 0)
+            curr_score = current_data.get('score', 0)
+            
+            if hist_score == 0:  # 避免除以零
+                return None
+                
+            # 计算相对改善
+            relative_improvement = (curr_score - hist_score) / abs(hist_score) if hist_score != 0 else 0
+            
+            # 限制在-1到1之间，并应用一些缩放因子
+            # 这里我们假设得分变化的10%相当于效果值的0.1
+            effectiveness = max(-1.0, min(1.0, relative_improvement * 10))
+            
+            return effectiveness
+        except Exception:
+            return None
 
     def run_full_evaluation(self) -> EvaluationReport:
         """执行完整评估，返回评估报告。"""
@@ -1077,6 +1382,9 @@ class ProjectAutoEvaluator:
         )
         report.summary['scan_duration_sec'] = round(elapsed, 2)
 
+        # 验证历史建议
+        report = self._validate_historical_recommendations(report)
+
         # 记录历史
         self._scan_history.append(report.to_dict())
         # 保留最近 10 次
@@ -1094,7 +1402,7 @@ class ProjectAutoEvaluator:
         results = [
             DataHealthEvaluator(self).evaluate(),
             AlgorithmWeightEvaluator(self).evaluate(),
-            AIModelEvaluator(self),
+            AIModelEvaluator(self).evaluate(),
         ]
 
         elapsed = time.perf_counter() - start_time
@@ -1104,6 +1412,10 @@ class ProjectAutoEvaluator:
             results=results,
         )
         report.summary['scan_duration_sec'] = round(elapsed, 2)
+        
+        # 验证历史建议
+        report = self._validate_historical_recommendations(report)
+        
         return report
 
     def schedule_periodic_scan(self, interval_hours: int = 24):

@@ -22,6 +22,7 @@ import logging
 import math
 from collections import Counter
 from typing import Dict, List, Any, Optional, Set
+from config import DATA_WINDOW_PERIOD
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,7 @@ class TrendAnalyzer:
         self.weight_mgr = TrendSignalWeightManager(enable_adapt, ewma_alpha)
 
     # ---------------- 功能1: 导入解析各类历史走势图数据 ----------------
-    def load_trend_data(self, period: int = 40) -> Dict[str, Any]:
+    def load_trend_data(self, period: int = DATA_WINDOW_PERIOD) -> Dict[str, Any]:
         """加载8类走势数据: 历史走势 / 基础走势 / 5位置走势 / 和值 / 贝叶斯(可选)"""
         if not self.db or not getattr(self.db, 'connection', None):
             logger.warning('TrendAnalyzer: 数据库未连接, 返回空')
@@ -165,14 +166,23 @@ class TrendAnalyzer:
         """返回该位置各信号源对 0-9 每个数字的归一化打分(0-1) + 可读特征"""
         pos_trends = data.get('pos_trends', {}).get(position, [])
         history_desc = data.get('history', [])
-        period = data.get('period', 60)
+        period = data.get('period', DATA_WINDOW_PERIOD)
         # 序列: 优先位置走势表(DESC->reversed=ASC), 不足用历史补
         s = [r.get(f'{position}_number') for r in reversed(pos_trends)
              if r.get(f'{position}_number') is not None]
         if len(s) < 10:
             hist_asc = list(reversed(history_desc))
-            s = [r.get(position) for r in hist_asc if r.get(position) is not None]
-        s = [int(x) for x in s if x is not None][-period:]
+            raw_list = [r.get(position) for r in hist_asc if r.get(position) is not None]
+            if len(raw_list) >= period:
+                s = raw_list[-period:]
+            else:
+                # 不足期数，使用全部可用数据，避免 IndexError
+                s = raw_list
+        s = [int(x) for x in s if x is not None]
+        if len(s) >= period:
+            s = s[-period:]
+        else:
+            s = s[:]
         n = len(s)
         if n == 0:
             return {'available': set(), 'scores': {}, 'features': {}, 'seq_len': 0}
@@ -324,7 +334,7 @@ class TrendAnalyzer:
 
         return {
             'target_issue': target_issue,
-            'data_period': data.get('period', 60),
+            'data_period': data.get('period', DATA_WINDOW_PERIOD),
             'positions': positions,
             'signal_weights': self.weight_mgr.get_weights(set(DEFAULT_SIGNAL_WEIGHTS)),
             'signal_diagnostics': all_signal_diag,
@@ -332,7 +342,7 @@ class TrendAnalyzer:
             'honest_disclaimer': HONEST_DISCLAIMER,
         }
 
-    def predict(self, target_issue: str = '', period: int = 60) -> Dict[str, Any]:
+    def predict(self, target_issue: str = '', period: int = DATA_WINDOW_PERIOD) -> Dict[str, Any]:
         """输出各位置 Top-3 + 相对热度 + 信号源分解 + 诊断 + 诚实免责
 
         内部 = load_trend_data + predict_with_data; 回测场景请直接调
@@ -358,7 +368,7 @@ def _cli():
 
     parser = argparse.ArgumentParser(description='走势图分析预测引擎 (v3.15 增量, 诚实口径)')
     parser.add_argument('--issue', default='', help='目标期号(仅标注, 不影响数据加载)')
-    parser.add_argument('--period', type=int, default=60, help='使用历史期数 (默认60)')
+    parser.add_argument('--period', type=int, default=DATA_WINDOW_PERIOD, help='使用历史期数 (默认60)')
     parser.add_argument('--adapt', action='store_true', help='启用信号源自适应(实验性, 默认关闭)')
     args = parser.parse_args()
 

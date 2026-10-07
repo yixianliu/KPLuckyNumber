@@ -996,6 +996,218 @@ class OnlineLearner:
         except Exception as e:
             logger.error(f'存储追踪数据到Redis失败: {e}', exc_info=True)
     
+    def _analyze_model_performance(self, recent_issues: List[str]) -> Dict[str, Any]:
+        """基于 Redis 中的命中率统计数据分析模型表现。
+
+        Args:
+            recent_issues: 已验证期号列表
+
+        Returns:
+            包含各指标的表现摘要
+        """
+        result = {
+            'total_issues': len(recent_issues),
+            'avg_top1_hit_rate': 0.0,
+            'avg_exact_match_count': 0.0,
+            'avg_partial_hits': 0.0,
+            'avg_recommendation_quality_score': 0.0,
+            'hit_rate_distribution': {'excellent': 0, 'good': 0, 'fair': 0, 'poor': 0},
+            'full_match_rate': 0.0,
+            'position_hit_rates': {'万位': 0.0, '千位': 0.0, '百位': 0.0, '十位': 0.0, '个位': 0.0},
+        }
+        if not recent_issues:
+            return result
+
+        total_top1 = 0.0
+        total_exact = 0.0
+        total_partial = 0.0
+        pos_hits = defaultdict(int)
+        quality_counts = defaultdict(int)
+
+        for issue in recent_issues:
+            try:
+                stats_key = f'kpluckynumber:pl5:hit_rate_stats:{issue}'
+                val = self.redis.safe_hget(stats_key, 'stats') if self.redis else None
+                if not val or not isinstance(val, dict):
+                    continue
+                total_top1 += val.get('top1_hits', 0)
+                total_exact += val.get('exact_match', 0)
+                total_partial += val.get('partial_hits', 0)
+                q = val.get('recommendation_quality', 'unknown')
+                quality_counts[q] += 1
+                pos_detail = val.get('hit_rate_by_position', {})
+                for pos_name in ['万位', '千位', '百位', '十位', '个位']:
+                    pos_hit = pos_detail.get(pos_name, {}).get('hit', False)
+                    if pos_hit:
+                        pos_hits[pos_name] += 1
+            except Exception:
+                continue
+
+        n = max(len(recent_issues), 1)
+        result['avg_top1_hit_rate'] = round(total_top1 / (n * 5), 4)
+        result['avg_exact_match_count'] = round(total_exact / n, 6)
+        result['avg_partial_hits'] = round(total_partial / n, 4)
+        result['full_match_rate'] = round(total_exact / n, 6)
+        for pos_name in result['position_hit_rates']:
+            result['position_hit_rates'][pos_name] = round(pos_hits.get(pos_name, 0) / n, 4)
+
+        # 质量评级
+        for q, cnt in quality_counts.items():
+            result['hit_rate_distribution'][q] = cnt
+        result['avg_recommendation_quality_score'] = round(
+            sum({'excellent': 1.0, 'good': 0.75, 'fair': 0.5, 'poor': 0.25, 'unknown': 0.0}.get(k, 0) * v for k, v in quality_counts.items()) / n, 4
+        )
+        return result
+
+    def _evaluate_experts(self, recent_issues: List[str]) -> Dict[str, Any]:
+        """评估专家推荐在本期追踪中的表现。
+
+        Args:
+            recent_issues: 已验证期号列表
+
+        Returns:
+            专家表现摘要
+        """
+        result = {
+            'total_evaluated': len(recent_issues),
+            'expert_hit_rates': defaultdict(float),
+            'best_expert': None,
+            'avg_best_expert_score': 0.0,
+        }
+        if not recent_issues or not self.redis:
+            return result
+
+        expert_scores: Dict[str, List[float]] = defaultdict(list)
+        best_per_issue: List[float] = []
+
+        for issue in recent_issues:
+            try:
+                board_key = f'kpluckynumber:pl5:tracking_board:{issue}'
+                val = self.redis.safe_hget(board_key, 'board_data')
+                if not val or not isinstance(val, dict):
+                    continue
+                # 从 board_data 提取最佳专家得分（score=命中位置数/5）
+                for expert_id in val.get('best_experts', []):
+                    expert_scores[expert_id].append(1.0)  # 进入 best_experts 说明命中
+            except Exception:
+                continue
+
+        n = max(len(expert_scores), 1)
+        avg_rates = {}
+        for eid, scores in expert_scores.items():
+            rate = round(sum(scores) / (len(scores) * 5), 4) if scores else 0.0
+            avg_rates[eid] = rate
+        result['expert_hit_rates'] = dict(avg_rates)
+        result['total_evaluated'] = len(recent_issues)
+
+        if avg_rates:
+            best_eid = max(avg_rates, key=avg_rates.get)
+            result['best_expert'] = best_eid
+            result['avg_best_expert_score'] = round(avg_rates[best_eid], 4)
+        return result
+
+    def _generate_suggestions(self, recent_issues: List[str],
+                              model_perf: Dict[str, Any],
+                              expert_eval: Dict[str, Any]) -> List[str]:
+        """根据模型表现生成改进建议。
+
+        Args:
+            recent_issues: 已验证期号列表
+            model_perf: _analyze_model_performance 返回的结果
+            expert_eval: _evaluate_experts 返回的结果
+
+        Returns:
+            改进建议字符串列表
+        """
+        suggestions = []
+        if not recent_issues:
+            return ['暂无已验证数据，请先完成至少一期的结果验证']
+
+        full_rate = model_perf.get('full_match_rate', 0)
+        avg_top1 = model_perf.get('avg_top1_hit_rate', 0)
+
+        # 全中率极低时提示随机性本质
+        if full_rate < 0.001:
+            suggestions.append(
+                f'全中率({full_rate*100:.4f}%)远低于理论概率(1/100000)，符合随机性预期，无需调整全中策略'
+            )
+
+        # Top-1 位命中率偏低
+        if avg_top1 < 0.12:
+            suggestions.append(
+                f'Top-1 位命中率({avg_top1*100:.1f}%)略低于随机基线(10%)，建议检查频率统计窗口是否合理'
+            )
+
+        # 质量评级偏低的处理
+        dist = model_perf.get('hit_rate_distribution', {})
+        poor = dist.get('poor', 0)
+        if poor > 0 and poor / max(len(recent_issues), 1) > 0.5:
+            suggestions.append(
+                f'较差推荐占比超过50%，建议调整算法权重或扩大特征工程覆盖'
+            )
+
+        # 专家推荐评估
+        best = expert_eval.get('best_expert')
+        if best:
+            suggestions.append(f'表现最佳专家为[{best}]，可适度提高其权重占比')
+
+        # 各位置命中率不均时给出针对性建议
+        pos_rates = model_perf.get('position_hit_rates', {})
+        if pos_rates:
+            worst_pos = min(pos_rates, key=pos_rates.get) if pos_rates else None
+            if worst_pos and pos_rates[worst_pos] < 0.15:
+                suggestions.append(f'{worst_pos}命中率偏低({pos_rates[worst_pos]*100:.1f}%)，建议加强该位的遗漏分析')
+
+        if not suggestions:
+            suggestions.append('当前模型表现稳定，继续监控并保持现有策略')
+        return suggestions
+
+    def _analyze_trends(self, recent_issues: List[str]) -> Dict[str, Any]:
+        """分析近期趋势变化，对比历史知识模型。
+
+        Args:
+            recent_issues: 已验证期号列表
+
+        Returns:
+            趋势分析摘要
+        """
+        result = {
+            'trend_direction': 'stable',
+            'recent_top_positions': {},
+            'latest_knowledge': None,
+            'trajectory_count': 0,
+        }
+        if not self.redis:
+            return result
+
+        # 读取最新知识模型
+        try:
+            knowledge_key = 'kpluckynumber:pl5:trend_knowledge'
+            latest = self.redis.safe_hget(knowledge_key, 'latest_update')
+            if latest and isinstance(latest, dict):
+                result['latest_knowledge'] = latest
+                ws = latest.get('weighted_scores', {})
+                if ws:
+                    sorted_pos = sorted(ws.items(), key=lambda x: x[1], reverse=True)
+                    result['recent_top_positions'] = {pos: round(score, 4) for pos, score in sorted_pos[:3]}
+        except Exception:
+            pass
+
+        # 读取轨迹数量
+        try:
+            trajectory_key = f'kpluckynumber:pl5:trend_knowledge:trajectory'
+            keys = self.redis.client.hkeys(trajectory_key)
+            result['trajectory_count'] = len(keys)
+        except Exception:
+            pass
+
+        # 根据近期命中方向判断趋势
+        if result['trajectory_count'] >= 3:
+            result['trend_direction'] = 'recording'
+        else:
+            result['trend_direction'] = 'insufficient_data'
+        return result
+
     def generate_learning_report(self, target_issue: str = '', days: int = 30) -> Dict[str, Any]:
         """
         生成学习报告 - 包含模型表现、专家评估、改进建议
@@ -1019,14 +1231,18 @@ class OnlineLearner:
             recent_issues = self._get_recent_issues(days)
             
             total_verified = len(recent_issues)
+            # 先计算模型表现和专家评估，供后续建议生成使用
+            model_perf = self._analyze_model_performance(recent_issues)
+            expert_eval = self._evaluate_experts(recent_issues)
+
             report = {
                 'report_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'statistics_period_days': days,
                 'total_issues_tracked': total_verified,
                 'total_verified': total_verified,
-                'model_performance': self._analyze_model_performance(recent_issues),
-                'expert_evaluation': self._evaluate_experts(recent_issues),
-                'improvement_suggestions': self._generate_suggestions(recent_issues),
+                'model_performance': model_perf,
+                'expert_evaluation': expert_eval,
+                'improvement_suggestions': self._generate_suggestions(recent_issues, model_perf, expert_eval),
                 'trend_analysis': self._analyze_trends(recent_issues)
             }
 
@@ -1034,7 +1250,6 @@ class OnlineLearner:
             # 注意: 必须在 db.disconnect() 之前使用本地刚建立的连接写入
             try:
                 if db.connection:
-                    model_perf = report.get('model_performance', {})
                     db.cursor.execute('''
                         INSERT INTO p5_learning_history
                         (learning_type, issue, change_reason, impact_score)
@@ -1181,44 +1396,3 @@ class OnlineLearner:
         except Exception as e:
             logger.error(f'获取近期期号失败: {e}')
             return []
-    
-    def _analyze_model_performance(self, issues: List[str]) -> Dict[str, Any]:
-        """分析模型表现"""
-        if not issues:
-            return {'status': 'no_data'}
-        
-        # 计算平均命中率
-        total_hits = sum(1 for _ in issues)  # 简化处理
-        return {
-            'total_issues': len(issues),
-            'full_match_rate': 0.0,
-            'partial_match_rate': 0.0,
-            'average_position_accuracy': 0.0
-        }
-    
-    def _evaluate_experts(self, issues: List[str]) -> Dict[str, Any]:
-        """评估专家表现"""
-        return {
-            'total_experts_evaluated': 0,
-            'top_experts': [],
-            'average_impact_score': 0.0
-        }
-    
-    def _generate_suggestions(self, issues: List[str]) -> List[str]:
-        """生成改进建议"""
-        suggestions = []
-        if not issues:
-            suggestions.append('暂无足够数据生成建议')
-        else:
-            suggestions.append('建议：增加特征维度，考虑季节性因素')
-            suggestions.append('建议：优化相邻位约束策略，减少过度惩罚')
-            suggestions.append('建议：引入更多专家历史数据，提升信誉评估准确性')
-        return suggestions
-    
-    def _analyze_trends(self, issues: List[str]) -> Dict[str, Any]:
-        """分析趋势"""
-        return {
-            'performance_trend': 'stable',
-            'improvement_needed': True,
-            'data_sufficiency': 'insufficient' if not issues else 'adequate'
-        }

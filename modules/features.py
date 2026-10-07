@@ -6,8 +6,8 @@
 核心特征：
 1. 基础统计特征：频率、遗漏、冷热号
 2. 高级统计特征：012路、连号、重隔号、区间分布
-3. 时序特征：滑动窗口统计、趋势动量
-4. 交叉特征：位置关联、组合约束
+3. 时序特征：滑动窗口统计、趋势动量、时序平滑/波动率/持续性、滚动统计特征
+4. 交叉特征：位置关联、组合约束、位置链关联、形态标记、时序特征、交互特征、状态特征、上下文特征、数字特性、频率分布、趋势关联、约束相关、位置对特征
 """
 
 import logging
@@ -590,6 +590,87 @@ class P5Features:
 
         return trend_features
 
+    # ==================== 3.11 滚动统计特征（v4.0） ====================
+
+    def calculate_rolling_statistics_features(self, data: List[Dict], windows: List[int] = [5, 10, 20]) -> Dict[str, Any]:
+        """
+        计算滚动统计特征
+        计算各统计量在不同窗口上的滚动值，捕捉短期变化动态
+        扩展时序特征维度，提升对短期波动的敏感度
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            windows: 滚动窗口大小列表
+
+        Returns:
+            滚动统计特征字典，包含各位置号码的滚动均值、标准差、最大值、最小值等统计量
+        """
+        if not data:
+            return {'error': '数据为空'}
+
+        rolling_features = {}
+
+        for window in windows:
+            if len(data) < window:
+                # 数据不足时使用所有可用数据
+                window_data = data
+                actual_window = len(data)
+            else:
+                window_data = data[-window:]
+                actual_window = window
+
+            if actual_window == 0:
+                continue
+
+            # 为每个位置计算滚动统计量
+            for pos in range(self.positions):
+                pos_name = self.position_names[pos]
+                
+                # 提取该位置的时间序列
+                sequence = []
+                for item in window_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        sequence.append(int(numbers[pos]))
+
+                if len(sequence) < 2:
+                    # 数据点太少，跳过
+                    continue
+
+                # 计算滚动统计量
+                mean_val = np.mean(sequence)
+                std_val = np.std(sequence) if len(sequence) > 1 else 0
+                min_val = np.min(sequence)
+                max_val = np.max(sequence)
+                median_val = np.median(sequence)
+                
+                # 计算变异系数（标准化的离散度量）
+                cv = std_val / mean_val if mean_val != 0 else 0
+                
+                # 计算范围（极差）
+                range_val = max_val - min_val
+                
+                # 计算偏度和峰度（简化版）
+                if len(sequence) >= 3 and std_val > 0:
+                    skewness = np.mean([(x - mean_val) ** 3 for x in sequence]) / (std_val ** 3)
+                    # 简化的峰度计算
+                    kurtosis = np.mean([(x - mean_val) ** 4 for x in sequence]) / (std_val ** 4) - 3
+                else:
+                    skewness = 0
+                    kurtosis = 0
+
+                rolling_features[f'{pos_name}_window{window}_mean'] = mean_val
+                rolling_features[f'{pos_name}_window{window}_std'] = std_val
+                rolling_features[f'{pos_name}_window{window}_min'] = min_val
+                rolling_features[f'{pos_name}_window{window}_max'] = max_val
+                rolling_features[f'{pos_name}_window{window}_median'] = median_val
+                rolling_features[f'{pos_name}_window{window}_cv'] = cv
+                rolling_features[f'{pos_name}_window{window}_range'] = range_val
+                rolling_features[f'{pos_name}_window{window}_skewness'] = skewness
+                rolling_features[f'{pos_name}_window{window}_kurtosis'] = kurtosis
+
+        return rolling_features
+
     # ==================== 4. 交叉特征 ====================
 
     def calculate_cross_position_features(self, data: List[Dict], window: Optional[int] = None) -> Dict[str, Any]:
@@ -639,7 +720,18 @@ class P5Features:
                         seq_j.append(int(numbers[j]))
 
                 if len(seq_i) > 1:
-                    corr = np.corrcoef(seq_i, seq_j)[0, 1]
+                    # v4.0 §2.4 健壮性加固：任一位置序列为常量（方差=0，如某位全 0）
+                    # 时 np.corrcoef 返回 nan，round(nan) 会污染下游且违反 [-1,1] 契约。
+                    # 常量序列视作「无相关性」，显式记 0.0；数值异常同样降级 0.0。
+                    if len(set(seq_i)) > 1 and len(set(seq_j)) > 1:
+                        try:
+                            corr = float(np.corrcoef(seq_i, seq_j)[0, 1])
+                            if np.isnan(corr):
+                                corr = 0.0
+                        except Exception:
+                            corr = 0.0
+                    else:
+                        corr = 0.0
                     position_correlations[f'{i}-{j}'] = round(corr, 4)
 
         cross_features['position_correlations'] = position_correlations
@@ -854,7 +946,7 @@ class P5Features:
         基于最近 30 期窗口，统计整期形态（对子/顺子/豹子）最近出现的滞后期数：
         - lag_2pairs：最近 30 期内「含对子（两位置同数字）」形态的滞后期数
         - lag_3seq：最近 30 期内「含三连顺（相邻3位连号）」形态的滞后期数
-        - lag_4quad：最近 30 期内「四连顺（相邻4位连号）」形态的滞后期数
+        - lag_4quad：最近 30 期内「含四连顺（相邻4位连号）」形态的滞后期数
         - window_2pairs_rate / window_3seq_rate / window_4quad_rate：窗口内形态占比
 
         形态判定规则：
@@ -948,6 +1040,1496 @@ class P5Features:
             'lookback': lookback
         }
 
+    # ==================== 4.7 时序特征 ====================
+
+    def calculate_timing_features(self, data: List[Dict], lookback: int = 60) -> Dict[str, Any]:
+        """
+        计算数字出现时序特征（平滑/波动率/持续性）
+        扩展时序特征维度，提升预测数字出现概率的能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            lookback: 时序分析窗口期数（默认60期）
+
+        Returns:
+            时序特征字典，包含每个数字(0-9)的时序平滑、波动率和持续性特征
+        """
+        if not data:
+            return {'error': '数据为空'}
+        
+        # 限制分析窗口
+        window_data = data[-lookback:] if len(data) > lookback else data
+        total_window = len(window_data)
+        total_history = len(data)
+        
+        if total_window == 0:
+            return {'error': '窗口数据为空'}
+        
+        timing_features = {}
+        
+        # 为每个数字(0-9)计算时序特征
+        for digit in range(10):
+            # 获取该数字在历史数据中的所有出现位置
+            positions_in_history = []
+            positions_in_window = []
+            
+            # 历史数据中的位置
+            for i, item in enumerate(data):
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    if digit in [int(n) for n in numbers]:
+                        positions_in_history.append(i)
+            
+            # 窗口数据中的位置
+            for i, item in enumerate(window_data):
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    if digit in [int(n) for n in numbers]:
+                        positions_in_window.append(i)
+            
+            # 时序平滑：最近出现频率相对历史频率的比值
+            if len(positions_in_history) > 0:
+                recent_freq = len(positions_in_window) / max(total_window, 1)
+                history_freq = len(positions_in_history) / max(total_history, 1)
+                smooth = recent_freq / (history_freq + 1e-6)
+            else:
+                smooth = 0.0
+            
+            # 时序波动率：出现间隔的标准差（标准化）
+            if len(positions_in_history) >= 2:
+                intervals = []
+                for i in range(1, len(positions_in_history)):
+                    intervals.append(positions_in_history[i] - positions_in_history[i-1])
+                volatility = np.std(intervals) / max(total_history, 1) if len(intervals) > 0 else 0.0
+            else:
+                volatility = 0.0
+            
+            # 时序持续性：连续出现的最大长度
+            max_consecutive = 0
+            current_consecutive = 0
+            
+            # 将历史数据转换为该数字的出现序列
+            digit_sequence = [1 if digit in [int(n) for n in item.get('numbers', [])] else 0 
+                            for item in data if len(item.get('numbers', [])) == self.positions]
+            
+            for val in digit_sequence:
+                if val == 1:
+                    current_consecutive += 1
+                    max_consecutive = max(max_consecutive, current_consecutive)
+                else:
+                    current_consecutive = 0
+            
+            continuity = max_consecutive / max(total_history, 1)
+            
+            timing_features[f'digit_{digit}_smooth'] = smooth
+            timing_features[f'digit_{digit}_volatility'] = volatility
+            timing_features[f'digit_{digit}_continuity'] = continuity
+        
+        return timing_features
+
+    # ==================== 4.8 交互特征 ====================
+
+    def calculate_interaction_features(self, data: List[Dict], window: Optional[int] = None) -> Dict[str, Any]:
+        """
+        计算位置间数字交互特征
+        扩展交互特征维度，提升组合规律识别能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            window: 滑动窗口大小，None表示使用全部数据
+
+        Returns:
+            交互特征字典，包含位置间交互关联、跨位差分布和位置关联强度
+        """
+        use_data = data[-window:] if window else data
+        total = len(use_data)
+        
+        if total == 0:
+            return {'error': '数据为空'}
+        
+        interaction_features = {}
+        
+        # 1. 相邻位数字交互关联
+        adjacency_interaction = {}
+        for i in range(self.positions - 1):
+            # 计算相邻位置的数字差分布
+            diffs = []
+            for item in use_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    a, b = int(numbers[i]), int(numbers[i+1])
+                    diffs.append(b - a)
+            
+            if diffs:
+                # 计算差值的均值、标准差、偏度
+                mean_diff = np.mean(diffs)
+                std_diff = np.std(diffs)
+                # 简单的偏度计算
+                if std_diff > 0:
+                    skewness = np.mean([(diff - mean_diff) ** 3 for diff in diffs]) / (std_diff ** 3)
+                else:
+                    skewness = 0.0
+                
+                adjacency_interaction[f'{i}_{i+1}_mean_diff'] = mean_diff
+                adjacency_interaction[f'{i}_{i+1}_std_diff'] = std_diff
+                adjacency_interaction[f'{i}_{i+1}_skewness'] = skewness
+        
+        interaction_features['adjacency_interaction'] = adjacency_interaction
+        
+        # 2. 跨位差分布（非相邻位置的差值）
+        cross_position_diff = {}
+        for i in range(self.positions):
+            for j in range(i+2, self.positions):  # 非相邻位置
+                diffs = []
+                for item in use_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        a, b = int(numbers[i]), int(numbers[j])
+                        diffs.append(b - a)
+                
+                if diffs:
+                    mean_diff = np.mean(diffs)
+                    std_diff = np.std(diffs)
+                    cross_position_diff[f'{i}_{j}_mean_diff'] = mean_diff
+                    cross_position_diff[f'{i}_{j}_std_diff'] = std_diff
+        
+        interaction_features['cross_position_diff'] = cross_position_diff
+        
+        # 3. 位置关联强度（基于互信息）
+        position_association = {}
+        for i in range(self.positions):
+            for j in range(i+1, self.positions):
+                seq_i = []
+                seq_j = []
+                for item in use_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        seq_i.append(int(numbers[i]))
+                        seq_j.append(int(numbers[j]))
+                
+                if len(seq_i) > 1:
+                    # 计算互信息的简化版本（基于协方差）
+                    cov = np.cov(seq_i, seq_j)[0, 1]
+                    std_i = np.std(seq_i)
+                    std_j = np.std(seq_j)
+                    if std_i > 0 and std_j > 0:
+                        correlation = cov / (std_i * std_j)
+                    else:
+                        correlation = 0.0
+                    
+                    position_association[f'{i}_{j}_correlation'] = correlation
+        
+        interaction_features['position_association'] = position_association
+        
+        return interaction_features
+
+    # ==================== 4.10 位置对特征（v4.0） ====================
+
+    def calculate_position_pair_features(self, data: List[Dict], window: Optional[int] = None) -> Dict[str, Any]:
+        """
+        计算位置对特征
+        分析特定位置对之间的数字关系和关联模式
+        扩展交互特征维度，提升特定位置组合的规律识别能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            window: 滑动窗口大小，None表示使用全部数据
+
+        Returns:
+            位置对特征字典，包含各位置对的数字差分布、关联强度和模式一致性
+        """
+        use_data = data[-window:] if window else data
+        total = len(use_data)
+        
+        if total == 0:
+            return {'error': '数据为空'}
+        
+        position_pair_features = {}
+        
+        # 1. 计算所有位置对的数字差分布
+        pair_differences = {}
+        for i in range(self.positions):
+            for j in range(i+1, self.positions):
+                pos_i_name = self.position_names[i]
+                pos_j_name = self.position_names[j]
+                pair_key = f'{pos_i_name}_{pos_j_name}'
+                
+                # 计算数字差序列
+                diffs = []
+                for item in use_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        num_i = int(numbers[i])
+                        num_j = int(numbers[j])
+                        diffs.append(num_j - num_i)  # j位置减i位置
+                
+                if diffs:
+                    # 计算差值的统计特征
+                    mean_diff = np.mean(diffs)
+                    std_diff = np.std(diffs) if len(diffs) > 1 else 0
+                    
+                    # 计算差值的分布特征
+                    # 正差、零差、负差的比例
+                    pos_count = sum(1 for d in diffs if d > 0)
+                    zero_count = sum(1 for d in diffs if d == 0)
+                    neg_count = sum(1 for d in diffs if d < 0)
+                    
+                    pair_differences[pair_key] = {
+                        'mean_diff': mean_diff,
+                        'std_diff': std_diff,
+                        'positive_ratio': pos_count / len(diffs),
+                        'zero_ratio': zero_count / len(diffs),
+                        'negative_ratio': neg_count / len(diffs),
+                        'min_diff': min(diffs),
+                        'max_diff': max(diffs)
+                    }
+        
+        position_pair_features['pair_differences'] = pair_differences
+        
+        # 2. 计算位置对之间的关联强度（基于数值关联）
+        pair_correlations = {}
+        for i in range(self.positions):
+            for j in range(i+1, self.positions):
+                pos_i_name = self.position_names[i]
+                pos_j_name = self.position_names[j]
+                pair_key = f'{pos_i_name}_{pos_j_name}'
+                
+                # 提取两个位置的数值序列
+                seq_i = []
+                seq_j = []
+                for item in use_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        seq_i.append(int(numbers[i]))
+                        seq_j.append(int(numbers[j]))
+                
+                if len(seq_i) > 1:
+                    # 计算皮尔逊相关系数
+                    try:
+                        corr = np.corrcoef(seq_i, seq_j)[0, 1]
+                        if np.isnan(corr):
+                            corr = 0.0
+                    except:
+                        corr = 0.0
+                    
+                    pair_correlations[pair_key] = round(corr, 4)
+        
+        position_pair_features['pair_correlations'] = pair_correlations
+        
+        # 3. 计算位置对的模式一致性（同向变化的比例）
+        pair_consistency = {}
+        for i in range(self.positions):
+            for j in range(i+1, self.positions):
+                pos_i_name = self.position_names[i]
+                pos_j_name = self.position_names[j]
+                pair_key = f'{pos_i_name}_{pos_j_name}'
+                
+                # 提取两个位置的数值序列
+                seq_i = []
+                seq_j = []
+                for item in use_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        seq_i.append(int(numbers[i]))
+                        seq_j.append(int(numbers[j]))
+                
+                if len(seq_i) >= 2:
+                    # 计算同向变化的比例
+                    same_direction_count = 0
+                    total_changes = 0
+                    
+                    for k in range(1, len(seq_i)):
+                        diff_i = seq_i[k] - seq_i[k-1]
+                        diff_j = seq_j[k] - seq_j[k-1]
+                        
+                        # 只要有变化就计算方向一致性
+                        if diff_i != 0 or diff_j != 0:
+                            total_changes += 1
+                            # 同向：都是增加、都是减少，或者都没变化
+                            if (diff_i > 0 and diff_j > 0) or (diff_i < 0 and diff_j < 0) or (diff_i == 0 and diff_j == 0):
+                                same_direction_count += 1
+                    
+                    consistency = same_direction_count / max(total_changes, 1)
+                    pair_consistency[pair_key] = consistency
+        
+        position_pair_features['pair_consistency'] = pair_consistency
+        
+        # 4. 计算位置对的特殊模式（如相等、固定差值等）
+        pair_patterns = {}
+        for i in range(self.positions):
+            for j in range(i+1, self.positions):
+                pos_i_name = self.position_names[i]
+                pos_j_name = self.position_names[j]
+                pair_key = f'{pos_i_name}_{pos_j_name}'
+                
+                # 检查特殊模式出现的频率
+                equal_count = 0  # 两位置数字相等
+                fixed_diff_count = 0  # 固定差值（这里简化为差值为1或-1）
+                
+                for item in use_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        num_i = int(numbers[i])
+                        num_j = int(numbers[j])
+                        
+                        if num_i == num_j:
+                            equal_count += 1
+                        
+                        # 检查固定差值（相邻数字）
+                        if abs(num_j - num_i) == 1:
+                            fixed_diff_count += 1
+                
+                pair_patterns[pair_key] = {
+                    'equal_ratio': equal_count / total if total > 0 else 0,
+                    'fixed_diff_ratio': fixed_diff_count / total if total > 0 else 0
+                }
+        
+        position_pair_features['pair_patterns'] = pair_patterns
+        
+        return position_pair_features
+
+    # ==================== 4.9 状态特征 ====================
+
+    def calculate_state_features(self, data: List[Dict], lookback: int = 30) -> Dict[str, Any]:
+        """
+        计算号码状态特征
+        扩展状态特征维度，提升组合筛选与优化能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            lookback: 状态分析窗口期数（默认30期）
+
+        Returns:
+            状态特征字典，包含冷热状态演变、形态状态和异常状态标记
+        """
+        if not data:
+            return {'error': '数据为空'}
+        
+        # 限制分析窗口
+        window_data = data[-lookback:] if len(data) > lookback else data
+        total_window = len(window_data)
+        
+        if total_window == 0:
+            return {'error': '窗口数据为空'}
+        
+        state_features = {}
+        
+        # 1. 冷热状态演变
+        hot_cold_evolution = {}
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            
+            # 计算该位置在窗口期内的冷热分布
+            hot_count = 0
+            cold_count = 0
+            warm_count = 0
+            
+            # 首先计算全历史数据的频率基准
+            position_freq = [0] * 10
+            for item in data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    num = int(numbers[pos])
+                    position_freq[num] += 1
+            
+            # 计算热冷阈值（使用百分位数）
+            sorted_freq = sorted(position_freq)
+            hot_threshold = sorted_freq[int(0.7 * len(sorted_freq))] if len(sorted_freq) > 0 else 0
+            cold_threshold = sorted_freq[int(0.3 * len(sorted_freq))] if len(sorted_freq) > 0 else 0
+            
+            # 统计窗口期内的冷热分布
+            for item in window_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    num = int(numbers[pos])
+                    freq = position_freq[num]
+                    if freq >= hot_threshold:
+                        hot_count += 1
+                    elif freq <= cold_threshold:
+                        cold_count += 1
+                    else:
+                        warm_count += 1
+            
+            hot_cold_evolution[f'{pos_name}_hot_ratio'] = hot_count / max(total_window, 1)
+            hot_cold_evolution[f'{pos_name}_cold_ratio'] = cold_count / max(total_window, 1)
+            hot_cold_evolution[f'{pos_name}_warm_ratio'] = warm_count / max(total_window, 1)
+        
+        state_features['hot_cold_evolution'] = hot_cold_evolution
+        
+        # 2. 形态状态（连号/豹子状态）
+        pattern_state = {}
+        
+        # 统计最近lookback期的形态出现频率
+        seq_count = 0
+        pair_count = 0
+        triple_count = 0
+        
+        for item in window_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                nums = [int(n) for n in numbers]
+                
+                # 检测顺子（连号）
+                is_sequence = False
+                for start in range(self.positions - 1):
+                    # 检查递增顺序
+                    if all(nums[start + k + 1] - nums[start + k] == 1 for k in range(self.positions - start - 1)):
+                        is_sequence = True
+                        break
+                    # 检查递减顺序
+                    if all(nums[start + k + 1] - nums[start + k] == -1 for k in range(self.positions - start - 1)):
+                        is_sequence = True
+                        break
+                
+                if is_sequence:
+                    seq_count += 1
+                
+                # 检测对子
+                has_pair = False
+                seen_nums = set()
+                for num in nums:
+                    if num in seen_nums:
+                        has_pair = True
+                        break
+                    seen_nums.add(num)
+                
+                if has_pair:
+                    pair_count += 1
+                
+                # 检测豹子（三个相同数字）
+                from collections import Counter
+                num_counts = Counter(nums)
+                if any(count >= 3 for count in num_counts.values()):
+                    triple_count += 1
+        
+        pattern_state['seq_ratio'] = seq_count / max(total_window, 1)
+        pattern_state['pair_ratio'] = pair_count / max(total_window, 1)
+        pattern_state['triple_ratio'] = triple_count / max(total_window, 1)
+        
+        state_features['pattern_state'] = pattern_state
+        
+        # 3. 异常状态标记
+        anomaly_state = {}
+        
+        # 检测异常的和值和跨度
+        sum_anomaly_count = 0
+        span_anomaly_count = 0
+        
+        # 计算正常范围（基于历史数据）
+        sums = []
+        spans = []
+        for item in data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                nums = [int(n) for n in numbers]
+                sums.append(sum(nums))
+                spans.append(max(nums) - min(nums))
+        
+        if sums and spans:
+            sum_mean, sum_std = np.mean(sums), np.std(sums)
+            span_mean, span_std = np.mean(spans), np.std(spans)
+            
+            # 异常阈值：超过2个标准差
+            sum_anomaly_threshold = 2 * sum_std
+            span_anomaly_threshold = 2 * span_std
+            
+            # 检测窗口期内的异常
+            for item in window_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    nums = [int(n) for n in numbers]
+                    curr_sum = sum(nums)
+                    curr_span = max(nums) - min(nums)
+                    
+                    if sum_std > 0 and abs(curr_sum - sum_mean) > sum_anomaly_threshold:
+                        sum_anomaly_count += 1
+                    if span_std > 0 and abs(curr_span - span_mean) > span_anomaly_threshold:
+                        span_anomaly_count += 1
+            
+            anomaly_state['sum_anomaly_ratio'] = sum_anomaly_count / max(total_window, 1)
+            anomaly_state['span_anomaly_ratio'] = span_anomaly_count / max(total_window, 1)
+        
+        state_features['anomaly_state'] = anomaly_state
+        
+        return state_features
+
+    # ==================== 4.10 上下文特征 ====================
+
+    def calculate_contextual_features(self, data: List[Dict], lookback: int = 30) -> Dict[str, Any]:
+        """
+        计算上下文特征
+        扩展上下文特征维度，提升预测趋势延续性的能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            lookback: 上下文分析窗口期数（默认30期）
+
+        Returns:
+            上下文特征字典，包含历史期上下文、趋势延续性和模式延续标记
+        """
+        if not data:
+            return {'error': '数据为空'}
+        
+        # 限制分析窗口
+        window_data = data[-lookback:] if len(data) > lookback else data
+        total_window = len(window_data)
+        
+        if total_window == 0:
+            return {'error': '窗口数据为空'}
+        
+        contextual_features = {}
+        
+        # 1. 历史期上下文（最近期数的特征保留度）
+        historical_context = {}
+        
+        # 计算各位置号码在历史期和窗口期的一致性
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            
+            # 历史期号码分布
+            history_nums = []
+            for item in data[-lookback*2:-lookback] if len(data) >= lookback*2 else data[:-lookback] if len(data) > lookback else []:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    history_nums.append(int(numbers[pos]))
+            
+            # 窗口期号码分布
+            window_nums = []
+            for item in window_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    window_nums.append(int(numbers[pos]))
+            
+            # 计算历史期到窗口期的号码保留率
+            if history_nums:
+                history_set = set(history_nums)
+                window_set = set(window_nums)
+                if history_set:
+                    retention_rate = len(history_set & window_set) / len(history_set)
+                else:
+                    retention_rate = 0.0
+            else:
+                retention_rate = 0.0
+            
+            historical_context[f'{pos_name}_retention_rate'] = retention_rate
+        
+        contextual_features['historical_context'] = historical_context
+        
+        # 2. 趋势延续性
+        trend_continuity = {}
+        
+        # 计算各位置的趋势方向一致性
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            
+            # 获取历史期和窗口期的趋势
+            def calculate_trend_direction(nums):
+                if len(nums) < 2:
+                    return 'stable'
+                # 简单线性趋势
+                x = list(range(len(nums)))
+                y = nums
+                slope = np.polyfit(x, y, 1)[0] if len(x) > 1 else 0
+                if slope > 0.1:
+                    return 'up'
+                elif slope < -0.1:
+                    return 'down'
+                else:
+                    return 'stable'
+            
+            # 历史期趋势
+            history_nums = []
+            for item in data[-lookback*2:-lookback] if len(data) >= lookback*2 else data[:-lookback] if len(data) > lookback else []:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    history_nums.append(int(numbers[pos]))
+            history_trend = calculate_trend_direction(history_nums)
+            
+            # 窗口期趋势
+            window_nums = []
+            for item in window_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    window_nums.append(int(numbers[pos]))
+            window_trend = calculate_trend_direction(window_nums)
+            
+            # 趋势延续性：历史趋势和窗口趋势一致性
+            trend_continuity[f'{pos_name}_trend_match'] = 1.0 if history_trend == window_trend else 0.0
+        
+        contextual_features['trend_continuity'] = trend_continuity
+        
+        # 3. 模式延续标记
+        pattern_continuity = {}
+        
+        # 检测特定模式的延续性
+        patterns_to_check = [
+            ('all_even', lambda nums: all(n % 2 == 0 for n in nums)),
+            ('all_odd', lambda nums: all(n % 2 == 1 for n in nums)),
+            ('all_high', lambda nums: all(n >= 5 for n in nums)),
+            ('all_low', lambda nums: all(n < 5 for n in nums))
+        ]
+        
+        for pattern_name, pattern_check in patterns_to_check:
+            # 历史期模式出现率
+            history_pattern_count = 0
+            history_total = 0
+            for item in data[-lookback*2:-lookback] if len(data) >= lookback*2 else data[:-lookback] if len(data) > lookback else []:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    history_total += 1
+                    nums = [int(n) for n in numbers]
+                    if pattern_check(nums):
+                        history_pattern_count += 1
+            
+            # 窗口期模式出现率
+            window_pattern_count = 0
+            window_total = 0
+            for item in window_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    window_total += 1
+                    nums = [int(n) for n in numbers]
+                    if pattern_check(nums):
+                        window_pattern_count += 1
+            
+            # 模式延续性
+            if history_total > 0:
+                history_rate = history_pattern_count / history_total
+            else:
+                history_rate = 0.0
+            
+            if window_total > 0:
+                window_rate = window_pattern_count / window_total
+            else:
+                window_rate = 0.0
+            
+            # 计算模式延续指数（窗口率/历史率）
+            if history_rate > 0:
+                continuity_index = window_rate / history_rate
+            else:
+                continuity_index = 0.0
+            
+            pattern_continuity[f'{pattern_name}_continuity'] = continuity_index
+        
+        contextual_features['pattern_continuity'] = pattern_continuity
+        
+        return contextual_features
+
+    # ==================== 4.11 组合约束交叉特征（v4.0） ====================
+
+    def calculate_constraint_correlation_features(self, data: List[Dict], lookback: int = 30) -> Dict[str, Any]:
+        """
+        计算组合约束交叉特征
+        分析不同组合约束条件之间的相关性和交互关系
+        扩展组合约束分析维度，提升约束规律识别能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            lookback: 分析窗口期数（默认30期）
+
+        Returns:
+            组合约束交叉特征字典，包含各约束条件之间的相关性分析
+        """
+        if not data:
+            return {'error': '数据为空'}
+
+        # 限制分析窗口
+        window_data = data[-lookback:] if len(data) > lookback else data
+        total_window = len(window_data)
+
+        if total_window == 0:
+            return {'error': '窗口数据为空'}
+
+        constraint_features = {}
+
+        # 1. 计算各组合约束条件的时间序列
+        constraint_series = {
+            'sum_values': [],           # 和值
+            'span_values': [],          # 跨度
+            'odd_even_ratios': [],      # 奇偶比例
+            'prime_ratios': [],         # 质数比例
+            'high_low_ratios': [],      # 大小比例
+            '012_road_ratios': [],      # 012路比例（主导路径）
+            'consecutive_counts': [],   # 连号数量
+            'repeat_counts': []         # 重号数量
+        }
+
+        for item in window_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                nums = [int(n) for n in numbers]
+                
+                # 和值
+                constraint_series['sum_values'].append(sum(nums))
+                
+                # 跨度
+                constraint_series['span_values'].append(max(nums) - min(nums))
+                
+                # 奇偶比例（奇数个数 / 总个数）
+                odd_count = sum(1 for n in nums if n % 2 == 1)
+                constraint_series['odd_even_ratios'].append(odd_count / self.positions)
+                
+                # 质数比例
+                prime_count = sum(1 for n in nums if n in self.primes)
+                constraint_series['prime_ratios'].append(prime_count / self.positions)
+                
+                # 大小比例（大于等于5的个数 / 总个数）
+                high_count = sum(1 for n in nums if n >= 5)
+                constraint_series['high_low_ratios'].append(high_count / self.positions)
+                
+                # 012路比例（找出数量最多的路径）
+                road_counts = [0, 0, 0]  # 0路, 1路, 2路
+                for n in nums:
+                    if n in self.road_0:
+                        road_counts[0] += 1
+                    elif n in self.road_1:
+                        road_counts[1] += 1
+                    else:
+                        road_counts[2] += 1
+                # 主导路径占比
+                max_road_count = max(road_counts)
+                constraint_series['012_road_ratios'].append(max_road_count / self.positions)
+                
+                # 连号数量
+                consecutive_count = 0
+                nums_sorted = sorted(nums)
+                for i in range(len(nums_sorted) - 1):
+                    if nums_sorted[i+1] - nums_sorted[i] == 1:
+                        consecutive_count += 1
+                constraint_series['consecutive_counts'].append(consecutive_count)
+                
+                # 重号数量（与上期相比，但这里简化为当期重复数字数量）
+                # 实际的重号需要和上期比较，这里我们计算当期内的重复程度
+                from collections import Counter
+                num_counts = Counter(nums)
+                repeat_count = sum(count - 1 for count in num_counts.values() if count > 1)
+                constraint_series['repeat_counts'].append(repeat_count)
+
+        # 2. 计算各约束条件之间的相关性
+        constraint_correlations = {}
+        constraint_names = list(constraint_series.keys())
+        
+        for i in range(len(constraint_names)):
+            for j in range(i+1, len(constraint_names)):
+                name_i = constraint_names[i]
+                name_j = constraint_names[j]
+                series_i = constraint_series[name_i]
+                series_j = constraint_series[name_j]
+                
+                if len(series_i) > 1 and len(series_j) > 1:
+                    # 计算皮尔逊相关系数
+                    try:
+                        corr = np.corrcoef(series_i, series_j)[0, 1]
+                        # 处理可能的NaN值
+                        if np.isnan(corr):
+                            corr = 0.0
+                    except:
+                        corr = 0.0
+                    
+                    constraint_correlations[f'{name_i}_{name_j}'] = round(corr, 4)
+
+        # 3. 计算约束条件的变化趋势一致性
+        trend_consistency = {}
+        for name in constraint_names:
+            series = constraint_series[name]
+            if len(series) >= 3:
+                # 计算最近3期的变化趋势
+                recent_trend = series[-1] - series[-3]
+                # 计算整体窗口的变化趋势
+                overall_trend = series[-1] - series[0] if len(series) > 1 else 0
+                # 趋势一致性：最近趋势与整体趋势的方向一致性
+                if overall_trend != 0:
+                    consistency = 1.0 if (recent_trend * overall_trend) > 0 else 0.0
+                else:
+                    consistency = 1.0 if recent_trend == 0 else 0.0
+                trend_consistency[f'{name}_trend_consistency'] = consistency
+            else:
+                trend_consistency[f'{name}_trend_consistency'] = 0.0
+
+        # 4. 计算约束条件的稳定性（变化系数的倒数）
+        stability = {}
+        for name in constraint_names:
+            series = constraint_series[name]
+            if len(series) > 0 and np.mean(series) != 0:
+                cv = np.std(series) / np.abs(np.mean(series))  # 变化系数
+                stability[f'{name}_stability'] = 1.0 / (1.0 + cv)  # 稳定性得分，范围(0,1]
+            else:
+                stability[f'{name}_stability'] = 0.0
+
+        return {
+            'constraint_correlations': constraint_correlations,
+            'trend_consistency': trend_consistency,
+            'stability': stability,
+            'constraint_means': {name: np.mean(series) if series else 0 for name, series in constraint_series.items()},
+            'constraint_stds': {name: np.std(series) if series else 0 for name, series in constraint_series.items()}
+        }
+
+    # ==================== 4.12 数字特性交叉特征（v4.0） ====================
+
+    def calculate_digit_characteristic_features(self, data: List[Dict], lookback: int = 30) -> Dict[str, Any]:
+        """
+        计算数字特性交叉特征
+        分析数字特性（奇偶、质合、大小等）在不同位置之间的分布和关联
+        扩展数字特性分析维度，提升特征规律识别能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            lookback: 分析窗口期数（默认30期）
+
+        Returns:
+            数字特性交叉特征字典，包含各数字特性在位置之间的分布关联
+        """
+        if not data:
+            return {'error': '数据为空'}
+
+        # 限制分析窗口
+        window_data = data[-lookback:] if len(data) > lookback else data
+        total_window = len(window_data)
+
+        if total_window == 0:
+            return {'error': '窗口数据为空'}
+
+        characteristic_features = {}
+
+        # 定义数字特性
+        characteristics = {
+            'is_odd': lambda x: x % 2 == 1,
+            'is_even': lambda x: x % 2 == 0,
+            'is_prime': lambda x: x in self.primes,
+            'is_composite': lambda x: x in self.composites,
+            'is_low': lambda x: x < 5,    # 0-4为小
+            'is_high': lambda x: x >= 5,  # 5-9为大
+            'is_road_0': lambda x: x in self.road_0,
+            'is_road_1': lambda x: x in self.road_1,
+            'is_road_2': lambda x: x in self.road_2
+        }
+
+        # 1. 计算每个位置各特性的出现频率
+        position_characteristic_ratios = {}
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            position_characteristic_ratios[pos_name] = {}
+            
+            for char_name, char_func in characteristics.items():
+                # 计算该位置在窗口期内具有该特性的频率
+                count = 0
+                for item in window_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        num = int(numbers[pos])
+                        if char_func(num):
+                            count += 1
+                
+                ratio = count / total_window if total_window > 0 else 0
+                position_characteristic_ratios[pos_name][char_name] = ratio
+
+        # 2. 计算位置间特性相关性（同一特性在不同位置之间的关联）
+        position_characteristic_correlations = {}
+        for char_name in characteristics.keys():
+            # 提取每个位置该特性的时间序列
+            position_sequences = {}
+            for pos in range(self.positions):
+                pos_name = self.position_names[pos]
+                sequence = []
+                for item in window_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        num = int(numbers[pos])
+                        sequence.append(1 if char_func(num) else 0)
+                position_sequences[pos_name] = sequence
+            
+            # 计算位置间相关性
+            for i in range(self.positions):
+                for j in range(i+1, self.positions):
+                    pos_i_name = self.position_names[i]
+                    pos_j_name = self.position_names[j]
+                    seq_i = position_sequences[pos_i_name]
+                    seq_j = position_sequences[pos_j_name]
+                    
+                    if len(seq_i) > 1 and len(seq_j) > 1:
+                        try:
+                            corr = np.corrcoef(seq_i, seq_j)[0, 1]
+                            if np.isnan(corr):
+                                corr = 0.0
+                        except:
+                            corr = 0.0
+                            
+                        position_characteristic_correlations[f'{char_name}_{pos_i_name}_{pos_j_name}'] = round(corr, 4)
+
+        # 3. 计算特性组合模式（例如：奇数+质数、大数+偶数等）
+        combination_patterns = {}
+        # 定义一些有趣的特性组合
+        characteristic_combinations = [
+            ('is_odd', 'is_prime'),      # 奇质数
+            ('is_even', 'is_prime'),     # 偶质数（只有2）
+            ('is_odd', 'is_composite'),  # 奇合数
+            ('is_even', 'is_composite'), # 偶合数
+            ('is_low', 'is_odd'),        # 小奇数
+            ('is_low', 'is_even'),       # 小偶数
+            ('is_high', 'is_odd'),       # 大奇数
+            ('is_high', 'is_even'),      # 大偶数
+            ('is_road_0', 'is_odd'),     # 0路奇数
+            ('is_road_0', 'is_even'),    # 0路偶数
+            ('is_road_1', 'is_odd'),     # 1路奇数
+            ('is_road_1', 'is_even'),    # 1路偶数
+            ('is_road_2', 'is_odd'),     # 2路奇数
+            ('is_road_2', 'is_even'),    # 2路偶数
+        ]
+
+        for char1_name, char2_name in characteristic_combinations:
+            char1_func = characteristics[char1_name]
+            char2_func = characteristics[char2_name]
+            
+            # 计算该组合在每个位置的出现频率
+            position_combination_ratios = {}
+            for pos in range(self.positions):
+                pos_name = self.position_names[pos]
+                count = 0
+                for item in window_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        num = int(numbers[pos])
+                        if char1_func(num) and char2_func(num):
+                            count += 1
+                ratio = count / total_window if total_window > 0 else 0
+                position_combination_ratios[pos_name] = ratio
+            
+            combination_patterns[f'{char1_name}_{char2_name}'] = position_combination_ratios
+
+        # 4. 计算位置间特性组合的一致性
+        combination_consistency = {}
+        for char1_name, char2_name in characteristic_combinations:
+            combination_key = f'{char1_name}_{char2_name}'
+            if combination_key in combination_patterns:
+                # 检查该组合在各位置的一致性（所有位置是否有相似的出现频率）
+                ratios = list(combination_patterns[combination_key].values())
+                if len(ratios) > 0:
+                    # 计算变异系数的倒数作为一致性度量
+                    mean_ratio = np.mean(ratios)
+                    if mean_ratio > 0:
+                        std_ratio = np.std(ratios)
+                        cv = std_ratio / mean_ratio
+                        consistency = 1.0 / (1.0 + cv)  # 一致性得分，范围(0,1]
+                    else:
+                        consistency = 0.0
+                else:
+                    consistency = 0.0
+                combination_consistency[combination_key] = consistency
+
+        return {
+            'position_characteristic_ratios': position_characteristic_ratios,
+            'position_characteristic_correlations': position_characteristic_correlations,
+            'characteristic_combination_ratios': combination_patterns,
+            'combination_consistency': combination_consistency
+        }
+
+    # ==================== 4.13 频率分布交叉特征（v4.0） ====================
+
+    def calculate_joint_frequency_features(self, data: List[Dict], lookback: int = 30) -> Dict[str, Any]:
+        """
+        计算频率分布交叉特征
+        分析号码联合频率分布和条件概率
+        扩展频率分析维度，提升联合特征识别能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            lookback: 分析窗口期数（默认30期）
+
+        Returns:
+            频率分布交叉特征字典，包含联合频率、条件概率和频率关联度量
+        """
+        if not data:
+            return {'error': '数据为空'}
+
+        # 限制分析窗口
+        window_data = data[-lookback:] if len(data) > lookback else data
+        total_window = len(window_data)
+
+        if total_window == 0:
+            return {'error': '窗口数据为空'}
+
+        joint_features = {}
+
+        # 1. 计算联合频率：两个位置上特定号码组合出现的频率
+        joint_frequencies = {}
+        for pos1 in range(self.positions):
+            for pos2 in range(pos1+1, self.positions):  # 避免重复和自我组合
+                pos1_name = self.position_names[pos1]
+                pos2_name = self.position_names[pos2]
+                key = f'{pos1_name}_{pos2_name}'
+                
+                # 初始化联合频率字典
+                joint_freq = {}
+                for num1 in self.number_range:
+                    for num2 in self.number_range:
+                        joint_freq[f'{num1},{num2}'] = 0
+                
+                # 统计出现次数
+                for item in window_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        num1 = int(numbers[pos1])
+                        num2 = int(numbers[pos2])
+                        joint_freq[f'{num1},{num2}'] += 1
+                
+                # 转换为频率
+                for key in joint_freq:
+                    joint_freq[key] = joint_freq[key] / total_window if total_window > 0 else 0
+                
+                joint_frequencies[key] = joint_freq
+
+        # 2. 计算边际频率（单个位置上号码出现的频率）
+        marginal_frequencies = {}
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            marginal_freq = {num: 0 for num in self.number_range}
+            
+            for item in window_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    num = int(numbers[pos])
+                    marginal_freq[num] += 1
+            
+            # 转换为频率
+            for num in self.number_range:
+                marginal_freq[num] = marginal_freq[num] / total_window if total_window > 0 else 0
+            
+            marginal_frequencies[pos_name] = marginal_freq
+
+        # 3. 计算条件概率：P(pos1=num1 | pos2=num2)
+        conditional_probabilities = {}
+        for pos1 in range(self.positions):
+            for pos2 in range(self.positions):
+                if pos1 != pos2:  # 不同位置之间
+                    pos1_name = self.position_names[pos1]
+                    pos2_name = self.position_names[pos2]
+                    key = f'{pos1_name}_given_{pos2_name}'  # P(pos1|pos2)
+                    
+                    conditional_prob = {}
+                    for num1 in self.number_range:
+                        conditional_prob[num1] = {}
+                        for num2 in self.number_range:
+                            # P(pos1=num1 | pos2=num2) = P(pos1=num1, pos2=num2) / P(pos2=num2)
+                            # 确定联合频率的键（总是用较小的位置索引在前）
+                            joint_pos1 = min(pos1, pos2)
+                            joint_pos2 = max(pos1, pos2)
+                            joint_key = f'{self.position_names[joint_pos1]}_{self.position_names[joint_pos2]}'
+                            
+                            if pos1 == joint_pos1 and pos2 == joint_pos2:
+                                # 顺序匹配：pos1在前，pos2在后
+                                joint_num_key = f'{num1},{num2}'
+                            else:
+                                # 顺序不匹配：需要交换
+                                joint_num_key = f'{num2},{num1}'
+                            
+                            joint_prob = joint_frequencies.get(joint_key, {}).get(joint_num_key, 0)
+                            marginal_prob = marginal_frequencies[pos2_name].get(num2, 0)
+                            
+                            if marginal_prob > 0:
+                                conditional_prob[num1][num2] = joint_prob / marginal_prob
+                            else:
+                                conditional_prob[num1][num2] = 0
+                    
+                    conditional_probabilities[key] = conditional_prob
+
+        # 4. 计算频率关联度量：互信息、 chi-square统计量等
+        association_measures = {}
+        for pos1 in range(self.positions):
+            for pos2 in range(pos1+1, self.positions):
+                pos1_name = self.position_names[pos1]
+                pos2_name = self.position_names[pos2]
+                key = f'{pos1_name}_{pos2_name}'
+                
+                # 互信息
+                mutual_info = 0.0
+                for num1 in self.number_range:
+                    for num2 in self.number_range:
+                        joint_key = f'{num1},{num2}'
+                        joint_prob = joint_frequencies.get(key, {}).get(joint_key, 0)
+                        prob1 = marginal_frequencies[pos1_name].get(num1, 0)
+                        prob2 = marginal_frequencies[pos2_name].get(num2, 0)
+                        
+                        if joint_prob > 0 and prob1 > 0 and prob2 > 0:
+                            mutual_info += joint_prob * np.log2(joint_prob / (prob1 * prob2))
+                
+                # 方差关联系数（简化版）
+                # 这里我们计算号码值之间的线性关联
+                seq1 = []
+                seq2 = []
+                for item in window_data:
+                    numbers = item.get('numbers', [])
+                    if len(numbers) == self.positions:
+                        seq1.append(int(numbers[pos1]))
+                        seq2.append(int(numbers[pos2]))
+                
+                pearson_corr = 0.0
+                if len(seq1) > 1:
+                    try:
+                        pearson_corr = np.corrcoef(seq1, seq2)[0, 1]
+                        if np.isnan(pearson_corr):
+                            pearson_corr = 0.0
+                    except:
+                        pearson_corr = 0.0
+                
+                association_measures[key] = {
+                    'mutual_information': round(max(mutual_info, 0), 4),
+                    'pearson_correlation': round(pearson_corr, 4)
+                }
+
+        # 5. 计算频率分布的均匀性偏离度
+        uniformity_deviation = {}
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            # 理想均匀分布下每个号码的频率应该是 1/10 = 0.1
+            expected_freq = 0.1
+            actual_freqs = list(marginal_frequencies[pos_name].values())
+            
+            # 卡方统计量（简化版，不考虑自由度）
+            chi_square = 0.0
+            for freq in actual_freqs:
+                if expected_freq > 0:
+                    chi_square += ((freq - expected_freq) ** 2) / expected_freq
+            
+            # 均匀性偏离度：越小越均匀
+            uniformity_deviation[pos_name] = round(chi_square, 4)
+
+        return {
+            'joint_frequencies': joint_frequencies,
+            'marginal_frequencies': marginal_frequencies,
+            'conditional_probabilities': conditional_probabilities,
+            'association_measures': association_measures,
+            'uniformity_deviation': uniformity_deviation
+        }
+
+    # ==================== 4.14 趋势关联交叉特征（v4.0） ====================
+
+    def calculate_trend_association_features(self, data: List[Dict], lookback: int = 30) -> Dict[str, Any]:
+        """
+        计算趋势关联交叉特征
+        分析不同维度趋势之间的关联和同步性
+        扩展趋势分析维度，提升趋势规律识别能力
+
+        Args:
+            data: 历史数据列表（按时间正序排列）
+            lookback: 分析窗口期数（默认30期）
+
+        Returns:
+            趋势关联交叉特征字典，包含各维度趋势之间的关联分析
+        """
+        if not data:
+            return {'error': '数据为空'}
+
+        # 限制分析窗口
+        window_data = data[-lookback:] if len(data) > lookback else data
+        total_window = len(window_data)
+
+        if total_window == 0:
+            return {'error': '窗口数据为空'}
+
+        trend_features = {}
+
+        # 1. 提取各种趋势时间序列
+        trend_series = {
+            # 位置趋势：每个位置号码的趋势
+            'position_trends': {},
+            # 和值趋势
+            'sum_trend': [],
+            # 跨度趋势
+            'span_trend': [],
+            # 奇偶比例趋势
+            'odd_even_trend': [],
+            # 质数比例趋势
+            'prime_trend': [],
+            # 012路分布趋势（熵）
+            '012_entropy_trend': [],
+            # 区间分布趋势（熵）
+            'interval_entropy_trend': []
+        }
+
+        # 提取位置趋势
+        for pos in range(self.positions):
+            pos_name = self.position_names[pos]
+            position_sequence = []
+            for item in window_data:
+                numbers = item.get('numbers', [])
+                if len(numbers) == self.positions:
+                    position_sequence.append(int(numbers[pos]))
+            trend_series['position_trends'][pos_name] = position_sequence
+
+        # 提取和值趋势
+        for item in window_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                nums = [int(n) for n in numbers]
+                trend_series['sum_trend'].append(sum(nums))
+
+        # 提取跨度趋势
+        for item in window_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                nums = [int(n) for n in numbers]
+                trend_series['span_trend'].append(max(nums) - min(nums))
+
+        # 提取奇偶比例趋势
+        for item in window_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                nums = [int(n) for n in numbers]
+                odd_count = sum(1 for n in nums if n % 2 == 1)
+                trend_series['odd_even_trend'].append(odd_count / self.positions)
+
+        # 提取质数比例趋势
+        for item in window_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                nums = [int(n) for n in numbers]
+                prime_count = sum(1 for n in nums if n in self.primes)
+                trend_series['prime_trend'].append(prime_count / self.positions)
+
+        # 提取012路分布趋势（使用香农熵）
+        for item in window_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                road_counts = [0, 0, 0]  # 0路, 1路, 2路
+                for n in numbers:
+                    n_int = int(n)
+                    if n_int in self.road_0:
+                        road_counts[0] += 1
+                    elif n_int in self.road_1:
+                        road_counts[1] += 1
+                    else:
+                        road_counts[2] += 1
+                
+                # 计算香农熵
+                total = sum(road_counts)
+                if total > 0:
+                    proportions = [c/total for c in road_counts if c > 0]
+                    entropy = -sum(p * np.log2(p) for p in proportions) if proportions else 0
+                else:
+                    entropy = 0
+                trend_series['012_entropy_trend'].append(entropy)
+
+        # 提取区间分布趋势（使用香农熵）
+        for item in window_data:
+            numbers = item.get('numbers', [])
+            if len(numbers) == self.positions:
+                interval_counts = {'low': 0, 'mid': 0, 'high': 0}
+                for n in numbers:
+                    n_int = int(n)
+                    if n_int in self.intervals['low']:
+                        interval_counts['low'] += 1
+                    elif n_int in self.intervals['mid']:
+                        interval_counts['mid'] += 1
+                    else:
+                        interval_counts['high'] += 1
+                
+                # 计算香农熵
+                total = sum(interval_counts.values())
+                if total > 0:
+                    proportions = [c/total for c in interval_counts.values() if c > 0]
+                    entropy = -sum(p * np.log2(p) for p in proportions) if proportions else 0
+                else:
+                    entropy = 0
+                trend_series['interval_entropy_trend'].append(entropy)
+
+        # 2. 计算趋势之间的关联性
+        trend_associations = {}
+        trend_names = list(trend_series.keys())
+        
+        # 位置趋势之间的关联
+        position_trends = trend_series['position_trends']
+        for pos1_name in position_trends:
+            for pos2_name in position_trends:
+                if pos1_name != pos2_name:
+                    seq1 = position_trends[pos1_name]
+                    seq2 = position_trends[pos2_name]
+                    if len(seq1) > 1 and len(seq2) > 1:
+                        try:
+                            corr = np.corrcoef(seq1, seq2)[0, 1]
+                            if np.isnan(corr):
+                                corr = 0.0
+                        except:
+                            corr = 0.0
+                        trend_associations[f'position_{pos1_name}_{pos2_name}'] = round(corr, 4)
+        
+        # 位置趋势与其他趋势的关联
+        for pos_name in position_trends:
+            pos_seq = position_trends[pos_name]
+            for trend_name in trend_names:
+                if trend_name != 'position_trends':
+                    other_seq = trend_series[trend_name]
+                    if len(pos_seq) > 1 and len(other_seq) > 1:
+                        try:
+                            corr = np.corrcoef(pos_seq, other_seq)[0, 1]
+                            if np.isnan(corr):
+                                corr = 0.0
+                        except:
+                            corr = 0.0
+                        trend_associations[f'position_{pos_name}_{trend_name}'] = round(corr, 4)
+        
+        # 其他趋势之间的关联
+        other_trend_names = [name for name in trend_names if name != 'position_trends']
+        for i in range(len(other_trend_names)):
+            for j in range(i+1, len(other_trend_names)):
+                name_i = other_trend_names[i]
+                name_j = other_trend_names[j]
+                seq_i = trend_series[name_i]
+                seq_j = trend_series[name_j]
+                if len(seq_i) > 1 and len(seq_j) > 1:
+                    try:
+                        corr = np.corrcoef(seq_i, seq_j)[0, 1]
+                        if np.isnan(corr):
+                            corr = 0.0
+                    except:
+                        corr = 0.0
+                    trend_associations[f'{name_i}_{name_j}'] = round(corr, 4)
+
+        # 3. 计算趋势同步性：多个趋势同时转折的程度
+        syncronicity = {}
+        # 为了简化，我们检查趋势方向的一致性
+        trend_directions = {}
+        
+        # 处理位置趋势（字典形式）
+        if 'position_trends' in trend_series:
+            position_trends_dict = trend_series['position_trends']
+            for pos_name, position_series in position_trends_dict.items():
+                if len(position_series) >= 3:
+                    # 计算最近的趋势方向（最近3点的线性趋势）
+                    recent = position_series[-3:] if len(position_series) >= 3 else position_series
+                    if len(recent) >= 2:
+                        x = list(range(len(recent)))
+                        y = recent
+                        try:
+                            slope = np.polyfit(x, y, 1)[0]
+                            if slope > 0.1:
+                                direction = 'up'
+                            elif slope < -0.1:
+                                direction = 'down'
+                            else:
+                                direction = 'stable'
+                        except:
+                            direction = 'stable'
+                    else:
+                        direction = 'stable'
+                    trend_directions[f'position_{pos_name}'] = direction
+                else:
+                    trend_directions[f'position_{pos_name}'] = 'insufficient_data'
+        
+        # 处理其他趋势（列表形式）
+        for name, series in trend_series.items():
+            if name == 'position_trends':
+                continue  # 已经单独处理过
+            if len(series) >= 3:
+                # 计算最近的趋势方向（最近3点的线性趋势）
+                recent = series[-3:] if len(series) >= 3 else series
+                if len(recent) >= 2:
+                    x = list(range(len(recent)))
+                    y = recent
+                    try:
+                        slope = np.polyfit(x, y, 1)[0]
+                        if slope > 0.1:
+                            direction = 'up'
+                        elif slope < -0.1:
+                            direction = 'down'
+                        else:
+                            direction = 'stable'
+                    except:
+                        direction = 'stable'
+                else:
+                    direction = 'stable'
+                trend_directions[name] = direction
+            else:
+                trend_directions[name] = 'insufficient_data'
+        
+        # 计算方向一致性：有多少趋势在同一方向上（不考虑'insufficient_data'）
+        valid_directions = [d for d in trend_directions.values() if d in ['up', 'down', 'stable']]
+        if valid_directions:
+            up_count = valid_directions.count('up')
+            down_count = valid_directions.count('down')
+            stable_count = valid_directions.count('stable')
+            max_same_direction = max(up_count, down_count, stable_count)
+            syncronicity['direction_consistency'] = max_same_direction / len(valid_directions)
+        else:
+            syncronicity['direction_consistency'] = 0.0
+        
+        # 计算趋势强度的一致性（标准化后的斜率绝对值的一致性）
+        trend_strengths = {}
+        
+        # 处理位置趋势强度
+        if 'position_trends' in trend_series:
+            position_trends_dict = trend_series['position_trends']
+            for pos_name, position_series in position_trends_dict.items():
+                if len(position_series) >= 2:
+                    # 计算标准化的趋势强度（斜率的绝对值）
+                    x = list(range(len(position_series)))
+                    y = position_series
+                    try:
+                        slope = np.polyfit(x, y, 1)[0]
+                        # 标准化：除以序列的标准差或均值
+                        scale = np.std(position_series) if np.std(position_series) > 0 else np.mean(position_series) if np.mean(position_series) != 0 else 1
+                        strength = abs(slope) / scale if scale != 0 else 0
+                    except:
+                        strength = 0
+                    trend_strengths[f'position_{pos_name}'] = strength
+                else:
+                    trend_strengths[f'position_{pos_name}'] = 0
+        
+        # 处理其他趋势强度
+        for name, series in trend_series.items():
+            if name == 'position_trends':
+                continue  # 已经单独处理过
+            if len(series) >= 2:
+                # 计算标准化的趋势强度（斜率的绝对值）
+                x = list(range(len(series)))
+                y = series
+                try:
+                    slope = np.polyfit(x, y, 1)[0]
+                    # 标准化：除以序列的标准差或均值
+                    scale = np.std(series) if np.std(series) > 0 else np.mean(series) if np.mean(series) != 0 else 1
+                    strength = abs(slope) / scale if scale != 0 else 0
+                except:
+                    strength = 0
+                trend_strengths[name] = strength
+            else:
+                trend_strengths[name] = 0
+        
+        if trend_strengths:
+            strengths = list(trend_strengths.values())
+            if np.mean(strengths) > 0:
+                strength_cv = np.std(strengths) / np.mean(strengths)
+                syncronicity['strength_consistency'] = 1.0 / (1.0 + strength_cv)  # 一致性得分
+            else:
+                syncronicity['strength_consistency'] = 0.0
+        else:
+            syncronicity['strength_consistency'] = 0.0
+
+        # 准备返回的趋势序列（最近5值）
+        trend_series_recent = {}
+        for name, series in trend_series.items():
+            if name == 'position_trends':
+                # 处理位置趋势字典
+                position_recent = {}
+                for pos_name, position_series in series.items():
+                    if len(position_series) >= 5:
+                        position_recent[pos_name] = position_series[-5:]
+                    else:
+                        position_recent[pos_name] = position_series
+                trend_series_recent[name] = position_recent
+            else:
+                # 处理其他趋势列表
+                if len(series) >= 5:
+                    trend_series_recent[name] = series[-5:]
+                else:
+                    trend_series_recent[name] = series
+        
+        return {
+            'trend_series': trend_series_recent,  # 最近5值
+            'trend_associations': trend_associations,
+            'trend_directions': trend_directions,
+            'syncronicity': syncronicity,
+            'trend_strengths': trend_strengths
+        }
+
     # ==================== 5. 综合特征提取 ====================
 
     def extract_all_features(self, data: List[Dict], windows: List[int] = [5, 10, 20, 50]) -> Dict[str, Any]:
@@ -984,6 +2566,7 @@ class P5Features:
         logger.info('提取时序特征...')
         all_features['sliding_window'] = self.calculate_sliding_window_features(data, windows)
         all_features['trend'] = self.calculate_trend_features(data)
+        all_features['rolling_statistics'] = self.calculate_rolling_statistics_features(data)
 
         # 4. 交叉特征
         logger.info('提取交叉特征...')
@@ -997,6 +2580,39 @@ class P5Features:
         # 4.6. 形态标记特征（v3.70）
         logger.info('提取形态标记特征...')
         all_features['recent_form'] = self.calculate_recent_form_features(data)
+
+        # 4.7. 时序特征
+        logger.info('提取时序特征...')
+        all_features['timing'] = self.calculate_timing_features(data)
+
+        # 4.8. 交互特征
+        logger.info('提取交互特征...')
+        all_features['interaction'] = self.calculate_interaction_features(data)
+        all_features['position_pair'] = self.calculate_position_pair_features(data)
+
+        # 4.9. 状态特征
+        logger.info('提取状态特征...')
+        all_features['state'] = self.calculate_state_features(data)
+
+        # 4.10. 上下文特征
+        logger.info('提取上下文特征...')
+        all_features['contextual'] = self.calculate_contextual_features(data)
+
+        # 4.11. 组合约束交叉特征（v4.0）
+        logger.info('提取组合约束交叉特征...')
+        all_features['constraint_correlation'] = self.calculate_constraint_correlation_features(data)
+
+        # 4.12. 数字特性交叉特征（v4.0）
+        logger.info('提取数字特性交叉特征...')
+        all_features['digit_characteristic'] = self.calculate_digit_characteristic_features(data)
+
+        # 4.13. 频率分布交叉特征（v4.0）
+        logger.info('提取频率分布交叉特征...')
+        all_features['joint_frequency'] = self.calculate_joint_frequency_features(data)
+
+        # 4.14. 趋势关联交叉特征（v4.0）
+        logger.info('提取趋势关联交叉特征...')
+        all_features['trend_association'] = self.calculate_trend_association_features(data)
 
         logger.info('特征提取完成')
         return all_features

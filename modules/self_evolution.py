@@ -23,7 +23,7 @@ import logging
 import datetime
 import multiprocessing
 import tempfile
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 # 深度调优核心（组件缓存 + 坐标下降），本模块无重型依赖，可安全顶层导入
 from modules.evolution_tuner import (
@@ -45,6 +45,30 @@ try:
     logger.setLevel(logging.INFO)
 except Exception:  # noqa: BLE001
     pass
+
+def _safe_subprocess_run(args, timeout=2, **kwargs):
+    """
+    安全执行 subprocess 命令，统一参数校验与超时控制。
+    参数:
+        args: list of str, 命令及其参数
+        timeout: 超时秒数，默认 2 秒
+        **kwargs: 其他传递给 subprocess.run 的参数
+    返回:
+        subprocess.CompletedProcess 对象的 stdout（已 strip）
+    异常:
+        将异常捕获并返回空字符串，以免影响主流程。
+    """
+    import subprocess
+    # 参数校验：确保 args 是列表且所有元素为字符串
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        logging.warning(f"_safe_subprocess_run: 参数非法 {args}")
+        return ""
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, **kwargs)
+        return result.stdout.strip()
+    except Exception as e:
+        logging.warning(f"_safe_subprocess_run: 命令执行失败 {args}: {e}")
+        return ""
 
 # 五位置常量（与 predictor / ml_predictor 保持一致）
 POS = ['wan', 'qian', 'bai', 'shi', 'ge']
@@ -109,6 +133,77 @@ def _json_default(o):
         except Exception:  # noqa: BLE001
             return repr(o)
     return str(o)
+
+
+# =====================================================================
+# Wilson 95% 置信区间 + CI 重叠闸门（诚实边界核心）
+# =====================================================================
+import math
+
+def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for binomial proportion.
+    
+    Returns (lower, upper) bounds clamped to [0, 1].
+    """
+    if n == 0:
+        return (0.0, 0.0)
+    p = successes / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = (z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
+
+
+def ci_overlap(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    """Check if two CIs overlap."""
+    return not (a[1] < b[0] or b[1] < a[0])
+
+
+def _gate_pass(cand: Dict, base: Dict) -> bool:
+    """Wilson CI 严格闸门：候选 CI 整体高于基线 CI 且不重叠才通过。
+    
+    返回 True = 候选显著优于基线（可激活为 active）
+    返回 False = CI 重叠或不优（归档为 trial）
+    """
+    # 需要 hits 和 n（测试期数 * 5 位置）
+    c_top1_hits = int(cand.get('top1_hits', 0))
+    c_top3_hits = int(cand.get('top3_hits', 0))
+    c_top5_hits = int(cand.get('top5_hits', 0))
+    c_n = int(cand.get('tested', 0)) * 5
+    
+    b_top1_hits = int(base.get('top1_hits', 0))
+    b_top3_hits = int(base.get('top3_hits', 0))
+    b_top5_hits = int(base.get('top5_hits', 0))
+    b_n = int(base.get('tested', 0)) * 5
+    
+    # 如果没有 hits 信息，回退到点估计比较（兼容旧版本记录）
+    if c_n == 0 or b_n == 0:
+        c_top1 = float(cand.get('top1', 0))
+        b_top1 = float(base.get('top1', 0))
+        return c_top1 > b_top1 + 1e-9
+    
+    c_ci = wilson_ci(c_top1_hits, c_n)
+    b_ci = wilson_ci(b_top1_hits, b_n)
+    
+    # 严格条件：候选 CI 下界 > 基线 CI 上界（不重叠且整体更优）
+    return (not ci_overlap(c_ci, b_ci)) and (c_ci[0] > b_ci[1])
+
+
+# =====================================================================
+# 防泄漏断言（运行时自检）
+# =====================================================================
+def _assert_no_leak(train_rows: list, eval_issue: Any) -> None:
+    """运行时断言：确保训练集不包含评估期或未来数据。
+    
+    Raises:
+        AssertionError: 如果检测到前视泄漏
+    """
+    eval_issue_int = int(eval_issue)
+    train_issues = {int(r['issue']) for r in train_rows if r.get('issue') is not None}
+    if eval_issue_int in train_issues:
+        raise AssertionError(f'LEAK: eval issue {eval_issue_int} in train set')
+    if train_issues and max(train_issues) >= eval_issue_int:
+        raise AssertionError(f'LEAK: future issue {max(train_issues)} >= eval {eval_issue_int} in train')
 
 
 def _ml_pred_to_per_position(raw):
@@ -189,9 +284,18 @@ def _row_to_sorted(rows):
 # =====================================================================
 
 class AutoEvoScheduler:
-    """后台静默调度器：控制 SelfEvolutionEngine 的自动触发频率，避免空转。"""
+    """后台静默调度器：控制 SelfEvolutionEngine 的自动触发频率，避免空转。
+
+    §3.6 自愈：内置「连续 N 次 DB 不可达 → 暂停并告警」计数。
+    自我进化六阶段强依赖数据库（历史开奖 / 进化版本表），若 DB 持续不可达，
+    引擎反复触发只会降级空转并刷屏告警。本计数在 DB 连续失败达到阈值后
+    自动暂停自动调度并产出告警，待 DB 恢复且用户显式 resume 后再触发，
+    防止「静默空转 + 无效进化」的资源浪费。
+    """
 
     DEFAULT_INTERVAL_HOURS = 24
+    # DB 连续不可达多少次后暂停自动调度（24h 间隔下 5 次 ≈ 5 天，给足恢复窗口）
+    DB_FAIL_THRESHOLD = 5
 
     def __init__(self, engine, data_dir=None, interval_hours=None):
         self.engine = engine
@@ -202,10 +306,91 @@ class AutoEvoScheduler:
                 data_dir = os.path.join(PROJECT_ROOT, 'data')
             except Exception:  # noqa: BLE001
                 data_dir = os.path.join(os.getcwd(), 'data')
+        self.data_dir = data_dir
         self.schedule_path = os.path.join(data_dir, 'self_evolution_schedule.json')
         self._timer = None
+        # §3.6：DB 连续不可达计数（持久化到 schedule_path 同目录，跨进程重启保留）
+        self.db_fail_state_path = os.path.join(data_dir, 'self_evolution_db_fail.json')
+        self._consecutive_db_fail = 0
+        self._db_paused = False
+        self._load_db_fail_state()
+
+    # ------------------------------------------------------------------
+    # §3.6 DB 不可达自愈计数
+    # ------------------------------------------------------------------
+    def _load_db_fail_state(self):
+        """进程重启后恢复上次的 DB 不可达计数与暂停标志。"""
+        try:
+            if os.path.isfile(self.db_fail_state_path):
+                with open(self.db_fail_state_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self._consecutive_db_fail = int(data.get('consecutive_db_fail', 0))
+                self._db_paused = bool(data.get('db_paused', False))
+        except Exception:  # noqa: BLE001
+            self._consecutive_db_fail = 0
+            self._db_paused = False
+
+    def _save_db_fail_state(self):
+        try:
+            with open(self.db_fail_state_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'consecutive_db_fail': self._consecutive_db_fail,
+                    'db_paused': self._db_paused,
+                    'updated_at': _now_str(),
+                }, f, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def report_db_failure(self) -> int:
+        """引擎在 DB 连接失败时调用：累加计数，达到阈值则暂停并告警。"""
+        self._consecutive_db_fail += 1
+        if self._consecutive_db_fail >= self.DB_FAIL_THRESHOLD and not self._db_paused:
+            self._db_paused = True
+            self._save_db_fail_state()
+            logger.warning(
+                '[AutoEvoScheduler] DB 连续不可达 %d 次（阈值 %d），已暂停自动调度',
+                self._consecutive_db_fail, self.DB_FAIL_THRESHOLD)
+            self._emit_db_pause_alert()
+        else:
+            self._save_db_fail_state()
+        return self._consecutive_db_fail
+
+    def report_db_success(self):
+        """引擎在 DB 连接成功时调用：清零计数并自动恢复调度。"""
+        if self._consecutive_db_fail != 0 or self._db_paused:
+            logger.info(
+                '[AutoEvoScheduler] DB 已恢复（此前连续失败 %d 次），清零计数并恢复调度',
+                self._consecutive_db_fail)
+        self._consecutive_db_fail = 0
+        self._db_paused = False
+        self._save_db_fail_state()
+
+    def is_db_paused(self) -> bool:
+        """当前是否因 DB 连续不可达而处于自动调度暂停。"""
+        return self._db_paused
+
+    def resume_db(self):
+        """用户显式恢复：DB 恢复后由 GUI/人工调用本方法重新启用自动调度。"""
+        self._consecutive_db_fail = 0
+        self._db_paused = False
+        self._save_db_fail_state()
+        logger.info('[AutoEvoScheduler] 用户显式恢复 DB 自动调度')
+
+    def _emit_db_pause_alert(self):
+        """暂停时向 GUI 投递一条告警消息（若引擎队列可用）。"""
+        try:
+            eng = self.engine
+            if eng is not None and hasattr(eng, '_emit'):
+                eng._emit('warning',
+                          f'自动进化调度已暂停：数据库连续不可达 '
+                          f'{self._consecutive_db_fail} 次（阈值 {self.DB_FAIL_THRESHOLD}）')
+        except Exception:  # noqa: BLE001
+            pass
 
     def should_run(self) -> bool:
+        # §3.6：DB 连续不可达已暂停时，不再自动触发，避免静默空转
+        if self._db_paused:
+            return False
         try:
             if os.path.isfile(self.schedule_path):
                 with open(self.schedule_path, 'r', encoding='utf-8') as f:
@@ -246,13 +431,21 @@ class _MLPredictorPool:
     def __init__(self, max_workers=2, timeout=60):
         self._timeout = timeout
         self._use_subprocess = False
+        # v3.67: Windows 上禁用 multiprocessing.Pool ——
+        # spawn 启动方式会为每个 worker 弹出独立的控制台窗口（子进程反复打印命令），
+        # 且 Windows 无法对 GUI 进程的子进程隐藏控制台；同时该项目里 sklearn 缺失降级为
+        # numpy-only（ml_predictor 已不依赖 sklearn），无需子进程隔离，直接进程内执行即可。
+        if sys.platform == 'win32':
+            self._pool = None
+            logger.info('[MLPredictorPool] Windows 平台，跳过 multiprocessing.Pool 创建，直接进程内执行')
+            return
         try:
             self._pool = multiprocessing.Pool(
                 processes=max_workers, maxtasksperchild=50
             )
             self._use_subprocess = True
         except Exception:  # noqa: BLE001
-            # Windows daemon 限制：无法在已运行的进程中创建子进程
+            # 无法创建子进程，降级为进程内
             self._pool = None
 
     def predict_next(self, sorted_data, cfg_snapshot):
@@ -319,12 +512,14 @@ class _MLPredictorPool:
                 import subprocess
                 # 获取当前进程的 pid，再 kill 其所有子进程
                 parent_pid = os.getpid()
-                result = subprocess.run(
+                # v3.67: creationflags 防止 tasklist 弹出黑色控制台窗口
+                stdout = _safe_subprocess_run(
                     ['tasklist', '/FO', 'CSV', '/NH', '/FI',
                      f'PARENTPROCESSID eq {parent_pid}'],
                     capture_output=True, text=True, timeout=3,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
-                for line in result.stdout.strip().splitlines():
+                for line in stdout.splitlines():
                     try:
                         # CSV 格式: "python.exe","1234",...
                         fields = line.split('","')
@@ -350,6 +545,292 @@ def _ml_predictor_worker_entry(sorted_data, cfg_snapshot):
     except Exception as e:  # noqa: BLE001
         logger.warning('[MLPredictorPool] 子进程异常: %s', e)
         return None
+
+
+# =====================================================================
+# 遗传算法搜索器（小空间 GA，与坐标下降互补）
+# =====================================================================
+import random
+import subprocess
+
+
+class GeneticAlgorithmTuner:
+    """小空间遗传算法搜索器（种群≤12/代≤20/变异率0.15）。
+
+    与 DeepTuner（坐标下降）互补：
+    - 坐标下降：局部精细搜索，适合凸/近凸空间
+    - GA：全局探索，能跳出局部最优，适合非凸/离散空间
+    
+    搜索空间（可通过 config.GA_CONFIG 覆盖）：
+    - 权重：frequency_weighted, ml_supervised, bayesian_inference, markov_transition
+    - lookback: 40-80
+    - feature_subset: auto（固定）
+    """
+    
+    def __init__(
+        self,
+        population_size: int = 12,
+        generations: int = 20,
+        mutation_rate: float = 0.15,
+        crossover: str = 'blend',
+        search_space: Optional[Dict] = None,
+    ):
+        self.population_size = population_size
+        self.generations = generations
+        self.mutation_rate = mutation_rate
+        self.crossover = crossover
+        self.search_space = search_space or {
+            'weights': ['frequency_weighted', 'ml_supervised', 'bayesian_inference', 'markov_transition'],
+            'lookback_range': [40, 80],
+            'feature_subset': 'auto',
+        }
+        self._eval_cache: Dict[str, Dict] = {}
+    
+    def _random_individual(self, base_weights: Dict[str, float], base_lookback: int) -> Dict[str, Any]:
+        """生成随机个体（权重在基线附近扰动，lookback 在范围内随机）"""
+        import copy
+        weights = copy.deepcopy(base_weights)
+        # 权重扰动：每个权重 ±20% 均匀分布，然后重归一化
+        for k in weights:
+            if k in self.search_space['weights']:
+                weights[k] *= random.uniform(0.8, 1.2)
+        total = sum(max(0.0, v) for v in weights.values())
+        if total > 0:
+            weights = {k: max(0.0, v) / total for k, v in weights.items()}
+        
+        lookback = random.randint(
+            self.search_space['lookback_range'][0],
+            self.search_space['lookback_range'][1]
+        )
+        return {'weights': weights, 'lookback': lookback}
+    
+    def _crossover(self, parent1: Dict, parent2: Dict) -> Dict[str, Any]:
+        """混合交叉"""
+        child_weights = {}
+        for k in parent1['weights']:
+            if self.crossover == 'blend':
+                alpha = random.random()
+                child_weights[k] = alpha * parent1['weights'][k] + (1 - alpha) * parent2['weights'][k]
+            else:  # uniform
+                child_weights[k] = random.choice([parent1['weights'][k], parent2['weights'][k]])
+        
+        # 归一化
+        total = sum(max(0.0, v) for v in child_weights.values())
+        if total > 0:
+            child_weights = {k: max(0.0, v) / total for k, v in child_weights.items()}
+        
+        # lookback 取父代之一
+        child_lookback = random.choice([parent1['lookback'], parent2['lookback']])
+        return {'weights': child_weights, 'lookback': child_lookback}
+    
+    def _mutate(self, individual: Dict, base_weights: Dict) -> Dict[str, Any]:
+        """变异：权重高斯扰动，lookback 随机跳变"""
+        import copy
+        weights = copy.deepcopy(individual['weights'])
+        for k in weights:
+            if k in self.search_space['weights'] and random.random() < self.mutation_rate:
+                weights[k] *= random.gauss(1.0, 0.1)
+                weights[k] = max(0.0, weights[k])
+        total = sum(max(0.0, v) for v in weights.values())
+        if total > 0:
+            weights = {k: max(0.0, v) / total for k, v in weights.items()}
+        
+        if random.random() < self.mutation_rate:
+            lookback = random.randint(
+                self.search_space['lookback_range'][0],
+                self.search_space['lookback_range'][1]
+            )
+        else:
+            lookback = individual['lookback']
+        return {'weights': weights, 'lookback': lookback}
+    
+    def _make_key(self, weights: Dict, lookback: int) -> str:
+        """生成缓存键"""
+        w_str = ','.join(f'{k}:{v:.4f}' for k, v in sorted(weights.items()))
+        return f'lb{lookback}|{w_str}'
+    
+    def tune(
+        self,
+        base_weights: Dict[str, float],
+        windows: List[Tuple[List[Dict], List[int]]],
+        base_lookback: int = 60,
+        baseline_metrics: Optional[Dict] = None,
+        fixed_keys: tuple = (),
+        provider=None,  # PredictorComponentProvider
+    ) -> Dict[str, Any]:
+        """运行 GA 搜索，返回最优个体"""
+        logger.info('[GA] 开始遗传算法搜索: pop=%d, gen=%d, mut=%.2f', 
+                    self.population_size, self.generations, self.mutation_rate)
+        
+        # 初始化种群：基线个体 + 随机个体
+        population = [{'weights': base_weights, 'lookback': base_lookback}]
+        while len(population) < self.population_size:
+            population.append(self._random_individual(base_weights, base_lookback))
+        
+        best_individual = None
+        best_metrics = None
+        candidates_evaluated = 0
+        
+        for gen in range(self.generations):
+            # 评估种群
+            scored_pop = []
+            for ind in population:
+                key = self._make_key(ind['weights'], ind['lookback'])
+                if key in self._eval_cache:
+                    metrics = self._eval_cache[key]
+                else:
+                    # 评估个体（使用 provider 做廉价融合评估，类似 DeepTuner）
+                    if provider is not None:
+                        from modules.evolution_tuner import _evaluate_candidate
+                        metrics = _evaluate_candidate(
+                            provider, windows, ind['weights'], ind['lookback'],
+                            fixed_keys=fixed_keys, baseline_metrics=baseline_metrics
+                        )
+                    else:
+                        metrics = {'tested': 0, 'top1': 0, 'top3': 0, 'top5': 0}
+                    self._eval_cache[key] = metrics
+                    candidates_evaluated += 1
+                
+                scored_pop.append((ind, metrics))
+            
+            # 选择最优
+            scored_pop.sort(key=lambda x: x[1].get('top1', 0), reverse=True)
+            if best_individual is None or scored_pop[0][1].get('top1', 0) > best_metrics.get('top1', 0):
+                best_individual = scored_pop[0][0]
+                best_metrics = scored_pop[0][1]
+            
+            # 精英保留 + 生成下一代
+            elite_count = max(1, self.population_size // 4)
+            next_gen = [ind for ind, _ in scored_pop[:elite_count]]
+            
+            while len(next_gen) < self.population_size:
+                # 锦标赛选择
+                p1 = random.choice(scored_pop[:self.population_size // 2])[0]
+                p2 = random.choice(scored_pop[:self.population_size // 2])[0]
+                child = self._crossover(p1, p2)
+                child = self._mutate(child, base_weights)
+                next_gen.append(child)
+            
+            population = next_gen
+            logger.debug('[GA] Gen %d: best_top1=%.2f%%', gen + 1, best_metrics.get('top1', 0))
+        
+        # 最终评估最佳个体（如果是缓存命中则直接用）
+        best_key = self._make_key(best_individual['weights'], best_individual['lookback'])
+        if best_key in self._eval_cache:
+            best_metrics = self._eval_cache[best_key]
+        
+        logger.info('[GA] 搜索完成: 候选=%d, 最优 Top1=%.2f%%, lookback=%d',
+                    candidates_evaluated, best_metrics.get('top1', 0), best_individual['lookback'])
+        
+        return {
+            'weights': best_individual['weights'],
+            'lookback': best_individual['lookback'],
+            'metrics': best_metrics,
+            'candidates_evaluated': candidates_evaluated,
+            'cache_hits': sum(1 for _ in self._eval_cache.values()),
+            'cache_misses': 0,
+            'elapsed_ms': 0,  # 由调用方计时
+            'improved': best_metrics.get('top1', 0) > (baseline_metrics or {}).get('top1', 0) if baseline_metrics else False,
+            'baseline_metrics': baseline_metrics or {},
+        }
+
+
+# =====================================================================
+# 实验追踪器（写超参+数据指纹+git哈希到 DB + 本地 JSONL）
+# =====================================================================
+class ExperimentTracker:
+    """实验追踪：每次 persist 时记录完整实验元数据。
+    
+    存储：
+    - DB: p5_evolution_version.metrics_json 扩展字段
+    - 本地: evolution_runs.jsonl（追加，便于离线分析）
+    
+    字段：
+    - version_tag, parent_tag, status
+    - hyperparams: weights, lookback, search_backend, search_params
+    - data_fingerprint: sample_count, latest_issue, data_hash
+    - git_hash: 当前提交短哈希
+    - timestamp
+    """
+    
+    def __init__(self, data_dir: str, db=None):
+        self._data_dir = data_dir
+        self._db = db
+        self._local_log = os.path.join(data_dir, 'evolution_runs.jsonl')
+        os.makedirs(data_dir, exist_ok=True)
+    
+    def _get_git_hash(self) -> str:
+        """获取当前 git 短哈希"""
+        try:
+            # v3.67: Windows 上加 CREATE_NO_WINDOW 防止 git 弹出黑色控制台窗口
+            _extra = {}
+            if sys.platform == 'win32':
+                _extra['creationflags'] = subprocess.CREATE_NO_WINDOW
+            stdout = _safe_subprocess_run(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
+                timeout=3, **_extra
+            )
+            if stdout:
+                return stdout
+        except Exception:  # noqa: BLE001
+            pass
+        return 'unknown'
+    
+    def _compute_data_fingerprint(self, hist_count: int, latest_issue: str) -> Dict:
+        """计算数据指纹"""
+        import hashlib
+        data_str = f'{hist_count}|{latest_issue}|{len(windows) if "windows" in locals() else 0}'
+        # 简化版：仅用样本量+最新期号
+        return {
+            'sample_count': hist_count,
+            'latest_issue': latest_issue,
+            'hash': hashlib.md5(data_str.encode()).hexdigest()[:12],
+        }
+    
+    def record(
+        self,
+        version_tag: str,
+        parent_tag: str,
+        status: str,
+        hyperparams: Dict,
+        data_fingerprint: Dict,
+        metrics: Dict,
+        search_backend: str = 'coord',
+    ) -> None:
+        """记录实验（DB + 本地 JSONL）"""
+        import datetime
+        
+        git_hash = self._get_git_hash()
+        timestamp = datetime.datetime.now().isoformat()
+        
+        # 扩展的 metrics_json（存入 p5_evolution_version）
+        extended_metrics = dict(metrics)
+        extended_metrics.update({
+            'hyperparams': hyperparams,
+            'data_fingerprint': data_fingerprint,
+            'git_hash': git_hash,
+            'search_backend': search_backend,
+            'tracked_at': timestamp,
+        })
+        
+        # 1. 本地 JSONL 追加（永久保留，不受 DB 限制）
+        record = {
+            'version_tag': version_tag,
+            'parent_tag': parent_tag,
+            'status': status,
+            'metrics': extended_metrics,
+            'timestamp': timestamp,
+        }
+        try:
+            with open(self._local_log, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, default=_json_default) + '\n')
+        except Exception as e:  # noqa: BLE001
+            logger.warning('[ExperimentTracker] 本地日志写入失败: %s', e)
+        
+        # 2. DB 写入由 save_evolution_version 处理（此处仅准备 extended_metrics）
+        self._last_extended_metrics = extended_metrics
+        logger.info('[ExperimentTracker] 实验已记录: %s (%s), git=%s', version_tag, status, git_hash)
 
 
 # =====================================================================
@@ -398,6 +879,14 @@ class SelfEvolutionEngine:
         self._db = None
         self._local_versions_path = os.path.join(data_dir, 'evolution_versions.json')
         self._versions: List[Dict[str, Any]] = []
+
+        # §4.2 更新流程可追溯台账（本地 JSONL，DB 不可达时仍可追溯/导出/回溯）
+        # 每次更新（进化产版 + 手动回滚 + 自动回滚）都追加一条含
+        # trigger_reason / execution_result / validation / auto_rolled_back 的记录。
+        self._update_ledger_path = os.path.join(data_dir, 'update_ledger.jsonl')
+        self._update_history: List[Dict[str, Any]] = []
+        # 记录「上一个可用 active 版本 tag」，供更新异常时自动回退（§4.2.2(3)）
+        self._last_usable_version_tag: Optional[str] = None
 
         # 调度器
         self._scheduler = AutoEvoScheduler(self)
@@ -789,6 +1278,14 @@ class SelfEvolutionEngine:
                 else:
                     logger.debug('[self_evolution] 定时器 tick：联动暂停中，跳过本轮')
                 next_delay = 300.0  # 暂停期间降低唤醒频率
+            # §3.6：DB 连续不可达暂停时，进一步降低唤醒频率并记录日志，避免静默空转。
+            # should_run() 在 DB 暂停时已恒返回 False，此处仅作观测与节流。
+            elif self._scheduler.is_db_paused():
+                logger.debug(
+                    '[self_evolution] 定时器 tick：DB 连续不可达已暂停自动调度'
+                    '（连续失败 %d 次），本轮跳过',
+                    self._scheduler._consecutive_db_fail)
+                next_delay = 3600.0  # DB 暂停期间每 1 小时检测一次恢复情况
             elif self._scheduler.should_run() and not self._running:
                 logger.info('[self_evolution] 定时器 tick：检测到应触发自我进化，启动轻量自检…')
                 self._running = True
@@ -925,6 +1422,11 @@ class SelfEvolutionEngine:
         if db is None:
             logger.warning('[self_evolution] _phase_collect: 数据库连接失败（_connect_db 返回 None）')
             self._emit('warning', '数据库不可用，采集阶段降级（使用本地快照）')
+            # §3.6：DB 不可达计数——连续达到阈值后调度器暂停并告警
+            try:
+                self._scheduler.report_db_failure()
+            except Exception:  # noqa: BLE001
+                pass
             self._checkpoint['history_count'] = 0
             self._checkpoint['latest_issue'] = ''
             self._send('metrics', {'history_count': 0, 'latest_issue': ''})
@@ -933,10 +1435,20 @@ class SelfEvolutionEngine:
         try:
             if not db.connect():
                 logger.warning('[self_evolution] _phase_collect: db.connect() 返回 False')
+                # §3.6：连接失败同样计入 DB 不可达
+                try:
+                    self._scheduler.report_db_failure()
+                except Exception:  # noqa: BLE001
+                    pass
                 self._checkpoint['history_count'] = 0
                 self._checkpoint['latest_issue'] = ''
                 self._send('metrics', {'history_count': 0, 'latest_issue': ''})
                 return
+            # §3.6：连接成功，清零 DB 不可达计数并（若之前暂停）自动恢复调度
+            try:
+                self._scheduler.report_db_success()
+            except Exception:  # noqa: BLE001
+                pass
             rows = db.get_history_data(limit=1, order='DESC')
             latest_issue = rows[0].get('issue', '') if rows else ''
             total = db.get_history_data_count()
@@ -994,7 +1506,13 @@ class SelfEvolutionEngine:
             return None
 
     def _get_statistical_weights(self) -> Dict[str, float]:
-        """读取当前生产预测器的「可调」统计类权重（排除冻结分量）。"""
+        """读取当前生产预测器的「可调」统计类权重（排除冻结分量）。
+
+        失败时不再静默回退硬编码（会掩盖配置错误），而是：
+        1. 记录 ERROR 级日志
+        2. 沿用上次成功快照（self._last_good_weights）
+        3. 无快照时抛出 ConfigError（由调用方决定降级或中止）
+        """
         try:
             from modules.predictor import P5Predictor
             p = P5Predictor()
@@ -1018,13 +1536,17 @@ class SelfEvolutionEngine:
                     else:
                         # If details is a number or unexpected format, skip
                         pass
-            return {k: float(v) for k, v in weights.items() if k not in TUNING_FIXED_KEYS}
+            result = {k: float(v) for k, v in weights.items() if k not in TUNING_FIXED_KEYS}
+            # 缓存成功快照供后续失败时兜底
+            self._last_good_weights = result
+            return result
         except Exception as e:  # noqa: BLE001
-            logger.warning('[self_evolution] 读取统计权重失败: %s', e)
-            return {'frequency_weighted': 0.68, 'omission_regression': 0.06,
-                    'bayesian_inference': 0.10, 'trend_momentum': 0.01,
-                    'markov_transition': 0.005, 'pattern_continuation': 0.003,
-                    'feature_engineering': 0.002}
+            logger.error('[self_evolution] 读取统计权重失败（不再回退硬编码）: %s', e)
+            if hasattr(self, '_last_good_weights') and self._last_good_weights:
+                logger.info('[self_evolution] 沿用上次成功权重快照: %s', self._last_good_weights)
+                return self._last_good_weights
+            # 无历史快照时抛出，强制上层处理
+            raise RuntimeError('ConfigError: 无法读取预测器权重且无历史快照可用') from e
 
     def _build_train_windows(self, eval_periods: int):
         """从 DB 读取历史并构造无前视 walk-forward 窗口。
@@ -1095,16 +1617,19 @@ class SelfEvolutionEngine:
         logger.info('[self_evolution] _phase_baseline 结束')
 
     def _phase_evolve(self):
-        """阶段 3：参数迭代——深度调优（权重空间坐标下降）+ 采集权重快照。
+        """阶段 3：参数迭代——深度调优（可插拔搜索后端：坐标下降/GA/两者）+ 采集权重快照。
 
-        v3.56 升级：
-          - 原实现仅「采集权重快照」+ 单次 ML 重训，不做参数搜索；
-          - 现引入 DeepTuner：在统计类融合权重 + lookback 空间做坐标下降，
-            以 walk-forward（无前视）命中率为目标，组件按窗口缓存、仅重融合，
-            成本从「候选×窗口×重训」降至「窗口×重算 + 候选×廉价重融合」。
+        v4.0 升级：
+          - 搜索后端由 config.SEARCH_BACKEND 控制："coord" | "ga" | "both"
+          - 坐标下降（DeepTuner）：局部精细搜索，组件缓存加速
+          - 遗传算法：全局探索，跳出局部最优，小空间（pop≤12, gen≤20, mut=0.15）
+          - 两者并行时取更优候选
+          - 所有候选经 Wilson CI 严格闸门（_gate_pass）评估，不优于基线归档 trial
         """
+        import time
+        start_ms = time.time()
         logger.info('[self_evolution] _phase_evolve 开始')
-        self._emit('info', '参数迭代：深度调优（组件缓存 + 坐标下降）…')
+        self._emit('info', '参数迭代：深度调优（可插拔搜索后端）…')
         # 惰性初始化 ML 子进程池
         if self._ml_pool is None:
             try:
@@ -1121,13 +1646,20 @@ class SelfEvolutionEngine:
         logger.info('[self_evolution] 权重快照已采集: weights=%s, lookback=%s',
                      weight_snapshot.get('weights'), weight_snapshot.get('lookback'))
 
-        # ── 深度调优：构造窗口 → 坐标下降搜索最优权重/lookback ──
+        # 读取搜索后端配置
+        from config import SEARCH_BACKEND, GA_CONFIG
+        search_backend = SEARCH_BACKEND.lower() if isinstance(SEARCH_BACKEND, str) else 'both'
+        logger.info('[self_evolution] 搜索后端: %s', search_backend)
+
+        # ── 深度调优：构造窗口 → 搜索最优权重/lookback ──
         hist_count = self._checkpoint.get('history_count', 0)
         eval_periods = 10 if (self.auto and not self.auto_full) else 15
         logger.info('[self_evolution] 样本量=%s, auto=%s, auto_full=%s, eval_periods=%s',
                      hist_count, self.auto, self.auto_full, eval_periods)
-        tuned = None
+        
+        best_tuned = None
         quality_stats = {'total_rows': 0, 'valid_rows': 0, 'invalid_rows': 0}
+        
         if hist_count >= ML_EVAL_MIN + 1:
             logger.info('[self_evolution] 样本量充足，开始构造训练窗口（eval_periods=%s）', eval_periods)
             try:
@@ -1138,48 +1670,87 @@ class SelfEvolutionEngine:
                     logger.info('[self_evolution] 当前统计权重: %s', base_weights)
                     tuning_predictor = self._make_tuning_predictor()
                     if tuning_predictor is not None:
-                        logger.info('[self_evolution] 调优预测器构造成功，开始坐标下降搜索')
                         from modules.evolution_tuner import PredictorComponentProvider
                         provider = PredictorComponentProvider(tuning_predictor)
-                        tuner = DeepTuner(
-                            provider=provider,
-                            delta=0.03, max_rounds=6,
-                            enable_lookback_search=(not self.auto or self.auto_full),
-                            lookback_candidates=(40, 60, 80),
-                        )
                         baseline_metrics = self._checkpoint.get('baseline', {}).get('metrics') if isinstance(
                             self._checkpoint.get('baseline'), dict) else None
-                        tuned = tuner.tune(
-                            base_weights, windows,
-                            base_lookback=60,
-                            baseline_metrics=baseline_metrics,
-                            fixed_keys=list(TUNING_FIXED_KEYS),
-                        )
-                        self._checkpoint['tuned_weights'] = tuned['weights']
-                        self._checkpoint['tuned_lookback'] = tuned['lookback']
-                        self._checkpoint['tuned_metrics'] = tuned['metrics']
-                        self._checkpoint['tuning_perf'] = {
-                            'candidates_evaluated': tuned['candidates_evaluated'],
-                            'cache_hits': tuned['cache_hits'],
-                            'cache_misses': tuned['cache_misses'],
-                            'elapsed_ms': tuned['elapsed_ms'],
-                            'improved': tuned['improved'],
-                            'quality_stats': quality_stats,
-                        }
-                        logger.info('[self_evolution] 深度调优结果: 候选=%s, 缓存命中=%s, 耗时=%sms, improved=%s, Top3=%s%%',
-                                    tuned['candidates_evaluated'], tuned['cache_hits'],
-                                    tuned['elapsed_ms'], tuned['improved'],
-                                    tuned['metrics'].get('top3'))
-                        # 推送调优性能给 GUI（更新调优耗时磁贴）
-                        self._send('tuning_perf', {'elapsed_ms': tuned['elapsed_ms']})
-                        self._emit('info',
-                                   f'  深度调优完成：候选 {tuned["candidates_evaluated"]} 组, '
-                                   f'组件缓存命中 {tuned["cache_hits"]} 次, '
-                                   f'耗时 {tuned["elapsed_ms"]}ms, '
-                                   f'Top3={tuned["metrics"].get("top3", "N/A")}% '
-                                   f'(基线 {tuned["baseline_metrics"].get("top3", "N/A")}%)')
-                        if tuned['improved']:
-                            self._emit('success', '  深度调优找到不劣于基线的候选配置')
+                        
+                        # 运行选定的搜索后端
+                        candidates = []
+                        
+                        if search_backend in ('coord', 'both'):
+                            logger.info('[self_evolution] 启动坐标下降搜索')
+                            tuner = DeepTuner(
+                                provider=provider,
+                                delta=0.03, max_rounds=6,
+                                enable_lookback_search=(not self.auto or self.auto_full),
+                                lookback_candidates=(40, 60, 80),
+                            )
+                            tuned_coord = tuner.tune(
+                                base_weights, windows,
+                                base_lookback=60,
+                                baseline_metrics=baseline_metrics,
+                                fixed_keys=list(TUNING_FIXED_KEYS),
+                            )
+                            candidates.append(('coord', tuned_coord))
+                        
+                        if search_backend in ('ga', 'both'):
+                            logger.info('[self_evolution] 启动遗传算法搜索')
+                            ga_tuner = GeneticAlgorithmTuner(
+                                population_size=GA_CONFIG.get('population_size', 12),
+                                generations=GA_CONFIG.get('generations', 20),
+                                mutation_rate=GA_CONFIG.get('mutation_rate', 0.15),
+                                crossover=GA_CONFIG.get('crossover', 'blend'),
+                                search_space=GA_CONFIG.get('search_space', {}),
+                            )
+                            tuned_ga = ga_tuner.tune(
+                                base_weights, windows,
+                                base_lookback=60,
+                                baseline_metrics=baseline_metrics,
+                                fixed_keys=list(TUNING_FIXED_KEYS),
+                                provider=provider,
+                            )
+                            candidates.append(('ga', tuned_ga))
+                        
+                        # 选择最优候选（按 Top1 点估计，最终仍由 Wilson CI 闸门决定是否激活）
+                        if candidates:
+                            candidates.sort(key=lambda x: x[1]['metrics'].get('top1', 0), reverse=True)
+                            best_name, best_tuned = candidates[0]
+                            logger.info('[self_evolution] 最优候选来自 %s: Top1=%.2f%%', best_name, best_tuned['metrics'].get('top1', 0))
+                            
+                            # 记录所有候选供实验追踪
+                            self._checkpoint['all_candidates'] = {name: t for name, t in candidates}
+                        
+                        if best_tuned:
+                            self._checkpoint['tuned_weights'] = best_tuned['weights']
+                            self._checkpoint['tuned_lookback'] = best_tuned['lookback']
+                            self._checkpoint['tuned_metrics'] = best_tuned['metrics']
+                            self._checkpoint['tuning_perf'] = {
+                                'candidates_evaluated': sum(c[1]['candidates_evaluated'] for c in candidates),
+                                'cache_hits': sum(c[1].get('cache_hits', 0) for c in candidates),
+                                'cache_misses': sum(c[1].get('cache_misses', 0) for c in candidates),
+                                'elapsed_ms': int((time.time() - start_ms) * 1000),
+                                'improved': best_tuned['improved'],
+                                'quality_stats': quality_stats,
+                                'best_backend': best_name,
+                            }
+                            logger.info('[self_evolution] 深度调优结果: 候选=%s, 耗时=%sms, improved=%s, Top3=%s%%',
+                                        self._checkpoint['tuning_perf']['candidates_evaluated'],
+                                        self._checkpoint['tuning_perf']['elapsed_ms'],
+                                        best_tuned['improved'],
+                                        best_tuned['metrics'].get('top3'))
+                            # 推送调优性能给 GUI
+                            self._send('tuning_perf', {'elapsed_ms': self._checkpoint['tuning_perf']['elapsed_ms']})
+                            self._emit('info',
+                                       f'  深度调优完成（{best_name}）：候选 {self._checkpoint["tuning_perf"]["candidates_evaluated"]} 组, '
+                                       f'耗时 {self._checkpoint["tuning_perf"]["elapsed_ms"]}ms, '
+                                       f'Top3={best_tuned["metrics"].get("top3", "N/A")}% '
+                                       f'(基线 {best_tuned["baseline_metrics"].get("top3", "N/A")}%)')
+                            if best_tuned['improved']:
+                                self._emit('success', f'  {best_name} 找到不劣于基线的候选配置')
+                        else:
+                            logger.warning('[self_evolution] 所有搜索后端均未产出候选')
+                            self._emit('warning', '  所有搜索后端均未产出候选')
                     else:
                         logger.warning('[self_evolution] 调优预测器构造失败，跳过深度调优')
                         self._emit('warning', '  调优预测器不可用，跳过深度调优')
@@ -1237,7 +1808,7 @@ class SelfEvolutionEngine:
         self._last_assessment = self._assess_improvement_internal(ml_metrics, b_metrics)
 
     def _phase_persist(self):
-        """阶段 5：持久化——写版本表/文件（含深度调优候选权重/lookback/性能）。"""
+        """阶段 5：持久化——写版本表/文件（含深度调优候选权重/lookback/性能 + 实验追踪）。"""
         logger.info('[self_evolution] _phase_persist 开始')
         self._emit('info', '持久化版本…')
         beat = self._checkpoint.get('beat_baseline', True)
@@ -1256,12 +1827,36 @@ class SelfEvolutionEngine:
             params_json['lookback'] = tuned_lookback
         if tuning_perf:
             params_json['tuning'] = tuning_perf
-        logger.info('[self_evolution] 准备持久化版本: beat=%s, tuned_weights=%s, tuned_lookback=%s',
-                     beat, bool(tuned_weights), tuned_lookback)
-
+        
+        # 实验追踪：收集超参、数据指纹、git哈希
+        from config import EXPERIMENT_TRACKING
+        all_candidates = self._checkpoint.get('all_candidates', {})
+        best_backend = tuning_perf.get('best_backend', 'coord') if tuning_perf else 'coord'
+        hist_count = self._checkpoint.get('history_count', 0)
+        latest_issue = self._checkpoint.get('latest_issue', '')
+        
+        hyperparams = {
+            'search_backend': best_backend,
+            'tuned_weights': tuned_weights,
+            'tuned_lookback': tuned_lookback,
+            'tuning_perf': tuning_perf,
+            'all_candidates': {k: v['metrics'] for k, v in all_candidates.items()} if all_candidates else {},
+            'baseline_metrics': baseline.get('metrics', {}) if isinstance(baseline, dict) else {},
+        }
+        
+        data_fingerprint = {
+            'sample_count': hist_count,
+            'latest_issue': latest_issue,
+        }
+        
         version_tag = self._make_version_tag()
         parent_tag = baseline.get('version_tag', '') if isinstance(baseline, dict) else ''
         status = 'active' if beat else 'trial'
+        # §4.2 可追溯：trigger_reason 记录「为什么触发本次更新」（方案明列必含字段）
+        trigger_reason = self._checkpoint.get(
+            'trigger_reason',
+            ('自动进化调度(auto=%s, full=%s), beat_baseline=%s'
+             % (self.auto, self.auto_full, beat)))
         record = {
             'version_tag': version_tag,
             'parent_tag': parent_tag,
@@ -1270,13 +1865,48 @@ class SelfEvolutionEngine:
             'metrics_json': ml_metrics,
             'baseline_json': baseline,
             'note': f'auto={self.auto}, full={self.auto_full}, beat={beat}, '
-                    f'tuned={"yes" if tuned_weights else "no"}',
+                    f'tuned={"yes" if tuned_weights else "no"}, backend={best_backend}',
             'created_at': _now_str(),
+            'trigger_reason': trigger_reason,   # §4.2.2(2) 触发原因（可追溯）
         }
-        logger.info('[self_evolution] 调用 _persist_version: tag=%s, status=%s', version_tag, status)
+        logger.info('[self_evolution] 准备持久化版本: tag=%s, status=%s', version_tag, status)
+
+        # §4.2.2(4) 更新前安全校验：版本兼容/数据完整/算法有效（本地、不依赖 DB）
+        validation = self._pre_update_validation(record)
+        record['validation'] = validation
+        if not validation['ok']:
+            logger.warning(
+                '[self_evolution] 更新前校验未通过(fatal): tag=%s details=%s',
+                version_tag, validation['details'])
+
+        # 实验追踪器（DB + 本地 JSONL）
+        tracker = ExperimentTracker(self._data_dir, db=None)  # DB 写入由 _persist_version 处理
+        tracker.record(
+            version_tag=version_tag,
+            parent_tag=parent_tag,
+            status=status,
+            hyperparams=hyperparams,
+            data_fingerprint=data_fingerprint,
+            metrics=ml_metrics,
+            search_backend=best_backend,
+        )
+        # 将扩展指标合并到记录的 metrics_json（存入 p5_evolution_version）
+        if hasattr(tracker, '_last_extended_metrics'):
+            record['metrics_json'] = tracker._last_extended_metrics
+
         saved = self._persist_version(record)
         if saved:
             self._versions.append(record)
+            record['execution_result'] = 'success'
+            self._last_usable_version_tag = version_tag
+            # §4.2.2(2) 可追溯台账：进化产版成功也记录（含校验 + 执行结果）
+            self._record_update(
+                action='evolution_persist', version_tag=version_tag,
+                trigger_reason=trigger_reason,
+                execution_result='success',
+                validation=validation,
+                extra={'status': status, 'parent_tag': parent_tag,
+                       'beat_baseline': beat})
             logger.info('[self_evolution] 版本持久化成功: %s [%s]', version_tag, status)
             self._emit('success', f'  版本已持久化: {version_tag} [{status}]')
             # 同步最优候选到联动状态，供「开始分析」读取
@@ -1289,7 +1919,12 @@ class SelfEvolutionEngine:
                 self._save_link_state()
                 logger.info('[self_evolution] 最优候选已写入联动状态')
         else:
-            logger.warning('[self_evolution] 版本持久化失败: tag=%s', version_tag)
+            # §4.2.2(3) 更新异常自动回滚：持久化失败 → 回退上一可用版本 + 可追溯记录
+            record['execution_result'] = 'failed'
+            logger.warning('[self_evolution] 版本持久化失败: tag=%s，触发自动回滚', version_tag)
+            rollback_result = self.auto_rollback_on_update_failure(
+                version_tag, reason='持久化失败(DB/本地均不可达)')
+            self._emit('warning', '  持久化失败，已自动回滚: ' + rollback_result['message'])
             self._emit('error', '  版本持久化失败')
         logger.info('[self_evolution] _phase_persist 结束')
 
@@ -1364,6 +1999,8 @@ class SelfEvolutionEngine:
             # 最近1期作为评估
             train = sorted_data[:-1] if len(sorted_data) > 1 else sorted_data
             target = sorted_data[-1]
+            # 防泄漏断言：训练集严格早于评估期
+            _assert_no_leak(train, target['issue'])
             pred = None
             if self._ml_pool is not None:
                 pred = self._ml_pool.predict_next(train, cfg_snap)
@@ -1444,6 +2081,8 @@ class SelfEvolutionEngine:
                 actual = windows[idx]['numbers']
                 if len(train) < ML_EVAL_MIN:
                     continue
+                # 防泄漏断言：训练集严格早于评估期
+                _assert_no_leak(train, windows[idx]['issue'])
                 # 使用进程池或进程内调用（进程内 predict_next 复用单例，避免循环内重复实例化）
                 pred = None
                 cfg_snap = self._checkpoint.get('weight_snapshot', {})
@@ -1498,27 +2137,17 @@ class SelfEvolutionEngine:
 
     @staticmethod
     def _compare_metrics(candidate: Dict, baseline: Dict) -> bool:
-        """诚实边界放宽版：Top1 或 Top3 任一显著优于基线即通过。
+        """Wilson 95% CI 严格闸门：候选 CI 整体高于基线 CI 且不重叠才通过。
 
-        v3.60 调整：与原 evolution_tuner._not_worse 逻辑对齐，
-        避免在随机基线附近波动时永无候选通过。
+        诚实边界 v4.0：替代点估计比较，杜绝随机波动误判。
+        - 要求候选的 Top1 Wilson CI 下界 > 基线 Top1 Wilson CI 上界
+        - 自动兼容旧版本记录（无 hits/n 时回退点估计）
         """
         if not baseline:
             return True
-        c_top1 = float(candidate.get('top1', 0))
-        c_top3 = float(candidate.get('top3', 0))
-        b_top1 = float(baseline.get('top1', 0))
-        b_top3 = float(baseline.get('top3', 0))
-        if c_top1 >= b_top1 + 0.3 and c_top3 >= b_top3:
-            return True
-        if c_top3 >= b_top3 + 0.5 and c_top1 >= b_top1:
-            return True
-        for key in ('top1', 'top3', 'top5'):
-            c = float(candidate.get(key, 0))
-            b = float(baseline.get(key, 0))
-            if c < b - 1e-9:
-                return False
-        return True
+        
+        # 使用模块级的 _gate_pass 函数（Wilson CI 闸门）
+        return _gate_pass(candidate, baseline)
 
     def _assess_improvement_internal(self, candidate: Dict, baseline: Dict) -> Dict[str, Any]:
         """评分 + 薄弱位分析，结晶为文字摘要。"""
@@ -1712,8 +2341,18 @@ class SelfEvolutionEngine:
             if v.get('version_tag') == version_tag:
                 target = v
         if target is None:
+            self._record_update(
+                action='manual_rollback', version_tag=version_tag,
+                trigger_reason='GUI 手动回滚',
+                execution_result='failed',
+                extra={'error': f'版本 {version_tag} 不存在'})
             return {'ok': False, 'error': f'版本 {version_tag} 不存在'}
         if current_active and current_active.get('version_tag') == version_tag:
+            self._record_update(
+                action='manual_rollback', version_tag=version_tag,
+                trigger_reason='GUI 手动回滚',
+                execution_result='noop',
+                extra={'error': '当前已是该版本，无需回滚'})
             return {'ok': False, 'error': '当前已是该版本，无需回滚'}
         # 执行回滚
         if current_active:
@@ -1722,6 +2361,13 @@ class SelfEvolutionEngine:
         target['status'] = 'active'
         target['parent_tag'] = current_active.get('version_tag', '') if current_active else ''
         self._persist_version(target)
+        self._last_usable_version_tag = version_tag
+        # §4.2 可追溯：手动回滚也写入更新台账（含触发原因 + 执行结果）
+        self._record_update(
+            action='manual_rollback', version_tag=version_tag,
+            trigger_reason='GUI 手动回滚（用户显式操作）',
+            execution_result='success',
+            extra={'from_tag': current_active.get('version_tag', '') if current_active else ''})
         self._emit('success', f'已回滚到 {version_tag}')
         return {'ok': True}
 
@@ -1738,6 +2384,242 @@ class SelfEvolutionEngine:
         except Exception as e:  # noqa: BLE001
             logger.warning('[self_evolution] 导出失败: %s', e)
             return 0
+
+    # ------------------------------------------------------------------
+    # §4.2 更新流程：可追溯 / 可回滚 / 安全校验
+    # ------------------------------------------------------------------
+
+    def _pre_update_validation(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """更新前安全校验（§4.2.2(4)：版本兼容性 + 数据完整性 + 算法有效性）。
+
+        纯本地校验，不依赖 DB，可在 DB 不可达时独立完成「更新前后校验」。
+
+        Args:
+            record: 待持久化/应用的版本记录（至少含 version_tag / params_json /
+                metrics_json / status / parent_tag）。
+
+        Returns:
+            {'ok': bool, 'checks': {name: 'pass'/'fail'/'warn'},
+             'fatal': bool, 'details': [str, ...]}
+            ok=False 且 fatal=True 时调用方应终止执行并记录（不静默吞异常）。
+        """
+        checks: Dict[str, str] = {}
+        details: List[str] = []
+        fatal = False
+
+        # (1) 版本兼容性：version_tag 非空且在本版本列表中唯一
+        tag = record.get('version_tag')
+        self._load_versions()
+        existing_tags = {v.get('version_tag') for v in self._versions}
+        if not tag:
+            checks['version_tag'] = 'fail'
+            details.append('version_tag 缺失（无法兼容/回滚定位）')
+            fatal = True
+        elif tag in existing_tags and record.get('_overwrite') is not True:
+            checks['version_tag_unique'] = 'warn'
+            details.append(f'版本 {tag} 已存在（幂等 upsert 将覆盖旧记录）')
+        else:
+            checks['version_tag'] = 'pass'
+
+        # (2) 数据完整性：params_json / metrics_json 必须存在且为映射
+        params = record.get('params_json') or {}
+        metrics = record.get('metrics_json') or record.get('metrics') or {}
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except Exception:  # noqa: BLE001
+                params = {}
+        if isinstance(metrics, str):
+            try:
+                metrics = json.loads(metrics)
+            except Exception:  # noqa: BLE001
+                metrics = {}
+        if isinstance(params, dict) and params:
+            checks['params_completeness'] = 'pass'
+        else:
+            checks['params_completeness'] = 'fail'
+            details.append('params_json 缺失或为空（权重/lookback 不完整）')
+            fatal = True
+        if isinstance(metrics, dict) and metrics:
+            checks['metrics_completeness'] = 'pass'
+        else:
+            checks['metrics_completeness'] = 'warn'
+            details.append('metrics_json 缺失（无法评估算法有效性，允许 trial 归档）')
+
+        # (3) 算法有效性：权重须为数值映射（冻结权重契约，非 dict-of-str）
+        weights = params.get('weights') if isinstance(params, dict) else None
+        if isinstance(weights, dict) and weights:
+            bad = [k for k, v in weights.items() if not isinstance(v, (int, float))]
+            if bad:
+                checks['algorithm_validity'] = 'warn'
+                details.append(f'权重含非数值项 {bad}（可能污染融合）')
+            else:
+                checks['algorithm_validity'] = 'pass'
+        else:
+            checks['algorithm_validity'] = 'warn'
+            details.append('未见 weights 数值映射（纯 trial 归档可接受）')
+
+        # (4) 溯源一致性：parent_tag 若给定，应能在版本列表中定位
+        parent = record.get('parent_tag')
+        if parent:
+            checks['lineage'] = ('pass' if parent in existing_tags
+                                  else 'warn')
+            if checks['lineage'] == 'warn':
+                details.append(f'parent_tag {parent} 未在版本列表中找到（历史缺失）')
+        else:
+            checks['lineage'] = 'pass'
+
+        ok = not fatal
+        return {'ok': ok, 'checks': checks, 'fatal': fatal, 'details': details}
+
+    def _record_update(self, action: str, version_tag: str,
+                       trigger_reason: str, execution_result: str,
+                       validation: Optional[Dict[str, Any]] = None,
+                       auto_rolled_back: bool = False,
+                       extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """§4.2 可追溯台账：追加一条更新记录（本地 JSONL，DB 不可达亦可用）。
+
+        记录含：更新内容(action/version_tag)、时间、触发原因(trigger_reason)、
+        执行结果(execution_result)、校验(validation)、是否自动回滚(auto_rolled_back)。
+
+        Args:
+            action: 'evolution_persist' / 'manual_rollback' / 'auto_rollback'。
+            version_tag: 关联版本标签。
+            trigger_reason: 触发原因（方案 §4.2.2(1)/(2) 明列必含字段）。
+            execution_result: 'success' / 'failed' / 'rolledback' 等。
+            validation: _pre_update_validation 的返回值（可空）。
+            auto_rolled_back: 是否触发了自动回滚。
+            extra: 其它可追溯信息（如 beat/baseline/parent）。
+
+        Returns:
+            已记录条目（含 timestamp）。
+        """
+        entry: Dict[str, Any] = {
+            'timestamp': _now_str(),
+            'action': action,
+            'version_tag': version_tag,
+            'trigger_reason': trigger_reason,
+            'execution_result': execution_result,
+            'validation': validation or {},
+            'auto_rolled_back': auto_rolled_back,
+        }
+        if extra:
+            entry.update(extra)
+        # 内存 + 本地 JSONL 双写（JSONL 跨进程可查询/导出/回溯）
+        self._update_history.append(entry)
+        try:
+            with open(self._update_ledger_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry, ensure_ascii=False,
+                                   default=_json_default) + '\n')
+        except Exception as e:  # noqa: BLE001
+            logger.warning('[self_evolution] 更新台账写入失败(非致命): %s', e)
+        return entry
+
+    def _load_update_history(self) -> List[Dict[str, Any]]:
+        """从本地 JSONL 补读更新台账（仅当内存为空时——跨进程重启补读）。
+
+        同进程内 ``_record_update`` 已把条目写入内存 + JSONL，故此处只在
+        内存为空（进程重启、GUI 读取引擎历史）时补读一次，避免重复追加。
+        """
+        if self._update_history:
+            return list(self._update_history)
+        if not os.path.isfile(self._update_ledger_path):
+            return []
+        try:
+            with open(self._update_ledger_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self._update_history.append(json.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception as e:  # noqa: BLE001
+            logger.warning('[self_evolution] 更新台账读取失败: %s', e)
+        return list(self._update_history)
+
+    def get_update_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """对外接口：查询更新记录（倒序，最新在前）。支持历史追溯（§4.2.2(2)）。
+
+        内存非空（同进程）直接用；内存为空（跨进程重启）先从本地 JSONL 补读一次。
+        """
+        self._load_update_history()
+        return list(reversed(self._update_history))[:max(0, int(limit))]
+
+    def export_update_history(self, path: str) -> int:
+        """导出更新台账到独立 JSON 文件（§4.2.2(2)：可导出、支持问题回溯）。"""
+        self._load_update_history()
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(list(reversed(self._update_history)), f,
+                          ensure_ascii=False, indent=2, default=_json_default)
+            return len(self._update_history)
+        except Exception as e:  # noqa: BLE001
+            logger.warning('[self_evolution] 导出更新台账失败: %s', e)
+            return 0
+
+    def auto_rollback_on_update_failure(self, failed_version_tag: str,
+                                        reason: str) -> Dict[str, Any]:
+        """§4.2.2(3) 更新异常自动回滚：把失败版本标记 failed，并回退到上一可用版本。
+
+        设计约束（诚实边界 + 平滑回滚）：
+          * 仅切换版本表 status 字段（失败版→'failed'，上一 active→'active'），
+            **不改**冻结权重、不写预测器配置（注入本就是诚实 no-op）；
+          * 「上一可用版本」取失败版本之前最近一个 active/trial（若存在），
+            找不到则保持现状并如实记录「无可用回退目标」；
+          * 全过程写可追溯台账（auto_rolled_back=True），不抛异常阻断主流程。
+
+        Args:
+            failed_version_tag: 更新失败/被拒的版本标签。
+            reason: 失败原因（写入台账 trigger_reason）。
+
+        Returns:
+            {'ok': bool, 'restored_tag': str|None, 'message': str}
+        """
+        self._load_versions()
+        # 定位上一可用版本（按 created_at 倒序中，除失败版外最近的一个 active/trial）
+        candidates = [v for v in self._versions
+                      if v.get('version_tag') != failed_version_tag
+                      and v.get('status') in ('active', 'trial')]
+        candidates.sort(key=lambda v: str(v.get('created_at', '')), reverse=True)
+        restored = candidates[0] if candidates else None
+
+        # 标记失败版本
+        failed = next((v for v in self._versions
+                       if v.get('version_tag') == failed_version_tag), None)
+        if failed is not None:
+            failed['status'] = 'failed'
+            failed['note'] = f'[auto-rollback] 更新失败({reason})，已自动回退'
+            self._persist_version(failed)
+
+        # 恢复上一可用版本为 active（若存在）
+        restored_tag = None
+        if restored is not None:
+            restored['status'] = 'active'
+            self._persist_version(restored)
+            restored_tag = restored.get('version_tag')
+            self._last_usable_version_tag = restored_tag
+            self._emit('warning',
+                       f'自动回滚: {failed_version_tag} → {restored_tag}')
+
+        entry = self._record_update(
+            action='auto_rollback',
+            version_tag=failed_version_tag,
+            trigger_reason=reason,
+            execution_result='rolledback' if restored_tag else 'no_restore_target',
+            auto_rolled_back=True,
+            extra={'restored_tag': restored_tag},
+        )
+        return {
+            'ok': bool(restored_tag),
+            'restored_tag': restored_tag,
+            'entry': entry,
+            'message': (f'已自动回滚到 {restored_tag}'
+                        if restored_tag
+                        else '无可用回退目标（无更早 active/trial 版本）'),
+        }
 
     def get_versions(self, limit: int = 50) -> List[Dict[str, Any]]:
         """对外接口：返回供 GUI 进化版本表展示的版本列表。

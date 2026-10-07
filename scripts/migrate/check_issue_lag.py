@@ -133,8 +133,9 @@ if __name__ == '__main__':
         if row:
             expected = str(int(row[0]) + 1)
             suggest_next_action(expected)
-    except:
-        pass
+    except Exception as e:
+        # 数据库不可达/期号同步检查失败属预期容错（离线脚本），静默跳过
+        print(f"⚠ 期号同步检查跳过（DB 异常: {e}）")
 
     print("=" * 70)
     if success:

@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
 from paths import LOGS_DIR
+from config import DATA_WINDOW_PERIOD
 
 # 版本号从 version.py 统一获取
 try:
@@ -795,13 +796,17 @@ class Pipeline:
         return result
 
     # ================================================================
-    # 步骤2: 走势图数据分析与AI预测
+    # 步骤2: 走势图数据分析与AI预测 (DEPRECATED v3.15+)
     # ================================================================
 
+    # ⚠ DEPRECATED (v4.0 §1.8/§4.1)：原 step1-3 报告链路已停用，本方法在
+    # execute_pipeline 中的调用点已注释（L4764/L4768），零活跃调用方。
+    # 保留方法体存档以兼容潜在外部脚本引用；下版物理删除。新预测一律走
+    # 两步流水线 _calc_statistical_prediction → step4_final_prediction。
     def step2_trend_analysis(self, target_issue: str, data_limit: int = 60) -> Dict[str, Any]:
         """
-        步骤2: 走势图数据分析与AI预测
-        
+        步骤2: 走势图数据分析与AI预测【DEPRECATED：v4.0 已停用，调用点注释，下版删除】
+
         完整流程:
         1. 获取最近30-60期走势图数据(基础+万千百十个位)
         2. 整合后调用AI分析走势规律并生成预测报告
@@ -821,6 +826,10 @@ class Pipeline:
             
         Returns:
             {success, report_key, report_data, trend_chart_report, error}
+        
+        Deprecated:
+            v3.15 起已在 execute_pipeline 中注释停用，pipeline_state 中 trend_report 恒为 None。
+            v4.0 计划物理删除。请勿在新代码中调用。
         """
         logger.info('=' * 80)
         logger.info('【步骤2】开始：走势图数据分析与AI预测')
@@ -1120,12 +1129,16 @@ class Pipeline:
         return result
 
     # ================================================================
-    # 步骤3: 专家报告整合分析
+    # 步骤3: 专家报告整合分析 (DEPRECATED v3.15+)
     # ================================================================
 
+    # ⚠ DEPRECATED (v4.0 §1.8/§4.1)：原 step1-3 报告链路已停用，本方法在
+    # execute_pipeline 中的调用点已注释（L4764/L4768），零活跃调用方。
+    # 保留方法体存档以兼容潜在外部脚本引用；下版物理删除。新预测一律走
+    # 两步流水线 _calc_statistical_prediction → step4_final_prediction。
     def step3_integrate_expert_reports(self, target_issue: str) -> Dict[str, Any]:
         """
-        步骤3: 从Redis读取所有专家分析报告，整合后调用AI综合分析
+        步骤3: 从Redis读取所有专家分析报告，整合后调用AI综合分析【DEPRECATED：v4.0 已停用，调用点注释，下版删除】
 
         流程:
         1. 从Redis读取步骤1存储的所有专家分析报告
@@ -1137,6 +1150,10 @@ class Pipeline:
 
         Returns:
             {success, integrated_report, redis_key, error}
+        
+        Deprecated:
+            v3.15 起已在 execute_pipeline 中注释停用，pipeline_state 中 integrated_report 恒为 None。
+            v4.0 计划物理删除。请勿在新代码中调用。
         """
         logger.info('=' * 80)
         logger.info('【步骤3】开始：专家报告整合分析')
@@ -1899,7 +1916,7 @@ class Pipeline:
     # 步骤4: 最终预测结果生成与入库
     # ================================================================
 
-    def _predict_trend_multi_source(self, target_issue: str, data_period: int = 60,
+    def _predict_trend_multi_source(self, target_issue: str, data_period: int = DATA_WINDOW_PERIOD,
                                     fused_probs: Optional[List[Dict[int, float]]] = None) -> Dict[str, Any]:
         """
         多源走势融合预测 (v3.11 深度优化版)
@@ -1972,8 +1989,17 @@ class Pipeline:
                 s = [r.get(f'{p}_number') for r in reversed(pos_trends[p])
                      if r.get(f'{p}_number') is not None]
                 if len(s) < 10:
-                    s = [r.get(p) for r in hist_asc if r.get(p) is not None][-data_period:]
-                seq[p] = s[-data_period:]
+                    hist_asc = list(reversed(history))
+                    raw_list = [r.get(p) for r in hist_asc if r.get(p) is not None]
+                    if len(raw_list) >= data_period:
+                        s = raw_list[-data_period:]
+                    else:
+                        # 不足期数，使用全部可用数据，避免 IndexError
+                        s = raw_list
+                if len(s) >= data_period:
+                    seq[p] = s[-data_period:]
+                else:
+                    seq[p] = s[:]
 
             # 升平降走势图数据(p5_spjzs_data): 多期方向偏好(最近10次涨跌多数方向)
             spj_pref = self._get_spj_direction_preference(data_period) or {}
@@ -2165,7 +2191,7 @@ class Pipeline:
                     'confidence': [round(float(sc), 4) for _, sc in top],
                     'reason': (f'全源融合(近{data_period}期: 历史+基础+{pos_names[p]}走势'
                               f'+升平降+和值重心{bayes_flag}{expert_flag}) '
-                              f'频率0.30/遗漏0.22/动量0.13/贝叶斯0.17加权, '
+                              f'频率0.30/遗漏0.10/动量0.13/贝叶斯0.17/融合0.14加权, '
                               f'近期均值{recent_avg:.1f}')
                 }
                 # 可读特征: 每个推荐号码的近期频率%与当前遗漏期数(基于历史, 非编造)
@@ -2288,7 +2314,7 @@ class Pipeline:
             logger.debug(f'专家约束融合失败: {e}')
             return None
 
-    def _get_spj_direction_preference(self, data_period: int = 60, n_dir: int = 10):
+    def _get_spj_direction_preference(self, data_period: int = DATA_WINDOW_PERIOD, n_dir: int = 10):
         """
         从 p5_spjzs_data(升平降走势) 派生每个位置的"涨跌方向偏好":
           对每个位置, 比较相邻期数字得到 升(up)/平(flat)/降(down) 序列(最近 n_dir 次变迁),
@@ -2337,7 +2363,7 @@ class Pipeline:
 
     def _build_constrained_combinations(self, prediction: Dict[str, Any],
                                          target_issue: str,
-                                         data_period: int = 60):
+                                         data_period: int = DATA_WINDOW_PERIOD):
         """
         用 p5_hzzst_data(和值走势) + p5_spjzs_data(升平降走势) 对多源融合的每位置 Top-4 候选做
         组合级约束与打分:
@@ -2860,7 +2886,7 @@ class Pipeline:
             # 问题2: 多源走势融合预测 —— 结合历史走势图/基础走势图/万千百十个独立走势表
             # 最近30期数据, 用「频率+遗漏+动量」加权融合算法输出每位置 Top-4 推荐。
             # 作为"走势图数据预测结果（实时）"的主预测来源(压缩到4位, 满足问题1)。
-            trend_multi = self._predict_trend_multi_source(target_issue, data_period=60, fused_probs=_fused)
+            trend_multi = self._predict_trend_multi_source(target_issue, data_period=DATA_WINDOW_PERIOD, fused_probs=_fused)
 
             # 知识模型增强：利用在线学习的历史知识动态调整走势预测分数
             if trend_multi and self.online_learner:
@@ -2872,7 +2898,7 @@ class Pipeline:
 
             # 升平降方向偏好(供最终报告展示, 与组合级约束同源)
             try:
-                spj_pref = self._get_spj_direction_preference(60) or {}
+                spj_pref = self._get_spj_direction_preference(data_period=DATA_WINDOW_PERIOD) or {}
             except Exception:
                 spj_pref = {}
 
@@ -2922,7 +2948,7 @@ class Pipeline:
             if trend_multi and any(prediction.get(p) for p in pos_keys):
                 try:
                     _cc, hezhi_range_str = self._build_constrained_combinations(
-                        prediction, target_issue, data_period=60)
+                        prediction, target_issue, data_period=DATA_WINDOW_PERIOD)
                     if _cc:
                         recommended_combinations = _cc
                 except Exception as e:
@@ -3431,7 +3457,7 @@ class Pipeline:
             'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'weights': {
                 'frequency_weighted': 0.35,
-                'omission_regression': 0.25,
+                'omission_regression': 0.0,
                 'trend_momentum': 0.12,
                 'markov_transition': 0.10,
                 'pattern_continuation': 0.08,
@@ -3691,6 +3717,18 @@ class Pipeline:
                     if hasattr(self.online_learner, 'record_algo_hit'):
                         self.online_learner.record_algo_hit(
                             algo_name, hit_rate, top1_hit=top1_hit_rate)
+
+                    # §3.4 模型监控反馈闭环：把本次验证的真实命中信号记入全局 ModelMonitor
+                    # 诚实边界：验证点仅 hit_rate(位置覆盖率) 与 top1_hit_rate(Top-1 精准度)
+                    # 真实可知；response_time / training_errors 此刻不可知，故不传(默认 None 跳过)，
+                    # 避免用 0.0 污染监控的 5 点均值窗口误触发 confidence/响应时间告警。
+                    # confidence 取真实的 top1_hit_rate(语义=模型对 Top-1 推荐的置信程度)。
+                    try:
+                        from modules.model_monitor import record_prediction_metrics
+                        record_prediction_metrics(
+                            algo_name, hit_rate, confidence=top1_hit_rate)
+                    except Exception as _mm_e:
+                        logger.debug(f'模型监控记录跳过(非致命): {_mm_e}')
 
                     weight_updates[algo_name] = {
                         'prev_hit_rate': hit_info.get('hit_rate', 0.0),
@@ -4967,7 +5005,7 @@ class Pipeline:
         return pipeline_result
 
 
-def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int = 60,
+def run_four_step_pipeline(target_issue: Optional[str] = None, data_limit: int = DATA_WINDOW_PERIOD,
                           progress_callback=None,
                           include_backtest: bool = True,
                           include_feature_analysis: bool = True,

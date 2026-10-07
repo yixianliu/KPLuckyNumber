@@ -805,7 +805,7 @@ class CacheClient:
     
     def safe_hset(self, key: str, field: str, value: Any, ttl_days: int = 7) -> bool:
         """
-        安全的Hash设置（兼容RedisKeyManager接口）
+        安全的Hash设置（统一语义：始终覆盖写，不再静默跳过）
         
         Args:
             key: Redis Key
@@ -821,19 +821,9 @@ class CacheClient:
                 logger.error('Redis未连接')
                 return False
             
-            # 如果Key已存在且有数据，警告但不覆盖
-            if self.client.exists(key):
-                existing = self.client.hget(key, field)
-                if existing:
-                    logger.warning(f'Key.Field已存在，跳过写入: {key}.{field}')
-                    return False
-            
-            # 存储数据
-            self.client.hset(
-                key,
-                field,
-                json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-            )
+            # 统一语义：始终覆盖写（修复旧版静默丢数据）
+            serialized = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+            self.client.hset(key, field, serialized)
             
             # 设置过期时间
             if ttl_days:

@@ -240,12 +240,12 @@ class PredictionCache:
         """
         if not history_data:
             return "empty|0|0"
-
-        latest_issue = str(history_data[-1].get('issue', ''))
-        count = len(history_data)
-
+        # 归一化：按 issue 升序排序，确保相同数据集产生相同指纹
+        sorted_data = sorted(history_data, key=lambda x: str(x.get('issue', '')))
+        latest_issue = str(sorted_data[-1].get('issue', ''))
+        count = len(sorted_data)
         # 前 10 条的 MD5 校验和（防止早期数据修正后旧缓存仍命中）
-        head = history_data[:10]
+        head = sorted_data[:10]
         checksum = hashlib.md5(
             json.dumps(head, sort_keys=True, default=str).encode()
         ).hexdigest()[:8]

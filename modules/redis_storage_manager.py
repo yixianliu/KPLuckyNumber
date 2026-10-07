@@ -107,7 +107,7 @@ class RedisKeyManager:
     def safe_hset(self, key: str, field: str, value: Any, 
                   ttl: Optional[timedelta] = None) -> bool:
         """
-        安全的Hash设置 - 先检查Key是否存在，避免覆盖
+        安全的Hash设置 - 统一语义：始终覆盖写（修复旧版静默跳过）
         
         Args:
             key: Redis Key
@@ -119,13 +119,7 @@ class RedisKeyManager:
             是否成功
         """
         try:
-            # 仅当该 field 已存在时才跳过，避免覆盖已有字段；
-            # 其余 field 仍可正常写入，防止流水线(pipeline)静默丢字段（B10）
-            if self.redis.client.hexists(key, field):
-                logger.warning(f'Field已存在，跳过写入: {key}.{field}')
-                return False
-            
-            # 存储数据
+            # 统一语义：始终覆盖写（修复旧版静默丢数据）
             self.redis.client.hset(key, field, json.dumps(value, ensure_ascii=False) 
                                    if not isinstance(value, str) else value)
             

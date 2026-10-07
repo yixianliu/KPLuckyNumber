@@ -28,8 +28,8 @@ import importlib
 # 基础版本信息
 # ---------------------------------------------------------------------------
 APP_NAME = "排列5 AI智能分析系统"
-APP_VERSION = "v3.71"
-APP_RELEASE_DATE = "2026-09-22"
+APP_VERSION = "v4.0"
+APP_RELEASE_DATE = "2026-09-29"
 
 # ---------------------------------------------------------------------------
 # 变更日志（从新到旧）
@@ -41,6 +41,32 @@ APP_RELEASE_DATE = "2026-09-22"
 #   fixes    : 已知问题修复列表
 # ---------------------------------------------------------------------------
 CHANGELOG = [
+    {
+        "version": "v4.0",
+        "date": "2026-09-29",
+        "summary": "KPLuckyNumber v4.0 升级：Wilson CI 评估门控、自我进化引擎 v2、代码重构与架构优化",
+        "features": [
+            "Wilson 95% CI 评估门控：替代点估计比较，避免随机噪声误判超额命中率",
+            "GeneticAlgorithmTuner：新增遗传算法搜索器，pop≤12/gen≤20/mut=0.15",
+            "ExperimentTracking：记录超参数+数据指纹+git hash，支持实验可追溯",
+            "Leak Prevention：walk-forward 窗口构建增加前视泄漏断言",
+            "Storage Unification：统一 StorageBackend 协议，Redis 写入改为始终 upsert",
+            "Dual Render Path Merge：_render_unified_dashboard 为唯一渲染入口",
+            "Stage Guard Decorator：_stage_guard 防止分析任务重入",
+            "Online Learner Writeback：在线学习写入回路开启，writeback=True"
+        ],
+        "fixes": [
+            "修复 SelfEvolutionEngine _connect_db 返回裸 pymysql.Connection 导致静默失败",
+            "修复 TweetButer 引擎 walk-forward off-by-one 前视泄漏",
+            "修复 _copy_prediction 复制按钮数据库兜底链",
+            "修复 _MLPredictorPool 子进程隔离问题"
+        ],
+        "notes": [
+            "v4.0 核心改进：诚实边界强化，所有命中率结论必须附带 Wilson 95% CI",
+            "架构优化：渲染路径合并、存储统一、阶段守卫，代码质量显著提升",
+            "排列5 为公平摇号，系统诚实标注：无法稳定超越随机基线（10%/30%/50%）"
+        ]
+    },
     {
         "version": "v3.71",
         "date": "2026-09-22",

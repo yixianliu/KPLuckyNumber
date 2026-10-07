@@ -25,10 +25,11 @@ from typing import Dict, List, Any, Optional
 logger = logging.getLogger(__name__)
 
 # v3.60 冻结基线权重（仅统计类，ml_supervised 在 tune 中被冻结）
+# v4.1 §2.4 同步：omission_regression 随 v4.0 清零（赌徒谬误反信号）
 FROZEN_WEIGHTS = {
     'frequency_weighted': 0.68,
     'bayesian_inference': 0.10,
-    'omission_regression': 0.06,
+    'omission_regression': 0.0,
     'trend_momentum': 0.01,
     'markov_transition': 0.005,
     'pattern_continuation': 0.003,

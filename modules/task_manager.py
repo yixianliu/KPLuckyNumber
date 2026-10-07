@@ -756,6 +756,16 @@ class TaskManager:
         Args:
             wait: 是否等待任务完成
             timeout: 等待超时时间（实际使用取决于Python版本）
+        
+        线程安全说明：
+            shutdown 可能在任意线程调用（main.py 关闭时用后台线程包裹），
+            因此禁止在此处直接调用 tkinter Tcl 方法（如 root.after_cancel），
+            跨线程调 Tcl 会被封送回主线程并阻塞等待；若此刻主线程正卡在
+            join() 等待 shutdown 线程结束，则形成死锁。
+            
+            停止 UI 轮询的正确做法：
+            1. 设 self._shutdown = True（poll() 开头检查此标志，自然终止）
+            2. 窗口 destroy() 会杀死所有 after 回调，兜底保障
         """
         logger.info("TaskManager 正在关闭...")
         self._shutdown = True
@@ -763,13 +773,11 @@ class TaskManager:
         # 取消所有运行中任务
         self.cancel_all()
         
-        # 停止 UI 轮询
-        if self._poll_handle:
-            try:
-                self.gui.root.after_cancel(self._poll_handle)
-            except Exception:
-                pass
-            self._poll_handle = None
+        # v3.67: 不在此处调用 self.gui.root.after_cancel(self._poll_handle) ——
+        # Tcl 调用跨线程不安全，会在 join() 下形成死锁。
+        # 停止轮询靠 self._shutdown 标志即可；main.py _confirm_close() 已在主线程
+        # 显式 cancel 所有定时器，是更安全的取消点。
+        self._poll_handle = None
         
         # 刷新剩余日志
         self.flush_pending_logs()
