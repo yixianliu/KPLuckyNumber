@@ -2542,6 +2542,54 @@ class LotteryGUI:
             f'性能监控 健康度 {summary.get("health_score", "—")}{detail}',
             color, duration=3000)
 
+    def _auto_verify_result(self, pipeline_final, quick_final) -> None:
+        """§4.4.3 自动自我验证：每次分析产出后登记一次验证。
+
+        目的：方案 §4.4.3 要求「结果自我验证覆盖率达 100%」。此前验证只在用户
+        手动点击「🔬 自我验证」时才发生，覆盖率实际取决于人工操作、并非 100%。
+        这里在结果落库后自动登记一次验证，使覆盖率为**真实度量**。
+
+        约束（对齐项目惯例 + 诚实边界）：
+          * 只登记到 ResultSelfVerifier（供 §4.1 自诊断 / 自动评估报告消费），
+            不弹窗、不渲染、不阻塞分析流程；
+          * 绝不自动调整 v4.0 冻结权重（建议仅为建议型记录）；
+          * 由 RESULT_VERIFIER_ENABLE 门控，任何异常一律静默（非致命）。
+        """
+        try:
+            import config as _cfg_av
+            if not getattr(_cfg_av, 'RESULT_VERIFIER_ENABLE', True):
+                return
+            from modules.result_verifier import get_result_verifier
+            rv = get_result_verifier()
+        except Exception as e:  # 模块不可用 → 静默跳过，不影响分析
+            logger.debug('[GUI] 自动自我验证不可用（非致命）: %s', e)
+            return
+
+        for cand in (pipeline_final, quick_final):
+            if not isinstance(cand, dict) or not cand:
+                continue
+            try:
+                fused = cand.get('fused_probabilities')
+                tops = (cand.get('top_combinations')
+                        or cand.get('recommended_combinations'))
+                inner = cand.get('prediction') or cand.get('raw_prediction') or {}
+                payload = {
+                    'fused_probabilities': (fused if fused is not None
+                                            else inner.get('fused_probabilities')),
+                    'top_combinations': tops or inner.get('top_combinations'),
+                    'target_issue': cand.get('current_issue') or cand.get('target_issue'),
+                    'next_issue': cand.get('next_issue'),
+                    'data_period': cand.get('data_period'),
+                    'per_algo_top_predictions': (
+                        cand.get('per_algo_top_predictions')
+                        or inner.get('per_algo_top_predictions')),
+                }
+                out = rv.self_verify_result(payload, None)
+                rv.generate_optimization_suggestions(out, None)
+            except Exception as e:
+                logger.debug('[GUI] 自动自我验证失败（非致命）: %s', e)
+            break  # 每次分析只登记最优先的那一个结果
+
     def _on_result_self_verify(self):
         """§4.4 结果自我验证 + 分级优化建议：对最近一次流水线结果做一致性自检。
 
@@ -6984,6 +7032,10 @@ class LotteryGUI:
             self._last_trend_result = trend_result
         if quick_final is not None:
             self._last_quick_final = quick_final
+
+        # §4.4.3：结果落库后自动登记一次自我验证，使「覆盖率 100%」成为真实度量
+        # （仅登记，不渲染/不阻塞；异常内部静默）
+        self._auto_verify_result(pipeline_final, quick_final)
 
         # 线程安全检查：非主线程投递回主线程
         if threading.current_thread() is not threading.main_thread():

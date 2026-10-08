@@ -1226,6 +1226,92 @@ class ModelMonitorHealthEvaluator(BaseEvaluator):
 # 主评估器
 # =====================================================================
 
+class ResultVerificationEvaluator(BaseEvaluator):
+    """结果自我验证与优化建议健康度（§4.4 → §4.1 自诊断）。
+
+    消费 ``modules.result_verifier``，把「验证覆盖率 / 通过率 + 分级建议」
+    纳入自动评估报告，落实方案 **§4.4.4 第三条**「验证结果可视化，状态明确；
+    优化建议分级展示，可操作性强」——此前验证结果只存在于手动「🔬 自我验证」
+    按钮，未进入自诊断主链路。
+
+    诚实边界：建议仅为**建议型记录**（auto_safe 标注是否触碰权重），
+    本评估器绝不自动调整 v4.0 冻结权重，也不写 p5_weight_history。
+    """
+
+    category = '结果验证'
+
+    def evaluate(self) -> EvalResult:  # noqa: C901 - 单评估器，线性分支
+        try:
+            from modules.result_verifier import get_result_verifier  # 懒加载
+
+            rv = get_result_verifier()
+            cov = rv.get_coverage() or {}
+            sugs = rv.get_suggestions(limit=50) or []
+
+            by_priority = {'high': 0, 'medium': 0, 'low': 0}
+            for s in sugs:
+                p = str((s or {}).get('priority') or 'low')
+                by_priority[p] = by_priority.get(p, 0) + 1
+
+            batches = int(cov.get('verified_batches', 0) or 0)
+            failed = int(cov.get('failed', 0) or 0)
+            pass_rate = float(cov.get('pass_rate', 1.0) or 0.0)
+            coverage = float(cov.get('coverage', 0.0) or 0.0)
+
+            if batches == 0:
+                # 尚无验证样本：不算失败，但提示覆盖率无法达成（§4.4.3）
+                status = 'warning'
+                score = 70
+                recs = ['尚未产生自我验证样本（执行一次「开始分析」后自动登记）']
+            else:
+                score = 100
+                score -= min(50, failed * 10)
+                score -= min(20, by_priority.get('high', 0) * 5)
+                score = max(0, score)
+                if failed > 0:
+                    status = 'critical'
+                elif by_priority.get('high', 0) or pass_rate < 1.0:
+                    status = 'warning'
+                else:
+                    status = 'healthy'
+                recs = []
+
+            # 分级建议明细（高优先级优先），附依据（§4.4.2(2)「依据清晰」）
+            order = {'high': 0, 'medium': 1, 'low': 2}
+            top = [f"[{s.get('priority')}] {s.get('title')} — 依据: {s.get('rationale')}"
+                   for s in sorted(sugs, key=lambda x: order.get(
+                       str((x or {}).get('priority') or 'low'), 3))[:5]]
+            recs = recs + top + [
+                '注：以上均为建议型记录，不会自动调整 v4.0 冻结权重（诚实边界）']
+
+            return EvalResult(
+                name='结果自我验证',
+                category=self.category,
+                status=status,
+                score=score,
+                details={
+                    '已验证批次': batches,
+                    '通过率': f'{pass_rate:.0%}',
+                    '失败批次': failed,
+                    '验证覆盖率': f'{coverage:.0%}',
+                    '建议数(高/中/低)': (f"{by_priority.get('high', 0)}/"
+                                    f"{by_priority.get('medium', 0)}/"
+                                    f"{by_priority.get('low', 0)}"),
+                },
+                recommendations=recs if recs else ['结果自我验证良好'],
+            )
+        except Exception as e:
+            logger.warning('[AutoEval] 结果自我验证评估失败: %s', e)
+            return EvalResult(
+                name='结果自我验证',
+                category=self.category,
+                status='warning',
+                score=70,
+                details={'error': str(e)},
+                recommendations=['检查结果自我验证模块可用性'],
+            )
+
+
 class ProjectAutoEvaluator:
     """KPLuckyNumber 项目自动化评估器。
 
@@ -1244,6 +1330,7 @@ class ProjectAutoEvaluator:
             AIModelEvaluator(self),
             CodeQualityEvaluator(self),
             ModelMonitorHealthEvaluator(self),
+            ResultVerificationEvaluator(self),   # §4.4 结果自验证 + 分级建议
         ]
         self._scan_history: List[Dict[str, Any]] = []
         self._schedule_thread: Optional[threading.Thread] = None

@@ -211,7 +211,9 @@ class TestProjectAutoEvaluator(unittest.TestCase):
 
     def test_initialization(self):
         self.assertIsInstance(self.evaluator.version, str)
-        self.assertEqual(len(self.evaluator._evaluators), 9)
+        # 与 ProjectAutoEvaluator._evaluators 注册数保持一致
+        # （9 → 10：新增 ResultVerificationEvaluator，§4.4 结果自验证 + 分级建议）
+        self.assertEqual(len(self.evaluator._evaluators), 10)
         self.assertIsInstance(self.evaluator._scan_history, list)
         self.assertIsNone(self.evaluator._schedule_thread)
         self.assertIsInstance(self.evaluator._schedule_stop, type(__import__('threading').Event()))
@@ -350,8 +352,10 @@ class TestProjectAutoEvaluator(unittest.TestCase):
     @patch('modules.auto_evaluator.ModuleDependencyEvaluator.evaluate')
     @patch('modules.auto_evaluator.AIModelEvaluator.evaluate')
     @patch('modules.auto_evaluator.CodeQualityEvaluator.evaluate')
+    @patch('modules.auto_evaluator.ResultVerificationEvaluator.evaluate')
     def test_run_full_evaluation(
         self,
+        mock_result_verification,
         mock_code_quality,
         mock_ai_model,
         mock_module_dep,
@@ -399,6 +403,10 @@ class TestProjectAutoEvaluator(unittest.TestCase):
             name='Model Monitor', category='Model Monitor', status='healthy', score=100,
             details={'hit_rate_points': 0}, recommendations=[]
         )
+        mock_result_verification.return_value = EvalResult(
+            name='Result Verification', category='结果验证', status='healthy', score=88,
+            details={'已验证批次': 1}, recommendations=[]
+        )
 
         # Run the evaluation
         report = self.evaluator.run_full_evaluation()
@@ -406,7 +414,8 @@ class TestProjectAutoEvaluator(unittest.TestCase):
         # Assertions
         self.assertIsInstance(report, EvaluationReport)
         self.assertEqual(report.version, self.evaluator.version)
-        self.assertEqual(len(report.results), 9)
+        # 每个已注册评估器产出一条结果；用注册数断言，避免新增评估器后需改死数字
+        self.assertEqual(len(report.results), len(self.evaluator._evaluators))
         # Check that each evaluator was called
         mock_data_health.assert_called_once()
         mock_prediction_perf.assert_called_once()
@@ -417,8 +426,10 @@ class TestProjectAutoEvaluator(unittest.TestCase):
         mock_ai_model.assert_called_once()
         mock_code_quality.assert_called_once()
         mock_model_monitor.assert_called_once()
+        mock_result_verification.assert_called_once()
         # Check overall score (average of all scores) with a tolerance of 0.1
         scores = [
+            mock_result_verification.return_value.score,
             mock_data_health.return_value.score,
             mock_prediction_perf.return_value.score,
             mock_algorithm_weight.return_value.score,
