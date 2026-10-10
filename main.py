@@ -3651,12 +3651,14 @@ class LotteryGUI:
 
         # ② v4.1：优先采用已聚合多源剪贴板（由 _compute_dashboard_aggregates 渲染时写入，
         #    与仪表盘共识主推荐完全一致）。命中且未过期即复制，避免单源陈旧缓存。
+        # 关键修复：当 _pf 为 None 时（如任务刚启动、仪表盘未渲染），强制重算，
+        # 避免沿用上一轮陈旧的预测结果导致不同期号出现完全相同的号码
         existing = (getattr(self, '_prediction_clipboard', '') or '').strip()
         _gen_ts = getattr(self, '_clipboard_generated_ts', 0) or 0
         _pf = getattr(self, '_last_pipeline_final', None)
         _pf_ts = getattr(self, '_last_pipeline_ts', 0) or 0
         # 判据：流水线单源在聚合缓存写入之后才产生（_pf 晚于 clipboard）→ 判定过期，重算聚合
-        _stale = bool(existing and _pf and _pf_ts > _gen_ts)
+        _stale = bool(existing and _pf and _pf_ts > _gen_ts) or (existing and not _pf)
         if existing and not _stale:
             clip = existing
             meta = getattr(self, '_clipboard_meta', {}) or {}
@@ -6951,12 +6953,15 @@ class LotteryGUI:
             f = ('微软雅黑', 9, 'bold') if (bold or is_head) else ('Consolas', 12, 'bold')
             if is_head:
                 f = ('微软雅黑', 9, 'bold')
-            # 表头增加边框高亮
-            bd = 1 if is_head else 0
+            # 表头增加边框高亮（注意：非表头不能传 highlightbackground=''，
+            # Tk 仍会解析该颜色选项，空字符串会触发 TclError: unknown color name ""）
+            kw = {}
+            if is_head:
+                kw['highlightbackground'] = COLORS['border']
+                kw['highlightthickness'] = 1
             lbl = tk.Label(grid, text=text, bg=bg, fg=fg, font=f,
                            padx=10, pady=6, width=7, relief='solid' if is_head else 'flat',
-                           highlightbackground=COLORS['border'] if is_head else '',
-                           highlightthickness=bd)
+                           **kw)
             lbl.grid(row=r, column=c, padx=1, pady=1, sticky='nsew')
 
         # 表头

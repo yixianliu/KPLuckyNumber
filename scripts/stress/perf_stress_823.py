@@ -111,7 +111,7 @@ def scenario_a_render(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         t1 = time.perf_counter()
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots()
-        ax.plot(rows[:2000][i]['numbers'][0] for i in range(2000))
+        ax.plot([rows[i]['numbers'][0] for i in range(2000)])
         fig.savefig(os.path.join(ROOT, 'reports', '_stress_render_probe.png'))
         plt.close(fig)
         t_render = time.perf_counter() - t1
