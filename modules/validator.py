@@ -11,10 +11,10 @@
     main.py → Validator → P5Database（读写预测验证数据）
 
 数据库依赖表：
-    - ai_predictions: 预测记录源（含待验证状态）
-    - prediction_verification: 验证结果表
-    - performance_stats: 性能统计汇总表
-    - p5_history: 历史开奖数据（用于获取实际号码）
+    - p5_prediction_record: 预测记录源（含待验证状态）
+    - p5_verification_detail: 验证结果明细表
+    - p5_performance_stats: 性能统计汇总表
+    - p5_history_data: 历史开奖数据（用于获取实际号码）
 """
 
 import json

@@ -47,6 +47,152 @@ if not logger.handlers:
 # 说明：本模块负责调用 AI 并生成结构化报告。AI 配置从 config.py 的 AGNES_API_CONFIG 加载。
 
 # ---------------------------------------------------------------------------
+# §6.1.2 system 角色指令（v5.0 新增）
+# 原实现把「分析师角色」塞在 user prompt 里，system 只有一句泛化描述。
+# 现提升为独立 system 段：角色定位 + 诚实边界约束。
+# 诚实边界（不可越界）：排列5 为公平摇号，任何分析方法都无法稳定超越随机基线
+#   （Top-1 ≈ 10% / Top-3 ≈ 30% / Top-5 ≈ 50%），置信度只表示「相对热度」。
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = (
+    "你是一位严谨的排列5历史数据分析助理，负责把统计特征整理成结构化 JSON，"
+    "供用户参考。你的定位是「辅助解读」，不是「中奖预测」。"
+)
+SYSTEM_PROMPT_HONESTY = (
+    "\n\n【诚实边界（必须遵守）】"
+    "1. 排列5 每期开奖是相互独立的公平摇号，历史数据不存在可利用的稳定规律；"
+    "任何分析方法都无法稳定超越随机基线（Top-1 约 10%、Top-3 约 30%、Top-5 约 50%）。"
+    "2. 不得编造、夸大或暗示高于随机基线的命中率；不得使用「稳赢」「必中」「高胜率」等表述。"
+    "3. predictions 中的 confidence 只表示「相对热度」，不是中奖概率；"
+    "confidence 必须在 0-1 之间，且不得全部给出 0.9 以上的乐观值。"
+    "4. 必须保留 risk_warning 字段并明确提示理性购彩、不保证中奖。"
+)
+SYSTEM_PROMPT_JSON_RULES = (
+    "\n\n【输出规则】只输出一个 JSON 对象，不要输出任何 JSON 之外的文字、"
+    "解释、markdown 代码块标记（不要 ```）。字段与层级必须与用户给出的模板完全一致。"
+)
+
+# §6.1.3 few-shot 合规样例：给 AI 一个可直接参照的完整样例，降低格式错误率。
+# 注：样例中的 confidence 刻意不乐观，与诚实边界一致。
+FEW_SHOT_EXAMPLE = (
+    "【合规输出样例（仅供格式参考，数值不要照抄）】\n"
+    "{\"data_source\":{\"description\":\"基于最近20期历史开奖数据的统计特征整理\","
+    "\"data_period\":\"最近20期\",\"data_count\":20,\"latest_issue\":\"2026000\","
+    "\"analysis_time\":\"2026-01-01 12:00:00\"},\n"
+    "\"predictions\":{\"wan\":[{\"number\":3,\"confidence\":0.24,\"reason\":\"近20期出现5次，频率中等\"}],"
+    "\"qian\":[{\"number\":7,\"confidence\":0.22,\"reason\":\"近期遗漏3期\"}],"
+    "\"bai\":[{\"number\":1,\"confidence\":0.21,\"reason\":\"频率偏低\"}],"
+    "\"shi\":[{\"number\":9,\"confidence\":0.23,\"reason\":\"近5期出现2次\"}]},\n"
+    "\"trend_analysis\":{\"wan\":\"万位近20期无显著趋势\",\"qian\":\"千位分布接近均匀\","
+    "\"bai\":\"百位无明显规律\",\"shi\":\"十位无明显规律\"},\n"
+    "\"key_features\":[\"五位分布均接近均匀分布\"],\n"
+    "\"reasoning_process\":[\"统计近20期各位置频次\",\"比较频次与均匀分布的差异\",\"记录未发现可利用的偏离\"],\n"
+    "\"recommended_combinations\":[{\"numbers\":[3,7,1,9],\"confidence\":0.18,"
+    "\"reason\":\"各位置相对热度最高的组合；该数值不代表中奖概率\"}],\n"
+    "\"risk_warning\":\"本分析仅为历史数据的统计描述，排列5为公平摇号，不保证中奖，请理性购彩。\"}"
+)
+
+
+def _load_prompt_config() -> Dict[str, Any]:
+    """读取 AI prompt 可调配置（config.AGNES_AI_PROMPT_CONFIG）。
+
+    任何读取失败都回退到内置默认值，绝不让配置问题阻断 AI 调用路径。
+    """
+    defaults = {
+        'history_periods': 20,
+        'inject_target_issue': True,
+        'few_shot': True,
+        'honesty_boundary': True,
+        'retry_on_invalid': True,
+        'history_periods_min': 5,
+        'history_periods_max': 60,
+    }
+    try:
+        import config as cfg
+        return {**defaults, **(getattr(cfg, 'AGNES_AI_PROMPT_CONFIG', {}) or {})}
+    except Exception:
+        return dict(defaults)
+
+
+def build_system_prompt(honesty: bool = True, json_rules: bool = True) -> str:
+    """拼装 system 角色指令（v5.0 §6.1.2）。
+
+    Args:
+        honesty: 是否附加诚实边界约束
+        json_rules: 是否附加「只输出 JSON」的输出规则
+    """
+    parts = [SYSTEM_PROMPT]
+    if honesty:
+        parts.append(SYSTEM_PROMPT_HONESTY)
+    if json_rules:
+        parts.append(SYSTEM_PROMPT_JSON_RULES)
+    return ''.join(parts)
+
+
+def validate_ai_result(ai_result: Any) -> Dict[str, Any]:
+    """校验 AI 解析结果是否符合契约（v5.0 §6.1.3 纯函数）。
+
+    字段白名单 + 值域校验：
+      - predictions 必须存在且为 dict
+      - predictions/<pos> 必须是非空 list
+      - 每项 number 必须能转成 int 且 ∈ [0, 9]
+      - confidence 必须是数值且 ∈ [0, 1]
+
+    Returns:
+        {'ok': bool, 'errors': [str, ...], 'warnings': [str, ...]}
+        ok=True 表示可用于报告生成；warnings 不阻断，仅记录。
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    if not isinstance(ai_result, dict) or not ai_result:
+        return {'ok': False, 'errors': ['AI 结果不是非空 JSON 对象'], 'warnings': warnings}
+
+    predictions = ai_result.get('predictions')
+    if not isinstance(predictions, dict) or not predictions:
+        errors.append('缺少 predictions 或为空对象')
+    else:
+        for pos, items in predictions.items():
+            if not isinstance(items, list) or not items:
+                errors.append(f'predictions.{pos} 不是非空列表')
+                continue
+            for i, item in enumerate(items):
+                if not isinstance(item, dict):
+                    errors.append(f'predictions.{pos}[{i}] 不是对象')
+                    continue
+                raw = item.get('number')
+                try:
+                    num = int(raw)
+                except (TypeError, ValueError):
+                    errors.append(f'predictions.{pos}[{i}].number 非整数: {raw!r}')
+                    continue
+                if num < 0 or num > 9:
+                    errors.append(f'predictions.{pos}[{i}].number={num} 超出 0-9')
+                conf = item.get('confidence')
+                try:
+                    conf_v = float(conf) if conf is not None else None
+                except (TypeError, ValueError):
+                    conf_v = None
+                if conf_v is None:
+                    errors.append(f'predictions.{pos}[{i}].confidence 缺失或非数值: {conf!r}')
+                elif conf_v < 0.0 or conf_v > 1.0:
+                    errors.append(f'predictions.{pos}[{i}].confidence={conf_v} 超出 0-1')
+                elif conf_v >= 0.9:
+                    # 不阻断，但记录：乐观置信度与诚实边界冲突
+                    warnings.append(f'predictions.{pos}[{i}].confidence={conf_v} 偏高')
+
+    if 'risk_warning' not in ai_result:
+        warnings.append('缺少 risk_warning 字段')
+
+    return {'ok': not errors, 'errors': errors, 'warnings': warnings}
+
+
+__all__ = [
+    'AIAnalyzer', 'SYSTEM_PROMPT', 'SYSTEM_PROMPT_HONESTY', 'SYSTEM_PROMPT_JSON_RULES',
+    'FEW_SHOT_EXAMPLE', 'build_system_prompt', 'validate_ai_result',
+    'reset_module_session',
+]
+
+# ---------------------------------------------------------------------------
 # 模块级 Session 复用（v3.68 新增）
 # 说明：
 #   - 每次调用新建 Session 会重复建立 TLS 握手与 HTTP 连接，浪费 CPU 与内存。
@@ -167,20 +313,30 @@ class AIAnalyzer:
             self.api_config = dict(defaults)
             logger.info('未能从config.py加载配置，使用默认值')
 
-        self.api_url = self.api_config.get('api_url', defaults['api_url'])
-        self.api_key = self.api_config.get('api_key', '')
-        self.model_name = self.api_config.get('model_name', defaults['model_name'])
-        self.backup_model = self.api_config.get('backup_model', defaults['backup_model'])
-        self.timeout = int(self.api_config.get('timeout', 60))
-        self.default_max_tokens = int(self.api_config.get('max_tokens', 2048))
-        self.default_temperature = float(self.api_config.get('temperature', 0.7))
-        self.top_p = float(self.api_config.get('top_p', 1.0))
-        self.stream = bool(self.api_config.get('stream', False))
-        self.max_retries = int(self.api_config.get('max_retries', 3))
-        self.retry_backoff_factor = float(self.api_config.get('retry_backoff_factor', 0.5))
-        self.pool_connections = int(self.api_config.get('pool_connections', 5))
-        self.pool_maxsize = int(self.api_config.get('pool_maxsize', 10))
-        self.response_format = self.api_config.get('response_format', 'json_object')
+        self._apply_api_config()
+
+    def _apply_api_config(self):
+        """把 self.api_config 的各字段回写到实例属性（v5.0 §6.1.4）。
+
+        抽出为独立方法，供 _init_ai_config 与 reload_agnes_config 共用——
+        热更新只改 api_config 而不回写属性会导致「配置改了但没生效」。
+        单字段类型转换失败不影响其余字段。
+        """
+        cfg = self.api_config or {}
+        self.api_url = cfg.get('api_url', "https://api.agnes-ai.cn/v1/chat/completions")
+        self.api_key = cfg.get('api_key', '') or ''
+        self.model_name = cfg.get('model_name', 'agnes-3.0-flash')
+        self.backup_model = cfg.get('backup_model', 'agnes-2.5-flash')
+        self.timeout = int(cfg.get('timeout', 60))
+        self.default_max_tokens = int(cfg.get('max_tokens', 2048))
+        self.default_temperature = float(cfg.get('temperature', 0.7))
+        self.top_p = float(cfg.get('top_p', 1.0))
+        self.stream = bool(cfg.get('stream', False))
+        self.max_retries = int(cfg.get('max_retries', 3))
+        self.retry_backoff_factor = float(cfg.get('retry_backoff_factor', 0.5))
+        self.pool_connections = int(cfg.get('pool_connections', 5))
+        self.pool_maxsize = int(cfg.get('pool_maxsize', 10))
+        self.response_format = cfg.get('response_format', 'json_object')
         self.ai_available = bool(self.api_key)
 
         if self.ai_available:
@@ -195,6 +351,52 @@ class AIAnalyzer:
             )
         else:
             logger.warning('config.py中未配置API密钥，AI功能将跳过')
+
+    def reload_agnes_config(self) -> bool:
+        """热更新 AGNES 配置，免重启进程（v5.0 §6.1.4）。
+
+        优先级：环境变量 AGNES_*（实时读取）> config.AGNES_API_CONFIG > 内置默认值。
+        这样修改 .env 后无需重启进程，调用本方法即可生效。
+
+        Returns:
+            True 表示密钥可用；False 表示仍无密钥（AI 功能跳过）。
+        """
+        try:
+            import config as cfg
+            base = dict(getattr(cfg, 'AGNES_API_CONFIG', {}) or {})
+            env_map = {
+                'api_url': 'AGNES_API_URL',
+                'api_key': 'AGNES_API_KEY',
+                'model_name': 'AGNES_MODEL_NAME',
+                'backup_model': 'AGNES_BACKUP_MODEL',
+                'timeout': 'AGNES_TIMEOUT',
+                'temperature': 'AGNES_TEMPERATURE',
+                'max_tokens': 'AGNES_MAX_TOKENS',
+                'top_p': 'AGNES_TOP_P',
+                'stream': 'AGNES_STREAM',
+                'max_retries': 'AGNES_MAX_RETRIES',
+                'retry_backoff_factor': 'AGNES_RETRY_BACKOFF',
+                'pool_connections': 'AGNES_POOL_CONNECTIONS',
+                'pool_maxsize': 'AGNES_POOL_MAXSIZE',
+                'response_format': 'AGNES_RESPONSE_FORMAT',
+            }
+            for key, env in env_map.items():
+                val = os.environ.get(env)
+                if val not in (None, ''):
+                    # 布尔型必须显式解析：bool('false') 为 True，不能直接用
+                    if key in ('stream',):
+                        base[key] = str(val).strip().lower() in ('1', 'true', 'yes', 'on')
+                    else:
+                        base[key] = val
+            if base:
+                self.api_config = {**self.api_config, **base}
+            self._apply_api_config()
+            logger.info('AGNES 配置已热更新: model=%s timeout=%ss api_key=%s',
+                        self.model_name, self.timeout,
+                        '已配置' if self.api_key else '缺失')
+        except Exception as e:
+            logger.warning('reload_agnes_config 失败，沿用当前配置: %s', e)
+        return bool(self.api_key)
 
     def _call_ai_model(self, messages: List[Dict[str, Any]],
                        max_tokens: Optional[int] = None,
@@ -508,16 +710,31 @@ class AIAnalyzer:
 
         return '\n'.join(lines)
 
-    def _build_ai_prompt(self, data: Dict[str, Any]) -> str:
+    def _build_ai_prompt(self, data: Dict[str, Any], target_issue: Optional[str] = None) -> str:
         """
         构建AI分析提示词，整合所有数据源
 
         Args:
             data: 包含所有数据源的字典
+            target_issue: 目标期号（下一期）。传入后注入 prompt，使 AI 明确分析对象
+                （v5.0 §6.1.2）。为 None 时自动由 _infer_next_issue 推算。
 
         Returns:
             完整的提示词字符串
         """
+        pcfg = _load_prompt_config()
+        hist_n = int(pcfg.get('history_periods', 20))
+        hist_n = max(int(pcfg.get('history_periods_min', 5)),
+                     min(int(pcfg.get('history_periods_max', 60)), hist_n))
+        inject_target = bool(pcfg.get('inject_target_issue', True))
+        few_shot = bool(pcfg.get('few_shot', True))
+        honesty = bool(pcfg.get('honesty_boundary', True))
+
+        issue_line = f"- 最新期号：{data['latest_issue']}"
+        if inject_target:
+            tgt = target_issue or self._infer_next_issue(str(data.get('latest_issue', '')))
+            issue_line += f"\n- 目标期号：{tgt}"
+
         prompt = f"""你是一位专业的排列5彩票数据分析专家。请基于以下提供的详细历史数据和走势数据，进行深度分析并预测下一期各位置号码。
 
 【彩种规则】
@@ -533,13 +750,13 @@ class AIAnalyzer:
 - 千位走势：最近{len(data['qian_trend_data'])}期
 - 百位走势：最近{len(data['bai_trend_data'])}期
 - 十位走势：最近{len(data['shi_trend_data'])}期
-- 最新期号：{data['latest_issue']}
+{issue_line}
 - 分析时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-【近期开奖数据（最近20期）】
+【近期开奖数据（最近{hist_n}期）】
 """
 
-        for item in data['history_data'][:20]:
+        for item in data['history_data'][:hist_n]:
             issue = item.get('issue', '')
             draw_date = item.get('draw_date', '')
             wan = item.get('wan', 0)
@@ -571,8 +788,15 @@ class AIAnalyzer:
 4. 趋势分析：分析各位置号码近期走势、冷热号变化趋势、关键特征提取
 5. 预测依据与模型推理过程：详细说明推理逻辑、使用的分析方法、数据支撑
 6. 风险提示：明确说明所有分析仅基于历史数据统计，不保证中奖，请理性购彩
-
-【输出格式要求】
+"""
+        if honesty:
+            prompt += """
+【诚实边界（必须遵守）】
+- 排列5 每期开奖是相互独立的公平摇号，历史数据不存在可利用的稳定规律；任何分析方法都无法稳定超越随机基线（Top-1 约 10%、Top-3 约 30%、Top-5 约 50%）。
+- 不得编造或夸大命中率，不得使用「稳赢」「必中」「高胜率」等表述。
+- confidence 仅表示「相对热度」而非中奖概率，必须在 0-1 之间，且不应全部给出 0.9 以上的高分。
+"""
+        prompt += """【输出格式要求】
 请严格按照以下JSON格式输出，不要包含任何额外文字：
 
 {
@@ -628,6 +852,8 @@ class AIAnalyzer:
     "risk_warning": "本分析基于历史数据统计，不保证中奖，请理性购彩。"
 }
 """
+        if few_shot:
+            prompt += f"\n{FEW_SHOT_EXAMPLE}\n"
         return prompt
 
     def _generate_structured_report(self, ai_result: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
@@ -865,28 +1091,32 @@ class AIAnalyzer:
                 'report': None
             }
 
-        # 2. 构建提示词
+        # 2. 构建提示词（v5.0 §6.1.2：注入目标期号 + 诚实边界 + few-shot）
         logger.info('步骤2：构建AI分析提示词...')
-        prompt = self._build_ai_prompt(data)
-        logger.info(f'提示词长度: {len(prompt)}')
+        pcfg = _load_prompt_config()
+        target_issue = self._infer_next_issue(str(data.get('latest_issue', '')))
+        prompt = self._build_ai_prompt(data, target_issue=target_issue)
+        logger.info(f'提示词长度: {len(prompt)} | 目标期号: {target_issue}')
 
-        # 3. 调用AI模型
+        # 3. 调用AI模型（v5.0 §6.1.2：角色与诚实约束提升为独立 system 段）
         logger.info('步骤3：调用AI模型...')
         messages = [
             {
                 "role": "system",
-                "content": "你是一位专业的排列5彩票数据分析专家，擅长基于历史数据进行深度分析和预测。请严格按照要求输出JSON格式。"
+                "content": build_system_prompt(honesty=pcfg.get('honesty_boundary', True))
             },
             {
                 "role": "user",
                 "content": prompt
             }
         ]
+        # 完整 JSON 输出需要较大 token 预算：配置值不足时保底 8000
+        ai_max_tokens = max(int(self.default_max_tokens or 0), 8000)
 
         ai_response = self._call_ai_model(
             messages=messages,
-            max_tokens=8000,
-            temperature=0.7
+            max_tokens=ai_max_tokens,
+            temperature=self.default_temperature
         )
 
         if not ai_response:
@@ -905,6 +1135,39 @@ class AIAnalyzer:
                 'error': 'AI响应解析失败',
                 'report': None
             }
+
+        # 4.5 §6.1.3 JSON Schema 校验 + 一次重试（换 backup_model），仍失败降级不崩溃
+        validation = validate_ai_result(ai_result)
+        for w in validation.get('warnings', []):
+            logger.warning('AI结果校验警告: %s', w)
+        if not validation['ok']:
+            logger.warning('AI结果不合规: %s', '; '.join(validation['errors'][:5]))
+            if bool(pcfg.get('retry_on_invalid', True)) and self.backup_model \
+                    and self.backup_model != self.model_name:
+                logger.info('使用备份模型 %s 重试一次', self.backup_model)
+                retry_resp = self._call_ai_model(
+                    messages=messages,
+                    max_tokens=ai_max_tokens,
+                    temperature=self.default_temperature,
+                    model=self.backup_model,
+                )
+                if retry_resp:
+                    retry_result = self._parse_ai_response(retry_resp)
+                    retry_val = validate_ai_result(retry_result)
+                    if retry_val['ok']:
+                        logger.info('备份模型重试后结果合规，采用备份模型结果')
+                        ai_result = retry_result
+                    else:
+                        logger.warning('备份模型结果仍不合规: %s',
+                                       '; '.join(retry_val['errors'][:5]))
+            if not validate_ai_result(ai_result)['ok']:
+                # 降级：返回诚实提示，不抛异常、不崩溃、不产出可能误导的报告
+                logger.error('AI 结果校验失败且重试无效，降级为「未获取到 AI 辅助」')
+                return {
+                    'success': False,
+                    'error': 'AI 辅助结果不符合输出契约，已降级（未生成 AI 解读）',
+                    'report': None,
+                }
 
         # 5. 生成结构化报告
         logger.info('步骤5：生成结构化报告...')

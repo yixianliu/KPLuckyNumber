@@ -278,6 +278,101 @@ def _renormalize(weights: Dict[str, float]) -> Dict[str, float]:
 
 
 # =====================================================================
+# 候选算法维度搜索闸门（v5.0 §7.4）
+# =====================================================================
+
+# 走窗归档中判定为「采纳」的字面值；其余（TRIAL / TRIAL(显著劣于基线) / BASELINE）
+# 一律不得进入搜索空间。
+_VERDICT_ADOPT = 'ADOPT'
+_TOP_KEYS = ('top1', 'top3', 'top5')
+_DEFAULT_ARCHIVE = 'reports/algo_candidates.csv'
+
+
+def build_algorithm_search_plan(search_space: Optional[Dict[str, Any]] = None,
+                                archive_path: Optional[str] = None
+                                ) -> Dict[str, Any]:
+    """构建「候选算法维度」搜索计划——**默认关闭**，逐个候选与走窗归档交叉核对。
+
+    v5.0 §7.4：进化引擎支持候选算法维度搜索，但**不得自动提升**任何候选算法。
+    两道门必须同时满足才允许进入搜索空间：
+
+      1. 配置显式列出 —— `search_space.algorithm_candidates` 非空；缺省/为空即关闭。
+      2. 归档已采纳 —— 该候选在走窗评估归档（reports/algo_candidates.csv）中
+         **所有 Top-k 的 verdict 均为 ADOPT**。任一档未通过、未出现在归档、
+         或归档缺失/不可读，一律拒绝（fail closed，不 fail open）。
+
+    拒绝原因逐条给出（含归档原文 verdict），便于人工判断，不静默吞掉。
+
+    背景：M8 走窗评估（n=2175 独立试验）中 seq_proxy / poisson / elo / stacking
+    四个候选全部归档为 trial（CI 与随机基线 k/10 重叠），从未通过 adoption gate。
+    若此处无条件开放候选维度，等于绕过 §5 诚实边界，把噪声当信号喂给 GA。
+
+    参数:
+        search_space: 配置里的 search_space 段（可含 algorithm_candidates 列表）
+        archive_path: 走窗归档 CSV 路径，None 时用项目默认路径
+
+    返回:
+        {'enabled': bool, 'candidates': [...], 'refused': [{'name', 'reason'}],
+         'reason': str}
+    """
+    plan: Dict[str, Any] = {
+        'enabled': False,
+        'candidates': [],
+        'refused': [],
+        'reason': '',
+    }
+    requested = list((search_space or {}).get('algorithm_candidates') or [])
+    if not requested:
+        plan['reason'] = ('未配置 algorithm_candidates，候选算法维度搜索默认关闭'
+                          '（不自动提升任何候选）')
+        return plan
+
+    archive = archive_path or _DEFAULT_ARCHIVE
+    try:
+        import csv
+        with open(archive, encoding='utf-8-sig', newline='') as f:
+            rows = {r.get('strategy', ''): r for r in csv.DictReader(f)}
+    except Exception as exc:  # noqa: BLE001
+        # 归档缺失/不可读 → fail closed：无法核验 verdict 就不开放
+        plan['reason'] = (f'走窗归档不可读（{archive}: {type(exc).__name__}），'
+                          '候选维度搜索已关闭')
+        for name in requested:
+            plan['refused'].append({
+                'name': name,
+                'reason': f'归档不可读，无法核验 verdict（fail closed）: {archive}',
+            })
+        return plan
+
+    for name in requested:
+        row = rows.get(str(name))
+        if row is None:
+            plan['refused'].append({
+                'name': name,
+                'reason': f'未在走窗归档中找到策略 {name!r}，拒绝纳入搜索',
+            })
+            continue
+        bad = [(k, row.get(f'{k}_verdict', '')) for k in _TOP_KEYS
+               if row.get(f'{k}_verdict', '') != _VERDICT_ADOPT]
+        if bad:
+            detail = '；'.join(f'{k}={v or "缺失"}' for k, v in bad)
+            plan['refused'].append({
+                'name': name,
+                'reason': f'未通过 adoption gate（{detail}），仍属 trial 级证据',
+            })
+        else:
+            plan['candidates'].append(name)
+
+    if plan['candidates']:
+        plan['enabled'] = True
+        plan['reason'] = (f"{len(plan['candidates'])} 个候选已在全部 Top-k 通过 "
+                          f"adoption gate：{', '.join(plan['candidates'])}")
+    else:
+        plan['reason'] = ('所有请求的候选均未通过 adoption gate（全部为 trial 级证据），'
+                          '候选算法维度搜索保持关闭')
+    return plan
+
+
+# =====================================================================
 # walk-forward 窗口构造（引擎 / 基准 / 测试 共享同一无前视逻辑）
 # =====================================================================
 

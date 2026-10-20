@@ -135,6 +135,37 @@ def _json_default(o):
     return str(o)
 
 
+def _atomic_write_json(path: str, data: Any) -> None:
+    """原子写 JSON（模块级，供检查点 / 调度状态 / 联动状态共用）。
+
+    v5.0 §7.3：所有自进化状态文件都必须 crash-safe。原先各文件各自
+    open('w')+json.dump，写一半进程被杀（断电 / Ctrl-C / 沙箱杀进程）会留下
+    半截 JSON；下次启动读到损坏内容后静默降级为空状态，丢掉的正是最贵的
+    GA 搜索结果。现在统一走 tempfile + os.replace（POSIX 下原子替换），
+    替换要么完整生效、要么完全不发生。
+
+    失败只告警不抛：这些文件都是「优化项」，写不进去不能中断主流程，
+    且替换被中断时上一份完整内容仍在位（见 test_kill_during_save_*）。
+    """
+    dir_name = os.path.dirname(path) or '.'
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+        # os.fdopen 接管 fd 所有权，因此不需要（也不能）再手动 os.close
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
+        os.replace(tmp, path)   # POSIX 原子替换
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[self_evolution] 原子写失败 (%s): %s', path, e)
+    finally:
+        # 成功路径下 tmp 已被 replace 移走；异常路径清理残留，不留 .tmp 垃圾
+        if tmp is not None and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 # =====================================================================
 # Wilson 95% 置信区间 + CI 重叠闸门（诚实边界核心）
 # =====================================================================
@@ -299,7 +330,10 @@ class AutoEvoScheduler:
 
     def __init__(self, engine, data_dir=None, interval_hours=None):
         self.engine = engine
-        self.interval_hours = interval_hours or self.DEFAULT_INTERVAL_HOURS
+        # 0 是合法值（表示「不限制触发间隔」），不能用 `or` 兜底——
+        # 否则 interval_hours=0 会被静默吞成默认 24h，调度行为与配置不符。
+        self.interval_hours = (self.DEFAULT_INTERVAL_HOURS
+                               if interval_hours is None else float(interval_hours))
         if data_dir is None:
             try:
                 from paths import PROJECT_ROOT
@@ -331,15 +365,12 @@ class AutoEvoScheduler:
             self._db_paused = False
 
     def _save_db_fail_state(self):
-        try:
-            with open(self.db_fail_state_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'consecutive_db_fail': self._consecutive_db_fail,
-                    'db_paused': self._db_paused,
-                    'updated_at': _now_str(),
-                }, f, ensure_ascii=False, indent=2)
-        except Exception:  # noqa: BLE001
-            pass
+        """持久化 DB 不可达计数（原子写：进程被杀不得留下半截 JSON）。"""
+        _atomic_write_json(self.db_fail_state_path, {
+            'consecutive_db_fail': self._consecutive_db_fail,
+            'db_paused': self._db_paused,
+            'updated_at': _now_str(),
+        })
 
     def report_db_failure(self) -> int:
         """引擎在 DB 连接失败时调用：累加计数，达到阈值则暂停并告警。"""
@@ -404,11 +435,8 @@ class AutoEvoScheduler:
         return False
 
     def mark_run(self):
-        try:
-            with open(self.schedule_path, 'w', encoding='utf-8') as f:
-                json.dump({'last_run_ts': time.time()}, f)
-        except Exception as e:  # noqa: BLE001
-            logger.warning('[AutoEvoScheduler] mark_run 写入失败: %s', e)
+        """登记本次执行时间戳（原子写：损坏的时间戳会让 should_run 判错）。"""
+        _atomic_write_json(self.schedule_path, {'last_run_ts': time.time()})
 
     def get_last_run_ts(self):
         try:
@@ -913,6 +941,9 @@ class SelfEvolutionEngine:
             'analysis_running': False,         # 初始分析是否进行中（用于暂停自动调度）
             'last_sync_ts': None,
             'best_candidate': None,           # {weights, lookback, metrics}
+            # v5.0 §7.3：进化触发去重凭据。同一期号只允许触发一次进化，
+            # 防止「一次未跑完的进化被重复入队多次」。
+            'last_evolve_trigger_issue': None,
         }
         self._load_link_state()
         # 调度暂停标志：初始分析进行中时挂起静默定时器，避免资源/数据竞争
@@ -1079,15 +1110,123 @@ class SelfEvolutionEngine:
                 'weak_positions': [],
                 'candidate': metrics, 'baseline': {}, 'ts': _now_str(),
             }
-            # 若调度已到期，轻量触发一次进化以消化新数据
+            # v5.0 §7.3：进化触发改走统一判定（去重 + 样本量闸门 + 不静默）
             try:
-                if self._scheduler.should_run() and not self._running:
+                trig = self._maybe_trigger_evolution(issue)
+                if trig.get('triggered'):
                     self.run_now(full=False)
-            except Exception:  # noqa: BLE001
-                pass
+                self._send('evolve_trigger', {
+                    'issue': issue,
+                    'triggered': bool(trig.get('triggered')),
+                    'reason_code': trig.get('reason_code'),
+                    'reason': trig.get('reason'),
+                    'ts': _now_str(),
+                })
+            except Exception as e:  # noqa: BLE001
+                logger.warning('[self_evolution] 进化触发判定异常（不影响回填结果）: %s', e)
             self._emit('info', f'联动：开奖回填完成（期号 {issue}）Top3={metrics["top3"]}%')
         except Exception as e:  # noqa: BLE001
             logger.warning('[self_evolution] sync_verification 失败: %s', e)
+
+    # ------------------------------------------------------------------
+    # 进化触发判定 + 只读建议（v5.0 §7.3）
+    # ------------------------------------------------------------------
+    def _maybe_trigger_evolution(self, issue: str) -> Dict[str, Any]:
+        """开奖回填后的「是否触发进化」判定。只做判定与事件投递，不自身启动。
+
+        三道闸（全部满足才触发），每一道都产出结构化 reason_code，便于 GUI 呈现：
+        1. **去重** —— 同一期号只触发一次。原先无去重：GUI 每回填一次开奖都会
+           入队一条 run_now，而 mark_run 只在 _run 末尾登记，于是一次未跑完的
+           进化会被重复入队多次，对同一份数据反复做最贵的 GA 搜索。
+        2. **样本量闸门** —— ML 分支需 >= ML_EVAL_MIN 样本才可评估；样本不足时
+           walk-forward 指标不可比，触发进化只会得到噪声结论。
+        3. **调度闸门** —— 沿用 AutoEvoScheduler 的间隔 / DB 不可达自愈计数。
+
+        不静默：任何触发或跳过都带 reason_code 与 reason，绝不无声放弃。
+        """
+        result = {'issue': str(issue), 'triggered': False,
+                  'reason_code': 'skipped', 'reason': ''}
+        try:
+            last = self._link_state.get('last_evolve_trigger_issue')
+            if last and str(last) == str(issue):
+                result['reason_code'] = 'already_triggered_for_issue'
+                result['reason'] = f'期号 {issue} 已触发过进化，本次跳过（去重）'
+                logger.info('[self_evolution] 进化触发放弃: %s', result['reason'])
+                return result
+
+            history_count = int(self._checkpoint.get('history_count') or 0)
+            if history_count < ML_EVAL_MIN:
+                result['reason_code'] = 'insufficient_samples'
+                result['reason'] = (f'样本量 {history_count} < 最小评估样本 '
+                                    f'{ML_EVAL_MIN}，walk-forward 指标不可比，跳过')
+                logger.info('[self_evolution] 进化触发放弃: %s', result['reason'])
+                return result
+
+            if self._running:
+                result['reason_code'] = 'engine_busy'
+                result['reason'] = '进化引擎正在运行中，本次跳过'
+                logger.info('[self_evolution] 进化触发放弃: %s', result['reason'])
+                return result
+
+            if not self._scheduler.should_run():
+                result['reason_code'] = 'not_due'
+                result['reason'] = '自动调度间隔未到期（或 DB 连续不可达已暂停调度）'
+                logger.info('[self_evolution] 进化触发放弃: %s', result['reason'])
+                return result
+
+            result['triggered'] = True
+            result['reason_code'] = 'scheduled_due'
+            result['reason'] = f'调度到期且样本量充足（n={history_count}），触发轻量进化'
+            # 先登记去重凭据再让调用方启动：登记失败时下次仍会重试，不会漏触发
+            self._link_state['last_evolve_trigger_issue'] = str(issue)
+            self._save_link_state()
+            logger.info('[self_evolution] %s', result['reason'])
+        except Exception as e:  # noqa: BLE001
+            # 判定失败绝不冒泡破坏开奖回填；但必须可见，不得无声吞掉
+            logger.warning('[self_evolution] 进化触发判定异常: %s', e)
+            result['reason_code'] = 'error'
+            result['reason'] = f'判定异常: {e}'
+        return result
+
+    def get_latest_advisory(self) -> Dict[str, Any]:
+        """只读地给出「当前最值得看的结论」，供 GUI / 报告直接展示。
+
+        **严格只读**：不写检查点、不写联动状态、不写权重历史、不写 DB。
+        排列5 是公平摇号，故建议文本必须诚实标注——无候选严格优于随机基线时
+        明确说明「无显著提升」，绝不暗示可提升命中率。
+        """
+        try:
+            verification = self._link_state.get('last_verification') or {}
+            best = self._link_state.get('best_candidate')
+            baseline = self._checkpoint.get('baseline') or {}
+            baseline_metrics = (baseline.get('metrics') or {}) if isinstance(baseline, dict) else {}
+
+            top3 = verification.get('top3')
+            baseline_top3 = baseline_metrics.get('top3')
+            hit_text = ('Top1=%s%% / Top3=%s%% / Top5=%s%%' % (
+                verification.get('top1'), verification.get('top3'), verification.get('top5'))
+                if top3 is not None else '暂无回填数据')
+
+            advisory = {
+                'ts': _now_str(),
+                'verification': dict(verification) if isinstance(verification, dict) else {},
+                'best_candidate': (dict(best) if isinstance(best, dict) else None),
+                'baseline_metrics': dict(baseline_metrics),
+                'has_better_candidate': False,
+                'honest_note': '排列5 为公平摇号，历史统计不改变随机概率。',
+            }
+            if isinstance(best, dict) and isinstance(best.get('metrics'), dict):
+                from modules.evolution_tuner import _score
+                b = best['metrics']
+                if baseline_metrics:
+                    advisory['has_better_candidate'] = (
+                        _score(b) > _score(baseline_metrics) + 1e-6
+                    )
+            return advisory
+        except Exception as e:  # noqa: BLE001
+            logger.warning('[self_evolution] get_latest_advisory 失败: %s', e)
+            return {'ts': _now_str(), 'error': str(e),
+                    'honest_note': '排列5 为公平摇号，历史统计不改变随机概率。'}
 
     def get_best_candidate_config(self) -> Optional[Dict[str, Any]]:
         """返回历史中指标最优的候选版本配置（含 weights / lookback）。
@@ -1393,26 +1532,8 @@ class SelfEvolutionEngine:
     # 阶段实现
     # ------------------------------------------------------------------
     def _atomic_write_json(self, path, data):
-        """原子写 JSON：先写临时文件，再 os.replace，避免断电/强杀后文件损坏。"""
-        dir_name = os.path.dirname(path)
-        fd, tmp = None, None
-        try:
-            fd, tmp = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, default=_json_default)
-            os.replace(tmp, path)
-        except Exception as e:
-            logger.warning('[self_evolution] 原子写失败 (%s): %s', path, e)
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            if tmp is not None and os.path.exists(tmp):
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+        """原子写 JSON：委托模块级实现（保留方法形态以兼容既有调用点与测试桩）。"""
+        _atomic_write_json(path, data)
 
     def _phase_collect(self):
         """阶段 1：数据采集——统计样本量、最新期号、新增数据量。"""
@@ -1677,7 +1798,30 @@ class SelfEvolutionEngine:
                         
                         # 运行选定的搜索后端
                         candidates = []
-                        
+
+                        # v5.0 §7.4：候选算法维度搜索闸门（默认关闭）。
+                        # 只有走窗归档中「全部 Top-k verdict 均为 ADOPT」的候选才可进入搜索；
+                        # 缺失归档 / trial 级证据一律拒绝，绝不把噪声当信号喂给 GA。
+                        from modules.evolution_tuner import build_algorithm_search_plan
+                        try:
+                            from paths import PROJECT_ROOT
+                            _archive = os.path.join(PROJECT_ROOT, 'reports',
+                                                    'algo_candidates.csv')
+                        except Exception:  # noqa: BLE001
+                            _archive = os.path.join(os.path.dirname(os.path.dirname(
+                                os.path.abspath(__file__))), 'reports',
+                                'algo_candidates.csv')
+                        algo_plan = build_algorithm_search_plan(
+                            GA_CONFIG.get('search_space') or {},
+                            archive_path=_archive,
+                        )
+                        self._checkpoint['algorithm_search_plan'] = algo_plan
+                        self._save_checkpoint()
+                        logger.info('[self_evolution] 候选算法维度搜索: enabled=%s | %s',
+                                    algo_plan['enabled'], algo_plan['reason'])
+                        for _ref in algo_plan.get('refused', []):
+                            logger.info('[self_evolution]   拒绝 %s: %s',
+                                        _ref.get('name'), _ref.get('reason'))
                         if search_backend in ('coord', 'both'):
                             logger.info('[self_evolution] 启动坐标下降搜索')
                             tuner = DeepTuner(
@@ -2672,18 +2816,37 @@ class SelfEvolutionEngine:
     # 检查点
     # ------------------------------------------------------------------
     def _load_checkpoint(self):
-        try:
-            if os.path.isfile(self._ckpt_path):
-                with open(self._ckpt_path, 'r', encoding='utf-8') as f:
-                    self._checkpoint = json.load(f)
-        except Exception:  # noqa: BLE001
-            self._checkpoint = {}
+        """从 JSON 加载检查点（故障恢复）。
 
-    def _save_checkpoint(self):
+        损坏 / 半截文件必须降级为空状态并显式告警：静默丢弃续跑位置会让
+        「引擎以为自己在 evaluate、实际从头重来」这种错位无人察觉。
+        """
+        self._checkpoint = {}
+        if not os.path.isfile(self._ckpt_path):
+            return
         try:
-            with open(self._ckpt_path, 'w', encoding='utf-8') as f:
-                json.dump(self._checkpoint, f, ensure_ascii=False, indent=2,
-                          default=_json_default)
+            with open(self._ckpt_path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            # 文件存在但解析失败，正是「写入被中断」的典型形态，必须可见
+            logger.warning('[self_evolution] 检查点解析失败，降级空状态续跑: %s', e)
+            return
+        if isinstance(loaded, dict):
+            self._checkpoint = loaded
+        else:
+            logger.warning('[self_evolution] 检查点顶层类型非法(%s)，按空状态处理',
+                           type(loaded).__name__)
+    def _save_checkpoint(self):
+        """保存检查点到 JSON（用于故障恢复）。
+
+        v5.0 §7.3：必须原子写入。原先直接 open('w')+json.dump，写一半进程被杀
+        （断电 / Ctrl-C / 沙箱杀进程）会留下半截 JSON；_load_checkpoint 读到损坏
+        内容后静默降级为 {} → 引擎从 PHASE_COLLECT 重启，丢掉的正是最贵的 GA 搜索
+        结果。现在复用 _atomic_write_json（tempfile + os.replace，POSIX 原子）。
+        写失败仅告警不抛——检查点属优化项，不能因它写不进去中断进化流程。
+        """
+        try:
+            self._atomic_write_json(self._ckpt_path, self._checkpoint or {})
         except Exception as e:  # noqa: BLE001
             logger.warning('[self_evolution] 检查点写入失败: %s', e)
 

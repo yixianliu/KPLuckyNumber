@@ -324,6 +324,9 @@ class P5Database:
         # 单连接模式（原有逻辑，保持兼容）
         try:
             db_name = self._get_db_config()['database']
+            # 验证数据库名是否安全
+            from modules.database_utils import assert_safe_database
+            assert_safe_database(db_name)
             
             try:
                 self.connection = pymysql.connect(
@@ -389,7 +392,7 @@ class P5Database:
                         connect_timeout=10
                     )
                     cursor = conn.cursor()
-                    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+                    cursor.execute('CREATE DATABASE IF NOT EXISTS `{}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'.format(db_name))
                     conn.commit()
                     cursor.close()
                     conn.close()
@@ -884,12 +887,14 @@ class P5Database:
             # 避免 CREATE TABLE IF NOT EXISTS 失效导致后续 INSERT 列不匹配。
             # (仅当表为空/旧schema时重建, 已含 wan 列的正确表不受影响)
             for _t in ('p5_spjzs_data', 'p5_hzzst_data'):
+                from modules.database_utils import assert_safe_table
+                assert_safe_table(_t)
                 try:
-                    self.cursor.execute(f'SELECT wan FROM {_t} LIMIT 0')
+                    self.cursor.execute('SELECT wan FROM `{}` LIMIT 0'.format(_t))
                 except Exception:
                     # 表不存在 或 无 wan 列(旧schema) -> 重建
                     try:
-                        self.cursor.execute(f'DROP TABLE IF EXISTS {_t}')
+                        self.cursor.execute('DROP TABLE IF EXISTS `{}`'.format(_t))
                         self.connection.commit()
                         logger.warning(f'检测到 {_t} 为旧schema/缺失, 已重建为新schema(基于爬取5位号码)')
                     except Exception as _e2:
@@ -1317,17 +1322,8 @@ class P5Database:
 
     def get_table_count(self, table: str) -> int:
         """获取任意数据表的总记录数（用于 GUI 数据概览，白名单校验表名防注入）。"""
-        allowed = {
-            'p5_history_data', 'p5_trend_data', 'p5_ai_report', 'p5_prediction_record',
-            'p5_verification_detail', 'p5_performance_stats', 'p5_wan_trend_data',
-            'p5_qian_trend_data', 'p5_bai_trend_data', 'p5_shi_trend_data', 'p5_ge_trend_data',
-            'p5_spjzs_data', 'p5_hzzst_data', 'p5_bayesian_result', 'p5_sum_end_trend_data',
-            'p5_back_three_trend_data', 'p5_expert_recommendation', 'p5_weight_history',
-            'p5_learning_history', 'p5_artifact', 'p5_evolution_version',
-        }
-        if table not in allowed:
-            logger.warning(f'get_table_count 拒绝未知表名: {table}')
-            return 0
+        from modules.database_utils import assert_safe_table
+        assert_safe_table(table)
         try:
             self.cursor.execute(f'SELECT COUNT(*) AS cnt FROM `{table}`')
             row = self.cursor.fetchone()
@@ -4145,8 +4141,10 @@ class P5Database:
             trend_tables = {}
             orphan_count = 0
 
+            from modules.database_utils import assert_safe_table
             for pos in position_tables:
                 table = f'p5_{pos}_trend_data'
+                assert_safe_table(table)
                 self.cursor.execute(f"SELECT MIN(issue), MAX(issue), COUNT(*) FROM `{table}`")
                 row = self.cursor.fetchone()
                 trend_tables[table] = {
@@ -4183,8 +4181,10 @@ class P5Database:
         """
         cleaned = 0
         position_tables = ['wan', 'qian', 'bai', 'shi', 'ge']
+        from modules.database_utils import assert_safe_table
         for pos in position_tables:
             table = f'p5_{pos}_trend_data'
+            assert_safe_table(table)
             try:
                 self.cursor.execute(
                     f"DELETE FROM `{table}` WHERE issue NOT IN (SELECT issue FROM p5_history_data)"

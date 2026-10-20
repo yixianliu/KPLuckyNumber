@@ -2395,7 +2395,8 @@ class P5Spider:
                     if not crawled:
                         return []
                     # 获取该表当前最新期号
-                    db.cursor.execute(f'SELECT issue FROM `{table_name}` ORDER BY issue DESC LIMIT 1')
+                    database_utils.assert_safe_table(table_name)
+                    db.cursor.execute('SELECT issue FROM `{}` ORDER BY issue DESC LIMIT 1'.format(table_name))
                     result = db.cursor.fetchone()
                     latest_issue = result['issue'] if result else None
                     if latest_issue:
@@ -2404,8 +2405,9 @@ class P5Spider:
                         except (ValueError, TypeError):
                             latest_int = 0
                         # 获取该表最近 check_window 期的已有期号
+                        database_utils.assert_safe_table(table_name)
                         db.cursor.execute(
-                            f'SELECT issue FROM `{table_name}` ORDER BY issue DESC LIMIT %s',
+                            'SELECT issue FROM `{}` ORDER BY issue DESC LIMIT %s'.format(table_name),
                             (_position_check_window,)
                         )
                         existing = {str(r['issue']) for r in (db.cursor.fetchall() or [])}
@@ -2600,8 +2602,9 @@ class P5Spider:
             for pos, (table, num_col) in position_map.items():
                 updated = 0
                 try:
+                    database_utils.assert_safe_table(table)
                     db.cursor.execute(
-                        f'SELECT issue FROM {table} WHERE draw_date IS NULL OR draw_date = \'\' ORDER BY issue DESC LIMIT 2000'
+                        'SELECT issue FROM `{}` WHERE draw_date IS NULL OR draw_date = \'\' ORDER BY issue DESC LIMIT 2000'.format(table)
                     )
                     rows = db.cursor.fetchall() or []
                     for row in rows:
@@ -2610,7 +2613,7 @@ class P5Spider:
                             new_date = date_map[issue]
                             # 同步更新 trend_json，保持字段一致性
                             db.cursor.execute(
-                                f'SELECT trend_json FROM {table} WHERE issue = %s',
+                                'SELECT trend_json FROM `{}` WHERE issue = %s'.format(table),
                                 (issue,)
                             )
                             trend_row = db.cursor.fetchone()
@@ -2619,20 +2622,15 @@ class P5Spider:
                                     tj = json.loads(trend_row['trend_json'])
                                     tj['draw_date'] = new_date
                                     db.cursor.execute(
-                                        f'UPDATE {table} SET draw_date = %s, trend_json = %s WHERE issue = %s',
+                                        'UPDATE `{}` SET draw_date = %s, trend_json = %s WHERE issue = %s'.format(table),
                                         (new_date, json.dumps(tj, ensure_ascii=False), issue)
                                     )
                                 except Exception:
                                     # trend_json 解析失败时只更新 draw_date
                                     db.cursor.execute(
-                                        f'UPDATE {table} SET draw_date = %s WHERE issue = %s',
+                                        'UPDATE `{}` SET draw_date = %s WHERE issue = %s'.format(table),
                                         (new_date, issue)
                                     )
-                            else:
-                                db.cursor.execute(
-                                    f'UPDATE {table} SET draw_date = %s WHERE issue = %s',
-                                    (new_date, issue)
-                                )
                             updated += 1
                     logger.info(f'{pos}位走势表 draw_date 回填完成: {updated} 条')
                 except Exception as e:
@@ -2652,9 +2650,11 @@ class P5Spider:
         """
         for pos, (table, num_col) in position_map.items():
             try:
+                database_utils.assert_safe_table(table)
+                database_utils.assert_safe_column(num_col)
                 # 全量统计各数字出现次数
                 db.cursor.execute(
-                    f'SELECT `{num_col}` AS n, COUNT(*) AS cnt FROM `{table}` GROUP BY `{num_col}`'
+                    'SELECT `{}` AS n, COUNT(*) AS cnt FROM `{}` GROUP BY `{}`'.format(num_col, table, num_col)
                 )
                 rows = db.cursor.fetchall() or []
                 counts: Dict[int, int] = {}
@@ -2687,12 +2687,12 @@ class P5Spider:
                 for n, level in level_map.items():
                     # 更新 hot_level 列
                     db.cursor.execute(
-                        f'UPDATE `{table}` SET hot_level = %s WHERE `{num_col}` = %s',
+                        'UPDATE `{}` SET hot_level = %s WHERE `{}` = %s'.format(table, num_col),
                         (level, n)
                     )
                     # 更新 trend_json 中的 hot_level
                     db.cursor.execute(
-                        f'SELECT issue, trend_json FROM `{table}` WHERE `{num_col}` = %s',
+                        'SELECT issue, trend_json FROM `{}` WHERE `{}` = %s'.format(table, num_col),
                         (n,)
                     )
                     trend_rows = db.cursor.fetchall() or []
@@ -2701,7 +2701,7 @@ class P5Spider:
                             tj = json.loads(tr.get('trend_json') or '{}')
                             tj['hot_level'] = level
                             db.cursor.execute(
-                                f'UPDATE `{table}` SET trend_json = %s WHERE issue = %s',
+                                'UPDATE `{}` SET trend_json = %s WHERE issue = %s'.format(table),
                                 (json.dumps(tj, ensure_ascii=False), tr['issue'])
                             )
                         except Exception:

@@ -7,6 +7,8 @@ reports
 *.bak
 *.bak_*
 scripts/verify/_ov_test_home/
+scripts/verify/_ui_test_home/
+scripts/verify/_evo_link_test_home/
 api/ai_api.py
 ai_report_generator.py
 modules/ai_analyzer.py

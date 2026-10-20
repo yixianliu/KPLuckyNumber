@@ -55,6 +55,8 @@ import logging
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import config  # 配置单一源：组合约束阈值外置（消除魔法数）
+
 logger = logging.getLogger(__name__)
 
 POSITIONS = 5
@@ -428,11 +430,21 @@ def _strategy_legacy(fused_probs: List[Dict[int, float]], k: int,
 
     同时统计"被约束显著降权的合法组合占比"，量化约束造成的信息损失。
     """
-    hezhi_min = constraints.get('hezhi_min', 10)
-    hezhi_max = constraints.get('hezhi_max', 35)
-    span_min = constraints.get('span_min', 3)
-    span_max = constraints.get('span_max', 8)
+    # 从 config.COMPOSITION_RULES 读取软约束打分带默认阈值（消除魔法数，默认值与历史一致）
+    _cr = config.COMPOSITION_RULES
+    _hezhi_cfg = _cr.get('hezhi', {})
+    _spread_cfg = _cr.get('spread', {})
+    _ssd_cfg = _cr.get('ssd', {})
+    hezhi_min = constraints.get('hezhi_min', _hezhi_cfg.get('score_min', 10))
+    hezhi_max = constraints.get('hezhi_max', _hezhi_cfg.get('score_max', 35))
+    span_min = constraints.get('span_min', _spread_cfg.get('score_min', 3))
+    span_max = constraints.get('span_max', _spread_cfg.get('score_max', 8))
     enable_ssd = constraints.get('sum_of_squares_penalty', True)
+    hezhi_extreme_min = _hezhi_cfg.get('extreme_min', 5)
+    hezhi_extreme_max = _hezhi_cfg.get('extreme_max', 40)
+    ssd_low = _ssd_cfg.get('low', 1.0)
+    ssd_mid = _ssd_cfg.get('mid', 15.0)
+    ssd_high = _ssd_cfg.get('high', 20.0)
     mean = 4.5
 
     candidates = []
@@ -459,7 +471,7 @@ def _strategy_legacy(fused_probs: List[Dict[int, float]], k: int,
             score *= 0.85
 
         hezhi = sum(combo)
-        if hezhi < 5 or hezhi > 40:
+        if hezhi < hezhi_extreme_min or hezhi > hezhi_extreme_max:
             score *= 0.6
         elif hezhi < hezhi_min or hezhi > hezhi_max:
             score *= 0.85
@@ -470,11 +482,11 @@ def _strategy_legacy(fused_probs: List[Dict[int, float]], k: int,
 
         if enable_ssd:
             ssd = sum((num - mean) ** 2 for num in combo) / POSITIONS
-            if ssd < 1.0:
+            if ssd < ssd_low:
                 score *= 0.9
-            elif ssd > 20.0:
+            elif ssd > ssd_high:
                 score *= 0.85
-            elif ssd > 15.0:
+            elif ssd > ssd_mid:
                 score *= 0.95
 
         combo_span = max(combo) - min(combo)

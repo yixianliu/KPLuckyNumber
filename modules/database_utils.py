@@ -16,7 +16,43 @@ database_utils.py - 数据库通用工具函数
 
 import logging
 import json
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
+
+# 安全标识符白名单（防止 SQL 注入）
+ALLOWED_TABLES: Set[str] = {
+    'p5_history_data', 'p5_trend_data', 'p5_ai_report', 'p5_prediction_record',
+    'p5_verification_detail', 'p5_performance_stats', 'p5_wan_trend_data',
+    'p5_qian_trend_data', 'p5_bai_trend_data', 'p5_shi_trend_data', 'p5_ge_trend_data',
+    'p5_spjzs_data', 'p5_hzzst_data', 'p5_bayesian_result', 'p5_sum_end_trend_data',
+    'p5_back_three_trend_data', 'p5_expert_recommendation', 'p5_weight_history',
+    'p5_learning_history', 'p5_artifact', 'p5_evolution_version',
+}
+
+ALLOWED_COLUMNS: Set[str] = {
+    'wan_number', 'qian_number', 'bai_number', 'shi_number', 'ge_number',
+    # 常见的列名（若作为变量出现）
+    'issue', 'draw_date', 'hot_level', 'is_odd', 'is_big', 'is_prime',
+    'omission', 'source', 'trend_json',
+}
+
+ALLOWED_DATABASES: Set[str] = {
+    'lucky_number',  # 根据 config.py 中的 DB_NAME 默认值
+}
+
+def assert_safe_table(name: str) -> None:
+    """校验表名是否在安全白名单内，否则抛出 ValueError。"""
+    if name not in ALLOWED_TABLES:
+        raise ValueError(f"不安全的表名: {name}")
+
+def assert_safe_column(name: str) -> None:
+    """校验列名是否在安全白名单内，否则抛出 ValueError。"""
+    if name not in ALLOWED_COLUMNS:
+        raise ValueError(f"不安全的列名: {name}")
+
+def assert_safe_database(name: str) -> None:
+    """校验库名是否在安全白名单内，否则抛出 ValueError。"""
+    if name not in ALLOWED_DATABASES:
+        raise ValueError(f"不安全的库名: {name}")
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +207,7 @@ def get_position_trend_data(cursor, position: str, limit: int = 1000) -> List[Di
 def get_position_trend_count(cursor, position: str) -> int:
     """获取位置走势数据总条数"""
     table, _ = _get_position_info(position)
+    assert_safe_table(table)
     try:
         cursor.execute(f'SELECT COUNT(*) as count FROM {table}')
         result = cursor.fetchone()
@@ -183,6 +220,7 @@ def get_position_trend_count(cursor, position: str) -> int:
 def get_position_trend_by_issue(cursor, position: str, issue: str) -> Optional[Dict[str, Any]]:
     """根据期号获取位置走势数据"""
     table, _ = _get_position_info(position)
+    assert_safe_table(table)
     try:
         cursor.execute(f'SELECT * FROM {table} WHERE issue = %s', (issue,))
         return cursor.fetchone()

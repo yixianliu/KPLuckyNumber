@@ -283,17 +283,29 @@ class Pipeline:
         if not min_records_check['passed']:
             had_critical_failure = True
 
+        # --- 单次全量遍历（性能：原实现遍历 history_data 共 3 次，此处合并为 1 次）---
+        # NUMBER_RANGE / DUPLICATE_ISSUES / MISSING_VALUES 三个门禁原本各自
+        # 全量遍历一次 history_data；这里一次性提取 期号 + 5位原始值 供后续复用，
+        # 逻辑与输出保持不变（仅减少遍历次数）。
+        issue_values = []
+        row_values = []  # (原始索引, 原始记录, 5位值列表)
+        for i, rec in enumerate(history_data):
+            iss = rec.get('issue')
+            if iss is not None:
+                issue_values.append(str(iss))
+            # 兼容两种格式
+            if 'numbers' in rec and isinstance(rec['numbers'], list) and len(rec['numbers']) >= 5:
+                vals = [rec['numbers'][0], rec['numbers'][1], rec['numbers'][2],
+                        rec['numbers'][3], rec['numbers'][4]]
+            else:
+                vals = [rec.get('wan'), rec.get('qian'), rec.get('bai'),
+                        rec.get('shi'), rec.get('ge')]
+            row_values.append((i, rec, vals))
+
         # --- Gate 2: NUMBER_RANGE ---
         range_passed = True
         range_issues = []
-        for i, rec in enumerate(history_data):
-            # 兼容两种格式
-            values = []
-            if 'numbers' in rec and isinstance(rec['numbers'], list) and len(rec['numbers']) >= 5:
-                values = [rec['numbers'][0], rec['numbers'][1], rec['numbers'][2], rec['numbers'][3], rec['numbers'][4]]
-            else:
-                values = [rec.get('wan'), rec.get('qian'), rec.get('bai'), rec.get('shi'), rec.get('ge')]
-
+        for i, _rec, values in row_values:
             for pos_name, val in zip(['wan', 'qian', 'bai', 'shi', 'ge'], values):
                 if val is None:
                     continue  # MISSING_VALUES 门禁负责
@@ -320,11 +332,7 @@ class Pipeline:
             had_critical_failure = True
 
         # --- Gate 3: DUPLICATE_ISSUES ---
-        issue_values = []
-        for rec in history_data:
-            iss = rec.get('issue')
-            if iss is not None:
-                issue_values.append(str(iss))
+        # issue_values 已在上方单次遍历中收集，此处直接复用（不再重复遍历）
         seen = set()
         duplicates = [x for x in issue_values if x in seen or seen.add(x)]
         dup_check = {
@@ -369,13 +377,8 @@ class Pipeline:
         # --- Gate 5: MISSING_VALUES ---
         missing_passed = True
         missing_samples = []
-        for i, rec in enumerate(history_data):
-            # 兼容两种格式
-            vals = []
-            if 'numbers' in rec and isinstance(rec['numbers'], list) and len(rec['numbers']) >= 5:
-                vals = [rec['numbers'][k] for k in range(5)]
-            else:
-                vals = [rec.get('wan'), rec.get('qian'), rec.get('bai'), rec.get('shi'), rec.get('ge')]
+        # 复用上方单次遍历结果（原实现此处为第 3 次全量遍历）
+        for i, rec, vals in row_values:
             for pos_name, val in zip(['wan', 'qian', 'bai', 'shi', 'ge'], vals):
                 if val is None or val == '' or val == 'null':
                     missing_passed = False
@@ -1920,7 +1923,8 @@ class Pipeline:
     # ================================================================
 
     def _predict_trend_multi_source(self, target_issue: str, data_period: int = DATA_WINDOW_PERIOD,
-                                    fused_probs: Optional[List[Dict[int, float]]] = None) -> Dict[str, Any]:
+                                    fused_probs: Optional[List[Dict[int, float]]] = None,
+                                    persist: bool = False) -> Dict[str, Any]:
         """
         多源走势融合预测 (v3.11 深度优化版)
 
@@ -1948,6 +1952,14 @@ class Pipeline:
         - 权重更均衡，降低单一信号依赖
         - 增加专家软约束融合
         - 增加SSD距离惩罚(避免相邻位置号码过于接近)
+
+        Args:
+            target_issue: 预测目标期号
+            data_period: 回溯期数（默认 60，与核心预测器 lookback 对齐）
+            fused_probs: 外部传入的融合概率 List[Dict[int,float]]（可选，供跨阶段复用）
+            persist: True 时把结果落 p5_prediction_record（v5.0 §8.2.1）。
+                仅独立调用本方法时使用；流水线 step4 内部调用保持默认 False，
+                由 step4 统一持久化，避免同一期号重复写入。
         """
         from collections import Counter
 
@@ -2208,6 +2220,16 @@ class Pipeline:
                 }
 
             logger.info(f'多源走势融合预测完成: { {k: v["numbers"] for k, v in out.items() if k in pos_keys} }')
+
+            # v5.0 §8.2.1：走势路径独立调用时（persist=True）也落 p5_prediction_record。
+            # 默认 False——流水线 step4 内部调用本方法后由 step4 统一持久化，
+            # 此处若再写会与 step4 重复（应用层幂等虽可去重，但会先写进部分数据）。
+            if persist and out:
+                self._persist_prediction(
+                    {'trend_prediction': out},
+                    target_issue,
+                    source='trend',
+                )
             return out
 
         except Exception as e:
@@ -2998,6 +3020,9 @@ class Pipeline:
                 'data_source': '统计融合模型(P5Predictor v3.2)+多源走势融合+可选AI文本增强',
                 'model_version': f'statistical+{_APP_VERSION}',
                 'current_issue': latest_issue,
+                # v5.0 §9.2：预测期号显式透传。复制文本首行必须含「预测期号」，
+                # clipboard_builder 优先读 target_issue（next_issue 仅作历史别名兜底）。
+                'target_issue': target_issue,
                 'next_issue': target_issue,
                 # 拆分为两个独立模块
                 'trend_prediction': prediction,  # 走势图数据预测结果（多源30期融合, Top-4）
@@ -3393,6 +3418,82 @@ class Pipeline:
         except Exception as e:
             logger.error(f'注册预测记录失败: {e}', exc_info=True)
             return False
+
+    def _persist_prediction(self, final_report: Dict[str, Any], target_issue: str,
+                            source: str = 'pipeline',
+                            report_uuid: Optional[str] = None) -> Dict[str, Any]:
+        """统一预测持久化入口（v5.0 §8.2.1）。
+
+        四步流水线 / 快速预测 / 多源走势三条终点的成功分支都必须调用本方法，
+        以保证每条预测路径 100% 落 p5_prediction_record，而不是各写各的。
+
+        职责委托给 modules.persistence（纯模块，可离线单测）：
+          字段扁平化 + [:4] 候选切片 → 可达性预检 + 指数退避重试 →
+          应用层幂等（同期号 pending 行原地更新）→ 失败本地 JSON 兜底。
+
+        Args:
+            final_report: 预测产物（prediction / trend_prediction / fused_probabilities 均可）
+            target_issue: 预测目标期号
+            source: 来源标识（'pipeline' / 'quick' / 'trend'），仅用于日志与兜底文件
+            report_uuid: 报告 UUID（None 时自动生成）
+
+        Returns:
+            dict：ok(bool) / db_ok / fallback_ok / local_path / attempts /
+                  updated / inserted / error
+            本方法**不抛异常**——DB 与本地兜底同时失败时把错误收敛进返回值，
+            由调用方决定是否向用户提示，避免打断流水线主流程。
+        """
+        try:
+            from modules.persistence import persist_prediction
+        except Exception as e:
+            logger.error(f'无法导入 persistence 模块，跳过持久化: {e}', exc_info=True)
+            return {'ok': False, 'db_ok': False, 'fallback_ok': False,
+                    'error': f'persistence 模块不可用: {e}'}
+
+        try:
+            if not self._ensure_db():
+                # 预检失败不立即放弃：重试回调会在每次尝试前再探一次连接
+                logger.warning(f'数据库预检失败，仍尝试写入（带重试）: 期号{target_issue}')
+        except Exception as e:
+            logger.warning(f'数据库预检异常（继续尝试写入）: {e}')
+
+        try:
+            result = persist_prediction(
+                self.db_client,
+                report_uuid or '',
+                target_issue,
+                final_report or {},
+                source=source,
+                connect=self._ensure_db,
+            )
+        except Exception as e:
+            # DBWriteError 或任何未预期异常：预测本身已成功，只提示持久化失败
+            logger.error(f'持久化异常 target_issue={target_issue} source={source}: {e}',
+                         exc_info=True)
+            self._emit('warning', f' 预测已生成但持久化失败: {e}')
+            return {'ok': False, 'db_ok': False, 'fallback_ok': False,
+                    'error': str(e)}
+
+        if result.db_ok:
+            logger.info(f'预测记录持久化成功 source={source} 期号={target_issue} '
+                        f'({"更新" if result.updated else "新增"}) '
+                        f'尝试{result.attempts}次')
+        elif result.fallback_ok:
+            self._emit('warning',
+                       f' 预测已生成但入库失败，已本地兜底: {result.local_path}')
+        else:
+            self._emit('warning', f' 预测已生成但持久化失败: {result.error}')
+
+        return {
+            'ok': result.persisted,
+            'db_ok': result.db_ok,
+            'fallback_ok': result.fallback_ok,
+            'local_path': result.local_path,
+            'attempts': result.attempts,
+            'updated': result.updated,
+            'inserted': result.inserted,
+            'error': result.error,
+        }
 
     def _load_adaptive_weights(self) -> Dict[str, Any]:
         """
@@ -4854,11 +4955,13 @@ class Pipeline:
                 pipeline_result['final_report'] = step4_result.get('final_report')
                 pipeline_result['error'] = None
 
-                # 注册预测记录供后续验证使用
-                self._register_prediction_for_verification(
-                    step4_result.get('report_uuid'),
+                # 注册预测记录供后续验证使用（v5.0 §8.2.1：统一持久化入口，
+                # 含可达性预检 / 指数退避重试 / 应用层幂等 / 本地兜底）
+                self._persist_prediction(
+                    step4_result.get('final_report', {}),
                     target_issue,
-                    step4_result.get('final_report', {})
+                    source='pipeline',
+                    report_uuid=step4_result.get('report_uuid'),
                 )
                 logger.info(f'预测记录已注册供后续验证: 期号{target_issue}')
                 # 实时输出最终预测结果(供GUI逐步骤追踪)

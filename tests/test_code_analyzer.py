@@ -136,12 +136,40 @@ def test_sql_identifier_interpolation_is_p1():
     assert 'sql_injection' not in _sev_rules(issues, 'P0')
 
 
-def test_sql_enum_loop_var_is_identifier():
-    """遍历字面量字符串列表的循环变量 → 固定枚举，按标识符处理。"""
+def test_sql_enum_loop_var_is_hardened_p3():
+    """遍历字面量字符串列表的循环变量 → 固定枚举派生标识符。
+
+    取值域是代码内有限集合（wan/qian/bai/shi/ge），拼接后只能落在有限合法
+    标识符，注入风险已消解 → §8.2.5 白名单加固后降为 P3 提示级，不再计 P1。
+    """
     src = (
         "def f(cur):\n"
         "    for p in ['wan', 'qian', 'bai', 'shi', 'ge']:\n"
         "        cur.execute(f'SELECT {p}_number FROM t')\n"
+    )
+    issues, _ = _scan_src(src)
+    assert 'sql_identifier_interpolation_hardened' in _sev_rules(issues, 'P3')
+    assert 'sql_identifier_interpolation' not in _sev_rules(issues, 'P1')
+    assert 'sql_injection' not in _sev_rules(issues, 'P0')
+
+
+def test_sql_guarded_identifier_is_hardened_p3():
+    """已被 assert_safe_table 白名单守卫的标识符 → 加固后降 P3 提示级。"""
+    src = (
+        "def f(cur, table_name):\n"
+        "    assert_safe_table(table_name)\n"
+        "    cur.execute(f'SELECT issue FROM `{table_name}` LIMIT 1')\n"
+    )
+    issues, _ = _scan_src(src)
+    assert 'sql_identifier_interpolation_hardened' in _sev_rules(issues, 'P3')
+    assert 'sql_identifier_interpolation' not in _sev_rules(issues, 'P1')
+
+
+def test_sql_unguarded_free_var_stays_p1():
+    """未做白名单守卫的自由变量拼 SQL → 仍计 P1（建议补加固）。"""
+    src = (
+        "def f(cur, table_name):\n"
+        "    cur.execute(f'SELECT issue FROM `{table_name}` LIMIT 1')\n"
     )
     issues, _ = _scan_src(src)
     assert 'sql_identifier_interpolation' in _sev_rules(issues, 'P1')

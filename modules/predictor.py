@@ -63,7 +63,7 @@ import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from config import DATA_WINDOW_PERIOD
+from config import DATA_WINDOW_PERIOD, COMPOSITION_RULES
 
 from paths import LOGS_DIR, REPORTS_DIR
 
@@ -897,10 +897,10 @@ class P5Predictor:
         # 形态约束参数：从 config.COMPOSITION_RULES 读取阈值（对应 BUG-05）
         # 完全无视配置的缺陷，改为从统一配置读取。
         constraints = {
-            'hezhi_min': cfg.COMPOSITION_RULES['hezhi']['min'],
-            'hezhi_max': cfg.COMPOSITION_RULES['hezhi']['max'],
-            'span_min': cfg.COMPOSITION_RULES['spread']['min'],
-            'span_max': cfg.COMPOSITION_RULES['spread']['max'],
+            'hezhi_min': COMPOSITION_RULES['hezhi']['min'],
+            'hezhi_max': COMPOSITION_RULES['hezhi']['max'],
+            'span_min': COMPOSITION_RULES['spread']['min'],
+            'span_max': COMPOSITION_RULES['spread']['max'],
             'sum_of_squares_penalty': True,  # 阈值已外置，保留开关默认开启
         }
 
@@ -1926,6 +1926,13 @@ class P5Predictor:
         params = self.config.config['algorithms']['markov_transition']['params']
         order = params.get('order', 1)              # 马尔可夫阶数
         decay = params.get('decay_factor', 0.95)    # 时间衰减系数
+        # v5.0 §5.2 第 5 项：转移矩阵拉普拉斯平滑（add-α）。
+        # 未平滑时每个源状态只覆盖约 N/10 个目标，长序列里仍常出现 P(c|p)=0 的硬零，
+        # 使下游排序在这些位置上区分度不足。加 α 后概率下限抬到 α/(count+α·|S|)，
+        # 既消除硬零又不改变高频转移的相对次序。α 默认 0.5，可由配置覆盖。
+        alpha = float(params.get('laplace_alpha', 0.5))
+        if alpha < 0:
+            alpha = 0.0
 
         if len(data) < order + 1:
             return [{n: 0.1 for n in self.number_range} for _ in range(self.positions)]
@@ -1954,17 +1961,24 @@ class P5Predictor:
         for pos in range(self.positions):
             prev_num = int(last_numbers[pos])
             counts = transition_counts[pos].get(prev_num, {})
-            total = sum(counts.values())
 
             pos_probs = {}
-            if total > 0:
-                # 有转移记录：按条件概率归一化
+            if alpha > 0:
+                # 拉普拉斯平滑：分子加 α，分母加 α × |号码空间|，保证每个目标号码概率 > 0
+                total = sum(counts.values()) + alpha * len(self.number_range)
                 for num in self.number_range:
-                    pos_probs[num] = counts.get(num, 0) / total
+                    pos_probs[num] = (counts.get(num, 0) + alpha) / total
             else:
-                # 无转移记录（该上期号码从未作为源状态）时回退到均匀分布
-                for num in self.number_range:
-                    pos_probs[num] = 0.1
+                # 关闭平滑时保持原行为：无转移记录回退均匀分布
+                total = sum(counts.values())
+                if total > 0:
+                    # 有转移记录：按条件概率归一化
+                    for num in self.number_range:
+                        pos_probs[num] = counts.get(num, 0) / total
+                else:
+                    # 无转移记录（该上期号码从未作为源状态）时回退到均匀分布
+                    for num in self.number_range:
+                        pos_probs[num] = 0.1
             probs.append(pos_probs)
 
         return probs
@@ -2918,16 +2932,18 @@ class P5Predictor:
         保护策略清单：
         1. 冷热号比例约束 — 防止全热号或全冷号
         2. 相邻位约束 — 避免相邻位置推荐号码过于集中
-        3. 【新增】Chebyshev距离检查 — 概率显著偏离群体水平的号码受罚
-        4. 【新增】位置方差检查 — 概率分布过于集中或发散时自动调节
+
+        【v3.12 已移除】Chebyshev 距离检查 与 位置方差检查：
+        这两项约束会把每个位置的概率分布主动拉向均匀（压制高概率号、抬升低
+        概率号），等价于抹掉各算法挖出的信号。回测证实它们使 Top-1/Top-3
+        命中率跌破随机基线，故整体删除；边界保护现仅保留「温和」的冷热比与
+        相邻位去重，且默认关闭。详见方法末尾注释。
 
         工作流程：
         1. 计算每个位置的热冷号等级
         2. 限制Top-3中热号/冷号的最高比例
         3. 检查相邻位置的号码重叠度,过高时施加惩罚
-        4. 使用Chebyshev距离检测异常概率值
-        5. 检查概率分布方差,自动调节极端值
-        6. 每次调整后重新归一化
+        4. 每次调整后重新归一化
 
         Args:
             probs: 原始融合概率分布

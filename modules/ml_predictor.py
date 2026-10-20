@@ -422,8 +422,10 @@ def _load_position_trend(conn) -> Dict[str, Dict[str, Dict]]:
                'shi': 'shi_number', 'ge': 'ge_number'}
         for p in POS:
             tbl = f'p5_{p}_trend_data'
+            from modules.database_utils import assert_safe_table
+            assert_safe_table(tbl)
             cur.execute(
-                f'SELECT issue, omission, hot_level, consecutive_count FROM {tbl}')
+                'SELECT issue, omission, hot_level, consecutive_count FROM `{}`'.format(tbl))
             for r in cur.fetchall():
                 out[p][str(r[0])] = {
                     'omission': r[1], 'hot_level': r[2], 'consecutive_count': r[3]}

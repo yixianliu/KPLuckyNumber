@@ -28,8 +28,8 @@ import importlib
 # 基础版本信息
 # ---------------------------------------------------------------------------
 APP_NAME = "排列5 AI智能分析系统"
-APP_VERSION = "v4.0"
-APP_RELEASE_DATE = "2026-09-29"
+APP_VERSION = "v5.1"
+APP_RELEASE_DATE = "2026-10-18"
 
 # ---------------------------------------------------------------------------
 # 变更日志（从新到旧）
@@ -41,6 +41,52 @@ APP_RELEASE_DATE = "2026-09-29"
 #   fixes    : 已知问题修复列表
 # ---------------------------------------------------------------------------
 CHANGELOG = [
+    {
+        "version": "v5.1",
+        "date": "2026-10-18",
+        "summary": "KPLuckyNumber v5.1：配置一致性治理、诚实口径守卫、命中率根因诊断与基线对照可视化",
+        "features": [
+            "组合约束阈值外置：selection_strategy 软约束打分带（和值/跨度/SSD）由 config.COMPOSITION_RULES 统一供给（新增 score_min/score_max/extreme_min/extreme_max/ssd low-mid-high 键），消除魔法数，默认值与历史完全一致",
+            "命中率根因诊断报告：reports/diagnosis/hitrate_root_cause.md 固化「低命中率 = 公平摇号属性，非代码缺陷」结论，含随机基线推导、2060 次 walk-forward 实证引用与 Wilson CI 说明",
+            "基线对照可视化：scripts/verify/gen_baseline_comparison.py 生成系统实测 vs 随机基线（10/30/50%）+ 95% Wilson CI 误差带对照图（reports/figures/baseline_comparison.png）",
+            "防前视泄漏回归：tests/test_no_lookahead.py 覆盖 _assert_no_leak 正反用例、build_walkforward_windows 无前视/上限/不足样本、诚实口径守卫（「集合包含」仅可作显式标注的宽松/参考口径出现）",
+            "命令行日志捕获器测试：tests/test_cli_log_sink.py 覆盖幂等安装、stdout/stderr 捕获、级别推断、行缓冲、logging 映射与 drain 限流（12 用例）"
+        ],
+        "fixes": [
+            "修复配置/文档不一致：ONLINE_LEARNER_WRITEBACK 代码默认 True 与全仓 docstring「默认关闭」矛盾，现对齐为 False（data/self_evolution_config.json 的 writeback 同步改 false），建议型回灌不再自动落盘权重历史；开启需显式环境变量或 JSON 覆盖",
+            "修复 validator.py docstring 陈旧表名：ai_predictions/prediction_verification/performance_stats/p5_history 更正为真实表名 p5_prediction_record/p5_verification_detail/p5_performance_stats/p5_history_data（仅注释）",
+            "修复 tests/test_config_self_evo_json.py 对旧默认值（writeback=True）的断言，与新默认值（False）对齐"
+        ],
+        "notes": [
+            "诚实边界声明：排列5 为公平摇号，系统与随机基线（Top-1≈10%/Top-3≈30%/Top-5≈50%）无统计显著差异；本次升级不修改 predictor.py 冻结权重、不削弱 Wilson CI 闸门与防泄漏断言、不自动调整任何权重",
+            "ONLINE_LEARNER_WRITEBACK 默认关闭为行为变更：此前 data/self_evolution_config.json 强制 writeback=true，实际处于开启状态；升级后如需恢复回写，请设置环境变量 ONLINE_LEARNER_WRITEBACK=true 或修改 JSON 的 online_learning.writeback",
+            "回归验证：pytest 相关套件全绿（config/online_learner/no_lookahead/cli_log_sink 共 37 passed），py_compile 全绿，code_analyzer P0=0/P1=0（CI 闸门通过）"
+        ]
+    },
+    {
+        "version": "v5.0",
+        "date": "2026-10-12",
+        "summary": "KPLuckyNumber v5.0：自我进化链路闭环、检查点原子写入、诚实边界仪表盘与版本正式化",
+        "features": [
+            "§7.3 检查点原子写入：_atomic_write_json 统一使用 tempfile.mkstemp + os.replace，crash-safe",
+            "§7.4 候选算法维度搜索 fail-closed：build_algorithm_search_plan 严格校验走窗归档 ADOPT，缺失即关闭",
+            "§7.5/7.6/7.7 分析→验证→进化触发链路与仪表盘联动状态只读展示，诚实声明常驻",
+            "get_latest_advisory 只读接口：不写检查点/权重/DB，附 Wilson CI 对比与诚实注释",
+            "_maybe_trigger_evolution 三道闸：去重、样本≥ML_EVAL_MIN、调度未到期，事件结构化投递",
+            "M10 版本正式化：APP_VERSION v5.0、CHANGELOG 与 KNOWN_ISSUES 统一"
+        ],
+        "fixes": [
+            "修复 checkpoint 半截 JSON 静默降级导致续跑错位：_load_checkpoint 显式告警、降级为空状态",
+            "修复 _save_checkpoint 直接 open('w') 非原子写入风险，统一委托 _atomic_write_json",
+            "修复 get_latest_advisory 可能误写状态：严格只读，异常时返回诚实注释",
+            "修复 algorithm_candidates 无条件开放风险：归档缺失/未 ADOPT 时 fail closed 并给出拒绝原因"
+        ],
+        "notes": [
+            "排列5 公平摇号，系统诚实标注：当前候选算法未通过 Wilson 95% CI adoption gate，仍归档为 trial",
+            "v5.0 冻结权重不变：频率0.68/ml_supervised0.14/贝叶斯0.10/趋势0.01/马尔可夫0.005/形态0.003/特征0.002",
+            "所有进化建议仅用于归档研究，不注入生产权重"
+        ]
+    },
     {
         "version": "v4.0",
         "date": "2026-09-29",
@@ -815,7 +861,8 @@ KNOWN_ISSUES = [
     "predict --model old/optimized 两条路径等价（use_optimized 形参被忽略），对比模式无差异。",
     "贝叶斯推断的似然累加已改为 log-space（v3.60 修复），数值稳定性显著改善。长期运行后后验分布不再无界漂移。",
     "组合生成的和值/跨度/SSD/方差等阈值硬编码，未读取统一配置。",
-    "prediction_stat 缓存以「期号+数据量」为复用条件，数据被修正但条数不变时会返回旧结果。",
+    "prediction_stat 缓存曾以「期号+数据量」为复用条件（数据被修正但条数不变时返回旧结果）；"
+    "现已增加近30期内容指纹 data_hash（sha256 of 期号+5位号码）作为复用条件之一，数据被修正即可正确失效缓存（原问题已修复）。",
     "ml_predictor.predict_next 段错误问题已在 v3.60 修复：通过 ProcessPoolExecutor 子进程隔离 + 60s 超时降级，原原生崩溃风险已消除。",
 ]
 

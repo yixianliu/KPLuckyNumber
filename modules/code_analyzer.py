@@ -125,6 +125,73 @@ def _collect_enum_vars(tree: ast.AST) -> Set[str]:
     return enum_vars
 
 
+# 白名单守卫函数：SQL 标识符经这些函数校验后再拼接，注入风险已消解
+SAFE_GUARD_FUNCS: Set[str] = {
+    'assert_safe_table', 'assert_safe_column', 'assert_safe_database',
+    'assert_safe_identifier',
+}
+
+
+def _collect_safe_identifiers(tree: ast.AST, enum_vars: Set[str]) -> Set[str]:
+    """收集「可证明安全」的 SQL 标识符名（白名单加固后应降级为 P3 提示）。
+
+    两类来源：
+      ① 枚举派生：``table = f'p5_{pos}_trend_data'`` 且 pos 本身是固定枚举
+         （循环遍历字面量字符串列表）→ 派生出的 table 只能落在有限合法集合。
+      ② 白名单守卫：同一文件内存在 ``assert_safe_table(x)`` 调用校验该变量
+         → 表明该标识符已按 §8.2.5 做白名单加固，拼接不再构成注入面。
+    """
+    safe: Set[str] = set(enum_vars)
+
+    # ① 枚举派生标识符：值是 f-string/字符串拼接，且其中插值变量全部已在枚举集合
+    def _interpolated_names(node: ast.AST):
+        out: Set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.FormattedValue) and isinstance(sub.value, ast.Name):
+                out.add(sub.value.id)
+            elif isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Add):
+                for side in (sub.left, sub.right):
+                    if isinstance(side, ast.Name):
+                        out.add(side.id)
+        return out
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            val = node.value
+            if isinstance(val, (ast.JoinedStr, ast.BinOp)):
+                inner = _interpolated_names(val)
+                # 插值变量要么全是枚举/已安全，要么目标名本身命中标识符字样
+                if inner and inner.issubset(safe):
+                    safe.add(node.targets[0].id)
+
+    # ② 白名单守卫变量
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fname = _dotted(node.func) or ''
+            base = fname.split('.')[-1]
+            if base in SAFE_GUARD_FUNCS:
+                for arg in node.args:
+                    if isinstance(arg, ast.Name):
+                        safe.add(arg.id)
+    return safe
+
+
+def _is_format_call(node: ast.AST) -> bool:
+    """是否为字符串模板 .format(...) 调用，如 '...{}...'.format(x)。
+
+    判定：节点是 Call，且 func 为 Attribute('.format') 或 Name('format')，
+    其 value 是字符串字面量/模板。用于把 .format() 拼接纳入注入实参识别。
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return f.attr == 'format'
+    if isinstance(f, ast.Name) and f.id == 'format':
+        return True
+    return False
+
+
 def _dotted(node: ast.AST) -> Optional[str]:
     """把 Name/Attribute 节点还原成点号名，如 requests.get → 'requests.get'。"""
     if isinstance(node, ast.Name):
@@ -140,7 +207,8 @@ class _RuleVisitor(ast.NodeVisitor):
 
     def __init__(self, rel_path: str, cfg: AnalyzerConfig, with_call_ids: Set[int],
                  assigned_call_ids: Optional[Set[int]] = None,
-                 enum_vars: Optional[Set[str]] = None):
+                 enum_vars: Optional[Set[str]] = None,
+                 safe_ids: Optional[Set[str]] = None):
         self.rel = rel_path
         self.cfg = cfg
         self._with_calls = with_call_ids
@@ -149,6 +217,8 @@ class _RuleVisitor(ast.NodeVisitor):
         self._assigned_calls = assigned_call_ids or set()
         # 固定枚举变量（遍历字面量字符串列表），拼 SQL 时按标识符处理
         self._enum_vars = enum_vars or set()
+        # 可证明安全的标识符（枚举派生 + 白名单守卫）→ 降级 P3 提示而非 P1
+        self._safe_ids = safe_ids or self._enum_vars
         self.issues: List[Issue] = []
         self._func_depth = 0             # >0 表示当前在函数体内（用于 inline import）
         self._in_class = 0
@@ -249,9 +319,16 @@ class _RuleVisitor(ast.NodeVisitor):
             if self._is_injection_arg(node.args[0]):
                 names = self._interpolated_names(node.args[0])
                 if names and all(self._looks_like_identifier(n) for n in names):
-                    self._add('P1', 'sql_identifier_interpolation', node.lineno,
-                              f'SQL 拼接标识符 {sorted(names)}（表名/列名，来自代码内白名单），'
-                              '非用户值注入；建议加白名单校验加固')
+                    # §8.2.5：已做白名单加固（枚举派生 / assert_safe_* 守卫）的标识符
+                    # 已证明安全 → 降为 P3 提示；未加固的才计 P1（建议补守卫）。
+                    if names.issubset(self._safe_ids):
+                        self._add('P3', 'sql_identifier_interpolation_hardened', node.lineno,
+                                  f'SQL 拼接标识符 {sorted(names)} 已做白名单加固'
+                                  '（枚举派生/断言守卫），注入风险已消解（提示级）')
+                    else:
+                        self._add('P1', 'sql_identifier_interpolation', node.lineno,
+                                  f'SQL 拼接标识符 {sorted(names)}（表名/列名，来自代码内白名单），'
+                                  '非用户值注入；建议加白名单校验加固')
                 else:
                     self._add('P0', 'sql_injection', node.lineno,
                               'SQL 通过 f-string/%/拼接构造，存在注入风险，请改用参数化查询 (%s 占位)')
@@ -314,7 +391,7 @@ class _RuleVisitor(ast.NodeVisitor):
 
     @staticmethod
     def _interpolated_names(node: ast.AST) -> Set[str]:
-        """提取 f-string / % / 拼接中被插值的变量名集合。"""
+        """提取 f-string / % / .format() / 拼接中被插值的变量名集合。"""
         names: Set[str] = set()
         for sub in ast.walk(node):
             if isinstance(sub, ast.FormattedValue):          # f-string 的 {xxx}
@@ -324,7 +401,23 @@ class _RuleVisitor(ast.NodeVisitor):
                 for side in (sub.left, sub.right):
                     if isinstance(side, ast.Name):
                         names.add(side.id)
+            elif _is_format_call(sub):                        # "..." .format(x)
+                for arg in sub.args:
+                    if isinstance(arg, ast.Name):
+                        names.add(arg.id)
         return names
+
+    @staticmethod
+    def _is_injection_arg(node: ast.AST) -> bool:
+        """判断 SQL 实参是否为 f-string / % 格式化 / .format() / 字符串拼接。"""
+        if isinstance(node, ast.JoinedStr):                  # f-string
+            return True
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, (ast.Mod, ast.Add)):      # % 或 +
+                return True
+        if _is_format_call(node):                            # "..." .format(...)
+            return True
+        return False
 
     def _looks_like_identifier(self, name: str) -> bool:
         """变量名是否像表名/列名等 SQL 标识符（而非业务值）。
@@ -336,20 +429,6 @@ class _RuleVisitor(ast.NodeVisitor):
             return True
         low = name.lower()
         return any(hint in low for hint in IDENTIFIER_HINTS) or low.startswith('_')
-
-    @staticmethod
-    def _is_injection_arg(node: ast.AST) -> bool:
-        """判断 SQL 实参是否为 f-string / % 格式化 / 字符串拼接。"""
-        if isinstance(node, ast.JoinedStr):          # f-string
-            return True
-        if isinstance(node, ast.BinOp):
-            if isinstance(node.op, (ast.Mod, ast.Add)):
-                return True
-        if isinstance(node, ast.Call):               # "..." .format(...)
-            name = _dotted(node.func)
-            if name and name.endswith('.format'):
-                return True
-        return False
 
 
 class CodeAnalyzer:
@@ -387,8 +466,10 @@ class CodeAnalyzer:
                 if isinstance(val, ast.Call) and _dotted(val.func) == 'open':
                     assigned_call_ids.add(id(val))
 
+        enum_vars = _collect_enum_vars(tree)
+        safe_ids = _collect_safe_identifiers(tree, enum_vars)
         visitor = _RuleVisitor(rel, self.cfg, with_call_ids, assigned_call_ids,
-                               _collect_enum_vars(tree))
+                               enum_vars, safe_ids)
         visitor.visit(tree)
 
         # P3 行长度

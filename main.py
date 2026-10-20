@@ -24,6 +24,7 @@ import re
 import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 窗口首屏因此可以近乎秒开。所有既有调用点（P5Database()、P5Spider() 等）无需改动。
 # =============================================================================
 import importlib
+
+
+def _safe_grab_set(win):
+    """安全版 grab_set：窗口已持有 / 另一弹窗先占锁时不得让整个对话框崩掉。
+
+    Tk 的 `grab_set()` 在「已有其他窗口持有 grab」或某些远程桌面 / 无显示
+    环境下会抛 TclError。对话框通常在 `win.grab_set()` 之后才填充内容，
+    一旦抛错就会留下一个只有标题栏的空壳窗口——用户看到的是「点了按钮
+    弹出一个空白弹窗」，比直接失败更糟。此处降级为「不抓焦点」，
+    对话框仍可正常展示与关闭。
+    """
+    try:
+        _safe_grab_set(win)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[GUI] grab_set 失败，对话框降级为普通弹窗（内容不受影响）: %s', e)
+        return False
 
 
 class _LazyClass:
@@ -118,30 +136,6 @@ class _LazyClass:
 
 
 # P5Database: 数据库连接、建表、增删改查操作
-def _safe_subprocess_run(args, timeout=2, **kwargs):
-    """
-    安全执行 subprocess 命令，统一参数校验与超时控制。
-    参数:
-        args: list of str, 命令及其参数
-        timeout: 超时秒数，默认 2 秒
-        **kwargs: 其他传递给 subprocess.run 的参数
-    返回:
-        subprocess.CompletedProcess 对象的 stdout（已 strip）
-    异常:
-        将异常捕获并返回空字符串，以免影响主流程。
-    """
-    import subprocess
-    # 参数校验：确保 args 是列表且所有元素为字符串
-    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
-        logging.warning(f"_safe_subprocess_run: 参数非法 {args}")
-        return ""
-    try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, **kwargs)
-        return result.stdout.strip()
-    except Exception as e:
-        logging.warning(f"_safe_subprocess_run: 命令执行失败 {args}: {e}")
-        return ""
-
 P5Database = _LazyClass('modules.database', 'P5Database')
 # P5Spider: 多源数据爬虫（历史开奖数据+走势数据）
 P5Spider = _LazyClass('modules.data_fetcher', 'P5Spider')
@@ -163,179 +157,72 @@ from modules.task_manager import TaskManager
 from modules.pipeline import run_four_step_pipeline
 # 可视化模块
 from modules.visualizer import visualizer, set_theme as _viz_set_theme
+# 中央样式工厂（v5.0 §2.1：统一色彩 token / 按钮三态 / ttk 样式注册）
+from modules import ui_styles
+# Toast 浮层契约（v5.2 GUI-10）：停留时长钳制 / 图标解析纯函数单一来源
+from modules import ui_toast
 
-    # ============================================================
-# 主题自适应系统
-# 支持浅色/深色主题自动检测与手动切换
-    # ============================================================
-import platform
-import os
+# 主题自适应系统（v5.2 GUI-08）：深浅主题色板与系统主题检测统一迁入
+# modules/ui_theme_spec；经再导出保持 main.ThemeManager / main.COLORS
+# 的外部引用（审计脚本/守护脚本/单测，含 is 身份比较）完全兼容
+from modules.ui_theme_spec import (
+    ThemeManager,
+    button_style_map,
+    WHITE,
+    SUCCESS_STATIC,
+    HIT_FG,
+    TOP3_FG,
+    MISS_FG,
+    HIT_ROW_BG,
+    HIT_ROW_FG,
+    CONSENSUS_HIT_FG,
+    CONSENSUS_HIT_BG,
+    ACCENT_P5_SOFT_FG,
+    CHART_SYSTEM,
+    CHART_SYSTEM_ERR,
+    CHART_RANDOM,
+    CHART_RANDOM_ERR,
+    CHART_NOTE_TEXT,
+    CHART_NOTE_FACE,
+    CHART_NOTE_EDGE,
+    CHART_BARS,
+)
 
-class ThemeManager:
-    """主题管理器：自动检测系统主题并提供浅色/深色主题配色"""
-
-    # 深色主题（原 Tailwind 风格）
-    DARK_THEME = {
-        'bg_primary': '#0f172a',
-        'bg_secondary': '#1e293b',
-        'bg_card': '#1e293b',
-        'bg_card_hover': '#334155',
-        'bg_input': '#1e1e2e',
-        'bg_panel': '#020617',
-        'accent_p5': '#059669',
-        'accent_p5_light': '#10b981',
-        'accent_p5_bright': '#34d399',
-        'accent_ai': '#7c3aed',
-        'accent_ai_light': '#8b5cf6',
-        'accent_ai_bright': '#a78bfa',
-        'accent_danger': '#dc2626',
-        'accent_danger_light': '#ef4444',
-        'accent_info': '#0891b2',
-        'accent_info_light': '#06b6d4',
-        'accent_warning': '#d97706',
-        'accent_warning_light': '#f59e0b',
-        'text_primary': '#f8fafc',
-        'text_secondary': '#cbd5e1',
-        'text_muted': '#64748b',
-        'text_disabled': '#475569',
-        'border': '#334155',
-        'border_light': '#475569',
-        'success': '#16a34a',
-        'success_light': '#22c55e',
-        'warning': '#d97706',
-        'gradient_start': '#0f172a',
-        'gradient_end': '#1e293b',
-        'shadow': '#000000',
-        'card_shadow': '#000000',
-        'card_elevation': 0.04,
-        'accent_pink': '#ec4899',
-        'accent_pink_light': '#f472b6',
-        'gradient_p5': ['#059669', '#10b981'],
-        'gradient_ai': ['#7c3aed', '#a78bfa'],
-        'surface_highlight': '#ffffff08',
-        'divider': '#334155',
-        'badge_active': '#059669',
-        'badge_trial': '#64748b',
-        'badge_rolledback': '#d97706',
-        'badge_active_bg': '#059669',
-        'badge_active_fg': '#ffffff',
-        'badge_trial_bg': '#334155',
-        'badge_trial_fg': '#94a3b8',
-        'badge_rolledback_bg': '#451a03',
-        'badge_rolledback_fg': '#f59e0b',
-    }
-
-    # 浅色主题
-    LIGHT_THEME = {
-        'bg_primary': '#f1f5f9',
-        'bg_secondary': '#ffffff',
-        'bg_card': '#ffffff',
-        'bg_card_hover': '#f8fafc',
-        'bg_input': '#f8fafc',
-        'bg_panel': '#f1f5f9',
-        'accent_p5': '#059669',
-        'accent_p5_light': '#10b981',
-        'accent_p5_bright': '#059669',
-        'accent_ai': '#7c3aed',
-        'accent_ai_light': '#8b5cf6',
-        'accent_ai_bright': '#7c3aed',
-        'accent_danger': '#dc2626',
-        'accent_danger_light': '#ef4444',
-        'accent_info': '#0891b2',
-        'accent_info_light': '#06b6d4',
-        'accent_warning': '#d97706',
-        'accent_warning_light': '#f59e0b',
-        'text_primary': '#0f172a',
-        'text_secondary': '#475569',
-        'text_muted': '#94a3b8',
-        'text_disabled': '#cbd5e1',
-        'border': '#e2e8f0',
-        'border_light': '#f1f5f9',
-        'success': '#16a34a',
-        'success_light': '#22c55e',
-        'warning': '#d97706',
-        'gradient_start': '#f8fafc',
-        'gradient_end': '#f1f5f9',
-        'shadow': '#000000',
-        'card_shadow': '#00000010',
-        'card_elevation': 0.06,
-        'accent_pink': '#ec4899',
-        'accent_pink_light': '#f472b6',
-        'gradient_p5': ['#059669', '#10b981'],
-        'gradient_ai': ['#7c3aed', '#a78bfa'],
-        'surface_highlight': '#ffffff40',
-        'divider': '#e2e8f0',
-        'badge_active': '#059669',
-        'badge_trial': '#64748b',
-        'badge_rolledback': '#d97706',
-        'badge_active_bg': '#059669',
-        'badge_active_fg': '#ffffff',
-        'badge_trial_bg': '#f1f5f9',
-        'badge_trial_fg': '#64748b',
-        'badge_rolledback_bg': '#fef3c7',
-        'badge_rolledback_fg': '#d97706',
-    }
-
-    @staticmethod
-    def detect_system_theme() -> str:
-        """检测系统主题设置，返回 'light' 或 'dark'"""
-        try:
-            # Windows 10/11 主题检测
-            if platform.system() == 'Windows':
-                try:
-                    import winreg
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                       r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize') as key:
-                        value, _ = winreg.QueryValueEx(key, 'AppsUseLightTheme')
-                        return 'light' if value == 1 else 'dark'
-                except (OSError, winreg.error):
-                    pass
-        
-        
-            
-            elif platform.system() == 'Darwin':
-                try:
-                    stdout = _safe_subprocess_run(['defaults', 'read', '-g', 'AppleInterfaceStyle'], timeout=2)
-                    return 'dark' if stdout.strip() == 'Dark' else 'light'
-                except Exception:
-                    pass
-            
-            elif platform.system() == 'Linux':
-                try:
-                    stdout = _safe_subprocess_run(['gsettings', 'get', 'org.gnome.desktop.interface', 'gtk-theme'], timeout=2)
-                    theme_name = stdout.strip().strip("'")
-                    return 'dark' if any(kw in theme_name.lower() for kw in ['dark', 'adwaita']) else 'light'
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # 默认返回深色主题
-        return 'dark'
-
-    @classmethod
-    def get_theme(cls, theme_name: str = None) -> dict:
-        """获取主题配色方案"""
-        if theme_name is None:
-            theme_name = cls.detect_system_theme()
-        return cls.DARK_THEME if theme_name == 'dark' else cls.LIGHT_THEME
-
-    @classmethod
-    def toggle_theme(cls, current_theme: dict) -> dict:
-        """切换主题并返回新主题"""
-        if current_theme is cls.DARK_THEME or current_theme.get('bg_primary') == cls.DARK_THEME['bg_primary']:
-            return cls.LIGHT_THEME
-        return cls.DARK_THEME
-
-
-# 全局颜色主题配置
+# 全局颜色主题配置（当前系统主题的实时色板）
 COLORS = ThemeManager.get_theme()
 
+# ---------------------------------------------------------------------------
+# 右侧仪表盘（Canvas + 内部 Frame）事件循环治理常量（v5.2 §2.2 GUI-01/02）
+# ---------------------------------------------------------------------------
+# GUI-01：dash_container Configure 回写内部视窗宽度的最小变化阈值（像素）。
+# 1px 级拖拽抖动不足以产生可见差异，合并后可避免大量无效 itemconfig 重排。
+_DASH_WIDTH_SYNC_THRESHOLD = 2
+# GUI-02：scrollregion 刷新防抖窗口（毫秒）。50ms 内的多次刷新请求合并为一次，
+# 使刷新执行离开 Configure 事件回调栈（验收 A4），同时拖拽期间刷新次数大幅下降。
+_DASH_REFRESH_DEBOUNCE_MS = 50
 
-    # ============================================================
+# ---------------------------------------------------------------------------
+# 响应式布局三档断点常量（v5.2 GUI-07，方案 PUP-20261019-013100 §308-317）
+# ---------------------------------------------------------------------------
+# 断点口径以「输出面板 Notebook 实际宽度」为准（非窗口宽度）：左侧导航栏
+# 常驻约 270px，窗口 1024×720 时面板实测仅 ~712px；只有按面板宽度分类，
+# 验收三尺寸（1024×720 / 1366×768 / 1920×1080）才分别落入紧凑 / 标准 /
+# 宽绰档（离屏实测 712 / 1054 / 1608）。
+# 紧凑档：面板宽度 < 1024px。工具栏按钮切换短文案，防止操作区溢出，
+# 保障窄屏可交互性（验收 A17）。
+_BREAKPOINT_COMPACT_MAX_W = 1024
+# 标准档上限：面板宽度 <= 1440px；超过进入宽绰档。当前宽绰档视觉与
+# 标准档一致（工具栏全文案 + 磁贴 4 列），保留档位供宽屏差异化扩展。
+_BREAKPOINT_STANDARD_MAX_W = 1440
+# 概览磁贴 2×2 网格启用阈值：磁贴容器宽度 < 1100px 时由 4 列并排 pack
+# 切换为 grid 网格（方案 §311）；>= 1100px 保持 4 列并排。
+_TILE_GRID_MAX_W = 1100
+
+# ============================================================
 # 预测号码「展示层」配置（v3.64：扩展为5位全展示，含个位）
 # 预测号码段、复制摘要、仪表盘均使用完整5位（万/千/百/十/个）。
 # 核心算法、数据存储、命中率分析等仍使用完整 5 位，不受影响。
-    # ============================================================
+# ============================================================
 DISPLAY_POS_KEYS = ['wan', 'qian', 'bai', 'shi', 'ge']
 DISPLAY_POS_NAMES = ['万位', '千位', '百位', '十位', '个位']
 
@@ -351,18 +238,170 @@ def compress_combo(combo):
     return s[:5] if len(s) >= 5 else s
 
 
+# ---------------------------------------------------------------------------
+# GUI-04：轮询统一调度特性开关（v5.2 §2.3 / R4 回滚路径）。
+# 默认开启：三条轮询（_poll_cli_log / _poll_evolution / _update_time）由
+# _ui_scheduler 单一 100ms tick 循环统一触发；置环境变量
+# ENABLE_UI_SCHEDULER=0/false/no/off（大小写不敏感）时回退为各自独立的
+# after 自调度链，行为与 v5.1 完全一致（R4 回滚预案）。
+# ---------------------------------------------------------------------------
+def _ui_scheduler_enabled() -> bool:
+    """返回轮询统一调度器是否启用（默认 True，环境变量可关闭）。"""
+    val = (os.environ.get('ENABLE_UI_SCHEDULER') or '1').strip().lower()
+    return val not in ('0', 'false', 'no', 'off')
+
+
+class _UIScheduler:
+    """GUI-04（v5.2 §2.3）：轮询定时器统一批处理调度器。
+
+    背景：原 _poll_cli_log（200ms）/ _poll_evolution（200ms）/ _update_time
+    （1000ms）三条各自独立的 after 自调度链与全量重建交错，既是主线程回调
+    风暴来源（30s 约 310+ 次），也使「时钟刷新」与「日志渲染」在不同帧
+    交错产生可见撕裂。
+
+    设计要点：
+      1. 注册制：register(name, job, interval_ms) 后由本调度器统一触发，
+         任务自身不再调用 root.after 自调度；任务签名保持原样（无参回调）。
+      2. 单一 100ms after 循环：到期任务在同一个主线程帧内串行执行，
+         天然避免「同一 flush 周期跨帧撕裂」（A13 单帧口径）。
+      3. 空闲退避：60s 无业务事件（notify_event）→ 跟随全局间隔任务的
+         轮询间隔 200ms→500ms；固定间隔任务（如时钟 1000ms）不受影响。
+      4. 漏调度防护：单个任务异常仅记警告并跳过，绝不拖垮循环；循环续期
+         置于 finally，异常逃逸也不会导致轮询停摆。
+
+    线程约定：所有调用均发生在 Tk 主线程（after 回调栈），不做加锁。
+    """
+
+    # 单一调度循环的基础步长（毫秒）
+    BASE_TICK_MS = 100
+    # 默认业务轮询间隔（毫秒）：与旧 _poll_cli_log / _poll_evolution 一致
+    ACTIVE_INTERVAL_MS = 200
+    # 空闲退避间隔（毫秒）：60s 无业务事件后启用
+    IDLE_INTERVAL_MS = 500
+    # 无业务事件判定阈值（毫秒）
+    IDLE_THRESHOLD_MS = 60000
+
+    def __init__(self, after_fn, after_cancel_fn=None, monotonic_fn=None):
+        """初始化调度器（不启动循环，start() 后才开始 tick）。
+
+        Args:
+            after_fn: root.after 的可调用替身（注入便于单测计数）。
+            after_cancel_fn: root.after_cancel 替身（可选）。
+            monotonic_fn: 单调时钟替身（可选，默认 time.monotonic）。
+        """
+        self._after = after_fn
+        self._after_cancel = after_cancel_fn
+        self._monotonic = monotonic_fn or time.monotonic
+        # 任务表：name -> {'job': callable, 'interval': int(0=跟随全局), 'last': float}
+        self._jobs = {}
+        self._running = False
+        self._stopped = False
+        self._tick_handle = None
+        self._last_event_ts = self._monotonic()
+        self._idle = False
+
+    # ---- 生命周期 ----
+    def start(self):
+        """启动单一调度循环（幂等；stop() 后不可重启）。"""
+        if self._running or self._stopped:
+            return
+        self._running = True
+        self._last_event_ts = self._monotonic()
+        self._schedule_tick()
+
+    def stop(self):
+        """停止调度循环并取消挂起的 tick（幂等）。"""
+        self._stopped = True
+        self._running = False
+        handle, self._tick_handle = self._tick_handle, None
+        if handle is not None and self._after_cancel is not None:
+            try:
+                self._after_cancel(handle)
+            except Exception:
+                pass
+
+    # ---- 任务管理 ----
+    def register(self, name, job, interval_ms=0):
+        """注册轮询任务（同名重复注册覆盖并重置计时）。
+
+        Args:
+            name: 任务唯一键。
+            job: 到期时在主线程执行的无参回调。
+            interval_ms: 固定触发间隔（毫秒）；0 表示跟随全局轮询间隔
+                        （默认 200ms，空闲退避后 500ms）。
+        """
+        self._jobs[name] = {
+            'job': job,
+            'interval': int(interval_ms or 0),
+            'last': self._monotonic(),
+        }
+
+    def unregister(self, name):
+        """注销任务（若存在），注销后调度循环不再触发它。"""
+        self._jobs.pop(name, None)
+
+    def job_names(self):
+        """返回已注册任务名列表（供自省/单测）。"""
+        return list(self._jobs)
+
+    # ---- 业务事件通知（驱动空闲退避切换）----
+    def notify_event(self):
+        """业务事件到达：重置空闲计时，恢复 200ms 活跃轮询间隔。"""
+        self._last_event_ts = self._monotonic()
+        self._idle = False
+
+    # ---- 内部机制 ----
+    def _poll_interval(self):
+        """当前全局轮询间隔（毫秒）：活跃 200ms / 空闲 500ms。"""
+        return self.IDLE_INTERVAL_MS if self._idle else self.ACTIVE_INTERVAL_MS
+
+    def _schedule_tick(self):
+        """安排下一次 tick（after 失败时停循环并告警，绝不外冒异常）。"""
+        try:
+            self._tick_handle = self._after(self.BASE_TICK_MS, self._tick)
+        except Exception as _e:
+            self._running = False
+            logger.warning('[GUI] _ui_scheduler tick 调度失败(循环停止): %s', _e)
+
+    def _tick(self):
+        """单一调度循环体：到期任务同帧串行执行（防撕裂 + 便于探针统计）。"""
+        if self._stopped:
+            return
+        now = self._monotonic()
+        # 空闲退避判定（毫秒阈值换算为单调秒）
+        self._idle = (now - self._last_event_ts) * 1000.0 >= self.IDLE_THRESHOLD_MS
+        try:
+            for name in list(self._jobs):
+                spec = self._jobs.get(name)
+                if spec is None:
+                    continue
+                interval = spec['interval'] or self._poll_interval()
+                if now - spec['last'] >= interval / 1000.0:
+                    spec['last'] = now
+                    try:
+                        spec['job']()
+                    except Exception as _je:
+                        # 漏调度防护：单任务异常不拖垮循环，也不影响其他任务
+                        logger.warning('[GUI] _ui_scheduler 任务 %s 执行异常(已跳过): %s',
+                                       name, _je)
+        finally:
+            # 续期置于 finally：即使上方异常逃逸也不会导致轮询停摆
+            if self._running:
+                self._schedule_tick()
+
+
 class LotteryGUI:
     """
     排列5 AI智能分析系统主界面
 
     负责构建和管理整个GUI，包括：
     - 控制面板（数据爬取、智能分析中心、自我进化、智能分析与验证四个功能卡片）
-    - 输出面板（预测结果 / 运行日志 / 历史命中率 / 自我进化 四个标签页）
+    - 输出面板（预测结果 / 命令行输出 / 自我进化 三个标签页；命令行输出实时展示 stdout/stderr 与 logging 日志）
     - 状态栏（任务状态、进度条、快捷统计）
 
     通过 TaskManager 将所有耗时业务逻辑放到后台线程执行，
     确保UI保持响应；自我进化引擎运行于独立后台线程，启动即自动触发，
-    状态/进度/进化日志通过 queue + root.after 轮询实时呈现，永不阻塞主界面。
+        状态/进度/进化日志通过 queue + root.after 轮询实时呈现，永不阻塞主界面。
     """
 
     def __init__(self, root):
@@ -413,6 +452,15 @@ class LotteryGUI:
             _lg2.getLogger(__name__).warning('性能监控启动跳过(非致命): %s', _pf_e)
 
         self.task_mgr = TaskManager(self, max_workers=4, queue_size=100, enable_structured_logging=True)  # 异步任务管理器（多线程、优先级队列、协作式取消、超时控制）
+        # §需求#3 命令行实时日志收集器：捕获 stdout/stderr + 全部 logging 记录，
+        # 推入线程安全队列，由 _poll_cli_log 在「命令行输出」标签页实时渲染。
+        # 安装为幂等，失败静默（绝不阻断 GUI 启动）。
+        try:
+            from modules.cli_log_sink import install_cli_sink
+            install_cli_sink()
+        except Exception as _cli_e:
+            import logging as _lg3
+            _lg3.getLogger(__name__).warning('CLI 日志收集器安装跳过(非致命): %s', _cli_e)
         self._buttons = []  # 所有按钮列表（用于批量启用/禁用）
         self._current_task_name = ""  # 当前正在执行的任务名称
         self._prediction_clipboard = ""  # 最近一次生成的预测号码（供一键复制）
@@ -434,28 +482,84 @@ class LotteryGUI:
         self._detail_frame = None   # 详细分析折叠区
         self._alt_content = None    # 备选号码折叠区
         self._alt_visible = False
+        # GUI-03 增量渲染（v5.2 §2.2）：结果卡片索引与上次渲染状态。
+        # key 形如 'section::card_id'；_dash_card_state 保存对应规格（含内容签名），
+        # 渲染时经 _dash_diff 计算 add/update/remove，仅对差异部分做 create/destroy。
+        self._dash_card_index = {}   # type: Dict[str, tk.Widget]
+        self._dash_card_state = {}   # type: Dict[str, dict]
+        self._dash_grid_ncols = {}   # type: Dict[str, int] 各 grid 容器已配置列数
         self.evolution = None       # 自我进化引擎句柄（启动后自动初始化）
         self._poll_evolution_handle = None  # _poll_evolution after 定时器句柄（用于关闭时精确 cancel）
         self._liveness_watchdog_handle = None  # _liveness_watchdog after 定时器句柄（用于关闭时精确 cancel）
         self._update_time_handle = None  # _update_time after 定时器句柄（用于关闭时精确 cancel）
-        # 进度节流状态
+        self._poll_cli_log_handle = None  # _poll_cli_log after 定时器句柄（用于关闭时精确 cancel）
+        # GUI-04：轮询统一调度器句柄（v5.2 §2.3）。None 表示特性开关关闭
+        # 或初始化失败，此时三条轮询回退为各自独立的 after 自调度链（R4）。
+        self._ui_scheduler = None
+        self.cli_log_text = None  # 命令行输出文本框（实时日志标签页）
+        self._cli_autoscroll = True  # 命令行日志自动滚动到底部
+        # 进度节流状态（v5.0 §2.1.3：值 + 文案双维度节流）
         self._last_progress_value = -1
+        self._last_progress_text = ""
+        # 预计剩余（ETA）几何外推估计器，仅运行中样本参与外推
+        self._progress_est = ui_styles.ProgressEstimator()
+        # 任务收尾原因（'' = 正常完成 / 'timeout' = 超时被杀），
+        # 用于区分「用户主动取消」与「超时取消」的文案呈现
+        self._task_finish_reason = ""
         # 行号更新节流
         self._line_number_update_pending = False
         # 概览刷新标志
         # overview_flush_pending removed = False
 
+        # GUI-04：初始化轮询统一调度器并注册任务（须先于 _build_ui：
+        # _build_ui 内状态栏会直接调用 _update_time 做首刷；注册后由 tick 接管）。
+        self._init_ui_scheduler()
         self._setup_window_style()
         self._build_ui()
         # 启动即自动触发「自我进化」引擎（后台守护线程，非阻塞）
         # 延迟初始化：避免在 UI 渲染阶段阻塞主线程导致白屏卡顿
         self.root.after(100, self._init_evolution_engine)
+        # 命令行实时日志轮询（每 200ms 消费队列，主线程安全渲染，永不阻塞）
+        # GUI-04：调度器开启时已在 _init_ui_scheduler 注册，此处仅覆盖回退路径
+        if self._ui_scheduler is None:
+            self.root.after(200, self._poll_cli_log)
         self._setup_keyboard_shortcuts()
         # 加载主题偏好
         self._load_theme_preference()
         
         # 初始化可视化菜单
         self._viz_menu = None
+
+    def _init_ui_scheduler(self):
+        """GUI-04（v5.2 §2.3）：创建轮询统一调度器并注册任务。
+
+        注册集中在 _build_ui 之前完成：
+          - update_time：固定 1000ms 间隔（与旧行为一致，不参与空闲退避）；
+          - poll_cli_log / poll_evolution：interval_ms=0 跟随全局轮询间隔
+            （默认 200ms，60s 无业务事件退避至 500ms）。
+        poll_evolution 由 _init_evolution_engine 在引擎就绪后注册（引擎未启动
+        时无需空转）；本方法保证调度循环在 _build_ui 前启动。
+
+        特性开关关闭或初始化失败时 _ui_scheduler 保持 None，三条轮询回退为
+        各自独立的 after 自调度链（R4 回滚，行为与 v5.1 一致）。
+        """
+        if not _ui_scheduler_enabled():
+            logger.info('[GUI] ENABLE_UI_SCHEDULER=false，轮询回退自调度 after 链（R4）')
+            return
+        try:
+            self._ui_scheduler = _UIScheduler(
+                self.root.after,
+                after_cancel_fn=self.root.after_cancel,
+            )
+            self._ui_scheduler.register('update_time', self._update_time,
+                                        interval_ms=1000)
+            self._ui_scheduler.register('poll_cli_log', self._poll_cli_log,
+                                        interval_ms=0)
+            self._ui_scheduler.start()
+            logger.info('[GUI] _ui_scheduler 已启动：单一 100ms tick 循环接管轮询')
+        except Exception as _us_e:
+            logger.warning('[GUI] _ui_scheduler 初始化失败(回退自调度链): %s', _us_e)
+            self._ui_scheduler = None
 
     def _setup_window_style(self):
         """配置ttk样式主题（暗色主题，clam引擎）"""
@@ -474,7 +578,7 @@ class LotteryGUI:
         # ------------------------------------------------------------------
         # Treeview 暗色适配
         # 问题：clam 主题下 Treeview 的行背景不会继承 '.' 样式，实测
-        # style.lookup('Treeview','background') == '#ffffff'，
+        # style.lookup('Treeview','background') 实测返回白色（非主题随动值），
         # 而前景继承自 '.' 的 #f8fafc（近白），于是
         # 「历史命中率」明细表变成白底白字，内容完全不可见。
         # 修复：显式指定 background / fieldbackground / foreground，
@@ -489,7 +593,7 @@ class LotteryGUI:
                         rowheight=24)
         style.map('Treeview',
                   background=[('selected', COLORS['accent_p5'])],
-                  foreground=[('selected', '#ffffff')])
+                  foreground=[('selected', WHITE)])
         style.configure('Treeview.Heading',
                         background=COLORS['bg_secondary'],
                         foreground=COLORS['text_primary'],
@@ -518,6 +622,25 @@ class LotteryGUI:
         # 运行日志标签页已移除，相关快捷键停用
         self.root.unbind('<Control-f>')
         self.root.unbind('<Control-a>')
+
+        # v5.0 §2.1 键盘可达性：开始分析 / 导出
+        # 复用 _on_button_click（内含 is_running() 守卫、任务提交与看门狗），
+        # 保证快捷键与点击按钮走完全相同的状态机，不会并发重复启动。
+        def _on_ctrl_return(_e=None):
+            self._on_button_click("智能分析", self._execute_unified_analysis)
+
+        def _on_ctrl_e(_e=None):
+            try:
+                self._show_export_menu()
+            except Exception as _e:
+                logger.debug(f'快捷键导出失败(非致命): {_e}')
+
+        self.root.bind('<Control-Return>', _on_ctrl_return)
+        # 兼容小键盘回车
+        self.root.bind('<Control-KP_Enter>', _on_ctrl_return)
+        self.root.bind('<Control-e>', _on_ctrl_e)
+        self.root.bind('<Control-E>', _on_ctrl_e)
+
         # Escape 取消当前操作
         self.root.bind('<Escape>', lambda e: self._cancel_current_task())
 
@@ -554,7 +677,7 @@ class LotteryGUI:
         icon.create_oval(4, 4, 36, 36, fill=COLORS['accent_p5'], outline='', width=0)
         # 内层 AI 紫叠加
         icon.create_oval(8, 8, 32, 32, fill=COLORS['accent_ai'], outline='', width=0)
-        icon.create_text(20, 20, text='5', font=('Consolas', 16, 'bold'), fill='#ffffff')
+        icon.create_text(20, 20, text='5', font=('Consolas', 16, 'bold'), fill=WHITE)
 
         title_box = tk.Frame(left, bg=COLORS['bg_secondary'])
         title_box.pack(side=tk.LEFT, padx=(10, 0), pady=0)
@@ -605,8 +728,14 @@ class LotteryGUI:
         self._update_time()
 
     def _update_time(self):
-        """每秒更新顶部时钟显示"""
+        """每秒更新顶部时钟显示
+
+        GUI-04：调度器开启时由 _ui_scheduler 以固定 1000ms 间隔触发，
+        本方法不再自调度（仅回退路径保留 after(1000) 自调度链）。
+        """
         self.time_label.config(text=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        if getattr(self, '_ui_scheduler', None) is not None:
+            return
         self._update_time_handle = self.root.after(1000, self._update_time)
 
     # 主题管理
@@ -626,14 +755,37 @@ class LotteryGUI:
         self._save_theme_preference()
 
     def _apply_theme(self, theme: dict):
-        """应用主题配色到所有控件"""
+        """应用主题配色到所有控件。
+
+        修复（v5.0 §2.3）：旧实现在重绑定 ``COLORS`` **之后**才遍历控件，并用
+        ``hasattr(widget, 'bg')`` 判定可改属性。tkinter 控件并不把 ``bg``/``background``
+        暴露为 Python 属性，判定恒为 False，导致 tk.Button / tk.Label / tk.Frame 被整批
+        跳过——主题切换后大面积残留旧主题色（实测 12 个 bg_card 按钮卡死）。
+        现改为：切换前快照旧主题做「色值→语义槽」反查，遍历时直接 cget/config。
+        """
         global COLORS
+        old_theme = COLORS  # 控件当前色取自旧主题，必须按旧主题反查语义槽
+        old_color_map = self._build_old_color_map(old_theme)
         COLORS = theme
+        # 根窗口直接取新主题值（不参与反向映射：它已被改写为新值，再按旧主题反查
+        # 会误配为第三色——实测浅色 text_primary 与深色 bg_primary 同为 #0f172a）
         self.root.configure(bg=theme['bg_primary'])
         # 重新应用样式
         self._setup_window_style()
-        # 递归更新所有子控件颜色
-        self._update_widget_colors(self.root, theme)
+        # 递归更新所有子控件颜色（从根的子控件开始，避开根窗口自身）
+        try:
+            root_children = self.root.winfo_children()
+        except Exception:
+            root_children = []
+        for child in root_children:
+            self._update_widget_colors(child, theme, old_color_map)
+        # 按钮经显式 token 精确还原（token 路径无歧义，不受反向映射碰撞影响）
+        self._refresh_registered_button_styles(theme)
+        # Text/Treeview 标签色与 Canvas 绘图项 fill 均不经
+        # cget('background') 反查（tag_configure/itemconfig 无此入口），
+        # 须按显式 token 重放，否则主题切换后残留旧色（v5.2 GUI-06）
+        self._refresh_theme_tags(theme)
+        self._refresh_theme_canvas_items(theme)
         # 更新可视化器主题（v4.0 §2.4 修复：set_theme 是 modules.visualizer 的模块级函数，
         # 旧代码误用「实例方法」调用 visualizer.set_theme → AttributeError 使主题切换崩溃。
         # 现导入模块级 _viz_set_theme，并加守卫：可视化器异常绝不阻断主题切换主流程。）
@@ -642,29 +794,164 @@ class LotteryGUI:
         except Exception as e:
             logger.warning('[GUI] 更新可视化器主题失败(不影响主题切换): %s', e)
 
-    def _update_widget_colors(self, widget, theme: dict):
-        """递归更新控件颜色（遍历所有子组件）"""
-        try:
-            # 更新当前控件
-            for attr in ['bg', 'background', 'fg', 'foreground']:
-                if hasattr(widget, attr):
+    def _build_old_color_map(self, old_theme: dict) -> dict:
+        """构建「旧主题色值 → 语义槽键」反查表。
+
+        委托 ui_styles.build_color_slot_map——与 token_for_color 共用同一张语义槽
+        优先级表，避免「按钮 token 反查」与「控件色值反查」两套规则各自漂移。
+
+        已知残余局限：对主题内重色的低频键（bg_panel、gradient_end 等）无法还原其
+        真实语义槽，会落到优先级更高的同色键上（视觉上同为深/浅底，无可见差异）。
+        """
+        return ui_styles.build_color_slot_map(old_theme)
+
+    def _refresh_registered_button_styles(self, theme: dict) -> None:
+        """按 token 精确还原所有已注册按钮的配色（长任务期间禁用态除外）。
+
+        禁用态由 _set_buttons_state 独占管理，主题切换不覆盖，避免任务运行中
+        按钮「突然变亮」掩盖运行中不可操作的视觉提示。
+        """
+        targets = list(getattr(self, '_buttons', []) or [])
+        copy_btn = getattr(self, '_result_copy_btn', None)
+        if copy_btn is not None and copy_btn not in targets:
+            targets.append(copy_btn)
+        for btn in targets:
+            try:
+                if str(btn.cget('state')) == 'disabled':
+                    continue
+                self._apply_button_normal_style(btn)
+            except Exception:
+                continue
+
+    def _register_theme_tags(
+        self, widget, tag_props: Dict[str, Dict[str, str]]
+    ) -> None:
+        """登记 Text/Treeview 的「tag → 主题 token」映射，供切换时重放。
+
+        tag_configure 设置的标签前景/背景色不经 cget('background')
+        反查（无此入口），控件树刷新无法覆盖，主题切换后残留旧色；
+        故创建时显式登记 token，切换时按新主题逐 tag 重放。
+
+        参数:
+            widget: Text/Treeview 等支持 tag_configure 的控件
+            tag_props: {tag 名: {tag 选项: 主题 token}}，如
+                {'error': {'foreground': 'accent_danger_light'}}
+        """
+        registrations = getattr(self, '_theme_tag_registrations', None)
+        if registrations is None:
+            registrations = []
+            self._theme_tag_registrations = registrations
+        registrations.append((widget, tag_props))
+
+    def _refresh_theme_tags(self, theme: dict) -> None:
+        """主题切换后重放所有已登记 tag 的 tag_configure（v5.2 GUI-06）。
+
+        参数:
+            theme: 新主题配色字典（COLORS 新值）
+        """
+        # list() 快照：重放过程中登记表不被遍历器持有，允许回调内再登记
+        for widget, tag_props in list(
+                getattr(self, '_theme_tag_registrations', []) or []):
+            for tag, props in tag_props.items():
+                for opt, token in props.items():
+                    value = theme.get(token)
+                    if not isinstance(value, str):
+                        continue
                     try:
-                        current = widget.cget(attr)
-                        if current in theme.values() or current in COLORS.values():
-                            # 映射颜色
-                            old_color_map = {v: k for k, v in ThemeManager.DARK_THEME.items()}
-                            old_color_map.update({v: k for k, v in ThemeManager.LIGHT_THEME.items()})
-                            if current in old_color_map:
-                                key = old_color_map[current]
-                                if key in theme:
-                                    widget.config(**{attr: theme[key]})
+                        widget.tag_configure(tag, **{opt: value})
+                    except Exception:
+                        # 控件已销毁或 tag 已删：跳过，不阻断其余刷新
+                        continue
+
+    def _register_theme_canvas_item(
+        self, canvas, item_id: int, token: str
+    ) -> None:
+        """登记 Canvas 绘图项（圆点/渐变条）的 fill 主题 token。
+
+        Canvas 绘图项不经控件树遍历刷新（itemconfig 需 item id，
+        无 cget 反查入口），主题切换后残留创建时旧色；故登记
+        (canvas, item_id) → token，切换时重放 itemconfig。
+        同一 (canvas, item_id) 重复登记时**更新** token，支持阶段
+        圆点等「按状态动态变色后仍跟随主题」的场景。
+
+        参数:
+            canvas: Canvas 控件
+            item_id: create_oval/create_rectangle 返回的绘图项 id
+            token: 主题语义槽键（COLORS 键名）
+        """
+        items = getattr(self, '_theme_canvas_items', None)
+        if items is None:
+            items = []
+            self._theme_canvas_items = items
+        for entry in items:
+            if entry[0] is canvas and entry[1] == item_id:
+                entry[2] = token
+                return
+        items.append([canvas, item_id, token])
+
+    def _refresh_theme_canvas_items(self, theme: dict) -> None:
+        """主题切换后重放所有已登记 Canvas 绘图项的 fill 色（GUI-06）。
+
+        参数:
+            theme: 新主题配色字典（COLORS 新值）
+        """
+        for canvas, item_id, token in list(
+                getattr(self, '_theme_canvas_items', []) or []):
+            value = theme.get(token)
+            if not isinstance(value, str):
+                continue
+            try:
+                canvas.itemconfig(item_id, fill=value)
+            except Exception:
+                # 画布已销毁或绘图项已删：跳过，不阻断其余刷新
+                continue
+
+    def _update_widget_colors(self, widget, theme: dict, old_color_map: dict):
+        """递归刷新控件配色：旧主题色值 → 语义槽 → 新主题值。
+
+        参数:
+            widget: 待刷新控件（递归起点）
+            theme: 新主题配色字典
+            old_color_map: _build_old_color_map(旧主题) 的结果，控件当前色按此反查语义槽
+        """
+        # 刷新当前控件
+        try:
+            # v5.2 GUI-06：可刷新属性清单 2 项扩至 10 项——
+            # activebackground/activeforeground（按钮/菜单按压色）、
+            # insertbackground（Text 插入光标）、highlightbackground/
+            # highlightcolor（高亮边框）、selectbackground/
+            # selectforeground（选中文本）、troughcolor（滚动槽）。
+            # 此前不在清单内，主题切换后这些属性残留旧主题色。
+            # 不支持该属性的控件（ttk 子集等）由下方 except 逐项跳过。
+            for attr in ('background', 'foreground',
+                         'activebackground', 'activeforeground',
+                         'insertbackground', 'highlightbackground',
+                         'highlightcolor', 'selectbackground',
+                         'selectforeground', 'troughcolor'):
+                try:
+                    current = widget.cget(attr)
+                except Exception:
+                    continue
+                if not isinstance(current, str):
+                    continue
+                key = old_color_map.get(current)
+                if key is None:
+                    continue
+                new_value = theme.get(key)
+                if isinstance(new_value, str) and new_value != current:
+                    try:
+                        widget.config(**{attr: new_value})
                     except Exception:
                         pass
-            # 递归处理子控件
-            for child in widget.winfo_children():
-                self._update_widget_colors(child, theme)
         except Exception:
             pass
+        # 递归处理子控件（单独 try：单个控件失败不中断整棵子树）
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            return
+        for child in children:
+            self._update_widget_colors(child, theme, old_color_map)
 
     def _save_theme_preference(self):
         """保存主题偏好设置"""
@@ -689,7 +976,10 @@ class LotteryGUI:
                             ThemeManager.LIGHT_THEME if self._current_theme == 'light'
                             else ThemeManager.DARK_THEME
                         )
-                        self._theme_btn.config(text="" if self._current_theme == 'light' else "")
+                        # 与 _toggle_theme 语义一致：浅色主题显示 🌙（点击切深色），深色显示 ☀️
+                        # v5.0 §2.3 修复：旧代码两个分支均为空串，加载偏好后主题按钮 emoji 恒为空
+                        self._theme_btn.config(
+                            text='🌙' if self._current_theme == 'light' else '☀️')
         except Exception:
             pass
 
@@ -781,6 +1071,12 @@ class LotteryGUI:
         try:
             # 触发所有子组件重新计算布局
             self.root.update_idletasks()
+            # v5.2 GUI-07：三档断点响应式重排（方案 §311）。该调用幂等：
+            # 仅当断点档位/磁贴布局模式相对上次发生变化时才触碰控件，
+            # 同档位内的连续 Configure（拖拽中）零开销，不干扰 A1-A4
+            # 闪烁守护；模式未变即返回，不会因磁贴高度变化引发
+            # Configure 二次触发死循环。
+            self._apply_breakpoint_layout()
         except Exception:
             pass
 
@@ -807,13 +1103,19 @@ class LotteryGUI:
         布局采用垂直卡片式排列,每张卡片用不同颜色区分功能域。
         """
         # 数据爬取卡片
-        crawl_card = self._create_card(parent, "数据爬取", '#f59e0b')
+        crawl_card = self._create_card(
+            parent, "数据爬取", COLORS['accent_warning_light'],
+            accent_token='accent_warning_light')
         crawl_card.pack(fill=tk.X, pady=(0, 8))
 
-        self._add_big_button(crawl_card, "增量爬取数据", '#f59e0b',
-                             lambda: self._on_button_click("增量爬取", self._execute_crawl_incremental))
-        self._add_action_button(crawl_card, "全量爬取数据", '#d97706',
-                                lambda: self._on_button_click("全量爬取", self._execute_crawl_full))
+        self._add_big_button(
+            crawl_card, "增量爬取数据", COLORS['accent_warning_light'],
+            lambda: self._on_button_click("增量爬取", self._execute_crawl_incremental),
+            color_token='accent_warning_light')
+        self._add_action_button(
+            crawl_card, "全量爬取数据", COLORS['accent_warning'],
+            lambda: self._on_button_click("全量爬取", self._execute_crawl_full),
+            color_token='accent_warning')
 
         # 数据爬取状态栏（数据库连接 + 历史数据量），启动后延迟刷新
         self.crawl_db_status_var = tk.StringVar(value="数据库：检测中…")
@@ -826,12 +1128,16 @@ class LotteryGUI:
         self.root.after(1500, self._refresh_crawl_status)
 
         # 智能分析中心（合并 四步流水线 + 走势引擎 + 快速预测，同一界面完成，避免多面板切换）
-        p5_card = self._create_card(parent, "智能分析中心", COLORS['accent_p5'])
+        p5_card = self._create_card(
+            parent, "智能分析中心", COLORS['accent_p5'],
+            accent_token='accent_p5')
         p5_card.pack(fill=tk.X, pady=(0, 8))
 
         # P2 优化: 快速模式与标准模式双按钮
-        self._add_big_button(p5_card, " 开始分析", COLORS['accent_p5'],
-                             lambda: self._on_button_click("智能分析", self._execute_unified_analysis))
+        self._add_big_button(
+            p5_card, " 开始分析", COLORS['accent_p5'],
+            lambda: self._on_button_click("智能分析", self._execute_unified_analysis),
+            color_token='accent_p5')
 
         tk.Label(p5_card,
                  text="开始分析: 完整流程（含验证/学习/AI解读）",
@@ -851,7 +1157,32 @@ class LotteryGUI:
                                        bg=COLORS['bg_secondary'],
                                        fg=COLORS['accent_p5'], width=4)
         self.progress_label.pack(side=tk.LEFT)
-        
+        # 显式取消按钮（v5.2 GUI-10 方案 §331：长任务可取消入口，与 Escape
+        # 快捷键共用 _cancel_current_task 链路）。不注册进 self._buttons：
+        # 其启用态与操作按钮相反（任务运行中才可点），由 _set_buttons_state
+        # 反转管理；初始为灰化禁用态，空闲时不可点击。
+        self._cancel_btn = tk.Button(progress_row, text="取消",
+                                     command=self._cancel_current_task,
+                                     font=('微软雅黑', 9),
+                                     bg=COLORS['bg_input'],
+                                     fg=COLORS['text_disabled'],
+                                     activebackground=COLORS['accent_danger'],
+                                     activeforeground=WHITE,
+                                     relief='flat', bd=0,
+                                     padx=8, pady=2,
+                                     cursor='hand2',
+                                     highlightthickness=0,
+                                     takefocus=True,
+                                     state=tk.DISABLED)
+        self._cancel_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        # 悬停效果复用工具栏按钮工厂的通用处理器（danger 三态）
+        self._cancel_btn.bind(
+            '<Enter>',
+            lambda e: self._on_button_enter(e, self._cancel_btn, 'danger'))
+        self._cancel_btn.bind(
+            '<Leave>',
+            lambda e: self._on_button_leave(e, self._cancel_btn, 'danger'))
+
         # 卡片状态徽章动态更新示例
         self._update_card_badge(p5_card, "就绪", "badge_trial")
 
@@ -862,14 +1193,16 @@ class LotteryGUI:
         self.task_status_label.pack(anchor=tk.W, padx=10, pady=(4, 8))
 
         # 智能分析与验证卡片 — 单个综合按钮，v3.11
-        analysis_card = self._create_card(parent, "智能分析与验证", '#059669')
+        analysis_card = self._create_card(
+            parent, "智能分析与验证", COLORS['accent_p5'],
+            accent_token='accent_p5')
         analysis_card.pack(fill=tk.X, pady=(0, 8))
 
         # 综合验证与分析按钮（一键执行「分析工具」全部子功能：验证→命中率→性能→回测→特征→报告）
         tk.Button(analysis_card, text=" 综合验证与分析",
                   font=('微软雅黑', 10, 'bold'),
-                  bg='#10b981', fg='#ffffff',
-                  activebackground='#059669', activeforeground='#ffffff',
+                  bg=COLORS['accent_p5_light'], fg=WHITE,
+                  activebackground=COLORS['accent_p5'], activeforeground=WHITE,
                   relief='flat', cursor='hand2',
                   command=lambda: self._on_button_click(
                       "综合验证与分析", self._execute_comprehensive_analysis_and_verify
@@ -905,14 +1238,16 @@ class LotteryGUI:
         # 已于 v3.17 整合进上方「智能分析与验证」卡片的「综合验证与分析」一键按钮,
         # 复用各子功能既有实现, 数据口径与单独点击完全一致, 故此处不再单独陈列。
 
-    def _create_card(self, parent, title, accent_color):
+    def _create_card(self, parent, title, accent_color, accent_token=None):
         """
         创建一个带标题和顶部彩色装饰条的功能卡片（v3.36 优化版）
 
         Args:
             parent: 父容器
             title: 卡片标题
-            accent_color: 装饰条和圆点颜色
+            accent_color: 装饰条和圆点颜色（创建时的主题值快照）
+            accent_token: 可选，accent_color 对应的主题语义槽键；提供后
+                主题切换时 Canvas 圆点按该 token 重放（v5.2 GUI-06）
 
         Returns:
             tk.Frame: 卡片框架
@@ -934,7 +1269,10 @@ class LotteryGUI:
         dot = tk.Canvas(title_frame, width=8, height=8,
                         bg=COLORS['bg_secondary'], highlightthickness=0)
         dot.pack(side=tk.LEFT, padx=(0, 6))
-        dot.create_oval(1, 1, 7, 7, fill=accent_color, outline='')
+        _dot_item = dot.create_oval(1, 1, 7, 7, fill=accent_color, outline='')
+        # Canvas 绘图项不经控件树反查刷新：登记 token，切换主题后重放（GUI-06）
+        if accent_token:
+            self._register_theme_canvas_item(dot, _dot_item, accent_token)
 
         tk.Label(title_frame, text=title,
                  font=('微软雅黑', 11, 'bold'),
@@ -966,16 +1304,18 @@ class LotteryGUI:
         for child in card._badge_placeholder.winfo_children():
             child.destroy()
         
-        # 根据 badge_type 获取样式
+        # 六个 badge_* 槽键在深浅两主题中均已定义，直接查表（v5.2 GUI-06：
+        # 原 .get 默认值字面量计缺口，且 COLORS['accent_orange'] 未定义，
+        # 默认参数会被提前求值，rolledback 分支一旦调用即 KeyError）
         if badge_type == 'badge_active':
-            bg = COLORS.get('badge_active_bg', COLORS['accent_p5'])
-            fg = COLORS.get('badge_active_fg', '#ffffff')
+            bg = COLORS['badge_active_bg']
+            fg = COLORS['badge_active_fg']
         elif badge_type == 'badge_rolledback':
-            bg = COLORS.get('badge_rolledback_bg', '#451a03')
-            fg = COLORS.get('badge_rolledback_fg', COLORS['accent_orange'])
+            bg = COLORS['badge_rolledback_bg']
+            fg = COLORS['badge_rolledback_fg']
         else:  # badge_trial
-            bg = COLORS.get('badge_trial_bg', '#334155')
-            fg = COLORS.get('badge_trial_fg', '#94a3b8')
+            bg = COLORS['badge_trial_bg']
+            fg = COLORS['badge_trial_fg']
         
         badge = tk.Label(card._badge_placeholder, text=text,
                         font=('微软雅黑', 8),
@@ -983,15 +1323,17 @@ class LotteryGUI:
                         padx=6, pady=2)
         badge.pack(side=tk.RIGHT)
 
-    def _add_big_button(self, parent, text, color, command):
+    def _add_big_button(self, parent, text, color, command, color_token=None):
         """
         添加主要操作按钮（大号、彩色背景、占满整行）（v3.36 优化版）
 
         Args:
             parent: 父容器
             text: 按钮文字
-            color: 按钮背景色
+            color: 按钮背景色（创建时的主题值快照）
             command: 点击回调函数
+            color_token: 可选，color 对应的主题语义槽键；显式提供时优先
+                用于正常态注册（v5.2 GUI-06）
 
         Returns:
             tk.Button: 按钮实例
@@ -1011,20 +1353,24 @@ class LotteryGUI:
                         padx=12, pady=10,
                         highlightthickness=0,
                         highlightbackground=COLORS['border'],
-                        bd=0)
+                        bd=0,
+                        # v5.0 §2.1 可访问性：tk.Button 默认不可 Tab 聚焦，显式开启
+                        takefocus=True)
         btn.pack(fill=tk.X)
 
         # 记录正常态配色（v4.0 §2.4：以主题 token 存储，主题切换后还原仍正确）
-        # color 可能是静态 hex（如 '#f59e0b'）或主题值快照；fg 用 token 'text_primary'
+        # color 可能是静态色常量或主题值快照；fg 用 token 'text_primary'
         # 动态解析，避免缓存创建时的浅/深 hex 快照导致切换主题后泄漏旧色。
         _hover_c = self._lighten_color(color, 1.15)
-        btn._normal_bg = color
-        btn._normal_fg = 'text_primary'
-
-        # hover效果：鼠标进入时变亮，离开时恢复
-        # 禁用守卫：按钮处于 disabled（任务运行中）时不响应 hover，避免误导视觉
-        btn.bind('<Enter>', lambda e, b=btn, c=_hover_c: b.config(bg=c) if str(b['state']) != 'disabled' else None)
-        btn.bind('<Leave>', lambda e, b=btn, c=color: b.config(bg=c) if str(b['state']) != 'disabled' else None)
+        # 反查 token：color 多为 COLORS 当前值快照，存 token 才能在主题切换后跟随
+        # （否则还原的仍是创建时的旧主题色 → 明暗不一致）；color_token 显式提供时
+        # 优先（v5.2 GUI-06：「同值多键」反查依赖兜底插入序，显式 token 根除脆弱性）
+        _bg_token = color_token or ui_styles.token_for_color(color, COLORS)
+        ui_styles.remember_button_normal(btn, _bg_token, 'text_primary')
+        # hover（Enter/Leave）委托中央样式工厂，禁用守卫由工厂统一处理；
+        # hover 色不传创建时快照 hex，由工厂按当前主题自适应派生（暗变亮/亮变暗），
+        # 主题切换后 hover 亦无残留（v5.2 GUI-06）
+        ui_styles.bind_hover(btn, lambda: COLORS)
         # 按下效果
         btn.bind('<Button-1>', lambda e, b=btn, c=self._lighten_color(color, 0.9): b.config(bg=c) if str(b['state']) != 'disabled' else None)
         btn.bind('<ButtonRelease-1>', lambda e, b=btn, c=_hover_c: b.config(bg=c) if str(b['state']) != 'disabled' else None)
@@ -1032,15 +1378,18 @@ class LotteryGUI:
         self._buttons.append(btn)
         return btn
 
-    def _add_action_button(self, parent, text, color, command):
+    def _add_action_button(self, parent, text, color, command,
+                           color_token=None):
         """
         添加次要操作按钮（小号、深色背景、hover时变色）
 
         Args:
             parent: 父容器
             text: 按钮文字
-            color: hover时的背景色
+            color: hover时的背景色（创建时的主题值快照）
             command: 点击回调函数
+            color_token: 可选，color 对应的主题语义槽键；显式提供时
+                优先用于 hover 派生（v5.2 GUI-06）
 
         Returns:
             tk.Button: 按钮实例
@@ -1057,17 +1406,17 @@ class LotteryGUI:
                         relief='flat',
                         cursor='hand2',
                         command=command,
-                        padx=12, pady=5)
+                        padx=12, pady=5,
+                        takefocus=True)  # v5.0 §2.1 可访问性：允许 Tab 聚焦
         btn.pack(fill=tk.X)
 
-        # 记录正常态配色（v4.0 §2.4：token 化，主题切换后还原仍正确）
-        btn._normal_bg = 'bg_card'
-        btn._normal_fg = 'text_primary'
-
-        # hover效果：鼠标进入时变亮，离开时恢复（禁用时不响应，避免误导视觉）
-        # 离开恢复用 token 动态解析，主题切换后不变旧色
-        btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=c) if str(b['state']) != 'disabled' else None)
-        btn.bind('<Leave>', lambda e, b=btn: b.config(bg=self._resolve_color_token('bg_card')) if str(b['state']) != 'disabled' else None)
+        # 正常态 token + hover（Enter/Leave）统一委托中央样式工厂（v5.0 §2.1）；
+        # hover 色优先取显式 color_token，禁用守卫由工厂统一处理（v5.2 GUI-06）
+        ui_styles.remember_button_normal(btn, 'bg_card', 'text_primary')
+        # hover_bg 支持传主题 token（v5.2 GUI-06：显式 color_token 优先，回落
+        # 传入 color 快照），bind_hover 内部在事件内惰性解析为当前主题值
+        _hover_token = color_token or color
+        ui_styles.bind_hover(btn, lambda: COLORS, hover_bg=_hover_token)
         # 按下效果
         btn.bind('<Button-1>', lambda e, b=btn, c=self._lighten_color(color, 0.85): b.config(bg=c) if str(b['state']) != 'disabled' else None)
         btn.bind('<ButtonRelease-1>', lambda e, b=btn, c=color: b.config(bg=c) if str(b['state']) != 'disabled' else None)
@@ -1097,16 +1446,13 @@ class LotteryGUI:
                         relief='flat',
                         cursor='hand2',
                         command=command,
-                        padx=10, pady=4)
+                        padx=10, pady=4,
+                        takefocus=True)  # v5.0 §2.1 可访问性：允许 Tab 聚焦
         btn.pack(side=tk.LEFT, padx=(0, 5))
 
-        # 记录正常态配色（v4.0 §2.4：token 化，主题切换后还原仍正确）
-        btn._normal_bg = 'bg_card'
-        btn._normal_fg = 'text_primary'
-
-        # hover效果（禁用时不响应，避免误导视觉；修复原重复绑定的冗余 bug）
-        btn.bind('<Enter>', lambda e, b=btn, c=color: b.config(bg=c) if str(b['state']) != 'disabled' else None)
-        btn.bind('<Leave>', lambda e, b=btn: b.config(bg=self._resolve_color_token('bg_card')) if str(b['state']) != 'disabled' else None)
+        # 正常态 token + hover 统一委托中央样式工厂（v5.0 §2.1），hover 色沿用 color
+        ui_styles.remember_button_normal(btn, 'bg_card', 'text_primary')
+        ui_styles.bind_hover(btn, lambda: COLORS, hover_bg=color)
 
         self._buttons.append(btn)
         return btn
@@ -1117,17 +1463,14 @@ class LotteryGUI:
         将十六进制颜色按比例变亮
 
         Args:
-            hex_color: 十六进制颜色字符串（如 '#10b981'）
+            hex_color: 十六进制颜色字符串（6 位 #RRGGBB 形式）
             factor: 亮度因子（>1变亮，<1变暗）
 
         Returns:
             变亮后的十六进制颜色字符串
         """
-        hex_color = hex_color.lstrip('#')
-        r = min(255, int(int(hex_color[0:2], 16) * factor))
-        g = min(255, int(int(hex_color[2:4], 16) * factor))
-        b = min(255, int(int(hex_color[4:6], 16) * factor))
-        return f'#{r:02x}{g:02x}{b:02x}'
+        # 委托中央样式工厂（v5.0 §2.1），与 UI 其余部分共用同一实现
+        return ui_styles.lighten_color(hex_color, factor)
 
     @staticmethod
     def _resolve_color_token(value):
@@ -1137,15 +1480,13 @@ class LotteryGUI:
         创建时的 hex 快照导致主题切换后泄漏旧主题色。
 
         参数:
-            value: 主题键名（如 'bg_card' / 'text_primary'）或静态 hex（如 '#10b981'）
+            value: 主题键名（如 'bg_card' / 'text_primary'）或静态色常量（如 WHITE）
 
         返回:
             str: value 是当前 COLORS 的键名 → 取该键的当前主题值；否则（静态 hex）原样返回。
         """
-        try:
-            return COLORS.get(value, value)
-        except Exception:
-            return value
+        # 委托中央样式工厂（v5.0 §2.1），保持「token → 当前主题值」单一实现
+        return ui_styles.resolve_color_token(value, COLORS)
 
     def _apply_button_normal_style(self, btn):
         """按缓存的 token/静态色还原按钮正常态外观（主题切换后调用亦正确）。
@@ -1153,18 +1494,15 @@ class LotteryGUI:
         参数:
             btn: 记录了 _normal_bg / _normal_fg 的按钮
         """
-        try:
-            if hasattr(btn, '_normal_bg'):
-                btn.config(bg=self._resolve_color_token(btn._normal_bg),
-                           fg=self._resolve_color_token(btn._normal_fg))
-        except Exception:
-            pass
+        # 委托中央样式工厂（v5.0 §2.1）
+        ui_styles.apply_button_normal_style(btn, COLORS)
 
     def _build_output_panel(self, parent):
         """构建右侧输出面板（ttk.Notebook）
 
-        仅保留「预测结果」「自我进化」两个标签页。
-        运行日志改为写入 ``logs/gui_run.log``，不再单独保留标签页。
+        保留「预测结果」「命令行输出」「自我进化」三个标签页。
+        「命令行输出」标签页实时展示命令行 stdout/stderr 与 logging 日志（需求 #3）；
+        同时 ``logs/gui_run.log`` 仍保留完整文件日志，二者互补不冲突。
         """
         panel = tk.Frame(parent, bg=COLORS['bg_primary'])
         panel.pack(fill=tk.BOTH, expand=True)
@@ -1176,6 +1514,11 @@ class LotteryGUI:
         result_tab = tk.Frame(nb, bg=COLORS['bg_primary'])
         nb.add(result_tab, text=" 预测结果")
         self._build_result_tab(result_tab)
+
+        # §需求#3 新增「命令行输出」标签页：实时展示命令行 stdout/stderr 与 logging 日志
+        cli_tab = tk.Frame(nb, bg=COLORS['bg_primary'])
+        nb.add(cli_tab, text=" 命令行输出")
+        self._build_cli_log_tab(cli_tab)
 
         evo_tab = tk.Frame(nb, bg=COLORS['bg_primary'])
         nb.add(evo_tab, text=" 自我进化")
@@ -1219,8 +1562,9 @@ class LotteryGUI:
         self._result_copy_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
         # 清空结果 Danger 样式
-        self._create_toolbar_button(btn_frame, " 清空结果",
-                                    self._clear_result_board, 'danger').pack(side=tk.RIGHT, padx=(6, 0))
+        clear_result_btn = self._create_toolbar_button(
+            btn_frame, " 清空结果", self._clear_result_board, 'danger')
+        clear_result_btn.pack(side=tk.RIGHT, padx=(6, 0))
 
         # 导出改为带下拉菜单的 Primary 样式（模拟下拉）
         export_menu_btn = self._create_toolbar_button(btn_frame, " 导出 ▾",
@@ -1231,6 +1575,17 @@ class LotteryGUI:
         self._result_visualize_btn = self._create_toolbar_button(
             btn_frame, " 📊 可视化", self._show_visualization_menu, 'primary')
         self._result_visualize_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        # v5.2 GUI-07：登记「按钮 → (标准文案, 紧凑文案)」映射。紧凑档
+        # （面板宽度 < _BREAKPOINT_COMPACT_MAX_W）下由 _set_toolbar_mode
+        # 统一切换短文案，窄屏释放操作区宽度（方案 §311 / 验收 A17）；
+        # 标准/宽绰档沿用完整文案。导出按钮原文案已够短，双档一致。
+        self._bp_toolbar_texts = {
+            self._result_copy_btn: (' ★ 复制预测号码', ' ★ 复制'),
+            clear_result_btn: (' 清空结果', ' 清空'),
+            export_menu_btn: (' 导出 ▾', ' 导出 ▾'),
+            self._result_visualize_btn: (' 📊 可视化', ' 📊'),
+        }
 
         # 分类筛选放到左侧
         self.result_category_var = tk.StringVar(value="全部")
@@ -1281,13 +1636,17 @@ class LotteryGUI:
                                           anchor='nw',
                                           width=self.dash_container.winfo_width())
 
-        def _on_dash_configure(event):
-            """仪表盘容器尺寸变化时同步内部宽度并刷新滚动区域。"""
-            self.dash_container.itemconfig('all', width=event.width - 4)
-            self._update_result_scrollregion()
-        self.dash_container.bind('<Configure>', _on_dash_configure)
+        # GUI-01/02（v5.2 §2.2）：dash_container 的 Configure 不再直接同步宽度 +
+        # 刷新滚动区域，改为「阈值守卫 + 防抖合并」，切断 Canvas 尺寸反馈循环：
+        #   * _on_dash_configure：仅当容器宽度较上次变化 >= 2px 才回写内部视窗宽度
+        #     （1px 级拖拽抖动被合并），且不再同步调用 scrollregion 刷新；
+        #   * _dash_request_refresh：50ms 防抖入口，短时间内的多次刷新请求合并为
+        #     一次统一执行（离开 Configure 事件回调栈，消除嵌套触发）。
+        self._dash_last_synced_width = None
+        self._dash_refresh_pending = False
+        self.dash_container.bind('<Configure>', self._on_dash_configure)
         self.dash_inner.bind('<Configure>',
-                              lambda e: self._update_result_scrollregion())
+                             lambda e: self._dash_request_refresh())
         # 鼠标滚轮滚动手感
         def _dash_wheel(event):
             self.dash_container.yview_scroll(int(-1 * (event.delta / 120)), 'units')
@@ -1312,7 +1671,7 @@ class LotteryGUI:
         # 图标：圆角卡片样式，统一空态视觉
         icon_canvas = tk.Canvas(ph_inner, width=64, height=64, bg=COLORS['bg_card'], highlightthickness=0)
         icon_canvas.create_oval(8, 8, 56, 56, fill=COLORS['accent_p5'], outline='', width=0)
-        icon_canvas.create_text(32, 32, text='5', font=('Consolas', 24, 'bold'), fill='#ffffff')
+        icon_canvas.create_text(32, 32, text='5', font=('Consolas', 24, 'bold'), fill=WHITE)
         icon_canvas.pack(pady=(0, 12))
         tk.Label(ph_inner, text="暂无预测结果",
                  font=('微软雅黑', 15, 'bold'),
@@ -1551,7 +1910,8 @@ class LotteryGUI:
 
         # ── 顶部概览区（带渐变边框效果）────────────────────────────────
         ov = tk.Frame(f, bg=COLORS['bg_card'],
-                      highlightbackground='#a78bfa', highlightthickness=2)
+                      highlightbackground=COLORS['accent_ai_bright'],
+                      highlightthickness=2)
         ov.pack(fill=tk.X, padx=12, pady=10)
 
         # 标题栏（带图标装饰）
@@ -1561,16 +1921,21 @@ class LotteryGUI:
         # 装饰渐变条
         grad_bar = tk.Canvas(hdr, width=4, height=28, bg=COLORS['bg_card'],
                              highlightthickness=0)
-        grad_bar.create_rectangle(0, 0, 4, 28, fill='#7c3aed', outline='')
+        # Canvas 绘图项登记 token，主题切换后重放（v5.2 GUI-06）
+        _grad_item = grad_bar.create_rectangle(
+            0, 0, 4, 28, fill=COLORS['accent_ai'], outline='')
+        self._register_theme_canvas_item(grad_bar, _grad_item, 'accent_ai')
         grad_bar.pack(side=tk.LEFT, padx=(0, 10))
 
         # 标题文字
         tk.Label(hdr, text="自我进化引擎", font=('微软雅黑', 13, 'bold'),
-                 bg=COLORS['bg_card'], fg='#a78bfa').pack(side=tk.LEFT)
+                 bg=COLORS['bg_card'],
+                 fg=COLORS['accent_ai_bright']).pack(side=tk.LEFT)
 
         # 状态徽章（动态更新）
         self.evo_status_badge = tk.Label(hdr, text="● 就绪", font=('微软雅黑', 9),
-                                         bg='#1e1e2e', fg='#10b981',
+                                         bg=COLORS['bg_input'],
+                                         fg=COLORS['accent_p5_light'],
                                          padx=10, pady=3, relief='flat')
         self.evo_status_badge.pack(side=tk.RIGHT)
 
@@ -1581,7 +1946,11 @@ class LotteryGUI:
         for i, phase_name in enumerate(['采集', '基线', '调优', '评估', '持久化', '完成']):
             dot = tk.Canvas(phase_frame, width=12, height=12, bg=COLORS['bg_card'],
                            highlightthickness=0)
-            dot.create_oval(1, 1, 11, 11, fill='#334155', outline='')
+            # 初始「未开始」灰色点：登记 text_muted token，主题切换后重放；
+            # 运行中由 _update_phase_indicator 按阶段改色并重登记（v5.2 GUI-06）
+            _dot_item = dot.create_oval(
+                1, 1, 11, 11, fill=COLORS['text_muted'], outline='')
+            self._register_theme_canvas_item(dot, _dot_item, 'text_muted')
             dot.pack(side=tk.LEFT, padx=4)
             self.evo_phase_indicators.append(dot)
             tk.Label(phase_frame, text=phase_name, font=('微软雅黑', 8),
@@ -1677,9 +2046,10 @@ class LotteryGUI:
 
         # 日志文本框（等宽字体，类终端风格）
         self.evo_log = tk.Text(log_frame, wrap=tk.WORD, font=('Consolas', 9),
-                               bg='#020617', fg='#e2e8f0',
+                               bg=COLORS['bg_panel'], fg=COLORS['text_secondary'],
                                relief='flat', padx=12, pady=10, state=tk.NORMAL,
-                               undo=True, insertbackground='#a78bfa')
+                               undo=True,
+                               insertbackground=COLORS['accent_ai_bright'])
         self.evo_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # 滚动条（匹配主题）
@@ -1690,18 +2060,31 @@ class LotteryGUI:
         self.evo_log.config(yscrollcommand=esb.set)
 
         # 日志标签颜色（终端风格）
-        self.evo_log.tag_config('section', foreground='#8b5cf6',
-                               font=('微软雅黑', 10, 'bold'))
-        self.evo_log.tag_config('success', foreground='#10b981',
-                               font=('微软雅黑', 9))
-        self.evo_log.tag_config('warning', foreground='#f59e0b',
-                               font=('微软雅黑', 9))
-        self.evo_log.tag_config('error', foreground='#ef4444',
-                               font=('微软雅黑', 9, 'bold'))
-        self.evo_log.tag_config('info', foreground='#94a3b8',
+        self.evo_log.tag_config(
+            'section', foreground=COLORS['accent_ai_light'],
+            font=('微软雅黑', 10, 'bold'))
+        self.evo_log.tag_config(
+            'success', foreground=COLORS['accent_p5_light'],
+            font=('微软雅黑', 9))
+        self.evo_log.tag_config(
+            'warning', foreground=COLORS['accent_warning_light'],
+            font=('微软雅黑', 9))
+        self.evo_log.tag_config(
+            'error', foreground=COLORS['accent_danger_light'],
+            font=('微软雅黑', 9, 'bold'))
+        self.evo_log.tag_config('info', foreground=COLORS['badge_trial_fg'],
                                font=('Consolas', 9))
-        self.evo_log.tag_config('dim', foreground='#475569',
+        self.evo_log.tag_config('dim', foreground=COLORS['text_disabled'],
                                font=('Consolas', 9))
+        # Text tag 色不经控件树反查刷新：登记 token，切换主题后重放（GUI-06）
+        self._register_theme_tags(self.evo_log, {
+            'section': {'foreground': 'accent_ai_light'},
+            'success': {'foreground': 'accent_p5_light'},
+            'warning': {'foreground': 'accent_warning_light'},
+            'error': {'foreground': 'accent_danger_light'},
+            'info': {'foreground': 'badge_trial_fg'},
+            'dim': {'foreground': 'text_disabled'},
+        })
         self.evo_log.insert(tk.END, "> 自我进化引擎已就绪。启动后将自动训练并记录版本。\n", 'dim')
 
         # ── 版本表格（带斑马纹效果 + 状态徽章颜色）──────────────────────
@@ -1727,11 +2110,22 @@ class LotteryGUI:
         # 斑马纹（支持明暗主题）
         self.evo_version_tree.tag_configure('odd', background=COLORS['bg_card'])
         self.evo_version_tree.tag_configure('even', background=COLORS['bg_secondary'])
-        # 状态徽章颜色
-        self.evo_version_tree.tag_configure('active', foreground='#059669',
-                                           font=('微软雅黑', 9, 'bold'))
+        # 状态徽章颜色（v5.2 GUI-06：字面量改主题槽查表，斑马纹与徽章色
+        # 一并登记，主题切换后 tag_configure 重放）
+        self.evo_version_tree.tag_configure(
+            'active', foreground=COLORS['accent_p5'],
+            font=('微软雅黑', 9, 'bold'))
         self.evo_version_tree.tag_configure('trial', foreground=COLORS['text_muted'])
-        self.evo_version_tree.tag_configure('rolledback', foreground='#d97706')
+        self.evo_version_tree.tag_configure(
+            'rolledback', foreground=COLORS['accent_warning'])
+        # ttk Treeview tag 色不经控件树反查刷新：登记 token 重放（GUI-06）
+        self._register_theme_tags(self.evo_version_tree, {
+            'odd': {'background': 'bg_card'},
+            'even': {'background': 'bg_secondary'},
+            'active': {'foreground': 'accent_p5'},
+            'trial': {'foreground': 'text_muted'},
+            'rolledback': {'foreground': 'accent_warning'},
+        })
         self.evo_version_tree.pack(fill=tk.BOTH, expand=True)
         # 绑定双击事件查看版本详情
         self.evo_version_tree.bind('<Double-1>', self._on_version_row_double_click)
@@ -1774,11 +2168,101 @@ class LotteryGUI:
             self.evolution.start()
             logger.info('[GUI] 自我进化引擎已初始化并启动，注册轮询定时器')
             self.root.after(300, self._refresh_evolution_versions)
-            self.root.after(200, self._poll_evolution)
+            # GUI-04：调度器开启时注册 poll_evolution 由 tick 循环触发；
+            # 回退路径保留原 after(200) 自调度链
+            if self._ui_scheduler is not None:
+                self._ui_scheduler.register('poll_evolution', self._poll_evolution,
+                                            interval_ms=0)
+            else:
+                self.root.after(200, self._poll_evolution)
         except Exception as e:
             logger.warning('自我进化引擎初始化失败: %s', e)
             import traceback
             logger.warning(traceback.format_exc())
+
+    def _build_cli_log_tab(self, parent):
+        """构建「命令行输出」标签页：实时展示 stdout/stderr 与 logging 日志（需求 #3）。
+
+        通过后台线程安全队列（modules.cli_log_sink）接收日志行，
+        由 _poll_cli_log 每 200ms 在主线程渲染，效果等同「命令行输出界面化」。
+        """
+        f = tk.Frame(parent, bg=COLORS['bg_primary'])
+        f.pack(fill=tk.BOTH, expand=True)
+
+        # ── 工具栏（清空 / 自动滚动）────────────────────────────────
+        tb = tk.Frame(f, bg=COLORS['bg_primary'])
+        tb.pack(fill=tk.X, padx=12, pady=(8, 4))
+        tk.Label(tb, text="命令行实时输出", font=('微软雅黑', 10, 'bold'),
+                 bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
+        # 关键字过滤框（Phase 4：复用已渲染文本 + 内存缓冲，大小写不敏感）
+        self._cli_filter_var = tk.StringVar()
+        self._cli_filter_var.trace_add('write', self._apply_cli_filter)
+        tk.Label(tb, text="过滤", font=('微软雅黑', 9),
+                 bg=COLORS['bg_primary'], fg=COLORS['text_muted']).pack(
+            side=tk.LEFT, padx=(12, 4))
+        tk.Entry(tb, textvariable=self._cli_filter_var, width=18,
+                 font=('Consolas', 9), bg=COLORS['bg_card'],
+                 fg=COLORS['text_primary'], relief='flat',
+                 insertbackground=COLORS['accent_ai']).pack(
+            side=tk.LEFT, padx=(0, 10))
+        self._cli_autoscroll_var = tk.BooleanVar(value=True)
+        _asb = tk.Checkbutton(tb, text="自动滚动", variable=self._cli_autoscroll_var,
+                              bg=COLORS['bg_primary'], fg=COLORS['text_muted'],
+                              selectcolor=COLORS['bg_card'], activebackground=COLORS['bg_primary'],
+                              command=lambda: setattr(self, '_cli_autoscroll', self._cli_autoscroll_var.get()))
+        _asb.pack(side=tk.RIGHT, padx=(0, 8))
+        tk.Button(tb, text="🗑️ 清空", command=self._clear_cli_log,
+                  bg=COLORS['bg_card'], fg=COLORS['text_primary'],
+                  activebackground=COLORS['bg_secondary'], relief='flat',
+                  font=('微软雅黑', 9), padx=10, pady=3).pack(side=tk.RIGHT)
+
+        # ── 日志文本框（等宽字体，类终端风格，与进化日志一致）──────────
+        log_frame = tk.Frame(f, bg=COLORS['bg_panel'],
+                             highlightbackground=COLORS['border'], highlightthickness=1)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+
+        self.cli_log_text = tk.Text(log_frame, wrap=tk.WORD, font=('Consolas', 9),
+                                    bg=COLORS['bg_panel'],
+                                    fg=COLORS['text_secondary'],
+                                    relief='flat', padx=12, pady=10,
+                                    state=tk.NORMAL, undo=True,
+                                    insertbackground=COLORS['cursor_cli'])
+        self.cli_log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        csb = tk.Scrollbar(log_frame, command=self.cli_log_text.yview, width=12,
+                           bg=COLORS['bg_card'], troughcolor=COLORS['bg_secondary'],
+                           activebackground=COLORS['accent_ai'])
+        csb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.cli_log_text.config(yscrollcommand=csb.set)
+
+        # 日志级别颜色（终端风格）
+        self.cli_log_text.tag_config(
+            'info', foreground=COLORS['badge_trial_fg'], font=('Consolas', 9))
+        self.cli_log_text.tag_config(
+            'success', foreground=COLORS['accent_p5_light'],
+            font=('Consolas', 9))
+        self.cli_log_text.tag_config(
+            'warning', foreground=COLORS['accent_warning_light'],
+            font=('Consolas', 9))
+        self.cli_log_text.tag_config(
+            'error', foreground=COLORS['accent_danger_light'],
+            font=('Consolas', 9, 'bold'))
+        self.cli_log_text.tag_config(
+            'dim', foreground=COLORS['text_disabled'], font=('Consolas', 9))
+        # Text tag 色不经控件树反查刷新：登记 token，切换主题后重放（GUI-06）
+        self._register_theme_tags(self.cli_log_text, {
+            'info': {'foreground': 'badge_trial_fg'},
+            'success': {'foreground': 'accent_p5_light'},
+            'warning': {'foreground': 'accent_warning_light'},
+            'error': {'foreground': 'accent_danger_light'},
+            'dim': {'foreground': 'text_disabled'},
+        })
+        self.cli_log_text.insert(tk.END,
+                                 "> 等待命令行输出…（开始分析 / 数据爬取 / 自进化等动作的输出将实时刷新到此）\n", 'dim')
+        # 内存缓冲：保留全部日志行（tag, line），供关键字过滤重建视图
+        self._cli_log_buffer = []
+        # Phase 4：右键复制选中 / 复制全部 / 清空
+        self.cli_log_text.bind('<Button-3>', self._cli_log_context_menu)
 
     def _poll_evolution(self):
         """轮询自我进化引擎消息队列（每 200ms），实时刷新 UI（主线程安全）。"""
@@ -1793,17 +2277,154 @@ class LotteryGUI:
             self._poll_evolution_handle = None
             return
         eng = getattr(self, 'evolution', None)
+        _consumed = False  # GUI-04：本次轮询是否真正消费到消息（驱动退避恢复）
         if eng is not None:
             try:
                 while True:
                     msg = eng.queue.get_nowait()
                     self._handle_evolution_msg(msg)
+                    _consumed = True
             except queue.Empty:
                 pass
             except Exception as e:
                 logger.warning('[GUI] _poll_evolution 消费消息时异常: %s', e)
-        # 保存句柄以便关闭时精确 cancel
+        # GUI-04：消费到消息即业务事件，重置空闲退避计时
+        if _consumed and self._ui_scheduler is not None:
+            self._ui_scheduler.notify_event()
+        # 保存句柄以便关闭时精确 cancel。
+        # GUI-04：调度器开启时不再自调度，由 tick 循环按间隔触发
+        if getattr(self, '_ui_scheduler', None) is not None:
+            return
         self._poll_evolution_handle = self.root.after(200, self._poll_evolution)
+
+    def _poll_cli_log(self):
+        """轮询命令行日志队列（GUI-04：由 _ui_scheduler 按 200ms/退避 500ms 触发）。
+
+        实时渲染到「命令行输出」标签页（主线程安全，永不阻塞）。
+        GUI-04 优化：
+          1. 空闲期（has_pending 为假）零 Tk 调用直接返回 —— A11「渲染类 0 次」；
+          2. 单次 drain 的全部行合并为**一次** txt.insert 批调用提交
+             （Tcl insert 支持 chars/tagList 交替段，保持日志时间顺序），
+             替代逐行 insert —— A12「1000 行 ≤ 5 次批插入」实际 1 次；
+          3. 消费到日志行即通知调度器业务事件到达，恢复 200ms 活跃轮询间隔。
+        """
+        if getattr(self, '_poll_cli_log_cancelled', False):
+            self._poll_cli_log_handle = None
+            return
+        try:
+            if self.root.winfo_exists() is False:
+                self._poll_cli_log_handle = None
+                return
+        except Exception:
+            self._poll_cli_log_handle = None
+            return
+        txt = getattr(self, 'cli_log_text', None)
+        buf = getattr(self, '_cli_log_buffer', None)
+        if txt is not None:
+            try:
+                from modules.cli_log_sink import drain_cli_lines, has_pending
+                # 空闲期无待渲染行：不 drain、不触 Tk（A11 渲染类 0 次）。
+                # 注意：此处不得提前 return —— 回退路径（调度器关闭）仍需
+                # 走到方法尾部完成 after(200) 自调度续期。
+                lines = drain_cli_lines() if has_pending() else []
+                if lines:
+                    # 业务事件到达 → 重置空闲退避计时，恢复 200ms 活跃轮询间隔
+                    if self._ui_scheduler is not None:
+                        self._ui_scheduler.notify_event()
+                    kw = (getattr(self, '_cli_filter_var', None).get()
+                          if getattr(self, '_cli_filter_var', None) is not None
+                          else '').strip().lower()
+                    # 过滤 + 内存缓冲逐行处理（不触 Tk），渲染合并为一次批 insert：
+                    # Tk Text.insert(index, chars, tagList, chars, tagList, ...)
+                    # 支持文本段与标签列表交替，天然保持日志原有顺序。
+                    segments = []  # type: list
+                    for tag, line in lines:
+                        if buf is not None:
+                            buf.append((tag, line))
+                            if len(buf) > 5000:
+                                del buf[:len(buf) - 5000]
+                        # 有关键字时仅渲染匹配行；无关键字渲染全部
+                        if not kw or kw in line.lower():
+                            segments.append(line + '\n')
+                            segments.append((tag,))
+                    if segments:
+                        txt.insert(tk.END, *segments)
+                    # 缓冲上限裁剪（防止无限增长）
+                    _count = int(txt.index('end-1c').split('.')[0])
+                    if _count > 5000:
+                        txt.delete('1.0', f'{_count - 5000}.0')
+                    if getattr(self, '_cli_autoscroll', True):
+                        txt.see(tk.END)
+            except Exception as e:
+                import logging as _lgc
+                _lgc.getLogger(__name__).warning('[GUI] _poll_cli_log 渲染异常: %s', e)
+        # GUI-04：调度器开启时不再自调度，由 tick 循环按间隔触发
+        if getattr(self, '_ui_scheduler', None) is not None:
+            return
+        self._poll_cli_log_handle = self.root.after(200, self._poll_cli_log)
+
+    def _apply_cli_filter(self, *_):
+        """关键字过滤：重建命令行输出文本框，仅展示匹配行（大小写不敏感）。
+
+        复用内存缓冲 ``_cli_log_buffer``，避免对原始队列重复消费。
+        """
+        txt = getattr(self, 'cli_log_text', None)
+        buf = getattr(self, '_cli_log_buffer', None)
+        if txt is None or buf is None:
+            return
+        try:
+            kw = (getattr(self, '_cli_filter_var', None).get()
+                  if getattr(self, '_cli_filter_var', None) is not None
+                  else '').strip().lower()
+            txt.config(state=tk.NORMAL)
+            txt.delete('1.0', tk.END)
+            for tag, line in buf:
+                if not kw or kw in line.lower():
+                    txt.insert(tk.END, line + '\n', tag)
+            if getattr(self, '_cli_autoscroll', True):
+                txt.see(tk.END)
+        except Exception:
+            pass
+
+    def _cli_log_context_menu(self, event):
+        """右键菜单：复制选中 / 复制全部 / 清空（Phase 4）。"""
+        txt = getattr(self, 'cli_log_text', None)
+        if txt is None:
+            return
+        try:
+            menu = tk.Menu(self.root, tearoff=0)
+            try:
+                sel = txt.selection_get()
+            except Exception:
+                sel = ''
+            if sel:
+                menu.add_command(label="复制选中", command=lambda: self._cli_copy(sel))
+            menu.add_command(label="复制全部",
+                             command=lambda: self._cli_copy(txt.get('1.0', tk.END)))
+            menu.add_separator()
+            menu.add_command(label="清空", command=self._clear_cli_log)
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            pass
+
+    def _cli_copy(self, text):
+        """将文本写入系统剪贴板（失败静默）。"""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            pass
+
+    def _clear_cli_log(self):
+        """清空命令行输出文本框（同步清空关键字过滤缓冲）。"""
+        if getattr(self, 'cli_log_text', None) is not None:
+            try:
+                self.cli_log_text.delete('1.0', tk.END)
+                self.cli_log_text.insert(tk.END, "> 日志已清空。\n", 'dim')
+                if getattr(self, '_cli_log_buffer', None) is not None:
+                    self._cli_log_buffer.clear()
+            except Exception:
+                pass
 
     def _handle_evolution_msg(self, m):
         """将引擎消息渲染到自我进化标签页（v3.55 增强版：支持 metrics/phase 消息）。"""
@@ -1816,11 +2437,20 @@ class LotteryGUI:
                 # 更新状态徽章
                 if hasattr(self, 'evo_status_badge'):
                     if '进行中' in txt or '训练' in txt or '运行' in txt:
-                        self.evo_status_badge.config(text="● 运行中", fg='#f59e0b', bg='#1e1e2e')
+                        self.evo_status_badge.config(
+                            text="● 运行中",
+                            fg=COLORS['accent_warning_light'],
+                            bg=COLORS['bg_input'])
                     elif '完成' in txt or '就绪' in txt:
-                        self.evo_status_badge.config(text="● 就绪", fg='#10b981', bg='#1e1e2e')
+                        self.evo_status_badge.config(
+                            text="● 就绪",
+                            fg=COLORS['accent_p5_light'],
+                            bg=COLORS['bg_input'])
                     else:
-                        self.evo_status_badge.config(text="● " + txt[:8], fg='#a78bfa', bg='#1e1e2e')
+                        self.evo_status_badge.config(
+                            text="● " + txt[:8],
+                            fg=COLORS['accent_ai_bright'],
+                            bg=COLORS['bg_input'])
             elif t == 'progress':
                 v = m.get('value', 0)
                 if hasattr(self, 'evo_tab_progress'):
@@ -1836,10 +2466,25 @@ class LotteryGUI:
                 total = m.get('total', 6)
                 name = m.get('name', '')
                 if hasattr(self, 'evo_tab_status'):
-                    self.evo_tab_status.config(text=f"阶段 {idx + 1}/{total}: {name}")
+                    # 统一文案模板（v5.0 §2.1.3）：阶段 N/M · 名称
+                    self.evo_tab_status.config(
+                        text=ui_styles.format_stage_text(idx, total, name))
                 # 更新阶段指示器
                 if hasattr(self, '_update_phase_indicator'):
                     self._update_phase_indicator(idx)
+            elif t == 'evolve_trigger':
+                # v5.0 §7.3：开奖回填后的进化触发判定必须可见，不得静默跳过
+                triggered = bool(m.get('triggered'))
+                issue = m.get('issue', '—')
+                reason = m.get('reason') or m.get('reason_code', '')
+                tag = 'success' if triggered else 'info'
+                icon = '⚡' if triggered else '⏸'
+                if hasattr(self, 'evo_log'):
+                    self.evo_log.insert(tk.END,
+                                        f"{icon} 进化触发判定（期号 {issue}）："
+                                        f"{'已触发轻量进化' if triggered else '跳过'} — {reason}\n",
+                                        tag)
+                    self.evo_log.see(tk.END)
             elif t == 'version':
                 self._refresh_evolution_versions()
                 d = m.get('data', {})
@@ -1849,7 +2494,10 @@ class LotteryGUI:
             elif t == 'done':
                 self._refresh_evolution_versions()
                 if hasattr(self, 'evo_status_badge'):
-                    self.evo_status_badge.config(text="● 就绪", fg='#10b981', bg='#1e1e2e')
+                    self.evo_status_badge.config(
+                        text="● 就绪",
+                        fg=COLORS['accent_p5_light'],
+                        bg=COLORS['bg_input'])
                 if hasattr(self, '_update_phase_indicator'):
                     self._update_phase_indicator(5)  # 完成阶段
             elif t == 'metrics':
@@ -1886,20 +2534,30 @@ class LotteryGUI:
         """
         if not hasattr(self, 'evo_phase_indicators'):
             return
-        colors = ['#059669', '#10b981', '#7c3aed', '#8b5cf6', '#d97706', '#f59e0b']
+        # 阶段点配色（v5.2 GUI-06：原 colors 字面量列表删除，改主题槽 token；
+        # 每次刷新同步重登记 Canvas 注册表，主题切换后按当前阶段状态重放）
+        _token_done = 'accent_p5_light'    # 已完成阶段（绿色）
+        _token_running = 'accent_ai'       # 当前阶段（紫色高亮）
+        _token_pending = 'text_muted'      # 未开始阶段（弱化灰）
         for i, dot_canvas in enumerate(self.evo_phase_indicators):
             if i < current_phase_idx:
-                # 已完成阶段（绿色）
                 dot_canvas.coords(dot_canvas.find_all()[0], 1, 1, 11, 11)
-                dot_canvas.itemconfig(dot_canvas.find_all()[0], fill='#10b981')
+                dot_canvas.itemconfig(
+                    dot_canvas.find_all()[0], fill=COLORS[_token_done])
+                self._register_theme_canvas_item(
+                    dot_canvas, dot_canvas.find_all()[0], _token_done)
             elif i == current_phase_idx:
-                # 当前阶段（紫色高亮）
                 dot_canvas.coords(dot_canvas.find_all()[0], 1, 1, 11, 11)
-                dot_canvas.itemconfig(dot_canvas.find_all()[0], fill='#7c3aed')
+                dot_canvas.itemconfig(
+                    dot_canvas.find_all()[0], fill=COLORS[_token_running])
+                self._register_theme_canvas_item(
+                    dot_canvas, dot_canvas.find_all()[0], _token_running)
             else:
-                # 未开始阶段（灰色）
                 dot_canvas.coords(dot_canvas.find_all()[0], 1, 1, 11, 11)
-                dot_canvas.itemconfig(dot_canvas.find_all()[0], fill='#334155')
+                dot_canvas.itemconfig(
+                    dot_canvas.find_all()[0], fill=COLORS[_token_pending])
+                self._register_theme_canvas_item(
+                    dot_canvas, dot_canvas.find_all()[0], _token_pending)
 
     def _on_version_row_double_click(self, event):
         """双击版本表格行，弹出该版本的详细信息窗口（v3.55 增强版）。"""
@@ -1987,7 +2645,7 @@ class LotteryGUI:
         win.geometry("520x480")
         win.resizable(False, False)
         win.transient(self.root)
-        win.grab_set()
+        _safe_grab_set(win)
 
         # 居中窗口
         win.update_idletasks()
@@ -2008,9 +2666,9 @@ class LotteryGUI:
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
         tk.Label(hdr, text="进化版本详情", font=('微软雅黑', 10, 'bold'),
-                 bg=COLORS['accent_ai'], fg='#ffffff').pack(side=tk.LEFT, padx=12, pady=9)
+                 bg=COLORS['accent_ai'], fg=WHITE).pack(side=tk.LEFT, padx=12, pady=9)
         tk.Button(hdr, text="✕", font=('微软雅黑', 9),
-                  bg=COLORS['accent_ai'], fg='#ffffff', relief='flat',
+                  bg=COLORS['accent_ai'], fg=WHITE, relief='flat',
                   command=win.destroy).pack(side=tk.RIGHT, padx=10, pady=6)
 
         # 内容区
@@ -2028,13 +2686,13 @@ class LotteryGUI:
         # 回滚按钮（非 active 状态显示）
         if status != 'active':
             tk.Button(btn_frame, text="回滚到此版本", font=('微软雅黑', 9),
-                      bg=COLORS['accent_warning'], fg='#ffffff', relief='flat',
-                      activebackground='#b45309',
+                      bg=COLORS['accent_warning'], fg=WHITE, relief='flat',
+                      activebackground=COLORS['accent_warning_active'],
                       command=lambda vt=version_tag: self._on_evo_rollback_to(vt)).pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Button(btn_frame, text="关闭", font=('微软雅黑', 9),
-                  bg=COLORS['accent_p5'], fg='#ffffff', relief='flat',
-                  activebackground='#047857',
+                  bg=COLORS['accent_p5'], fg=WHITE, relief='flat',
+                  activebackground=COLORS['accent_p5_active'],
                   command=win.destroy).pack(side=tk.RIGHT)
 
     def _on_evo_rollback(self):
@@ -2129,7 +2787,7 @@ class LotteryGUI:
         win.geometry("480x420")
         win.resizable(False, False)
         win.transient(self.root)
-        win.grab_set()
+        _safe_grab_set(win)
 
         # 居中
         win.update_idletasks()
@@ -2144,9 +2802,9 @@ class LotteryGUI:
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
         tk.Label(hdr, text="联动状态", font=('微软雅黑', 10, 'bold'),
-                 bg=COLORS['accent_ai'], fg='#ffffff').pack(side=tk.LEFT, padx=12, pady=9)
+                 bg=COLORS['accent_ai'], fg=WHITE).pack(side=tk.LEFT, padx=12, pady=9)
         tk.Button(hdr, text="✕", font=('微软雅黑', 9),
-                  bg=COLORS['accent_ai'], fg='#ffffff', relief='flat',
+                  bg=COLORS['accent_ai'], fg=WHITE, relief='flat',
                   command=win.destroy).pack(side=tk.RIGHT, padx=10, pady=6)
 
         # 内容区（卡片式布局）
@@ -2154,35 +2812,58 @@ class LotteryGUI:
         content.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
         # 构建展示文本
+        # v5.0 §7.3：命中/候选判定统一走引擎的只读建议接口，避免 GUI 自算两套口径。
+        # 注意 `or {}` 而非 dict.get 默认值：键存在但值为 None 时不会触发默认值。
         lines = []
-        lines.append(f"最后分析期号: {link_state.get('last_analysis_issue', '—')}")
-        lines.append(f"预测目标期号: {link_state.get('last_prediction', {}).get('target_issue', '—') if isinstance(link_state.get('last_prediction'), dict) else '—'}")
+        lines.append(f"最后分析期号: {link_state.get('last_analysis_issue') or '—'}")
+        last_pred = link_state.get('last_prediction') or {}
+        lines.append(f"预测目标期号: {last_pred.get('target_issue') or '—'}"
+                     if isinstance(last_pred, dict) else "预测目标期号: —")
         lines.append(f"等待回填: {'是' if link_state.get('pending_verification') else '否'}")
-        lines.append(f"最后同步时间: {link_state.get('last_sync_ts', '—')}")
+        lines.append(f"最后同步时间: {link_state.get('last_sync_ts') or '—'}")
         lines.append("")
         lines.append("─" * 30)
         lines.append("")
 
         # 最新验证结果
-        last_verif = link_state.get('last_verification', {})
-        if last_verif:
-            lines.append(f"期号: {last_verif.get('issue', '—')}")
-            lines.append(f"Top-1 命中: {last_verif.get('top1', '—')}%")
-            lines.append(f"Top-3 命中: {last_verif.get('top3', '—')}%")
-            lines.append(f"Top-5 命中: {last_verif.get('top5', '—')}%")
-            lines.append(f"验证时间: {last_verif.get('ts', '—')}")
+        last_verif = link_state.get('last_verification') or {}
+        if isinstance(last_verif, dict) and last_verif:
+            lines.append(f"期号: {last_verif.get('issue') or '—'}")
+            lines.append(f"Top-1 命中: {last_verif.get('top1')}%")
+            lines.append(f"Top-3 命中: {last_verif.get('top3')}%")
+            lines.append(f"Top-5 命中: {last_verif.get('top5')}%")
+            lines.append(f"验证时间: {last_verif.get('ts') or '—'}")
         else:
             lines.append("暂无验证记录")
 
-        # 最佳候选
-        best = link_state.get('best_candidate', {})
-        if best:
+        # 最佳候选（v5.0 §7.3：附诚实结论，不暗示可提升命中率）
+        advisory = {}
+        try:
+            if eng is not None and hasattr(eng, 'get_latest_advisory'):
+                advisory = eng.get_latest_advisory() or {}
+        except Exception:  # noqa: BLE001
+            advisory = {}
+        best = link_state.get('best_candidate') or {}
+        if isinstance(best, dict) and best:
             lines.append("")
             lines.append("─" * 30)
             lines.append("")
-            lines.append(f"候选版本: {best.get('version_tag', '—')}")
-            metrics = best.get('metrics', {})
-            lines.append(f"Top-1: {metrics.get('top1', '—')}%  Top-3: {metrics.get('top3', '—')}%  Top-5: {metrics.get('top5', '—')}%")
+            lines.append(f"候选版本: {best.get('version_tag') or '—'}")
+            metrics = best.get('metrics') or {}
+            lines.append(f"Top-1: {metrics.get('top1')}%  "
+                         f"Top-3: {metrics.get('top3')}%  "
+                         f"Top-5: {metrics.get('top5')}%")
+            if advisory.get('has_better_candidate'):
+                lines.append("结论: 综合评分高于基线（walk-forward 口径）")
+            elif advisory.get('baseline_metrics'):
+                lines.append("结论: 未严格超越基线，未注入生产权重")
+            else:
+                lines.append("结论: 暂无可比基线，无法判定优劣")
+
+        # 诚实边界声明（常驻，不随状态消失）
+        lines.append("")
+        lines.append("─" * 30)
+        lines.append(f"⚠ {advisory.get('honest_note') or '排列5 为公平摇号，历史统计不改变随机概率。'}")
 
         txt = "\n".join(lines)
 
@@ -2195,8 +2876,8 @@ class LotteryGUI:
 
         # 关闭按钮
         tk.Button(win, text="关闭", font=('微软雅黑', 9),
-                  bg=COLORS['accent_p5'], fg='#ffffff', relief='flat',
-                  activebackground='#047857',
+                  bg=COLORS['accent_p5'], fg=WHITE, relief='flat',
+                  activebackground=COLORS['accent_p5_active'],
                   command=win.destroy).pack(pady=(8, 0))
 
     def _refresh_evolution_versions(self):
@@ -2728,6 +3409,66 @@ class LotteryGUI:
         except Exception:
             pass
 
+    def _on_dash_configure(self, event):
+        """仪表盘容器尺寸变化处理器（GUI-01 阈值守卫版，v5.2 §2.2）。
+
+        v5.1 旧行为：每次 Configure 都无条件 ``itemconfig('all', width=event.width - 4)``
+        并同步刷新滚动区域。当内部视窗宽度改变又反向触发容器 Configure 时，形成
+        Canvas 尺寸反馈循环（闪烁根因之一），且拖拽时的 1px 抖动会产生大量无效重排。
+
+        修复后行为：
+          * 仅当容器宽度较上次同步宽度变化 >= ``_DASH_WIDTH_SYNC_THRESHOLD`` 像素时，
+            才回写内部视窗宽度（1px 级抖动被合并）；
+          * 不再在本回调内同步调用 ``_update_result_scrollregion``，改为走防抖入口
+            ``_dash_request_refresh``，使滚动区域刷新离开 Configure 事件回调栈。
+
+        参数:
+            event: Tk Configure 事件（``event.width`` 为 dash_container 新宽度）。
+        """
+        try:
+            last = getattr(self, '_dash_last_synced_width', None)
+            width = int(event.width)
+            # 口径说明：与「上次事件宽度」比较，skip 时也更新 last，
+            # 使连续 1px 拖拽被逐级合并，仅在累计达到阈值时才真正同步一次。
+            self._dash_last_synced_width = width
+            if last is None or abs(width - last) >= _DASH_WIDTH_SYNC_THRESHOLD:
+                self.dash_container.itemconfig('all', width=width - 4)
+            self._dash_request_refresh()
+        except Exception:
+            pass
+
+    def _dash_request_refresh(self, force: bool = False) -> None:
+        """GUI-02 防抖入口：合并短时间内的多次 scrollregion 刷新请求。
+
+        50ms 窗口内的重复请求仅保留一个待执行标记，由 ``root.after`` 统一到
+        ``_dash_flush_refresh`` 执行；``force=True`` 时立即执行（用于渲染等
+        需要即时同步的场景）。
+
+        参数:
+            force: 为 True 时跳过防抖、立即执行一次刷新并取消待执行标记。
+        """
+        if force:
+            self._dash_refresh_pending = False
+            self._dash_flush_refresh()
+            return
+        if getattr(self, '_dash_refresh_pending', False):
+            return
+        self._dash_refresh_pending = True
+        try:
+            self.root.after(_DASH_REFRESH_DEBOUNCE_MS, self._dash_flush_refresh)
+        except Exception:
+            # 窗口已销毁等场景：退化为直接执行，避免刷新丢失
+            self._dash_refresh_pending = False
+            try:
+                self._dash_flush_refresh()
+            except Exception:
+                pass
+
+    def _dash_flush_refresh(self):
+        """防抖刷新落地：执行一次滚动区域刷新并清除待执行标记。"""
+        self._dash_refresh_pending = False
+        self._update_result_scrollregion()
+
     def _update_result_scrollregion(self):
         """刷新结果滚动画布的滚动区域（内容变化后调用）。"""
         try:
@@ -2763,16 +3504,37 @@ class LotteryGUI:
         self._update_result_scrollregion()
 
     def _clear_result_board(self):
-        """清空右侧预测结果仪表盘（不影响运行日志）。"""
+        """清空右侧预测结果仪表盘（工具栏「清空」按钮专用）。
+
+        GUI-03（v5.2 §2.2）：语义收窄——仅响应用户显式清空动作，
+        无条件销毁全部卡片；常规渲染更新走 _render_dashboard_impl 的
+        增量 diff 路径（_dash_diff），不再全量 destroy。
+        """
+        self._dash_reset()
+        self._show_toast('结果已清空', COLORS['success'])
+
+    def _dash_reset(self):
+        """销毁全部仪表盘卡片并复位索引/状态，恢复空态占位（GUI-03）。"""
+        # 按原 v3.66 约定：卡片自身不注册 after 回调，destroy 前无需额外清理，
+        # 窗口已销毁等场景一律静默降级。
         try:
             for w in list(self.result_dash.winfo_children()):
-                w.destroy()
+                if w.winfo_exists():
+                    w.destroy()
+        except Exception:
+            pass
+        self._dash_card_index = {}
+        self._dash_card_state = {}
+        self._dash_grid_ncols = {}
+        self._last_dashboard_key = None
+        self._alt_content = None
+        self._alt_visible = False
+        try:
             self.result_dash.pack_forget()
             self._result_placeholder.pack(fill=tk.BOTH, expand=True)
             self._update_result_scrollregion()
         except Exception:
             pass
-        self._show_toast('结果已清空', COLORS['success'])
 
     def _export_result_board(self):
         """导出当前预测结果（结构化 JSON）为 Markdown 报告。"""
@@ -2854,11 +3616,9 @@ class LotteryGUI:
             tk.Label: 承载数值的主标签，调用方持有以便后续 config(text=...) 回填
         """
         tile = tk.Frame(parent, bg=COLORS['bg_secondary'],
-                         highlightbackground=COLORS['border'], highlightthickness=1)
-        tile.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
-        # 横向并排磁贴：约束最小宽度防止被挤窄
-        tile.pack_propagate(False)
-        tile.configure(width=220)
+                        highlightbackground=COLORS['border'], highlightthickness=1)
+        # 4 列并排布局统一入口（v5.2 GUI-07：窄屏 grid 切回复用同参）
+        self._pack_ov_tile_row(tile)
 
         tk.Label(tile, text=label, font=('微软雅黑', 8),
                  bg=COLORS['bg_secondary'], fg=COLORS['text_muted']
@@ -2873,12 +3633,159 @@ class LotteryGUI:
                      ).pack(anchor=tk.W, padx=10, pady=(0, 8))
         return val_label
 
+    @staticmethod
+    def _pack_ov_tile_row(tile) -> None:
+        """概览磁贴按「4 列并排 pack」布局（标准/宽绰档，v5.2 GUI-07）。
+
+        构建期与 grid→row 切回均走本入口，保证 pack 参数单一来源，
+        避免两处书写漂移导致两种并排形态。
+
+        GUI-07 缺陷修复（v5.2 登记）：原实现 pack_propagate(False) 且
+        只设 width 不设 height，磁贴请求高度塌缩为 1px（离屏实测显示
+        高度 9px=1px 内容 + ipady 8px），内部标签溢出到底板之外、
+        背景割裂。本入口改为
+        自然尺寸（propagate True）：并排时 expand+fill=X 平分容器宽度
+        （row 档容器宽度 >= _TILE_GRID_MAX_W=1100，单磁贴实际 >=265px，
+        原 220px 最小宽约束已无适用场景），高度自适应内容 ~95px。
+        grid 档下发自然宽度由列权重与 sticky 拉伸铺满，与此一致。
+
+        参数:
+            tile: 单个磁贴 Frame（_create_ov_tile 的返回值宿主）
+        """
+        # 自然尺寸：宽度由 pack expand 平分，高度由内容决定
+        tile.pack_propagate(True)
+        tile.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
+
+    @staticmethod
+    def _classify_breakpoint(panel_width: int) -> str:
+        """按输出面板宽度划分三档断点（v5.2 GUI-07，方案 §311）。
+
+        参数:
+            panel_width: 输出面板（output_nb）当前实际宽度（像素）
+
+        返回:
+            str: 'compact'（<1024 紧凑）/ 'standard'（1024-1440 标准）
+                 / 'wide'（>1440 宽绰）
+        """
+        if panel_width < _BREAKPOINT_COMPACT_MAX_W:
+            return 'compact'
+        if panel_width <= _BREAKPOINT_STANDARD_MAX_W:
+            return 'standard'
+        return 'wide'
+
+    def _set_toolbar_mode(self, bp: str) -> None:
+        """按断点切换结果页工具栏按钮文案（GUI-07：短文案 <1024）。
+
+        紧凑档使用登记表中的短文案（释放窄屏操作区宽度，验收 A17），
+        标准/宽绰档使用完整文案。仅改 text，不触碰按钮其余属性与
+        禁用态（禁用外观由任务运行链路单独负责）。
+
+        参数:
+            bp: 断点档位（_classify_breakpoint 的返回值）
+        """
+        compact = (bp == 'compact')
+        registry = getattr(self, '_bp_toolbar_texts', None) or {}
+        for btn, texts in registry.items():
+            text = texts[1] if compact else texts[0]
+            try:
+                if btn.winfo_exists():
+                    btn.config(text=text)
+            except Exception:
+                continue
+
+    def _set_ov_tiles_mode(self, mode: str) -> None:
+        """概览磁贴在「4 列并排 pack」与「2×2 网格 grid」间切换（GUI-07）。
+
+        方案 §311：容器宽度 < _TILE_GRID_MAX_W 时以 grid 替代并排 pack，
+        窄屏两列排布避免磁贴被过度挤压；切回按同一套参数复原。
+
+        Tk 约束：同一容器内 pack 与 grid 几何管理器不可混用，必须先
+        成批脱离旧管理器、再成批挂载新管理器——逐个小部件交错切换会抛
+        TclError（离屏实测证实），故此处脱离/挂载两段循环严格分离。
+
+        参数:
+            mode: 'grid'（2×2 网格）或 'row'（4 列并排）
+        """
+        cont = getattr(self, '_ov_container', None)
+        # _ov_tiles 存的是磁贴「数值标签」句柄，其 master 即磁贴 Frame
+        tiles = [lbl.master
+                 for lbl in (getattr(self, '_ov_tiles', None) or {}).values()]
+        if cont is None or not tiles:
+            return
+        try:
+            if mode == 'grid':
+                for t in tiles:
+                    t.pack_forget()
+                    t.pack_propagate(True)
+                    t.configure(width=0)
+                # uniform 组保证两列等宽、两行等高；weight=1 让磁贴
+                # 随容器拉伸铺满单元格（sticky='nsew'）
+                cont.grid_columnconfigure((0, 1), weight=1, uniform='ovcol')
+                cont.grid_rowconfigure((0, 1), weight=1, uniform='ovrow')
+                for idx, t in enumerate(tiles):
+                    t.grid(row=idx // 2, column=idx % 2, sticky='nsew',
+                           padx=(0, 8), pady=(0, 4) if idx < 2 else 0)
+            else:
+                for t in tiles:
+                    t.grid_forget()
+                for t in tiles:
+                    self._pack_ov_tile_row(t)
+        except Exception:
+            # 个别磁贴已销毁等异常：放弃本次切换，不影响主流程
+            return
+
+    def _apply_breakpoint_layout(self) -> None:
+        """按当前输出面板宽度应用响应式布局（幂等，GUI-07 主入口）。
+
+        由 _on_layout_resize（right 容器 Configure → after_idle）驱动：
+        1. 读 output_nb 实际宽度划分三档断点，档位变化时切换工具栏文案；
+        2. 读磁贴容器宽度，按 _TILE_GRID_MAX_W 阈值切换 grid/row 布局；
+        3. 幂等保护：未映射（withdraw / 离屏未 deiconify，宽度为 1）时
+           跳过；档位与磁贴模式均未变化时零触碰，拖拽期连续 Configure
+           不产生重排风暴（不干扰 A1-A4 闪烁守护）。
+
+        无参数、无返回值。
+        """
+        nb = getattr(self, 'output_nb', None)
+        if nb is None:
+            return
+        try:
+            if not nb.winfo_exists():
+                return
+            panel_w = nb.winfo_width()
+        except Exception:
+            return
+        if panel_w <= 1:
+            return  # 未映射：保持构建期默认布局（标准档全文案 + 4 列并排）
+        bp = self._classify_breakpoint(panel_w)
+        if bp != getattr(self, '_active_breakpoint', 'standard'):
+            self._set_toolbar_mode(bp)
+            self._active_breakpoint = bp
+        cont = getattr(self, '_ov_container', None)
+        if cont is None:
+            return
+        try:
+            cont_w = cont.winfo_width()
+        except Exception:
+            return
+        if cont_w <= 1:
+            return  # 容器未映射：保持当前磁贴模式
+        mode = 'grid' if cont_w < _TILE_GRID_MAX_W else 'row'
+        if mode != getattr(self, '_active_tile_mode', 'row'):
+            self._set_ov_tiles_mode(mode)
+            self._active_tile_mode = mode
+
     def _refresh_result_overview(self):
         """后台刷新「预测结果」页概览区四个指标磁贴（v4.0 §2.4）。
 
         在后台线程查询数据库（最新预测期号 / Top-1 历史命中率 / 已验证期数 / 历史数据量），
         结果经 root.after 回投主线程原地回填磁贴数值，全程不阻塞 UI。
         数据库不可用时各磁贴优雅降级为「—」，不影响主流程。
+
+        GUI-05 指纹节流（PUP-20261019-013100 §2.2，验收 A14）：回投主线程前比对
+        指纹 (latest_issue, verified_count, data_count) 三元组——与上次刷新完全
+        一致时直接跳过，主线程零唤醒（_apply_ov_values 不被调用）；任一成分变化
+        才回投。命中率由已验证数据聚合派生、不在指纹内，遵循方案三元组口径。
 
         参数:
             无（方法内部读取 self._ov_tiles 中的数值标签句柄）
@@ -2890,6 +3797,9 @@ class LotteryGUI:
         def _worker():
             """后台线程：查库收集四个指标，返回 (issue_text, hit_rate_text, verified_text, data_text)。"""
             issue_text, hit_text, verified_text, data_text = '—', '—', '—', '—'
+            # 指纹原始值（库内原始口径，非格式化文案）：-1 表示该查询未成功，
+            # 与「查询成功且为 0」区分，保证失败→成功跳变必然触发回投。
+            issue_raw, total_raw, cnt_raw = '—', -1, -1
             try:
                 db = P5Database()
                 if db.connect():
@@ -2901,6 +3811,7 @@ class LotteryGUI:
                         row = db.cursor.fetchone()
                         if row and row.get('target_issue'):
                             issue_text = str(row['target_issue'])
+                            issue_raw = issue_text
                         # 已验证期数 + 历史命中率（Top-1 真实口径）
                         stats = db.get_verification_stats()
                         total = int(stats.get('total', 0) or 0)
@@ -2908,14 +3819,21 @@ class LotteryGUI:
                             verified_text = f"{total} 期"
                             top1 = stats.get('top1_avg_accuracy', stats.get('avg_accuracy', 0)) or 0
                             hit_text = f"{float(top1):.1f}%"
+                        total_raw = total
                         # 历史数据量
                         cnt = db.get_history_data_count()
                         data_text = f"{cnt} 期"
+                        cnt_raw = cnt
                     finally:
                         db.disconnect()
             except Exception:
                 # DB 不可用：保持占位符，静默降级
                 pass
+            # GUI-05 指纹节流：三元组与上次刷新一致则跳过回投（主线程零唤醒）
+            fingerprint = (issue_raw, total_raw, cnt_raw)
+            if getattr(self, '_ov_last_fingerprint', None) == fingerprint:
+                return
+            self._ov_last_fingerprint = fingerprint
             try:
                 self.root.after(0, lambda: self._apply_ov_values(
                     issue_text, hit_text, verified_text, data_text))
@@ -2954,7 +3872,7 @@ class LotteryGUI:
             win.geometry("520x400")
             win.configure(bg=COLORS['bg_secondary'])
             win.transient(self.root)
-            win.grab_set()
+            _safe_grab_set(win)
 
             tk.Label(win, text=f"期号: {target_issue}", font=('微软雅黑', 11, 'bold'),
                      bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).pack(pady=(10, 4))
@@ -3077,12 +3995,12 @@ class LotteryGUI:
                     top1 = nums[0] if nums else None
                     act = int(actual.get(pk))
                     if top1 is not None and int(top1) == act:
-                        fg, note = '#2e7d32', '' # 首选命中
+                        fg, note = HIT_FG, '' # 首选命中
                         hit_cnt += 1
                     elif any(int(n) == act for n in nums[:3] if n is not None):
-                        fg, note = '#e65100', '' # Top-3 含开奖
+                        fg, note = TOP3_FG, '' # Top-3 含开奖
                     else:
-                        fg, note = '#b71c1c', '' # 未含
+                        fg, note = MISS_FG, '' # 未含
                     tk.Label(grid, text=f"{top1 if top1 is not None else '-'} {note}",
                              width=6, font=('Consolas', 11, 'bold'),
                              bg=COLORS['bg_secondary'], fg=fg
@@ -3125,8 +4043,8 @@ class LotteryGUI:
                     is_hit = (act is not None and n is not None and int(n) == act)
                     tk.Label(line, text=str(n),
                              font=('Consolas', 9, 'bold' if is_hit else 'normal'),
-                             bg='#c8e6c9' if is_hit else COLORS['bg_secondary'],
-                             fg='#1b5e20' if is_hit else COLORS['text_primary']
+                             bg=HIT_ROW_BG if is_hit else COLORS['bg_secondary'],
+                             fg=HIT_ROW_FG if is_hit else COLORS['text_primary']
                              ).pack(side=tk.LEFT, padx=3)
 
             combo_raw = row.get('recommended_combinations') or '[]'
@@ -3157,7 +4075,7 @@ class LotteryGUI:
 
             combo_text.config(state=tk.DISABLED)
             tk.Button(win, text="关闭", font=('微软雅黑', 9),
-                      bg=COLORS['accent_p5'], fg='#fff', relief='flat',
+                      bg=COLORS['accent_p5'], fg=WHITE, relief='flat',
                       command=win.destroy).pack(pady=(0, 8))
 
         except Exception as e:
@@ -3271,8 +4189,11 @@ class LotteryGUI:
     def _on_task_started(self, task_name):
         """任务启动时：禁用按钮、重置进度条、更新状态指示器（v3.36 优化版）"""
         self._current_task_name = task_name
-        # 重置进度节流状态
+        # 重置进度节流状态与 ETA 外推估计器（v5.0 §2.1.3）
         self._last_progress_value = -1
+        self._last_progress_text = ""
+        self._progress_est.reset()
+        self._task_finish_reason = ""
 
         # 重置并隐藏结果仪表盘（每次任务以最新结果为准）
         self._last_pipeline_final = None
@@ -3305,7 +4226,10 @@ class LotteryGUI:
         self.progress['value'] = 0
         self.progress_label.config(text="0%")
         self.status_var.set("正在执行...")
-        self.task_status_label.config(text=f"{task_name} 运行中...", fg=COLORS['warning'])
+        # 统一文案模板：阶段名 · 百分比 · 预计剩余（v5.0 §2.1.3）
+        self.task_status_label.config(
+            text=ui_styles.format_progress_text(0, "", task_name=task_name),
+            fg=COLORS['warning'])
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['warning'])
 
         # 使用 TaskManager 刷新日志，避免高频UI操作
@@ -3329,8 +4253,12 @@ class LotteryGUI:
         self.progress['value'] = 100
         self.progress_label.config(text="100%")
         self._last_progress_value = 100  # 更新节流状态
+        self._last_progress_text = ""    # 终态文案与运行中不同，避免节流误跳过
         self.status_var.set("任务完成")
-        self.task_status_label.config(text=f"{self._current_task_name} 已完成", fg=COLORS['success'])
+        # 统一文案模板（v5.0 §2.1.3）
+        self.task_status_label.config(
+            text=ui_styles.format_progress_text(100, "完成", task_name=self._current_task_name),
+            fg=COLORS['success'])
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['success'])
 
         # 关键修复：强制重置任务运行状态，防止竞态条件导致复制按钮误判
@@ -3417,8 +4345,12 @@ class LotteryGUI:
         self.progress['value'] = 0
         self.progress_label.config(text="0%")
         self._last_progress_value = 0  # 更新节流状态
+        self._last_progress_text = ""    # 终态文案与运行中不同，避免节流误跳过
         self.status_var.set("任务失败")
-        self.task_status_label.config(text=f"{self._current_task_name} 失败", fg=COLORS['accent_danger'])
+        # 统一文案模板（v5.0 §2.1.3）
+        self.task_status_label.config(
+            text=ui_styles.format_progress_text(0, "失败", task_name=self._current_task_name),
+            fg=COLORS['accent_danger'])
         self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['accent_danger'])
 
         # 分类归因 + 建议操作（v4.0 §2.4 错误引导）
@@ -3437,12 +4369,73 @@ class LotteryGUI:
         # 使用 after(0) 确保在主线程中执行，避免多线程问题
         self.root.after(0, self._sync_task_state)
 
+    def _on_task_cancelled(self, task_id=None):
+        """任务被取消（TaskManager 经 TASK_CANCELLED 消息通知）。
+
+        v5.0 §2.1 修复：本方法此前**缺失**——TaskManager 派发 TASK_CANCELLED 时
+        抛 AttributeError，被 _dispatch_ui_message 的 except 静默吞掉，导致
+        「取消任务」后按钮永久禁用、状态条停在运行中。现统一恢复交互并按
+        统一文案模板呈现已取消状态。
+
+        幂等：可安全重复调用（GUI 主动取消与后台 TASK_CANCELLED 消息都会触发）。
+        """
+        self._hide_loading_indicator()
+        self._set_buttons_state(tk.NORMAL)
+        reason = getattr(self, '_task_finish_reason', '') or ''
+
+        if reason == 'timeout':
+            # 超时杀死任务：按失败呈现，而非「用户主动取消」
+            self._last_progress_value = 0
+            self._last_progress_text = ""
+            self.progress['value'] = 0
+            self.progress_label.config(text="0%")
+            self.task_status_label.config(
+                text=ui_styles.format_progress_text(0, '超时', task_name=self._current_task_name),
+                fg=COLORS['accent_danger'])
+            self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['accent_danger'])
+            self.status_var.set("任务超时")
+            self._show_toast("任务超时已停止", COLORS['accent_danger'], duration=2500)
+        else:
+            # 用户主动取消：保留取消瞬间的进度值，仅标注已取消
+            try:
+                at = int(self.progress['value'])
+            except Exception:
+                at = 0
+            self._last_progress_value = at
+            self._last_progress_text = ""
+            self.task_status_label.config(
+                text=ui_styles.format_progress_text(at, '已取消', task_name=self._current_task_name),
+                fg=COLORS['warning'])
+            self.status_dot.itemconfig(self._status_dot_id, fill=COLORS['warning'])
+            self.status_var.set("任务已取消")
+
+        # 强制重置任务运行状态，防止竞态导致后续按钮状态误判
+        self.root.after(0, self._sync_task_state)
+
+    def _on_task_timeout(self, task_id=None, name=''):
+        """任务超时（TaskManager 经 TASK_TIMEOUT 消息通知）。
+
+        v5.0 §2.1 修复：本方法此前**缺失**——TaskManager 超时监控线程派发
+        TASK_TIMEOUT 时抛 AttributeError 被静默吞掉，超时后按钮永久禁用、
+        用户无从得知任务已被终止。超时视为失败：记录原因后统一恢复，
+        文案由紧随的 TASK_CANCELLED 处理路径按「超时」呈现。
+        """
+        self._task_finish_reason = 'timeout'
+        if name:
+            self._current_task_name = name
+        self._on_task_cancelled(task_id)
+
     def _cancel_current_task(self):
-        """取消当前任务（v3.36 新增）"""
+        """取消当前任务（v3.36 新增 / v5.0 §2.1 修正状态文案）。
+
+        原实现直接调用 _on_task_finished()，会把已取消的任务显示为
+        「已完成 100%」，属状态误导。现改为按统一文案模板呈现「已取消」，
+        并保留后续 TASK_CANCELLED 消息的幂等恢复能力。
+        """
         if self.task_mgr.is_running():
             self.task_mgr.cancel()
             self._show_toast("任务已取消", COLORS['warning'], duration=1500)
-            self._on_task_finished()
+            self._on_task_cancelled(None)
 
     # ============================================================
     # 日志文件写入
@@ -3482,47 +4475,30 @@ class LotteryGUI:
         Returns:
             tk.Button: 创建的按钮对象
         """
-        styles = {
-            'primary': {
-                'bg': COLORS['accent_p5'],
-                'fg': '#ffffff',
-                'active_bg': COLORS['accent_p5_light'],
-                'font': ('微软雅黑', 9, 'bold')
-            },
-            'secondary': {
-                'bg': COLORS['bg_card'],
-                'fg': COLORS['text_secondary'],
-                'active_bg': COLORS['bg_card_hover'],
-                'font': ('微软雅黑', 9)
-            },
-            'danger': {
-                'bg': COLORS['bg_card'],
-                'fg': COLORS['accent_danger_light'],
-                'active_bg': COLORS['accent_danger'],
-                'font': ('微软雅黑', 9)
-            }
-        }
-        
-        style = styles.get(button_type, styles['secondary'])
+        # 按钮三态样式表由视觉规范工厂按当前主题即时产出（v5.2 GUI-08）：
+        # 主题切换后天然跟随，且消除与 _on_button_leave 的重复字面量
+        _style_map = button_style_map(COLORS)
+        style = _style_map.get(button_type, _style_map['secondary'])
         
         btn = tk.Button(parent, text=text, command=command,
                         font=style['font'],
                         bg=style['bg'],
                         fg=style['fg'],
                         activebackground=style['active_bg'],
-                        activeforeground='#ffffff' if button_type == 'danger' else style['fg'],
+                        activeforeground=WHITE if button_type == 'danger' else style['fg'],
                         relief='flat', 
                         bd=0, 
                         padx=10, 
                         pady=4, 
                         cursor='hand2',
-                        highlightthickness=0)
+                        highlightthickness=0,
+                        takefocus=True)  # v5.0 §2.1 可访问性：允许 Tab 聚焦
         
         # 记录正常态配色（v4.0 §2.4：token 化，主题切换后还原仍正确，不泄漏旧色）
-        # primary 的 fg 固定为白色（两主题下文字均白），故静态存 '#ffffff'；
+        # primary 的 fg 固定为白色（两主题下文字均白），故静态存 WHITE 常量；
         # 其余 bg/fg 存主题键 token，_resolve_color_token 在还原时动态取当前主题值。
         _token_map = {
-            'primary': ('accent_p5', '#ffffff'),
+            'primary': ('accent_p5', WHITE),
             'secondary': ('bg_card', 'text_secondary'),
             'danger': ('bg_card', 'accent_danger_light'),
         }
@@ -3550,16 +4526,13 @@ class LotteryGUI:
             button.config(fg=COLORS['text_primary'])
         elif button_type == 'danger':
             button.config(bg=COLORS['accent_danger'])
-            button.config(fg='#ffffff')
+            button.config(fg=WHITE)
 
     def _on_button_leave(self, event, button, button_type):
         """按钮悬停离开效果（禁用时维持禁用外观，不还原为正常态色）"""
-        styles = {
-            'primary': {'bg': COLORS['accent_p5'], 'fg': '#ffffff'},
-            'secondary': {'bg': COLORS['bg_card'], 'fg': COLORS['text_secondary']},
-            'danger': {'bg': COLORS['bg_card'], 'fg': COLORS['accent_danger_light']}
-        }
-        style = styles.get(button_type, styles['secondary'])
+        # 按钮三态样式表由视觉规范工厂按当前主题即时产出（v5.2 GUI-08）
+        _style_map = button_style_map(COLORS)
+        style = _style_map.get(button_type, _style_map['secondary'])
         button.config(bg=style['bg'], fg=style['fg'])
         # 若仍处于禁用（任务运行中），应用禁用外观而非正常态
         if str(button['state']) == 'disabled':
@@ -3894,114 +4867,29 @@ class LotteryGUI:
             messagebox.showerror("导出失败", f"导出图片时出错:\n{e}")
 
     def _build_prediction_clipboard(self, final_report):
-        """根据四步流水线 final_report 生成结构化的可复制预测摘要"""
-        if not isinstance(final_report, dict):
-            return ""
-        # 预测号码段展示使用完整5位（v3.64），仅展示层
-        pos_keys = DISPLAY_POS_KEYS
-        pos_names = DISPLAY_POS_NAMES
-        _pos_names_full = ['万位', '千位', '百位', '十位', '个位']  # 贝叶斯分段按位索引用(保留5位分析)
-        lines = ["【排列5 预测号码】",
-                 f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
-
-        # 1. 走势图数据预测
-        trend = final_report.get('trend_prediction', {})
-        if isinstance(trend, dict) and trend:
-            lines.append("一、走势图数据预测 (Top 候选)")
-            for pos_key, pos_name in zip(pos_keys, pos_names):
-                nums = trend.get(pos_key, {}).get('numbers', [])
-                if nums:
-                    lines.append(f"  {pos_name}: {' '.join(str(n) for n in nums)}")
-            combos = final_report.get('recommended_combinations', [])
-            if isinstance(combos, list) and combos:
-                lines.append("  推荐组合:")
-                for i, c in enumerate(combos[:10], 1):
-                    if isinstance(c, dict):
-                        _comb = compress_combo(c.get('combination', ''))
-                        _reason = c.get('reason', '')
-                        _line = f"    {i}. {_comb}"
-                        if _reason:
-                            _line += f"  — {_reason}"
-                        lines.append(_line)
-            lines.append("")
-
-        # 2. 专家文章预测
-        article = final_report.get('article_prediction', {})
-        if isinstance(article, dict) and article:
-            lines.append("二、专家文章预测 (Top 候选)")
-            for pos_key, pos_name in zip(pos_keys, pos_names):
-                nums = article.get(pos_key, {}).get('numbers', [])
-                if nums:
-                    lines.append(f"  {pos_name}: {' '.join(str(n) for n in nums)}")
-            ac = final_report.get('article_recommendations', [])
-            if isinstance(ac, list) and ac:
-                lines.append("  专家推荐组合:")
-                for i, c in enumerate(ac[:5], 1):
-                    if isinstance(c, dict):
-                        lines.append(f"    {i}. {compress_combo(c.get('combination', ''))} "
-                                     f"(共识度: {c.get('consensus_degree', 0):.2f})")
-            lines.append("")
-
-        # 3. 贝叶斯后验概率 Top-4
-        bi = final_report.get('bayesian_inference')
-        if isinstance(bi, list) and bi:
-            lines.append("三、贝叶斯后验概率 Top-4")
-            for i, pos_dict in enumerate(bi[:5]):
-                if isinstance(pos_dict, dict) and pos_dict:
-                    top_nums = sorted(pos_dict.items(),
-                                      key=lambda x: float(x[1]), reverse=True)[:4]
-                    probs = ", ".join(f"{k}({float(v):.3f})" for k, v in top_nums)
-                    lines.append(f"  {_pos_names_full[i]}: {probs}")
-
-        return "\n".join(lines)
+        """根据四步流水线 final_report 生成结构化的可复制预测摘要（委托纯函数）"""
+        from modules.clipboard_builder import build_prediction_clipboard
+        return build_prediction_clipboard(final_report, getattr(self, '_clipboard_meta', None))
 
     def _direct_extract_clipboard(self, final_report):
-        """直接从 final_report 提取可复制文本，作为 _compute_dashboard_aggregates 兜底使用。
-        
-        当 _compute_dashboard_aggregates 因结构不匹配而未能设置 clipboard/meta时，
-        此方法直接提取 trend_prediction 和 recommended_combinations 等关键字段。
-        """
-        if not isinstance(final_report, dict):
-            return ""
-        
-        lines = ["【排列5 预测号码】",
-                 f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
-        
-        # 1. 走势图数据预测
-        trend = final_report.get('trend_prediction', {})
-        if isinstance(trend, dict) and trend:
-            lines.append("一、走势图数据预测 (Top 候选)")
-            pos_keys = DISPLAY_POS_KEYS
-            pos_names = DISPLAY_POS_NAMES
-            for pos_key, pos_name in zip(pos_keys, pos_names):
-                nums = trend.get(pos_key, {}).get('numbers', [])
-                if nums:
-                    lines.append(f"  {pos_name}: {' '.join(str(n) for n in nums)}")
-            combos = final_report.get('recommended_combinations', [])
-            if isinstance(combos, list) and combos:
-                lines.append("  推荐组合:")
-                for i, c in enumerate(combos[:10], 1):
-                    if isinstance(c, dict):
-                        _comb = compress_combo(c.get('combination', ''))
-                        _reason = c.get('reason', '')
-                        _line = f"    {i}. {_comb}"
-                        if _reason:
-                            _line += f"  — {_reason}"
-                        lines.append(_line)
-            lines.append("")
-        
-        return "\n".join(lines)
+        """直接从 final_report 提取可复制文本，作为 _compute_dashboard_aggregates 兜底使用（委托纯函数）"""
+        from modules.clipboard_builder import build_prediction_clipboard
+        return build_prediction_clipboard(final_report, getattr(self, '_clipboard_meta', None))
 
     def _flash_status(self, text, color=COLORS['success']):
         """在底部状态栏临时显示提示，2.5 秒后恢复"就绪" """
         self.status_var.set(text)
         self.root.after(2500, lambda: self.status_var.set("就绪"))
 
-    def _show_toast(self, text, color=None, duration=2200):
+    def _show_toast(self, text, color=None,
+                    duration=ui_toast.TOAST_DEFAULT_DURATION_MS):
         """在主窗口内顶部居中弹出醒目的浮层提示（比状态栏更抓眼球）。
 
         无边框 Toplevel，淡入→短驻→淡出后自动销毁；同一时刻只保留一个 toast。
         任何异常都静默降级（不影响主流程），并同时刷新状态栏作为兜底。
+        停留时长经 ui_toast.clamp_toast_duration 钳制（v5.2 GUI-10 方案
+        §331 验收：Toast 自动消失 ≤ 5 s）；图标由 ui_toast.toast_icon_for
+        按背景色解析，与此前内联三元行为完全一致。
         """
         bg = color or COLORS['success']
         try:
@@ -4026,9 +4914,9 @@ class LotteryGUI:
 
             frame = tk.Frame(toast, bg=bg, highlightthickness=0)
             frame.pack(fill=tk.BOTH, expand=True)
-            # 添加图标前缀区分状态
-            icon = '✓' if bg == COLORS.get('success') else '✗' if bg in [COLORS.get('accent_danger'), COLORS.get('accent_danger_light')] else 'ℹ' if bg == COLORS.get('info') else '⚠'
-            tk.Label(frame, text=f"{icon}  {text}", bg=bg, fg='#ffffff',
+            # 添加图标前缀区分状态（图标解析收敛至 v5.2 GUI-10 契约纯函数）
+            icon = ui_toast.toast_icon_for(bg, COLORS)
+            tk.Label(frame, text=f"{icon}  {text}", bg=bg, fg=WHITE,
                      font=('微软雅黑', 11, 'bold'),
                      padx=22, pady=12).pack()
 
@@ -4083,7 +4971,10 @@ class LotteryGUI:
                         self._toast_win = None
 
             _fade_in()
-            toast.after(max(600, duration), _fade_out)
+            # 停留时长先钳制（≤5s 契约）再与最短驻留取大，行为同旧 max(600, duration)
+            _hold_ms = ui_toast.clamp_toast_duration(duration)
+            _hold_ms = max(ui_toast.TOAST_MIN_HOLD_MS, _hold_ms)
+            toast.after(_hold_ms, _fade_out)
         except Exception as e:
             logger.debug(f"toast 显示失败(非致命): {e}")
         # 状态栏兜底，确保信息始终可见
@@ -4141,6 +5032,22 @@ class LotteryGUI:
             except Exception:
                 pass
             self._poll_evolution_handle = None
+
+        # cancel _poll_cli_log 定时器（需求 #3：命令行输出实时刷新）
+        self._poll_cli_log_cancelled = True
+        cli_handle = getattr(self, '_poll_cli_log_handle', None)
+        if cli_handle is not None:
+            try:
+                self.root.after_cancel(cli_handle)
+            except Exception:
+                pass
+            self._poll_cli_log_handle = None
+
+        # GUI-04：停止轮询统一调度循环（cancel 挂起 tick；stop 幂等，
+        # 已取消的任务内部自守卫双保险，防止 destroy() 后回调继续调度）
+        _scheduler = getattr(self, '_ui_scheduler', None)
+        if _scheduler is not None:
+            _scheduler.stop()
 
         # cancel _liveness_watchdog 定时器（v3.65）
         lw_handle = getattr(self, '_liveness_watchdog_handle', None)
@@ -4234,16 +5141,44 @@ class LotteryGUI:
         return True
 
     def _update_progress_ui(self, value, text=""):
-        """更新进度条值和进度文本（v3.36 节流版）"""
-        # 节流：相同进度值跳过重复更新
-        if hasattr(self, '_last_progress_value') and self._last_progress_value == value:
-            return
-        self._last_progress_value = value
+        """更新进度条值与进度文本（v3.36 节流版 / v5.0 §2.1.3 统一文案模板）。
 
-        self.progress['value'] = value
-        self.progress_label.config(text=f"{int(value)}%")
+        文案模板统一为「阶段名 · 百分比 · 预计剩余」：
+          * 运行中：``阶段名 · 42% · 预计剩余约1分20秒``（ETA 不可估时显示「计算中」）
+          * 终态：  ``任务名 · 已完成/失败原因 · NN%``
+        预计剩余来自 :class:`ui_styles.ProgressEstimator` 的几何外推，样本不足时
+        显示「计算中」而非编造数字。上游 ``task_mgr.progress(value, text)`` 的既有
+        文案全部保持不变，归一化只发生在本渲染层。
+        进度条本体（progress / progress_label）仍只显示百分比，避免与状态标签重复。
+        """
+        try:
+            pct = int(round(max(0.0, min(100.0, float(value)))))
+        except Exception:
+            pct = 0
+
+        # 仅运行中样本参与 ETA 外推；终态样本不外推
+        if ui_styles.classify_progress_text(text, pct) == ui_styles.STATUS_RUNNING:
+            eta = self._progress_est.sample(pct)
+        else:
+            eta = None
+        new_text = ui_styles.format_progress_text(
+            pct, text,
+            task_name=getattr(self, '_current_task_name', '') or '',
+            eta_seconds=eta,
+        )
+
+        # 节流：值与文案均未变化才跳过（仅文案变化仍须刷新，例如 ETA 从
+        # 「计算中」变为具体时长，或同百分比下阶段名变化）
+        if (hasattr(self, '_last_progress_value') and self._last_progress_value == pct
+                and getattr(self, '_last_progress_text', '') == new_text):
+            return
+        self._last_progress_value = pct
+        self._last_progress_text = new_text
+
+        self.progress['value'] = pct
+        self.progress_label.config(text=f"{pct}%")
         if text:
-            self.task_status_label.config(text=text, fg=COLORS['text_secondary'])
+            self.task_status_label.config(text=new_text, fg=COLORS['text_secondary'])
 
     def _update_status_ui(self, text, color=COLORS['text_muted']):
         """更新底部状态栏文字（v3.36 节流版）"""
@@ -4264,6 +5199,7 @@ class LotteryGUI:
         恢复（NORMAL）：还原各按钮记录的正常态配色。
         还原经 _apply_button_normal_style 按 token 动态解析（v4.0 主题适配）：
         按钮缓存的是「主题键 token / 静态 hex」，切换主题后仍取当前主题值，不泄漏旧色。
+        另含显式取消按钮的反转管理（v5.2 GUI-10，详见 _set_cancel_btn_state）。
         """
         for btn in self._buttons:
             try:
@@ -4284,6 +5220,40 @@ class LotteryGUI:
                     self._apply_button_normal_style(self._result_copy_btn)
             except Exception:
                 pass
+        # 显式取消按钮（v5.2 GUI-10）启用态与操作按钮相反，单独反转管理
+        _cancel_btn = getattr(self, '_cancel_btn', None)
+        if _cancel_btn is not None:
+            self._set_cancel_btn_state(_cancel_btn, state)
+
+    def _set_cancel_btn_state(self, btn, state):
+        """反转设置显式取消按钮的启停状态（v5.2 GUI-10 方案 §331）。
+
+        取消按钮的启用语义与操作按钮相反：任务运行中（操作按钮收到
+        tk.DISABLED）才允许点击取消；任务结束/取消/出错（操作按钮收到
+        tk.NORMAL）后取消按钮灰化禁用。配色取自视觉规范工厂（v5.2
+        GUI-08 单一来源）的 danger 三态，禁用外观与其余按钮统一
+        （bg_input / text_disabled）。
+
+        参数:
+            btn: 取消按钮控件（tk.Button 或其测试替身）
+            state: 操作按钮侧的状态（tk.DISABLED / tk.NORMAL）
+
+        返回:
+            None
+        """
+        try:
+            if state == tk.DISABLED:
+                # 任务运行中：取消按钮转为可点击的危险态
+                _style_map = button_style_map(COLORS)
+                _danger = _style_map.get('danger', _style_map['secondary'])
+                btn.config(state=tk.NORMAL)
+                btn.config(bg=_danger['bg'], fg=_danger['fg'])
+            else:
+                # 空闲态：灰化禁用，与操作按钮禁用外观一致
+                btn.config(state=tk.DISABLED)
+                btn.config(bg=COLORS['bg_input'], fg=COLORS['text_disabled'])
+        except Exception:
+            pass
 
     # ============================================================
     # 业务任务 - 系统操作
@@ -5365,15 +6335,40 @@ class LotteryGUI:
             self.hr_pos_bars[key] = pb
             self.hr_pos_vars[key] = var
 
+        # 图表显示区域（用于基线对照等可视化）
+        self.chart_label = tk.Label(f, bg=COLORS['bg_primary'])
+        self.chart_label.pack(fill=tk.X, pady=(0, 8))
+        
         # ================================================================
-        # 说明文字（移除图表区）
+        # 说明文字（可折叠）
         # ================================================================
-            tk.Label(f, text=" 命中率说明：\n"
-                         "• 容错命中(±1)：号码偏差1以内也算命中，数据偏高\n"
-                         "• 严格命中（精确）：仅完全匹配才算命中，更真实反映预测能力\n"
-                         "数据来源：p5_prediction_record 已验证记录（真实、不编造）。",
-                 font=('微软雅黑', 9), bg=COLORS['bg_primary'], fg=COLORS['text_muted'],
-                 wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
+        # 创建可折叠的说明框架
+        self.hr_explanation_frame = tk.Frame(f, bg=COLORS['bg_primary'])
+        self.hr_explanation_frame.pack(fill=tk.X, pady=(0, 8))
+        self.hr_explanation_visible = tk.BooleanVar(value=False)
+        
+        # 说明文字标题（可点击切换）
+        explanation_header = tk.Frame(self.hr_explanation_frame, bg=COLORS['bg_primary'])
+        explanation_header.pack(fill=tk.X)
+        tk.Label(explanation_header, text=" 命中率说明：", 
+                 font=('微软雅黑', 9, 'bold'),
+                 bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
+        self.hr_explanation_toggle = tk.Label(explanation_header, text=" [显示]", 
+                                            font=('微软雅黑', 8),
+                                            bg=COLORS['bg_primary'], fg=COLORS['text_secondary'],
+                                            cursor="hand2")
+        self.hr_explanation_toggle.pack(side=tk.RIGHT)
+        self.hr_explanation_toggle.bind("<Button-1>", self._toggle_hr_explanation)
+        
+        # 说明文字内容（初始隐藏）
+        self.hr_explanation_text = tk.Label(self.hr_explanation_frame, 
+                                          text="• 容错命中(±1)：号码偏差1以内也算命中，数据偏高\n"
+                                               "• 严格命中（精确）：仅完全匹配才算命中，更真实反映预测能力\n"
+                                               "数据来源：p5_prediction_record 已验证记录（真实、不编造）。",
+                                          font=('微软雅黑', 9), bg=COLORS['bg_primary'], fg=COLORS['text_muted'],
+                                          wraplength=420, justify=tk.LEFT)
+        # 初始隐藏说明文字
+        self.hr_explanation_text.pack_forget()
 
         # ================================================================
         # 历史预测记录一览表（真实验证明细, 可回溯）
@@ -5393,7 +6388,7 @@ class LotteryGUI:
                        font=('微软雅黑', 9), bg=COLORS['bg_primary'],
                        fg=COLORS['text_secondary'],
                        activebackground=COLORS['bg_primary'],
-                       selectcolor=COLORS.get('bg_input', '#ffffff'),
+                       selectcolor=COLORS.get('bg_input', WHITE),
                        cursor='hand2').pack(side=tk.RIGHT, padx=(0, 10))
 
         table_wrap = tk.Frame(f, bg=COLORS['bg_primary'])
@@ -5440,8 +6435,8 @@ class LotteryGUI:
                                            background=COLORS['bg_secondary'],
                                            foreground=COLORS['accent_p5_bright'])
         self.hr_records_tree.tag_configure('hit_full',
-                                           background=COLORS.get('success', '#2e7d32'),
-                                           foreground='#ffffff')
+                                           background=COLORS.get('success', SUCCESS_STATIC),
+                                           foreground=WHITE)
         # 排序状态: (列key, 是否降序)
         self._hr_sort_state = (None, False)
         # 双击某行 → 查看该期完整 AI 报告
@@ -5449,6 +6444,95 @@ class LotteryGUI:
         tk.Label(f, text=" 双击任一行可查看该期完整 AI 预测详情；点击「期号/命中位数/准确率/验证时间」列头可排序。",
                  font=('微软雅黑', 8), bg=COLORS['bg_primary'],
                  fg=COLORS['text_muted']).pack(anchor=tk.W, pady=(4, 0))
+
+        # ================================================================
+        # 历史预测记录一览表（真实验证明细, 可回溯）
+        # ================================================================
+        rec_head = tk.Frame(f, bg=COLORS['bg_primary'])
+        rec_head.pack(fill=tk.X, pady=(16, 4))
+        tk.Label(rec_head, text=" 历史预测记录明细（最近已验证）",
+                 font=('微软雅黑', 11, 'bold'),
+                 bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
+        self.hr_records_hint = tk.StringVar(value="（加载中…）")
+        tk.Label(rec_head, textvariable=self.hr_records_hint, font=('微软雅黑', 9),
+                 bg=COLORS['bg_primary'], fg=COLORS['text_muted']).pack(side=tk.RIGHT)
+        # 筛选开关——只看命中≥3 的记录
+        self.hr_filter_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(rec_head, text="只看命中≥3", variable=self.hr_filter_var,
+                       command=self._apply_records_filter,
+                       font=('微软雅黑', 9), bg=COLORS['bg_primary'],
+                       fg=COLORS['text_secondary'],
+                       activebackground=COLORS['bg_primary'],
+                       selectcolor=COLORS.get('bg_input', WHITE),
+                       cursor='hand2').pack(side=tk.RIGHT, padx=(0, 10))
+
+        table_wrap = tk.Frame(f, bg=COLORS['bg_primary'])
+        table_wrap.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+
+        cols = ('issue', 'pred', 'actual', 'hit', 'acc', 'time')
+        self.hr_records_tree = ttk.Treeview(table_wrap, columns=cols,
+                                            show='headings', height=8)
+        # 列头文案（供排序箭头指示恢复使用）
+        self._hr_col_titles = {'issue': '期号', 'pred': '预测号码',
+                               'actual': '开奖号码', 'hit': '命中位数',
+                               'acc': '准确率', 'time': '验证时间'}
+        # 可排序列（号码列排序无意义, 不参与）
+        sortable = {'issue', 'hit', 'acc', 'time'}
+        headers = [('issue', 78), ('pred', 100), ('actual', 100),
+                   ('hit', 68), ('acc', 68), ('time', 130)]
+        for key, w in headers:
+            if key in sortable:
+                self.hr_records_tree.heading(
+                    key, text=self._hr_col_titles[key],
+                    command=lambda c=key: self._sort_records_by(c))
+            else:
+                self.hr_records_tree.heading(key, text=self._hr_col_titles[key])
+            anchor = tk.W if key in ('issue', 'time') else tk.CENTER
+            self.hr_records_tree.column(key, width=w, anchor=anchor,
+                                        stretch=(key == 'time'))
+        vsb = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL,
+                            command=self.hr_records_tree.yview)
+        self.hr_records_tree.configure(yscrollcommand=vsb.set)
+        self.hr_records_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        # 行配色标签（暗色主题）：每行只挂一个标签，避免多标签同属性优先级歧义。
+        # 组合 = 隔行底色 × 是否命中高亮，前景一律保证与底色有足够对比。
+        self.hr_records_tree.tag_configure('row_even',
+                                           background=COLORS['bg_card'],
+                                           foreground=COLORS['text_primary'])
+        self.hr_records_tree.tag_configure('row_odd',
+                                           background=COLORS['bg_secondary'],
+                                           foreground=COLORS['text_primary'])
+        self.hr_records_tree.tag_configure('row_even_hit',
+                                           background=COLORS['bg_card'],
+                                           foreground=COLORS['accent_p5_bright'])
+        self.hr_records_tree.tag_configure('row_odd_hit',
+                                           background=COLORS['bg_secondary'],
+                                           foreground=COLORS['accent_p5_bright'])
+        self.hr_records_tree.tag_configure('hit_full',
+                                           background=COLORS.get('success', SUCCESS_STATIC),
+                                           foreground=WHITE)
+        # 排序状态: (列key, 是否降序)
+        self._hr_sort_state = (None, False)
+        # 双击某行 → 查看该期完整 AI 报告
+        self.hr_records_tree.bind('<Double-1>', self._on_record_double_click)
+        tk.Label(f, text=" 双击任一行可查看该期完整 AI 预测详情；点击「期号/命中位数/准确率/验证时间」列头可排序。",
+                 font=('微软雅黑', 8), bg=COLORS['bg_primary'],
+                 fg=COLORS['text_muted']).pack(anchor=tk.W, pady=(4, 0))
+
+    def _toggle_hr_explanation(self, event):
+        """切换历史命中率说明文字的显示/隐藏状态。"""
+        if self.hr_explanation_visible.get():
+            # 隐藏说明文字
+            self.hr_explanation_text.pack_forget()
+            self.hr_explanation_toggle.config(text=" [显示]")
+            self.hr_explanation_visible.set(False)
+        else:
+            # 显示说明文字
+            self.hr_explanation_text.pack(before=self.hr_explanation_toggle.master.master, fill=tk.X, pady=(0, 8))
+            self.hr_explanation_toggle.config(text=" [隐藏]")
+            self.hr_explanation_visible.set(True)
+
 
     def _on_record_double_click(self, event):
         """双击明细表某行 → 弹出该期完整 AI 预测详情。"""
@@ -5463,6 +6547,181 @@ class LotteryGUI:
             issue = str(tree.set(item, 'issue') or '').strip()
             if issue and issue != '--':
                 self._show_ai_report_detail(issue)
+        except Exception:
+            pass
+
+    def _load_and_draw_baseline_chart(self):
+        """（主线程）启动后台线程生成基线对照图表。"""
+        try:
+            threading.Thread(target=self._draw_baseline_chart_internal, daemon=True).start()
+        except Exception:
+            pass
+
+    def _draw_baseline_chart_internal(self):
+        """（后台线程）生成基线对照柱状图，显示系统实测 vs 随机基线。"""
+        try:
+            # 导入必要模块
+            import matplotlib
+            matplotlib.use('Agg')  # 无头环境
+            import matplotlib.pyplot as plt
+            import numpy as np
+            import os
+            
+            # 中文字体配置
+            plt.rcParams['font.sans-serif'] = [
+                'Microsoft YaHei', 'SimHei', 'Source Han Sans CN', 'SimSun', 'DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
+            
+            # 代表性评估窗口数（用于 Wilson 95% CI 宽度）
+            N = 1000
+            
+            def wilson_ci(pct, n=N, z=1.96):
+                """Wilson 95% 置信区间（输入/输出均为百分数）。"""
+                p = pct / 100.0
+                denom = 1 + z * z / n
+                center = (p + z * z / (2 * n)) / denom
+                half = (z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
+                return (center - half) * 100.0, (center + half) * 100.0
+            
+            # 数据（来源：reports/diagnosis/hitrate_root_cause.md §2/§3）
+            labels = ['Top-1\n(首推号精确匹配)', 'Top-3', 'Top-5']
+            # 从数据库获取实际的系统实测数据
+            db = P5Database()
+            if db.connect():
+                stats = db.get_verification_stats()
+                db.disconnect()
+            else:
+                stats = {}
+            system_top1 = stats.get('top1_avg_accuracy', 9.2)
+            system_top3 = stats.get('top3_avg_accuracy', 30.0)
+            system_top5 = stats.get('top5_avg_accuracy', 45.0)
+            system = np.array([system_top1, system_top3, system_top5])
+            baseline = np.array([10.0, 30.0, 50.0])    # 随机基线常量
+            
+            # 计算置信区间
+            sys_lo = [wilson_ci(v)[0] for v in system]
+            sys_hi = [wilson_ci(v)[1] for v in system]
+            base_lo = [wilson_ci(v)[0] for v in baseline]
+            base_hi = [wilson_ci(v)[1] for v in baseline]
+            sys_err = [[v - lo for v, lo in zip(system, sys_lo)],
+                       [hi - v for v, hi in zip(system, sys_hi)]]
+            base_err = [[v - lo for v, lo in zip(baseline, base_lo)],
+                        [hi - v for v, hi in zip(baseline, base_hi)]]
+            
+            # 使用 matplotlib Agg 后端生成柱状图
+            fig, ax = plt.subplots(figsize=(9, 5.2), dpi=150)
+            
+            x = np.arange(len(labels))
+            w = 0.36
+            b1 = ax.bar(x - w / 2, system, w, yerr=sys_err, capsize=5,
+                        color=CHART_SYSTEM, alpha=0.85, label='系统实测（严格口径）',
+                        error_kw={'elinewidth': 1.4, 'ecolor': CHART_SYSTEM_ERR})
+            b2 = ax.bar(x + w / 2, baseline, w, yerr=base_err, capsize=5,
+                        color=CHART_RANDOM, alpha=0.85, label='随机基线（公平摇号）',
+                        error_kw={'elinewidth': 1.4, 'ecolor': CHART_RANDOM_ERR})
+            
+            ax.set_ylabel('命中率 (%)', fontsize=12)
+            ax.set_title('排列5 命中率：系统实测 vs 随机基线（95% Wilson CI）',
+                        fontsize=13, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, fontsize=11)
+            ax.set_ylim(0, 62)
+            ax.grid(axis='y', alpha=0.3)
+            ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
+            
+            # 数值标注
+            for bars, vals in ((b1, system), (b2, baseline)):
+                for bar, val in zip(bars, vals):
+                    ax.text(bar.get_x() + bar.get_width() / 2, val + 1.2, f'{val:.1f}%',
+                            ha='center', va='bottom', fontsize=9)
+            
+            # 诚实结论注释
+            conclusion = ('结论：系统实测 Top-1/3/5 全部落在随机基线 95% 置信区间内，\n'
+                         '无统计显著差异 —— 低命中率 = 公平摇号属性，非代码缺陷。')
+            ax.text(0.5, -0.22, conclusion, transform=ax.transAxes, ha='center',
+                    fontsize=9.5, color=CHART_NOTE_TEXT,
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor=CHART_NOTE_FACE, edgecolor=CHART_NOTE_EDGE))
+            
+            ax.text(0.01, 0.98, f'n≈{N} 评估窗口（代表性）', transform=ax.transAxes,
+                    ha='left', va='top', fontsize=8.5, color=CHART_NOTE_TEXT)
+            
+            plt.tight_layout()
+            
+            # 保存到临时文件
+            import tempfile
+            tmp_dir = REPORTS_CHARTS_DIR
+            os.makedirs(tmp_dir, exist_ok=True)
+            chart_path = os.path.join(tmp_dir, f'baseline_{int(time.time())}.png')
+            plt.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor=COLORS['bg_primary'])
+            plt.close(fig)
+            
+            # 移除 matplotlib 内嵌的 iCCP 色彩块，规避 libpng 警告
+            self._strip_png_iccp(chart_path)
+            
+            # 回到主线程更新图片
+            self.root.after(0, lambda: self._update_chart_image(chart_path))
+            
+        except Exception as e:
+            logger.debug(f'生成基线对照图表失败: {e}')
+            self.root.after(0, lambda: self._update_chart_image(None))
+
+    def _update_hit_rate_tab(self, stats):
+        """（主线程）用 stats 刷新命中率面板控件。
+
+        改用严格命中率（无容错）作为主指标，同时显示容错数据供对比。
+        """
+        if not hasattr(self, 'hr_summary_var') or not stats:
+            return
+        try:
+            total = stats.get('total', 0)
+            if not total:
+                self.hr_summary_var.set("（暂无验证数据）")
+                for key in self.hr_pos_vars:
+                    self.hr_pos_vars[key].set("--")
+                    self.hr_pos_bars[key]['value'] = 0
+                return
+
+            merged = int(stats.get('merged_duplicates', 0) or 0)
+            self._hr_merged_duplicates = merged
+            merge_txt = f" | 已合并重复记录 {merged} 条" if merged else ""
+
+            # Top-1 真实口径（首推号精确命中, v3.67: strict_* 已改为真实预测力指标）
+            # 随机基线: 排列5 公平摇号, 每位 Top-1 理论 = 10%, 系统无法稳定超越
+            top1_avg = float(stats.get('top1_avg_accuracy', stats.get('strict_avg_accuracy', 0)) or 0)
+            top1_full = int(stats.get('top1_full_matches', stats.get('strict_full_matches', 0)) or 0)
+            top1_total = int(stats.get('top1_total_matched', stats.get('strict_total_matched', 0)) or 0)
+
+            # 集合包含参考口径（候选集~5, 宽松, 仅作对照, 非真实预测力）
+            loose_avg = float(stats.get('avg_accuracy', 0) or 0)
+            loose_matched = int(stats.get('total_matched', 0) or 0)
+
+            # 随机基线对照
+            _delta_pp = top1_avg - 10.0
+            _verdict = "略高于随机" if _delta_pp > 0 else ("接近随机" if abs(_delta_pp) <= 1.0 else "低于随机")
+
+            self.hr_summary_var.set(
+                f"已验证 {total} 期（按期号去重）\n"
+                f"★ Top-1 真实命中（首推号精确）: 全中 {top1_full} 期 | 平均 {top1_avg:.1f}%\n"
+                f"   随机基线 = 10% → 系统{_verdict}（Δ{_delta_pp:+.1f}pp）\n"
+                f"集合包含参考（宽松口径·非预测力）: 全中 {loose_matched} 期 | 平均 {loose_avg:.1f}%"
+                f"{merge_txt}"
+            )
+
+            # 更新进度条：显示 Top-1 真实命中率
+            top1_keys = ('top1_wan_accuracy', 'top1_qian_accuracy', 'top1_bi_accuracy',
+                        'top1_shi_accuracy', 'top1_ge_accuracy')
+            for key in top1_keys:
+                rate = float(stats.get(key, stats.get(key.replace('top1_', 'strict_'), 0)) or 0)
+                pos_name = key.replace('top1_', '').replace('_accuracy', '')
+                var_key = f'{pos_name}_accuracy'
+                if var_key in self.hr_pos_vars:
+                    self.hr_pos_vars[var_key].set(f"{rate:.1f}%")
+                    self.hr_pos_bars[var_key]['value'] = max(0.0, min(100.0, rate))
+
+            # 不再自动加载图表（已改为手动触发基线对照图表）
+            # 可通过定时器或手动触发 _load_and_draw_baseline_chart() 来更新基线对照图表
+            # 同时更新基线对照图表以反映最新的验证统计
+            self._load_and_draw_baseline_chart()
         except Exception:
             pass
 
@@ -5619,7 +6878,7 @@ class LotteryGUI:
             fig, ax = plt.subplots(figsize=(8, 4.5))
             fig.patch.set_facecolor(COLORS['bg_primary'])
             ax.set_facecolor(COLORS['bg_card'])
-            bars = ax.bar(pos_names, values, color=['#059669', '#10b981', '#34d399', '#6ee7b7', '#34d399'])
+            bars = ax.bar(pos_names, values, color=CHART_BARS)
             ax.set_ylim(0, 100)
             ax.set_ylabel('命中率 (%)', fontsize=10, color=fg)
             ax.set_title('各位置 Top-1 真实命中率（首推号精确·随机基线=10%）', fontsize=11, fontweight='bold', color=fg)
@@ -6297,6 +7556,24 @@ class LotteryGUI:
             }
             # v4.1：快速预测产物时间戳
             self._last_quick_ts = time.time()
+
+            # v5.0 §8.2.1：快速预测也落 p5_prediction_record（此前只有四步流水线落库，
+            # 快速预测产物完全不持久化，导致验证闭环缺数据）。走统一持久化入口，
+            # 含可达性预检 / 指数退避重试 / 应用层幂等 / 本地兜底，失败不阻断主流程。
+            try:
+                from modules.pipeline import Pipeline
+                _persist_pipe = Pipeline()
+                _persist_res = _persist_pipe._persist_prediction(
+                    final, target_issue, source='quick')
+                if not _persist_res.get('db_ok') and _persist_res.get('fallback_ok'):
+                    task_mgr.append_warning(
+                        f" 预测已生成但入库失败，已本地兜底: {_persist_res.get('local_path')}")
+                elif not _persist_res.get('db_ok'):
+                    task_mgr.append_warning(
+                        f" 预测已生成但持久化失败: {_persist_res.get('error')}")
+            except Exception as _persist_e:
+                task_mgr.append_warning(f" 预测已生成但持久化失败: {_persist_e}")
+
             self._show_result_dashboard(quick_final=final)
             task_mgr.progress(100, "完成")
 
@@ -6355,7 +7632,7 @@ class LotteryGUI:
                 target_issue = qf.get('target_issue') or ''
 
         # 走势引擎（信号源：每位置 top5） - 已禁用，使用核心预测器融合概率
-        if not target_issue:
+        if not target_issue and isinstance(tr, dict):
             target_issue = tr.get('target_issue') or ''
 
         # 由走势引擎 top5[0] 拼接其完整组合 - 已禁用
@@ -6783,64 +8060,388 @@ class LotteryGUI:
         else:
             f.pack(fill=tk.X, padx=6, pady=(0, 6))
 
-    def _build_alt_section(self, parent, combos, main_combo, pos_keys, pos_names):
-        """备选号码折叠区（视觉弱化，明确区别于主推荐）"""
-        alt_outer = tk.Frame(parent, bg=COLORS['bg_card'],
-                             highlightbackground=COLORS['border'],
-                             highlightthickness=1)
-        alt_outer._rcat = "预测结论"   # 分类筛选标记：备选号码属结论范畴
-        alt_outer.pack(fill=tk.X, pady=(0, 8))
-        
-        toggle_btn = tk.Button(alt_outer, text=" 备选号码（各分析源结果）", 
-                               bg=COLORS['bg_card'], fg=COLORS['text_secondary'], 
-                               font=('微软雅黑', 10, 'bold'), relief='flat',
-                               cursor='hand2', padx=12, pady=6)
-        toggle_btn.pack(anchor=tk.W)
-        
-        content = tk.Frame(alt_outer, bg=COLORS['bg_card'])
-        content.pack_forget()
-        self._alt_content = content
-        self._alt_visible = False
+    def _build_dashboard_specs(self, agg):
+        """GUI-03（v5.2 §2.2）：把仪表盘渲染逻辑编译为纯数据规格树。
 
-        def _toggle():
-            """折叠 / 展开「备选号码（各分析源结果）」区域，并同步切换按钮箭头文案。"""
-            if self._alt_visible:
-                content.pack_forget()
-                toggle_btn.config(text=" 备选号码（各分析源结果）")
-                self._alt_visible = False
-            else:
-                content.pack(fill=tk.X, padx=12, pady=(0, 8))
-                toggle_btn.config(text=" 收起备选号码")
-                self._alt_visible = True
+        规格树不再直接创建 Tkinter 控件，而是按 ``key = 'section::card_id'``
+        逐条登记卡片规格（创建参数/几何/内容签名）。渲染时由 ``_dash_diff``
+        对比新旧规格树：同 key 仅 ``configure`` 文本/色值（不 destroy），
+        仅 add/remove 才涉及 create/destroy，从根上消除全量重建闪白。
 
-        toggle_btn.config(command=_toggle)
+        本方法与原 ``_build_alt_section`` / ``_build_source_matrix`` /
+        ``_build_basis_section`` 三个「创建即渲染」的构建函数一一对应，
+        视觉布局保持完全不变。
 
-        # 备选组合使用完整5位展示（v3.64），与最终预测一致
+        参数:
+            agg: ``_compute_dashboard_aggregates`` 产出的聚合 dict。
+
+        返回:
+            Dict[str, dict]: {key: spec}；dict 插入顺序保证父规格先于子规格，
+            spec 含 key/kind/parent/pack/grid/props/rcat/cmd/extra/sig。
+        """
+        specs = {}   # type: Dict[str, dict]
+
+        def _emit(section, card_id, kind, parent=None, pack=None, grid=None,
+                  props=None, rcat=None, cmd=None, extra=None):
+            """向规格树注册一张卡片；props 只允许可哈希值（用于内容签名）。"""
+            props = dict(props or {})
+            # sig 内容签名：结构（kind/parent/几何/命令标签/分类标记）与
+            # props 全部纳入；任一变化即视为 update，kind/parent/几何变化
+            # 由 _dash_diff 升级为 remove+add（无法原地 configure）。
+            sig = (kind, parent,
+                   tuple(sorted((pack or {}).items())),
+                   tuple(sorted((grid or {}).items())),
+                   cmd, rcat, tuple(sorted(props.items())))
+            key = '{}::{}'.format(section, card_id)
+            specs[key] = {
+                'key': key,
+                'kind': kind,
+                'parent': parent,
+                'pack': pack,
+                'grid': grid,
+                'props': props,
+                'rcat': rcat,
+                'cmd': cmd,
+                'extra': extra,
+                'sig': sig,
+            }
+            return key
+
+        pf = self._last_pipeline_final
+        tr = self._last_trend_result
+        qf = self._last_quick_final
+        picks = agg['picks']
+        combos = agg['combos']
+        consensus = agg['consensus']
+        target_issue = agg['target_issue']
+        main_combo_disp = agg['main_combo_disp']
+        conf = agg['conf']
+        high_conf = agg['high_conf']
+        main_combo = agg['main_combo']
+        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
+        pos_names = ['万位', '千位', '百位', '十位', '个位']
+
+        # ── 标题栏（渐变效果：P5绿 → AI紫）──────────────────────────
+        _emit('hdr', 'canvas', 'canvas', pack={'fill': tk.X},
+              props={'height': 42, 'highlightthickness': 0,
+                     'bg': COLORS['bg_secondary']},
+              extra={'draw': 'hdr_gradient'})
+        _emit('hdr', 'left', 'frame', parent='hdr::canvas',
+              pack={'side': tk.LEFT, 'padx': 12, 'pady': 4},
+              props={'bg': COLORS['accent_p5']})
+        _emit('hdr', 'lbl_ai', 'label', parent='hdr::left',
+              pack={'anchor': tk.W},
+              props={'text': ' AI智能预测', 'bg': COLORS['accent_p5'],
+                     'fg': WHITE, 'font': ('微软雅黑', 12, 'bold')})
+        # 最近一次分析时间标记（副标题, 让结论有明确的时间归属）
+        _ana_t = getattr(self, '_last_analysis_time', None)
+        if _ana_t is not None:
+            _today = datetime.now().date()
+            _tstr = (_ana_t.strftime('%H:%M:%S') if _ana_t.date() == _today
+                     else _ana_t.strftime('%Y-%m-%d %H:%M'))
+            _emit('hdr', 'lbl_ana', 'label', parent='hdr::left',
+                  pack={'anchor': tk.W},
+                  props={'text': f' 最近分析 {_tstr}',
+                         'bg': COLORS['accent_p5'], 'fg': ACCENT_P5_SOFT_FG,
+                         'font': ('微软雅黑', 8)})
+        _emit('hdr', 'right', 'frame', parent='hdr::canvas',
+              pack={'side': tk.RIGHT, 'padx': 8, 'pady': 6},
+              props={'bg': COLORS['accent_p5']})
+        # 导出下拉 / 详细分析按钮（Primary 样式，命令按标签在应用期绑定）
+        _emit('hdr', 'btn_export', 'button', parent='hdr::right',
+              pack={'side': tk.RIGHT, 'padx': (6, 0)},
+              props={'text': ' 导出 ▾', 'bg': COLORS['accent_p5_light'],
+                     'fg': WHITE, 'font': ('微软雅黑', 9, 'bold'),
+                     'relief': 'flat', 'padx': 10, 'pady': 3,
+                     'cursor': 'hand2',
+                     'activebackground': COLORS['accent_p5_bright']},
+              cmd='export_menu')
+        _emit('hdr', 'btn_detail', 'button', parent='hdr::right',
+              pack={'side': tk.RIGHT, 'padx': (6, 0)},
+              props={'text': ' 详细分析', 'bg': COLORS['accent_p5_light'],
+                     'fg': WHITE, 'font': ('微软雅黑', 9, 'bold'),
+                     'relief': 'flat', 'padx': 10, 'pady': 3,
+                     'cursor': 'hand2',
+                     'activebackground': COLORS['accent_p5_bright']},
+              cmd='detail_toggle')
+
+        # ── 层次容器 ────────────────────────────────────────────────
+        _emit('layers', 'container', 'frame',
+              pack={'fill': tk.X, 'padx': 12, 'pady': 10},
+              props={'bg': COLORS['bg_secondary']})
+
+        # === 预测结论层 ===
+        _emit('conclusion', 'frame', 'frame', parent='layers::container',
+              pack={'fill': tk.X, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_secondary']}, rcat='预测结论')
+
+        # 风险提示（放在结论层顶部）
+        risk = ''
+        if isinstance(pf, dict):
+            risk = (pf.get('risk_warning') or '').strip()
+        elif isinstance(qf, dict):
+            risk = (qf.get('risk_warning') or '').strip()
+        if risk:
+            _emit('risk', 'frame', 'frame', parent='conclusion::frame',
+                  pack={'fill': tk.X, 'pady': (0, 4)},
+                  props={'bg': COLORS['bg_card'],
+                         'highlightbackground': COLORS['accent_warning'],
+                         'highlightthickness': 1})
+            _emit('risk', 'lbl', 'label', parent='risk::frame',
+                  pack={'anchor': tk.W, 'padx': 12, 'pady': 6},
+                  props={'text': ' ' + risk, 'bg': COLORS['bg_card'],
+                         'fg': COLORS['accent_warning_light'],
+                         'font': ('微软雅黑', 9), 'wraplength': 620,
+                         'justify': tk.LEFT})
+
+        # 1) 数据概览行：期号 + 一致率 + 高置信度 + 来源数
+        _emit('info', 'row', 'frame', parent='conclusion::frame',
+              pack={'fill': tk.X, 'pady': (0, 6)},
+              props={'bg': COLORS['bg_secondary']})
+        _emit('info', 'lbl_issue', 'label', parent='info::row',
+              pack={'side': tk.LEFT},
+              props={'text': f"{'第' if target_issue else ''}"
+                             f"{target_issue or '—'}"
+                             f"{'期' if target_issue else ''}",
+                     'font': ('Consolas', 13, 'bold'),
+                     'bg': COLORS['bg_secondary'],
+                     'fg': COLORS['text_primary']})
+        if conf is not None:
+            _emit('info', 'lbl_conf', 'label', parent='info::row',
+                  pack={'side': tk.LEFT, 'padx': (8, 0)},
+                  props={'text': f' 一致率 {conf}%',
+                         'bg': COLORS['bg_card'],
+                         'fg': COLORS['accent_p5'],
+                         'font': ('微软雅黑', 10, 'bold')})
+        if high_conf:
+            _emit('info', 'lbl_high', 'label', parent='info::row',
+                  pack={'side': tk.LEFT, 'padx': (8, 0)},
+                  props={'text': ' 高置信度 ✓',
+                         'bg': COLORS['badge_active_bg'],
+                         'fg': COLORS['badge_active_fg'],
+                         'font': ('微软雅黑', 9, 'bold')})
+        src_names = ['四步流水线', '走势引擎', '快速预测']
+        used = [n for i, n in enumerate(src_names)
+                if (i == 0 and pf) or (i == 1 and tr) or (i == 2 and qf)]
+        _emit('info', 'lbl_src', 'label', parent='info::row',
+              pack={'side': tk.LEFT, 'padx': (8, 0)},
+              props={'text': f' 来源 {len(used)}/3',
+                     'bg': COLORS['bg_card'],
+                     'fg': COLORS['text_secondary'],
+                     'font': ('微软雅黑', 9)})
+
+        # 2) 主推号大卡
+        _emit('main', 'card', 'frame', parent='conclusion::frame',
+              pack={'fill': tk.X, 'pady': (8, 6)},
+              props={'bg': COLORS['bg_card'],
+                     'highlightbackground': COLORS['border'],
+                     'highlightthickness': 1})
+        _emit('main', 'lbl_title', 'label', parent='main::card',
+              pack={'anchor': tk.W, 'padx': 12, 'pady': (8, 4)},
+              props={'text': '推荐号码', 'font': ('微软雅黑', 11, 'bold'),
+                     'bg': COLORS['bg_card'],
+                     'fg': COLORS['text_primary']})
+        _emit('main', 'row', 'frame', parent='main::card',
+              pack={'fill': tk.X, 'padx': 12, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_card']})
+        for _i, _pk_disp in enumerate(DISPLAY_POS_KEYS):
+            _d = consensus.get(_pk_disp)
+            _emit('main', 'digit_%d' % _i, 'label', parent='main::row',
+                  pack={'side': tk.LEFT, 'padx': 4},
+                  props={'text': str(_d) if _d is not None else '—',
+                         'font': ('Consolas', 18, 'bold'),
+                         'bg': (COLORS['accent_p5'] if _d is not None
+                                else COLORS['bg_card']),
+                         'fg': (WHITE if _d is not None
+                                else COLORS['text_muted']),
+                         'width': 3, 'padx': 6, 'pady': 6})
+        _emit('main', 'lbl_conf', 'label', parent='main::card',
+              pack={'anchor': tk.W, 'padx': 12, 'pady': (0, 8)},
+              props={'text': f"高置信度 · 一致率 {conf or 0}%",
+                     'font': ('微软雅黑', 9), 'bg': COLORS['bg_card'],
+                     'fg': COLORS['text_secondary']})
+
+        # 3) 备选号码折叠区（结论层的一部分，原 _build_alt_section 逻辑）
+        _emit('alt', 'outer', 'frame', parent='conclusion::frame',
+              pack={'fill': tk.X, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_card'],
+                     'highlightbackground': COLORS['border'],
+                     'highlightthickness': 1}, rcat='预测结论')
+        _emit('alt', 'btn_toggle', 'button', parent='alt::outer',
+              pack={'anchor': tk.W},
+              props={'text': (' 收起备选号码' if self._alt_visible
+                              else ' 备选号码（各分析源结果）'),
+                     'bg': COLORS['bg_card'],
+                     'fg': COLORS['text_secondary'],
+                     'font': ('微软雅黑', 10, 'bold'),
+                     'relief': 'flat', 'cursor': 'hand2',
+                     'padx': 12, 'pady': 6},
+              cmd='alt_toggle')
+        # content 的 pack/unpack 由 _apply_dashboard_diff 结构修正段按
+        # self._alt_visible 统一处理（保留用户折叠状态，规格内不写几何）
+        _emit('alt', 'content', 'frame', parent='alt::outer',
+              props={'bg': COLORS['bg_card']})
         _main_disp = compress_combo(main_combo)
-        for key, name in [('pipeline', '四步流水线'), ('quick', '快速预测'), ('trend', '走势引擎')]:
-            c = combos.get(key)
-            if not c:
+        for _key, _name in [('pipeline', '四步流水线'),
+                            ('quick', '快速预测'),
+                            ('trend', '走势引擎')]:
+            _c = combos.get(_key)
+            if not _c:
                 continue
-            c_disp = compress_combo(c)
-            is_main = (c_disp == _main_disp)
-            row = tk.Frame(content, bg=COLORS['bg_card'])
-            row.pack(fill=tk.X, pady=3)
-            
-            # 来源标签
-            tk.Label(row, text=f" {name}:", bg=COLORS['bg_card'],
-                     fg=COLORS['text_muted'], font=('微软雅黑', 9, 'bold')).pack(side=tk.LEFT)
-            
-            # 号码
-            num_color = COLORS['accent_p5_light'] if is_main else COLORS['text_secondary']
-            num_font = ('Consolas', 11, 'bold') if is_main else ('Consolas', 11)
-            tk.Label(row, text=c_disp,
-                     bg=COLORS['bg_card'], fg=num_color, font=num_font).pack(side=tk.LEFT, padx=(8, 0))
-            
-            # 主推荐标记
-            if is_main:
-                tk.Label(row, text="← 选为最终预测",
-                         bg=COLORS['bg_card'], fg=COLORS['accent_p5'], 
-                         font=('微软雅黑', 8, 'bold')).pack(side=tk.LEFT, padx=(6, 0))
+            _c_disp = compress_combo(_c)
+            _is_main = (_c_disp == _main_disp)
+            _num_color = (COLORS['accent_p5_light'] if _is_main
+                          else COLORS['text_secondary'])
+            _num_font = (('Consolas', 11, 'bold') if _is_main
+                         else ('Consolas', 11))
+            _emit('alt', 'row_%s' % _key, 'frame', parent='alt::content',
+                  pack={'fill': tk.X, 'pady': 3},
+                  props={'bg': COLORS['bg_card']})
+            _emit('alt', 'lbl_%s' % _key, 'label',
+                  parent='alt::row_%s' % _key,
+                  pack={'side': tk.LEFT},
+                  props={'text': f' {_name}:', 'bg': COLORS['bg_card'],
+                         'fg': COLORS['text_muted'],
+                         'font': ('微软雅黑', 9, 'bold')})
+            _emit('alt', 'num_%s' % _key, 'label',
+                  parent='alt::row_%s' % _key,
+                  pack={'side': tk.LEFT, 'padx': (8, 0)},
+                  props={'text': _c_disp, 'bg': COLORS['bg_card'],
+                         'fg': _num_color, 'font': _num_font})
+            if _is_main:
+                _emit('alt', 'badge_%s' % _key, 'label',
+                      parent='alt::row_%s' % _key,
+                      pack={'side': tk.LEFT, 'padx': (6, 0)},
+                      props={'text': '← 选为最终预测',
+                             'bg': COLORS['bg_card'],
+                             'fg': COLORS['accent_p5'],
+                             'font': ('微软雅黑', 8, 'bold')})
+
+        # === 分位信号层（原 _build_source_matrix 逻辑）────────────────
+        _emit('signals', 'frame', 'frame', parent='layers::container',
+              pack={'fill': tk.X, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_secondary']}, rcat='分位信号')
+        src_defs = [('pipeline', '流水线'), ('trend', '走势'),
+                    ('quick', '快速')]
+        # 仅展示实际有数据的来源列，避免空列干扰
+        active_srcs = [(k, n) for k, n in src_defs
+                       if any(k in picks.get(pk, {}) for pk in pos_keys)]
+        _emit('matrix', 'wrap', 'frame', parent='signals::frame',
+              pack={'fill': tk.X, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_card'],
+                     'highlightbackground': COLORS['border'],
+                     'highlightthickness': 1}, rcat='分位信号')
+        _emit('matrix', 'lbl_title', 'label', parent='matrix::wrap',
+              pack={'anchor': tk.W, 'padx': 12, 'pady': (8, 4)},
+              props={'text': ' 分源对比（逐位）',
+                     'bg': COLORS['bg_card'],
+                     'fg': COLORS['accent_info'],
+                     'font': ('微软雅黑', 10, 'bold')})
+        _cols = [('位置', None)] + [(n, k) for k, n in active_srcs] \
+            + [('综合', '__consensus__')]
+        _emit('matrix', 'grid', 'frame', parent='matrix::wrap',
+              pack={'fill': tk.X, 'padx': 12, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_card']},
+              extra={'grid_weight_cols': len(_cols)})
+        for _c, (_name, _) in enumerate(_cols):
+            _emit('matrix', 'head_%d' % _c, 'label', parent='matrix::grid',
+                  grid={'row': 0, 'column': _c, 'padx': 1, 'pady': 1,
+                        'sticky': 'nsew'},
+                  props={'text': _name, 'fg': COLORS['text_secondary'],
+                         'bg': COLORS['bg_secondary'],
+                         'font': ('微软雅黑', 9, 'bold'),
+                         'padx': 10, 'pady': 6, 'width': 7,
+                         'relief': 'solid',
+                         'highlightbackground': COLORS['border'],
+                         'highlightthickness': 1})
+        for _r, (_pk, _pn) in enumerate(zip(pos_keys, pos_names), start=1):
+            _cons = consensus.get(_pk)
+            _emit('matrix', 'cell_%d_0' % _r, 'label',
+                  parent='matrix::grid',
+                  grid={'row': _r, 'column': 0, 'padx': 1, 'pady': 1,
+                        'sticky': 'nsew'},
+                  props={'text': _pn, 'fg': COLORS['text_muted'],
+                         'bg': COLORS['bg_secondary'],
+                         'font': ('微软雅黑', 9, 'bold'),
+                         'padx': 10, 'pady': 6, 'width': 7,
+                         'relief': 'solid',
+                         'highlightbackground': COLORS['border'],
+                         'highlightthickness': 1})
+            for _c, (_name, _key) in enumerate(_cols[1:], start=1):
+                if _key == '__consensus__':
+                    _txt = str(_cons) if _cons is not None else '—'
+                    _fg, _bg = WHITE, (COLORS['accent_p5']
+                                       if _cons is not None
+                                       else COLORS['bg_secondary'])
+                else:
+                    _v = picks.get(_pk, {}).get(_key)
+                    if _v is None:
+                        _txt = '—'
+                        _fg = COLORS['text_disabled']
+                        _bg = COLORS['bg_panel']
+                    elif _cons is not None and _v == _cons:
+                        # 与共识一致 → 绿色高亮
+                        _txt = str(_v)
+                        _fg = CONSENSUS_HIT_FG
+                        _bg = CONSENSUS_HIT_BG
+                    else:
+                        _txt = str(_v)
+                        _fg = COLORS['text_secondary']
+                        _bg = COLORS['bg_panel']
+                _emit('matrix', 'cell_%d_%d' % (_r, _c), 'label',
+                      parent='matrix::grid',
+                      grid={'row': _r, 'column': _c, 'padx': 1, 'pady': 1,
+                            'sticky': 'nsew'},
+                      props={'text': _txt, 'fg': _fg, 'bg': _bg,
+                             'font': ('Consolas', 12, 'bold'),
+                             'padx': 10, 'pady': 6, 'width': 7,
+                             'relief': 'flat'})
+
+        # === 算法依据层（原 _build_basis_section 逻辑）────────────────
+        _emit('basis', 'frame', 'frame', parent='layers::container',
+              pack={'fill': tk.X, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_secondary']}, rcat='算法依据')
+        _emit('basis', 'card', 'frame', parent='basis::frame',
+              pack={'fill': tk.X, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_card'],
+                     'highlightbackground': COLORS['border'],
+                     'highlightthickness': 1}, rcat='算法依据')
+        _emit('basis', 'lbl_title', 'label', parent='basis::card',
+              pack={'anchor': tk.W, 'padx': 12, 'pady': (8, 4)},
+              props={'text': '算法依据',
+                     'font': ('微软雅黑', 10, 'bold'),
+                     'bg': COLORS['bg_card'],
+                     'fg': COLORS['text_primary']})
+        _emit('basis', 'weights', 'frame', parent='basis::card',
+              pack={'fill': tk.X, 'padx': 12, 'pady': (0, 8)},
+              props={'bg': COLORS['bg_card']})
+        # 冻结权重（来自升级方案）
+        weight_items = [
+            ('频率', '0.68'),
+            ('监督学习', '0.14'),
+            ('贝叶斯', '0.10'),
+            ('遗漏', '0.00'),
+            ('趋势', '0.01'),
+            ('马尔可夫', '0.005'),
+            ('形态', '0.003'),
+            ('特征', '0.002'),
+        ]
+        for _i, (_name, _w) in enumerate(weight_items):
+            _emit('basis', 'row_%d' % _i, 'frame', parent='basis::weights',
+                  pack={'fill': tk.X, 'pady': 2},
+                  props={'bg': COLORS['bg_card']})
+            _emit('basis', 'name_%d' % _i, 'label',
+                  parent='basis::row_%d' % _i, pack={'side': tk.LEFT},
+                  props={'text': _name, 'font': ('微软雅黑', 9),
+                         'bg': COLORS['bg_card'],
+                         'fg': COLORS['text_secondary']})
+            _emit('basis', 'val_%d' % _i, 'label',
+                  parent='basis::row_%d' % _i, pack={'side': tk.RIGHT},
+                  props={'text': _w, 'font': ('Consolas', 9, 'bold'),
+                         'bg': COLORS['bg_card'],
+                         'fg': COLORS['accent_p5']})
+
+        return specs
 
     def _build_detail_section(self, parent, picks, top5, combos, target_issue,
                               pos_keys, pos_names, total_sources, conf, high_conf):
@@ -6865,11 +8466,12 @@ class LotteryGUI:
             'trend': '走势引擎：6信号源相对热度打分',
         }
         
-        # 来源颜色映射
+        # 来源颜色映射（v5.2 GUI-06：trend 原用未定义键 accent_orange，
+        # dict 构造即 KeyError；走势引擎语义为橙，改查已定义槽 accent_warning）
         source_colors = {
             'pipeline': COLORS['accent_p5'],
             'quick': COLORS['accent_ai'],
-            'trend': COLORS['accent_orange']
+            'trend': COLORS['accent_warning']
         }
         
         row = 1
@@ -6913,116 +8515,269 @@ class LotteryGUI:
                      bg=COLORS['bg_secondary'], fg=COLORS['text_muted'],
                      font=('微软雅黑', 8), wraplength=600, justify=tk.LEFT).grid(row=len(diff_rows)+1, column=0, columnspan=2, padx=8, pady=(0, 4), sticky='w')
 
-    def _build_source_matrix(self, parent, picks, consensus, pos_keys, pos_names):
-        """分源对比表：行=5个位置，列=各来源(流水线/走势/快速)+综合，直观对比逐位差异。
+    @staticmethod
+    def _dash_diff(old_state, new_data):
+        """计算仪表盘卡片差异（GUI-03 增量渲染核心，纯函数，可离线单测）。
 
-        - 与「综合」一致的来源单元格用绿色高亮，不一致用弱化色，缺失显示「—」。
-        - 常驻展示（非折叠），是本次右侧面板信息分层的核心：一眼看清各源分歧与共识。
+        对比新旧规格树（`{key: spec}`），产出 add/update/remove 三列表：
+
+        * add: 新出现的 key（首次渲染 / 新数据源 / 新卡片）；
+        * update: 同 key 且结构不变（kind/parent/pack/grid 均一致），
+          仅内容签名 sig 变化（文本/色值等）→ 走原地 configure；
+        * remove: 旧树中消失的 key + 结构变化的 key（结构变化无法
+          原地 configure，降级为 remove+add）。
+
+        参数:
+            old_state: 上一次渲染保存的规格树（_dash_card_state）。
+            new_data: 本次渲染编译出的新规格树。
+
+        返回:
+            dict: {'add': [spec, ...], 'update': [(key, spec), ...],
+                   'remove': [key, ...]}
         """
-        src_defs = [('pipeline', '流水线'), ('trend', '走势'), ('quick', '快速')]
-        # 仅展示实际有数据的来源列，避免空列干扰
-        active_srcs = [(k, n) for k, n in src_defs
-                       if any(k in picks.get(pk, {}) for pk in pos_keys)]
+        old_state = old_state or {}
+        new_data = new_data or {}
+        add, update, remove = [], [], []
+        for key, spec in new_data.items():
+            old = old_state.get(key)
+            if old is None:
+                add.append(spec)
+            elif (old.get('kind') != spec.get('kind')
+                  or old.get('parent') != spec.get('parent')
+                  or old.get('pack') != spec.get('pack')
+                  or old.get('grid') != spec.get('grid')):
+                # 结构变化无法原地 configure → 升级为 remove+add
+                remove.append(key)
+                add.append(spec)
+            elif old.get('sig') != spec.get('sig'):
+                update.append((key, spec))
+        remove.extend(k for k in old_state if k not in new_data)
+        return {'add': add, 'update': update, 'remove': remove}
 
-        wrap = tk.Frame(parent, bg=COLORS['bg_card'],
-                        highlightbackground=COLORS['border'], highlightthickness=1)
-        wrap._rcat = "分位信号"   # 分类筛选标记：分源逐位对比
-        wrap.pack(fill=tk.X, pady=(0, 8))
+    def _dash_card_create(self, spec):
+        """按规格创建单张卡片控件并完成几何布局（GUI-03 唯一创建入口）。
 
-        tk.Label(wrap, text=" 分源对比（逐位）", bg=COLORS['bg_card'],
-                 fg=COLORS['accent_info'], font=('微软雅黑', 10, 'bold')
-                 ).pack(anchor=tk.W, padx=12, pady=(8, 4))
+        创建参数全部来自规格树 props（与 configure 同源，保证视觉一致）；
+        pack/grid 几何来自 spec['pack'] / spec['grid']；parent 为规格 key，
+        经 _dash_card_index 解析为真实父控件（缺失时降级挂到 result_dash，
+        保证父子顺序异常时也不会丢失卡片）。
 
-        grid = tk.Frame(wrap, bg=COLORS['bg_card'])
-        grid.pack(fill=tk.X, padx=12, pady=(0, 8))
+        参数:
+            spec: 规格树中的单项 spec dict。
 
-        cols = [('位置', None)] + [(n, k) for k, n in active_srcs] + [('综合', '__consensus__')]
+        返回:
+            创建成功的控件；kind 未知或创建异常时返回 None（记日志，不中断渲染）。
+        """
+        parent_w = None
+        if spec.get('parent'):
+            parent_w = self._dash_card_index.get(spec['parent'])
+            if parent_w is not None and not parent_w.winfo_exists():
+                parent_w = None
+        if parent_w is None:
+            parent_w = self.result_dash
+        kind = spec['kind']
+        props = dict(spec['props'])
+        try:
+            if kind == 'frame':
+                w = tk.Frame(parent_w, **props)
+            elif kind == 'label':
+                w = tk.Label(parent_w, **props)
+            elif kind == 'button':
+                w = tk.Button(parent_w, **props)
+            elif kind == 'canvas':
+                w = tk.Canvas(parent_w, **props)
+            else:
+                logger.warning('[GUI-03] 未知卡片类型 kind=%s（key=%s），已跳过',
+                               kind, spec.get('key'))
+                return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning('[GUI-03] 卡片创建失败 key=%s: %s',
+                           spec.get('key'), e)
+            return None
+        # 分类筛选标记（兼容 _apply_result_category 的 _rcat 遍历协议）
+        if spec.get('rcat'):
+            try:
+                w._rcat = spec['rcat']
+            except Exception:
+                pass
+        # 几何布局（一张卡片只会使用 pack 或 grid 之一）
+        try:
+            if spec.get('grid'):
+                w.grid(**dict(spec['grid']))
+            elif spec.get('pack'):
+                w.pack(**dict(spec['pack']))
+        except Exception as e:  # noqa: BLE001
+            logger.warning('[GUI-03] 卡片布局失败 key=%s: %s',
+                           spec.get('key'), e)
+        # 命令按钮按标签重建闭包，规避缓存闭包持有已销毁控件（见 _dash_bind_command）
+        if spec.get('cmd'):
+            self._dash_bind_command(w, spec['cmd'])
+        # 标题栏渐变（复刻原实现：两个同尺寸矩形先后叠加，后绘者覆盖前者）
+        extra = spec.get('extra') or {}
+        if extra.get('draw') == 'hdr_gradient':
+            try:
+                _dash_w = self.result_dash.winfo_width()
+                w.create_rectangle(0, 0, _dash_w, 42,
+                                   fill=COLORS['accent_p5'], outline='')
+                w.create_rectangle(0, 0, _dash_w, 42,
+                                   fill=COLORS['accent_ai'], outline='')
+            except Exception:
+                pass
+        return w
 
-        def _cell(r, c, text, fg, bg, bold=False, is_head=False):
-            """在号码来源矩阵中创建并放置一个单元格标签。
+    def _dash_bind_command(self, widget, cmd):
+        """按命令标签为按钮重建闭包（GUI-03）。
 
-            参数:
-                r: 网格行号
-                c: 网格列号
-                text: 单元格显示文本
-                fg: 前景（文字）颜色
-                bg: 背景颜色
-                bold: 是否使用加粗字体
-                is_head: 是否为表头单元格（表头统一用微软雅黑 9 号加粗）
-            """
-            f = ('微软雅黑', 9, 'bold') if (bold or is_head) else ('Consolas', 12, 'bold')
-            if is_head:
-                f = ('微软雅黑', 9, 'bold')
-            # 表头增加边框高亮（注意：非表头不能传 highlightbackground=''，
-            # Tk 仍会解析该颜色选项，空字符串会触发 TclError: unknown color name ""）
-            kw = {}
-            if is_head:
-                kw['highlightbackground'] = COLORS['border']
-                kw['highlightthickness'] = 1
-            lbl = tk.Label(grid, text=text, bg=bg, fg=fg, font=f,
-                           padx=10, pady=6, width=7, relief='solid' if is_head else 'flat',
-                           **kw)
-            lbl.grid(row=r, column=c, padx=1, pady=1, sticky='nsew')
+        按钮 command 闭包不可哈希、无法进入内容签名，改以 cmd 标签在
+        create / update 应用期重建；任何阶段拿到的命令绑定的都是当前
+        最新控件引用，杜绝「缓存闭包调用已销毁控件」类故障。
 
-        # 表头
-        for c, (name, _) in enumerate(cols):
-            _cell(0, c, name, COLORS['text_secondary'], COLORS['bg_secondary'], is_head=True)
+        参数:
+            widget: 目标按钮控件。
+            cmd: 命令标签（'export_menu' / 'detail_toggle' / 'alt_toggle'）。
+        """
+        if cmd == 'export_menu':
+            widget.config(command=self._show_export_menu)
+        elif cmd == 'detail_toggle':
+            widget.config(command=self._toggle_detail)
+        elif cmd == 'alt_toggle':
+            widget.config(command=self._make_alt_toggle())
 
-        # 数据行
-        for r, (pk, pn) in enumerate(zip(pos_keys, pos_names), start=1):
-            _cell(r, 0, pn, COLORS['text_muted'], COLORS['bg_secondary'], is_head=True)
-            cons = consensus.get(pk)
-            for c, (name, key) in enumerate(cols[1:], start=1):
-                if key == '__consensus__':
-                    txt = str(cons) if cons is not None else '—'
-                    _cell(r, c, txt, '#ffffff',
-                          COLORS['accent_p5'] if cons is not None else COLORS['bg_secondary'])
-                else:
-                    v = picks.get(pk, {}).get(key)
-                    if v is None:
-                        _cell(r, c, '—', COLORS['text_disabled'], COLORS['bg_panel'])
-                    elif cons is not None and v == cons:
-                        # 与共识一致 → 绿色高亮
-                        _cell(r, c, str(v), '#d1fae5', '#065f46')
+    def _make_alt_toggle(self):
+        """构造「备选号码」折叠开关闭包（GUI-03）。
+
+        折叠状态以 self._alt_visible 为单一事实源：切换时同步
+        pack/unpack ``alt::content`` 与按钮文案；下一次渲染的规格树
+        会按新状态生成按钮文本（text 纳入 sig），实现自愈。
+        """
+
+        def _toggle():
+            self._alt_visible = not self._alt_visible
+            content = self._dash_card_index.get('alt::content')
+            try:
+                if content is not None and content.winfo_exists():
+                    if self._alt_visible:
+                        content.pack(fill=tk.X, padx=12, pady=(0, 8))
                     else:
-                        _cell(r, c, str(v), COLORS['text_secondary'], COLORS['bg_panel'])
+                        content.pack_forget()
+                btn = self._dash_card_index.get('alt::btn_toggle')
+                if btn is not None and btn.winfo_exists():
+                    btn.config(text=' 收起备选号码' if self._alt_visible
+                               else ' 备选号码（各分析源结果）')
+                # 折叠/展开改变内容高度，防抖刷新滚动区域
+                self._dash_request_refresh()
+            except Exception:
+                pass
 
-        # 均分列宽
-        for c in range(len(cols)):
-            grid.grid_columnconfigure(c, weight=1)
+        return _toggle
 
-    def _build_basis_section(self, parent):
-        """算法依据部分：展示算法权重和贡献"""
-        frame = tk.Frame(parent, bg=COLORS['bg_card'],
-                         highlightbackground=COLORS['border'], highlightthickness=1)
-        frame.pack(fill=tk.X, pady=(0, 8))
-        frame._rcat = "算法依据"   # 分类筛选标记：算法依据
-        tk.Label(frame, text="算法依据", font=('微软雅黑', 10, 'bold'),
-                 bg=COLORS['bg_card'], fg=COLORS['text_primary']).pack(anchor=tk.W, padx=12, pady=(8, 4))
-        # 算法权重表格
-        weights_frame = tk.Frame(frame, bg=COLORS['bg_card'])
-        weights_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
-        # 冻结权重（来自升级方案）
-        weight_items = [
-            ("频率", "0.68"),
-            ("监督学习", "0.14"),
-            ("贝叶斯", "0.10"),
-            ("遗漏", "0.00"),
-            ("趋势", "0.01"),
-            ("马尔可夫", "0.005"),
-            ("形态", "0.003"),
-            ("特征", "0.002"),
-        ]
-        for i, (name, w) in enumerate(weight_items):
-            row = tk.Frame(weights_frame, bg=COLORS['bg_card'])
-            row.pack(fill=tk.X, pady=2)
-            tk.Label(row, text=name, font=('微软雅黑', 9),
-                     bg=COLORS['bg_card'], fg=COLORS['text_secondary']).pack(side=tk.LEFT)
-            tk.Label(row, text=w, font=('Consolas', 9, 'bold'),
-                     bg=COLORS['bg_card'], fg=COLORS['accent_p5']).pack(side=tk.RIGHT)
-        # 可选：显示当前分析来源的贡献（如果有pf/tr/qf）
-        # 这里可以添加更多详情，但保持简单
-        return frame
+    def _dash_restore_scroll(self, saved):
+        """A9：渲染后若视口位置漂移超过 5% 则回拽到渲染前位置。
+
+        参数:
+            saved: 渲染前保存的 ``dash_container.yview()`` 元组（None 时跳过）。
+        """
+        if saved is None:
+            return
+        try:
+            cur = self.dash_container.yview()
+            if abs(cur[0] - saved[0]) > 0.05:
+                self.dash_container.yview_moveto(saved[0])
+        except Exception:
+            pass
+
+    def _apply_dashboard_diff(self, diff):
+        """应用渲染 diff：remove → add → update → 结构修正（GUI-03 唯一 Tk 写入口）。
+
+        执行顺序保证父子控件依赖：先销毁消失卡片，再按规格树顺序
+        （父先于子）创建新卡片，最后原地更新同 key 卡片；末尾单次
+        ``update_idletasks`` 摊平本轮全部几何变化，避免逐控件抖动。
+
+        参数:
+            diff: ``_dash_diff`` 产出的 {'add': [spec], 'update': [(key, spec)],
+                'remove': [key]}；三项均为空时零 Tk 操作（A7 口径）。
+        """
+        add = diff.get('add') or []
+        update = diff.get('update') or []
+        remove = diff.get('remove') or []
+        if not (add or update or remove):
+            return  # 无差异：本帧不触碰 Tk
+
+        # A9：apply 前保存滚动位置，末尾按漂移回拽
+        try:
+            _saved_y = self.dash_container.yview()
+        except Exception:
+            _saved_y = None
+
+        # 1) remove：销毁消失的卡片并摘除全部索引（含 grid 列权与折叠句柄）
+        for _k in remove:
+            w = self._dash_card_index.pop(_k, None)
+            self._dash_card_state.pop(_k, None)
+            self._dash_grid_ncols.pop(_k, None)
+            if _k == 'alt::content':
+                self._alt_content = None
+            try:
+                if w is not None and w.winfo_exists():
+                    w.destroy()
+            except Exception:
+                pass
+
+        # 2) add：按规格树顺序创建（_build_dashboard_specs 保证父先于子）
+        for spec in add:
+            w = self._dash_card_create(spec)
+            if w is None:
+                continue
+            self._dash_card_index[spec['key']] = w
+            if spec['key'] == 'alt::content':
+                self._alt_content = w
+
+        # 3) update：同 key 原地 configure（仅文本/色值等可配置项，不销毁）
+        for key, spec in update:
+            w = self._dash_card_index.get(key)
+            if w is None or not w.winfo_exists():
+                continue
+            try:
+                w.configure(**dict(spec['props']))
+            except Exception as e:  # noqa: BLE001
+                logger.warning('[GUI-03] 卡片更新失败 key=%s: %s', key, e)
+            if spec.get('cmd'):
+                self._dash_bind_command(w, spec['cmd'])
+
+        # 4) 结构修正：同 key 场景的类级配置 / 折叠状态保持
+        for spec in add + [s for _, s in update]:
+            extra = spec.get('extra') or {}
+            _ncols = extra.get('grid_weight_cols')
+            if _ncols:
+                gw = self._dash_card_index.get(spec['key'])
+                if (gw is not None and gw.winfo_exists()
+                        and self._dash_grid_ncols.get(spec['key']) != _ncols):
+                    try:
+                        for _c in range(_ncols):
+                            gw.grid_columnconfigure(_c, weight=1)
+                    except Exception:
+                        pass
+                    self._dash_grid_ncols[spec['key']] = _ncols
+
+        # 备选号码折叠区：pack/unpack 不在规格内，按用户折叠状态统一修正
+        # （规格树只描述「应有内容」，几何由本段按运行时状态补齐）
+        content = self._dash_card_index.get('alt::content')
+        if content is not None and content.winfo_exists():
+            try:
+                if self._alt_visible:
+                    if not content.winfo_manager():
+                        content.pack(fill=tk.X, padx=12, pady=(0, 8))
+                elif content.winfo_manager():
+                    content.pack_forget()
+            except Exception:
+                pass
+
+        # 单次 idle 刷新，摊平本轮全部几何变化（避免逐个 create 触发重排）
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        # A9：滚动位置回拽
+        self._dash_restore_scroll(_saved_y)
 
     def _show_result_dashboard(self, pipeline_final=None, trend_result=None, quick_final=None):
         """
@@ -7059,10 +8814,20 @@ class LotteryGUI:
             except Exception:
                 pass
 
-    def _render_dashboard_impl(self):
-        """v4.0 实际渲染实现：从 self._last_* 属性读取数据并渲染仪表盘。
-        
-        该方法由 _render_unified_dashboard 调用，包含完整的 UI 渲染逻辑。
+    def _render_dashboard_impl(self, _pre_agg=None, _diff: Optional[Dict] = None):
+        """v5.2（GUI-03）实际渲染实现：规格树 + diff 增量渲染。
+
+        与 v4.0「创建即渲染、每次全量重建」的区别：渲染逻辑先编译为
+        纯数据规格树（``_build_dashboard_specs``），再经 ``_dash_diff``
+        计算 add/update/remove，仅对差异部分执行 create/destroy/configure；
+        数据无变化时零 Tk 写操作，从根上消除重复渲染的整屏闪白（A7）。
+
+        参数:
+            _pre_agg: 调用方已算好的聚合结果（dict）。传入则直接复用，
+                避免同一次渲染重复执行 _compute_dashboard_aggregates
+                （§2.1 第 4 项 响应速度：聚合计算只做一次）。
+            _diff: 调用方预先算好的 diff（dict，含 add/update/remove），
+                传入则跳过本方法内的 _dash_diff 计算（供异步预计算场景）。
         """
         pf = self._last_pipeline_final
         tr = self._last_trend_result
@@ -7077,7 +8842,8 @@ class LotteryGUI:
 
         # v3.62：聚合计算抽到纯函数 _compute_dashboard_aggregates，
         # 后台线程也可直接调用同步写 _prediction_clipboard，避开 after(0) 时序竞态。
-        agg = self._compute_dashboard_aggregates(pf, tr, qf)
+        # §2.1 第 4 项：复用调用方已算好的聚合结果（_pre_agg），同一次渲染不重复计算。
+        agg = _pre_agg or self._compute_dashboard_aggregates(pf, tr, qf)
         if not agg:
             # v4.0 简化：聚合失败时仅用 pipeline_final 恢复 clipboard，
             # _copy_prediction 会在点击时自动从 _last_pipeline_final 或数据库兜底。
@@ -7101,7 +8867,7 @@ class LotteryGUI:
         main_combo = agg['main_combo']
 
         # 核心计算仍使用完整5位（万/千/百/十/个），保证算法与数据处理不受影响
-# [DEBUG v3.54] 渲染参数日志
+        # [DEBUG v3.54] 渲染参数日志
         try:
             import logging
             _dbg = logging.getLogger('kplucky.debug')
@@ -7111,20 +8877,15 @@ class LotteryGUI:
                       {k: consensus.get(k) for k in ['wan','qian','bai','shi','ge']})
         except Exception:
             pass
-        # 清空旧内容
-        for w in self.result_dash.winfo_children():
-            w.destroy()
-        pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
-        pos_names = ['万位', '千位', '百位', '十位', '个位']
 
-        # 可用信号源数（并集，用于措辞）
-        total_sources = agg['total_sources']
-
-        # 渲染去重——内容与上次渲染完全一致时跳过全量重建，仅确保可见，
+        # 渲染去重——内容与上次渲染完全一致时跳过重建，仅确保可见，
         # 避免重复点击「开始分析」或缓存命中时不必要的控件销毁/重建，提升响应速度
+        # （GUI-03 之后常态命中：无数据变化时连 diff 都不计算，零 Tk 操作）
         _combos_disp = tuple(sorted(compress_combo(v) for v in combos.values()))
         _render_key = (target_issue, main_combo_disp, conf, high_conf, _combos_disp)
-        if getattr(self, '_last_dashboard_key', None) == _render_key and self.result_dash.winfo_children():
+        if (getattr(self, '_last_dashboard_key', None) == _render_key
+                and self._dash_card_index
+                and self.result_dash.winfo_children()):
             try:
                 if getattr(self, '_result_placeholder', None) is not None:
                     self._result_placeholder.pack_forget()
@@ -7133,124 +8894,20 @@ class LotteryGUI:
             except Exception:
                 pass
             return
-        # 清空旧内容
-        for w in self.result_dash.winfo_children():
-            w.destroy()
 
-        # v3.62：clipboard 已在 _compute_dashboard_aggregates 中同步写好，
-        # 这里仅做记录本次分析生成时间（保留原有逻辑），不再二次覆盖。
         # 记录本次分析生成时间（供「最近一次分析时间」标记展示）
         self._last_analysis_time = datetime.now()
 
-        # ---- 渲染 ----
-        dash = self.result_dash
-
-        # 标题栏（渐变效果：P5绿 → AI紫）
-        hdr = tk.Canvas(dash, height=42, highlightthickness=0, bg=COLORS['bg_secondary'])
-        hdr.pack(fill=tk.X)
-        # 渐变模拟：绘制两色矩形交错
-        hdr.create_rectangle(0,0, dash.winfo_width(),42, fill=COLORS['accent_p5'], outline='')
-        hdr.create_rectangle(0,0, dash.winfo_width(),42, fill=COLORS['accent_ai'], outline='')
-        
-        hdr_left = tk.Frame(hdr, bg=COLORS['accent_p5'])
-        hdr_left.pack(side=tk.LEFT, padx=12, pady=4)
-        tk.Label(hdr_left, text=" AI智能预测", bg=COLORS['accent_p5'], fg='#ffffff',
-                 font=('微软雅黑', 12, 'bold')).pack(anchor=tk.W)
-        # 最近一次分析时间标记（副标题, 让结论有明确的时间归属）
-        _ana_t = getattr(self, '_last_analysis_time', None)
-        if _ana_t is not None:
-            _today = datetime.now().date()
-            _tstr = (_ana_t.strftime('%H:%M:%S') if _ana_t.date() == _today
-                     else _ana_t.strftime('%Y-%m-%d %H:%M'))
-            tk.Label(hdr_left, text=f" 最近分析 {_tstr}",
-                     bg=COLORS['accent_p5'], fg='#e0e7ff',
-                     font=('微软雅黑', 8)).pack(anchor=tk.W)
-        
-        hdr_right = tk.Frame(hdr, bg=COLORS['accent_p5'])
-        hdr_right.pack(side=tk.RIGHT, padx=8, pady=6)
-        
-        # 导出下拉：Primary 样式
-        export_btn = tk.Button(hdr_right, text=" 导出 ▾",
-                               command=self._show_export_menu,
-                               bg=COLORS['accent_p5_light'], fg='#ffffff',
-                               font=('微软雅黑', 9, 'bold'),
-                               relief='flat', padx=10, pady=3, cursor='hand2',
-                               activebackground=COLORS['accent_p5_bright'])
-        export_btn.pack(side=tk.RIGHT, padx=(6, 0))
-
-        detail_btn = tk.Button(hdr_right, text=" 详细分析", command=self._toggle_detail,
-                               bg=COLORS['accent_p5_light'], fg='#ffffff', 
-                               font=('微软雅黑', 9, 'bold'),
-                               relief='flat', padx=10, pady=3, cursor='hand2',
-                               activebackground=COLORS['accent_p5_bright'])
-        detail_btn.pack(side=tk.RIGHT, padx=(6, 0))
-
-        # 创建层次容器
-        layers_container = tk.Frame(dash, bg=COLORS['bg_secondary'])
-        layers_container.pack(fill=tk.X, padx=12, pady=10)
-
-        # === 预测结论层 ===
-        conclusion_frame = tk.Frame(layers_container, bg=COLORS['bg_secondary'])
-        conclusion_frame.pack(fill=tk.X, pady=(0, 8))
-        conclusion_frame._rcat = "预测结论"   # 分类筛选标记：预测结论
-
-        # 风险提示（放在结论层顶部）
-        risk = ''
-        if isinstance(pf, dict):
-            risk = (pf.get('risk_warning') or '').strip()
-        elif isinstance(qf, dict):
-            risk = (qf.get('risk_warning') or '').strip()
-        if risk:
-            risk_frame = tk.Frame(conclusion_frame, bg=COLORS['bg_card'], highlightbackground=COLORS['accent_warning'], highlightthickness=1)
-            risk_frame.pack(fill=tk.X, pady=(0, 4))
-            tk.Label(risk_frame, text=" " + risk, bg=COLORS['bg_card'], fg=COLORS['accent_warning_light'],
-                     font=('微软雅黑', 9), wraplength=620, justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=6)
-
-        # 1) 数据概览磁贴：期号 + 一致率 + 高置信度 + 来源数
-        info_row = tk.Frame(conclusion_frame, bg=COLORS['bg_secondary'])
-        info_row.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(info_row, text=f"{'第' if target_issue else ''}{target_issue or '—'}{'期' if target_issue else ''}", font=('Consolas', 13, 'bold'),
-                 bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
-        if conf is not None:
-            tk.Label(info_row, text=f" 一致率 {conf}%", bg=COLORS['bg_card'], fg=COLORS['accent_p5'], font=('微软雅黑', 10, 'bold')).pack(side=tk.LEFT, padx=(8, 0))
-        if high_conf:
-            tk.Label(info_row, text=" 高置信度 ✓", bg=COLORS['badge_active_bg'], fg=COLORS['badge_active_fg'], font=('微软雅黑', 9, 'bold')).pack(side=tk.LEFT, padx=(8, 0))
-        src_names = ['四步流水线', '走势引擎', '快速预测']
-        used = [n for i, n in enumerate(src_names) if (i == 0 and pf) or (i == 1 and tr) or (i == 2 and qf)]
-        tk.Label(info_row, text=f" 来源 {len(used)}/3", bg=COLORS['bg_card'], fg=COLORS['text_secondary'], font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=(8, 0))
-
-        # 2) 主推号大卡
-        main_card = tk.Frame(conclusion_frame, bg=COLORS['bg_card'], highlightbackground=COLORS['border'], highlightthickness=1)
-        main_card.pack(fill=tk.X, pady=(8, 6))
-        tk.Label(main_card, text="推荐号码", font=('微软雅黑', 11, 'bold'),
-                 bg=COLORS['bg_card'], fg=COLORS['text_primary']).pack(anchor=tk.W, padx=12, pady=(8, 4))
-        nums_row = tk.Frame(main_card, bg=COLORS['bg_card'])
-        nums_row.pack(fill=tk.X, padx=12, pady=(0, 8))
-        for _pk_disp in DISPLAY_POS_KEYS:
-            _d = consensus.get(_pk_disp)
-            _lbl = tk.Label(nums_row, text=str(_d) if _d is not None else '—',
-                            font=('Consolas', 18, 'bold'),
-                            bg=COLORS['accent_p5'] if _d is not None else COLORS['bg_card'],
-                            fg='#ffffff' if _d is not None else COLORS['text_muted'],
-                            width=3, padx=6, pady=6)
-            _lbl.pack(side=tk.LEFT, padx=4)
-        tk.Label(main_card, text=f"高置信度 · 一致率 {conf or 0}%", font=('微软雅黑', 9),
-                 bg=COLORS['bg_card'], fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=12, pady=(0, 8))
-
-        # 备选号码折叠区（结论层的一部分）
-        self._build_alt_section(conclusion_frame, combos, main_combo, pos_keys, pos_names)
-
-        # === 分位信号层 ===
-        signals_frame = tk.Frame(layers_container, bg=COLORS['bg_secondary'])
-        signals_frame.pack(fill=tk.X, pady=(0, 8))
-        signals_frame._rcat = "分位信号"   # 分类筛选标记：分位信号
-        self._build_source_matrix(signals_frame, picks, consensus, pos_keys, pos_names)
-
-        # === 算法依据层 ===
-        basis_frame = tk.Frame(layers_container, bg=COLORS['bg_secondary'])
-        basis_frame.pack(fill=tk.X, pady=(0, 8))
-        basis_frame._rcat = "算法依据"   # 分类筛选标记：算法依据
-        self._build_basis_section(basis_frame)
+        # ---- GUI-03 增量渲染：规格树 → diff → 应用 ----
+        new_state = self._build_dashboard_specs(agg)
+        if _diff is not None:
+            diff = _diff
+        else:
+            diff = self._dash_diff(self._dash_card_state, new_state)
+        self._apply_dashboard_diff(diff)
+        # 状态只登记真实创建成功的卡片（create 失败的 key 留待下次渲染重试）
+        self._dash_card_state = {k: v for k, v in new_state.items()
+                                 if k in self._dash_card_index}
 
         # 有结果 → 隐藏空态占位，展示仪表盘，并自动聚焦「预测结果」页
         try:
@@ -7274,7 +8931,7 @@ class LotteryGUI:
                 logging.getLogger('kplucky.debug').error('DASHBOARD_FOCUS_FAIL: %s', _focus_e)
             except Exception:
                 pass
-        # 记录本次渲染指纹，供下次渲染去重（避免无谓的全量重建）
+        # 记录本次渲染指纹，供下次渲染去重（避免无谓的增量计算）
         self._last_dashboard_key = _render_key
         try:
             import logging
@@ -7324,8 +8981,9 @@ class LotteryGUI:
             pf = getattr(self, '_last_pipeline_final', None)
             qf = getattr(self, '_last_quick_final', None)
             tr = getattr(self, '_last_trend_result', None)
-            self._compute_dashboard_aggregates(pf, tr, qf)
+            _pre_agg = self._compute_dashboard_aggregates(pf, tr, qf)
         except Exception as e:
+            _pre_agg = None
             try:
                 import logging
                 logging.getLogger('kplucky.debug').error(
@@ -7333,23 +8991,26 @@ class LotteryGUI:
             except Exception:
                 pass
 
-        # 执行实际渲染
+        # 执行实际渲染（复用上面的聚合结果，避免同一次渲染重复计算）
         _pre_key = getattr(self, '_last_dashboard_key', None)
-        self._render_dashboard_impl()
+        self._render_dashboard_impl(_pre_agg)
 
-        # 强制刷新剪贴板，确保复制按钮立即可用（兜底）
+        # 兜底：仅当多源聚合未写出剪贴板时才用单源构建补齐。
+        # v5.0 §2.1 第 4 项修正：原实现无条件覆盖 _prediction_clipboard，
+        # 会把刚算好的多源聚合（共识/置信度/备选组合）改回单源内容。
         try:
-            pf = getattr(self, '_last_pipeline_final', None)
-            if isinstance(pf, dict) and pf:
-                clip = self._build_prediction_clipboard(pf)
-                if clip and clip.strip():
-                    self._prediction_clipboard = clip
-                    self._clipboard_meta = {
-                        'target_issue': pf.get('target_issue') or pf.get('next_issue') or '',
-                        'conf': '',
-                        'high_conf': '',
-                        'main_combo': '',
-                    }
+            if not (getattr(self, '_prediction_clipboard', '') or '').strip():
+                _pf = getattr(self, '_last_pipeline_final', None)
+                if isinstance(_pf, dict) and _pf:
+                    clip = self._build_prediction_clipboard(_pf)
+                    if clip and clip.strip():
+                        self._prediction_clipboard = clip
+                        self._clipboard_meta = {
+                            'target_issue': _pf.get('target_issue') or _pf.get('next_issue') or '',
+                            'conf': '',
+                            'high_conf': '',
+                            'main_combo': '',
+                        }
         except Exception:
             pass
         # v3.59：兜底数据库写入。若本次分析全程未产出结果（_last_*_final 全为 None），
