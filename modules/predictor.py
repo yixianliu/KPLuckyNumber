@@ -62,7 +62,6 @@ from typing import Dict, List, Any, Optional, Tuple
 import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from config import DATA_WINDOW_PERIOD, COMPOSITION_RULES
 
 from paths import LOGS_DIR, REPORTS_DIR
@@ -787,6 +786,16 @@ class P5PredictorConfig:
         return self.config.copy()
 
 
+# ============ ALG-02：预测器 AI 调用专用 Session（进程级复用，无传输层重试） ============
+# 变更背景：原 _build_ai_session 复用 ai_analyzer 的共享 Session，其
+# Retry(total=3, connect=3, read=3, respect_retry_after_header=True) 会使
+# 单次 request 最坏 ≈4×60s+退避 ≈250s，远超 A22 单次 30s 墙钟上限，且
+# Retry 不感知 run 级预算、预算熔断形同虚设。现改为：连接池复用但不再
+# 挂载任何 Retry，重试/降级/超时统一收敛到 P5Predictor._call_ai_model
+# 的预算感知循环（读超时截断、退避截断、4xx 不重试、404/410 切 backup）。
+_AI_CALL_SESSION: Optional[requests.Session] = None
+
+
 class P5Predictor:
     """
     优化后的排列5预测器核心类
@@ -961,6 +970,50 @@ class P5Predictor:
         self.pool_connections = int(self.api_config.get('pool_connections', 5))
         self.pool_maxsize = int(self.api_config.get('pool_maxsize', 10))
         self.response_format = self.api_config.get('response_format', 'json_object')
+
+        # ============ ALG-02：AI 调用预算（分级超时 + run 级熔断，v5.2） ============
+        # 背景：原单次 60s 标量超时叠加共享 Session 的传输层重试，最坏可达
+        # 分钟级（A22 不达标）；且单期 predict 无共享预算（A23 不达标）。
+        # 预算参数以 config.py 的 AI_CALL_BUDGET 为进程级配置源，此处做实例化兜底。
+        _budget_defaults = {
+            'enabled': True,
+            'soft_timeout': 20.0,
+            'hard_timeout': 30.0,
+            'per_run_max_calls': 2,
+        }
+        try:
+            import config as _budget_cfg
+            _budget_merged = {
+                **_budget_defaults,
+                **(getattr(_budget_cfg, 'AI_CALL_BUDGET', None) or {}),
+            }
+        except ImportError:
+            _budget_merged = dict(_budget_defaults)
+        # 下限保护：soft ≥ 1.0s（防误配置将正常响应判超时）、hard ≥ 2.0s、次数 ≥ 1
+        self.ai_budget_enabled = bool(_budget_merged['enabled'])
+        self.ai_soft_timeout = max(1.0, float(_budget_merged['soft_timeout']))
+        self.ai_hard_timeout = max(2.0, float(_budget_merged['hard_timeout']))
+        self.ai_per_run_max_calls = max(
+            1, int(_budget_merged['per_run_max_calls']))
+        # 单期（一次 predict / 一次 _algo_bayesian_inference）AI 总墙钟预算：
+        # per_run_max_calls × hard_timeout（默认 2×30=60s，对齐 A23）
+        self.ai_run_budget_seconds = (
+            self.ai_per_run_max_calls * self.ai_hard_timeout)
+        # run 级熔断运行态（_call_ai_model 累加/读取，predict 与
+        # _algo_bayesian_inference 重置）：
+        #   _ai_run_wall_seconds —— 本 run 已消耗的 AI 墙钟秒数；
+        #   _ai_budget_exhausted —— 非空表示本 run 已熔断降级，透传为结果字典
+        #     ai_degraded_notice 字段（用户可见提示；不改 bayesian_ai_auxiliary
+        #     语义，避免回测将其非空当作命中信号造成误判）。
+        self._ai_run_wall_seconds = 0.0
+        self._ai_budget_exhausted = ''
+        logger.info(
+            f'AI调用预算: enabled={self.ai_budget_enabled}, '
+            f'soft={self.ai_soft_timeout}s, hard={self.ai_hard_timeout}s, '
+            f'per_run_max_calls={self.ai_per_run_max_calls}, '
+            f'run_budget={self.ai_run_budget_seconds:g}s'
+        )
+
         self.ai_available = bool(self.api_key)
         self.ai_auxiliary_available = bool(self.api_key)
 
@@ -1046,7 +1099,9 @@ class P5Predictor:
     def _call_ai_model(self, prompt: str, max_tokens: Optional[int] = None,
                        temperature: Optional[float] = None, force: bool = False,
                        tools: Optional[List[Dict[str, Any]]] = None,
-                       model: Optional[str] = None) -> Optional[str]:
+                       model: Optional[str] = None, *,
+                       soft_timeout: Optional[float] = None,
+                       hard_timeout: Optional[float] = None) -> Optional[str]:
         """调用AI大语言模型（对齐 api.txt 官方接口规范）。
 
         force=True 时仅校验 api_key 是否存在（不要求 self.ai_available 为真），
@@ -1055,6 +1110,16 @@ class P5Predictor:
 
         请求契约（api.txt）：POST {api_url}，Header 携带 Bearer Token，Body 含
         model / messages / max_tokens / temperature / (可选)tools / stream / response_format。
+
+        ALG-02 预算治理（v5.2，替代原「4 次固定退避 + 60s 标量超时」）：
+        - 分级超时：connect 一级用 soft_timeout（响应慢但未死时快速切断），
+          read 一级取 min(soft_timeout, 剩余墙钟)，单次调用总墙钟硬上限 call_cap；
+        - run 级熔断：本 run（一次 predict / 一次 _algo_bayesian_inference）
+          累计墙钟 ≥ ai_run_budget_seconds 时，后续调用直接返回 None 并记录
+          用户可见提示（_ai_budget_exhausted），不再发起请求浪费配额（A23）；
+        - 4xx 不重试、404/410 降级 backup_model 保持原行为；
+        - soft_timeout / hard_timeout 为仅关键字参数，供测试与应急临时覆盖，
+          默认 None 走 _init_ai_config 加载的实例预算（A22：单次 ≤30s）。
         """
         if not self.api_key:
             logger.warning('AI模型不可用（未配置API密钥）')
@@ -1063,14 +1128,41 @@ class P5Predictor:
             logger.warning('AI模型不可用（未配置API密钥）')
             return None
 
+        # ---------- 预算解析 ----------
+        # 注意：显式覆盖仅做极小 sanity 下限；实例默认值的下限保护
+        # （soft≥1s / hard≥2s）已在 _init_ai_config 完成，此处放行小值，
+        # 以便测试用小超时复现预算熔断路径。
+        budget_on = bool(getattr(self, 'ai_budget_enabled', True))
+        soft = float(soft_timeout if soft_timeout is not None
+                     else getattr(self, 'ai_soft_timeout', 20.0))
+        hard = float(hard_timeout if hard_timeout is not None
+                     else getattr(self, 'ai_hard_timeout', 30.0))
+        soft = max(0.01, soft)
+        hard = max(0.02, hard)
+        run_budget = float(getattr(self, 'ai_run_budget_seconds', hard * 2))
+        used = float(getattr(self, '_ai_run_wall_seconds', 0.0))
+
+        # ---------- run 级熔断门控（A23：单期总预算耗尽即降级，不发请求） ----------
+        if budget_on and used >= run_budget:
+            notice = (f'AI调用预算已耗尽（{used:.1f}/{run_budget:g}s），'
+                      f'本期已自动降级为算法原生预测')
+            self._ai_budget_exhausted = notice
+            logger.warning('AI预算熔断：%s', notice)
+            return None
+
+        # 单次调用墙钟硬上限：run 预算关闭时仅 hard；开启时再受剩余预算约束
+        call_cap = hard if not budget_on else min(hard, run_budget - used)
+
         use_model = model or self.model_name
         mt = int(max_tokens if max_tokens is not None else self.default_max_tokens)
         temp = float(temperature if temperature is not None else self.default_temperature)
         rf = self.response_format
 
         logger.info(
-            f'=== 开始调用AI模型: {use_model} | max_tokens={mt} | temperature={temp} | '
-            f'tools={len(tools) if tools else 0} ==='
+            f'=== 开始调用AI模型: {use_model} | max_tokens={mt} | '
+            f'temperature={temp} | tools={len(tools) if tools else 0} | '
+            f'soft={soft}s hard={hard}s cap={call_cap:.2f}s '
+            f'used={used:.1f}/{run_budget:g}s ==='
         )
 
         payload: Dict[str, Any] = {
@@ -1098,92 +1190,125 @@ class P5Predictor:
         if rf and rf not in (False, 'false', 'False'):
             payload["response_format"] = {"type": rf}
 
-        # 复用 ai_analyzer 的进程级 Session（连接池 + Retry），避免重复 TLS 握手
-        session = self._build_ai_session()
+        # 复用进程级 Session（ALG-02：无传输层重试，重试收敛到下方预算感知循环）
+        session = self._build_ai_session(self.pool_connections,
+                                         self.pool_maxsize)
 
         last_err = None
         max_attempts = 4
-        for attempt in range(max_attempts):
-            try:
-                response = session.request(
-                    "POST", self.api_url, headers=self.headers,
-                    data=json.dumps(payload), timeout=self.timeout
-                )
-                response.raise_for_status()
+        _t0 = time.monotonic()
+        try:
+            for attempt in range(max_attempts):
+                remaining = call_cap - (time.monotonic() - _t0)
+                # 剩余预算不足 0.5s 不再发起新尝试（留安全余量防边界超调）
+                if remaining <= 0.5:
+                    notice = (f'AI调用墙钟剩余不足（{remaining:.2f}s / '
+                              f'单期 {run_budget:g}s），本期已自动降级')
+                    self._ai_budget_exhausted = notice
+                    logger.warning('AI预算截断：%s', notice)
+                    break
+                # 分级超时：connect 一级用 soft；read 一级不超过 soft 与剩余墙钟
+                read_to = max(0.05, min(soft, remaining))
+                try:
+                    response = session.request(
+                        "POST", self.api_url, headers=self.headers,
+                        data=json.dumps(payload), timeout=(soft, read_to)
+                    )
+                    response.raise_for_status()
 
-                result = response.json()
+                    result = response.json()
 
-                if 'choices' in result and len(result['choices']) > 0:
-                    choice = result['choices'][0]
-                    content = choice.get('message', {}).get('content')
-                    if content:
-                        usage = result.get('usage', {})
-                        logger.info(
-                            f'AI模型调用成功(第{attempt + 1}次), 长度={len(content)}, '
-                            f'usage={usage}, finish_reason={choice.get("finish_reason")}'
-                        )
-                        return content
+                    if 'choices' in result and len(result['choices']) > 0:
+                        choice = result['choices'][0]
+                        content = choice.get('message', {}).get('content')
+                        if content:
+                            usage = result.get('usage', {})
+                            logger.info(
+                                f'AI模型调用成功(第{attempt + 1}次), '
+                                f'长度={len(content)}, '
+                                f'usage={usage}, '
+                                f'finish_reason={choice.get("finish_reason")}'
+                            )
+                            return content
 
-                logger.error(f'AI模型返回格式异常: {result}')
-                return None
-
-            except requests.exceptions.HTTPError as e:
-                last_err = e
-                status = e.response.status_code if e.response is not None else None
-                # 4xx 非重试，直接返回，避免浪费配额；404/410 尝试降级到备份模型
-                if status is not None and 400 <= status < 500:
-                    if status in (404, 410) and use_model != self.backup_model and self.backup_model:
-                        logger.warning(f'模型 {use_model} 不存在，降级到 {self.backup_model}')
-                        return self._call_ai_model(
-                            prompt, max_tokens=max_tokens, temperature=temperature,
-                            force=force, tools=tools, model=self.backup_model
-                        )
-                    logger.error(f'AI模型 HTTP {status} 错误（非重试）: {e}')
+                    logger.error(f'AI模型返回格式异常: {result}')
                     return None
-                wait = 0.8 * (2 ** attempt)
-                logger.warning(f'AI模型调用第{attempt + 1}次失败: {e}; {wait:.1f}s 后重试')
-                if attempt < max_attempts - 1:
-                    time.sleep(wait)
-            except requests.exceptions.RequestException as e:
-                last_err = e
-                wait = 0.8 * (2 ** attempt)  # 指数退避: 0.8s / 1.6s / 3.2s
-                logger.warning(f'AI模型调用第{attempt + 1}次失败: {e}; {wait:.1f}s 后重试')
-                if attempt < max_attempts - 1:
-                    time.sleep(wait)
-            except json.JSONDecodeError as e:
-                logger.error(f'AI响应JSON解析失败: {e}')
-                return None
-            except Exception as e:
-                logger.error(f'AI模型调用异常: {e}')
-                return None
+
+                except requests.exceptions.HTTPError as e:
+                    last_err = e
+                    status = (e.response.status_code
+                              if e.response is not None else None)
+                    # 4xx 非重试，直接返回，避免浪费配额；404/410 尝试降级到备份模型
+                    if status is not None and 400 <= status < 500:
+                        if (status in (404, 410)
+                                and use_model != self.backup_model
+                                and self.backup_model):
+                            logger.warning(
+                                f'模型 {use_model} 不存在，'
+                                f'降级到 {self.backup_model}')
+                            return self._call_ai_model(
+                                prompt, max_tokens=max_tokens,
+                                temperature=temperature, force=force,
+                                tools=tools, model=self.backup_model,
+                                soft_timeout=soft_timeout,
+                                hard_timeout=hard_timeout
+                            )
+                        logger.error(f'AI模型 HTTP {status} 错误（非重试）: {e}')
+                        return None
+                    _rem = call_cap - (time.monotonic() - _t0)
+                    wait = min(0.8 * (2 ** attempt), max(0.0, _rem - 0.5))
+                    logger.warning(f'AI模型调用第{attempt + 1}次失败: '
+                                   f'{e}; {wait:.1f}s 后重试')
+                    if attempt < max_attempts - 1 and wait > 0:
+                        time.sleep(wait)
+                except requests.exceptions.RequestException as e:
+                    last_err = e
+                    _rem = call_cap - (time.monotonic() - _t0)
+                    # 指数退避 0.8s/1.6s/3.2s，但不超过剩余墙钟预算（留 0.5s 余量）
+                    wait = min(0.8 * (2 ** attempt), max(0.0, _rem - 0.5))
+                    logger.warning(f'AI模型调用第{attempt + 1}次失败: '
+                                   f'{e}; {wait:.1f}s 后重试')
+                    if attempt < max_attempts - 1 and wait > 0:
+                        time.sleep(wait)
+                except json.JSONDecodeError as e:
+                    logger.error(f'AI响应JSON解析失败: {e}')
+                    return None
+                except Exception as e:
+                    logger.error(f'AI模型调用异常: {e}')
+                    return None
+        finally:
+            # run 级预算记账：按真实墙钟累加（含递归 backup 调用的保守双计，偏安全）
+            self._ai_run_wall_seconds = float(
+                getattr(self, '_ai_run_wall_seconds', 0.0)
+            ) + (time.monotonic() - _t0)
 
         logger.error(f'AI模型调用在 {max_attempts} 次重试后仍失败: {last_err}')
         return None
 
     @staticmethod
-    def _build_ai_session() -> requests.Session:
-        """获取进程级复用的 AI Session（连接池 + Retry）。
+    def _build_ai_session(pool_connections: int = 5,
+                          pool_maxsize: int = 10) -> requests.Session:
+        """获取进程级复用的 AI 调用 Session（ALG-02：连接池复用，无传输层重试）。
 
-        说明：优先复用 ai_analyzer 模块维护的单例 Session（含 429/5xx 自动重试），
-        避免每次调用重新建立 TLS 握手；若 ai_analyzer 无法导入，则回退到本地构造。
+        变更背景（A22）：原实现复用 ai_analyzer 的共享 Session，其
+        Retry(total=3, connect=3, read=3, respect_retry_after_header=True)
+        会使单次 request 最坏 ≈4×60s+退避 ≈250s，超出单次硬上限，且
+        Retry 不感知 run 级预算，熔断形同虚设。现收敛为：
+        - HTTPAdapter 仅做连接池化（保留 TLS 复用收益），不挂载 Retry；
+        - 重试/降级/超时全部由 _call_ai_model 预算感知循环承担，
+          读超时、退避 sleep、run 熔断均受墙钟预算截断；
+        - 首次调用时的池化参数（pool_connections/pool_maxsize）由调用方
+          按 AGNES_API_CONFIG 透传，后续调用复用同一 Session。
         """
-        try:
-            from modules.ai_analyzer import _get_module_session as _sess_factory
-            return _sess_factory()
-        except Exception:
-            # 回退：本地构造 Session（保持原实现）
+        global _AI_CALL_SESSION
+        if _AI_CALL_SESSION is None:
             session = requests.Session()
-            retry = Retry(
-                total=3,
-                backoff_factor=0.5,
-                status_forcelist=(429, 500, 502, 503, 504),
-                allowed_methods=frozenset(['POST', 'GET']),
-                raise_on_status=False,
-            )
-            adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=10)
+            adapter = HTTPAdapter(pool_connections=pool_connections,
+                                  pool_maxsize=pool_maxsize)
             session.mount('https://', adapter)
             session.mount('http://', adapter)
-            return session
+            _AI_CALL_SESSION = session
+        return _AI_CALL_SESSION
 
     def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
         """解析AI响应（鲁棒：兼容单引号/裸key/尾随逗号/代码块）"""
@@ -1254,6 +1379,11 @@ class P5Predictor:
             return cancel_event is not None and cancel_event.is_set()
         if not history_data:
             return {'error': '历史数据为空，无法预测'}
+
+        # ALG-02：run 边界重置（一期 predict = 一个 AI 预算 run，
+        # 每期预算独立，允许上期熔断不影响本期评估）
+        self._ai_run_wall_seconds = 0.0
+        self._ai_budget_exhausted = ''
 
         min_required = self.config.get_global_param('min_data_required', 30)
         if len(history_data) < min_required:
@@ -1419,6 +1549,7 @@ class P5Predictor:
             'data_samples': len(history_data),
             'ai_analysis_enabled': ai_enabled and self.ai_available,
             'ai_result': ai_result,
+            'ai_degraded_notice': getattr(self, '_ai_budget_exhausted', ''),
             'bayesian_ai_auxiliary': getattr(self, '_bayesian_ai_auxiliary', {}),
             'risk_warning': ' 重要提示：本程序仅基于历史数据统计分析和AI模型预测，无法保证开奖结果，不构成任何投资建议。彩票开奖具有随机性，请理性购彩。'
         }
@@ -1435,6 +1566,10 @@ class P5Predictor:
             _ctx = getattr(self, '_ai_disabled_context', '') or ''
             if _ctx:
                 _ai_tag += f'（{_ctx}）'
+        # ALG-02：AI 预算熔断/截断降级提示（透明告知用户，避免降级被误读为故障）
+        _budget_notice = getattr(self, '_ai_budget_exhausted', '') or ''
+        if _budget_notice:
+            _ai_tag += f'（{_budget_notice}）'
         logger.info(f'预测完成: 目标期号{next_issue}, 推荐组合数{len(top_combinations)}, AI分析:{_ai_tag}')
 
         # 写入缓存
@@ -2097,6 +2232,12 @@ class P5Predictor:
         Returns:
             各位置号码的后验概率分布列表,格式为 List[Dict[int, float]]
         """
+        # ALG-02：run 边界重置（覆盖回测/调度等直接调用 _algo_bayesian_inference
+        # 的场景 = 单期 run，保证每期预算独立、评估口径一致；经 predict 链路
+        # 进入时此处的 0→0 重置与 predict 入口重置等价，无害）
+        self._ai_run_wall_seconds = 0.0
+        self._ai_budget_exhausted = ''
+
         params = self.config.config['algorithms']['bayesian_inference']['params']
         prior_smooth = params.get('prior_smooth', 0.10)         # v3.2增强:增大平滑系数
         posterior_weight = params.get('posterior_weight', 0.92)  # v3.2增强:更强信任似然
@@ -2358,12 +2499,16 @@ class P5Predictor:
         重点关注号码提示，不构成任何超越随机的命中保证。AI 不可用时返回 {}，
         纯统计流程完全不受影响（不抛异常、不改概率）。
         """
-        ai_enabled = self.config.get_global_param('enable_ai_model', True)
-        _aux_wanted = ai_enabled or getattr(self, '_bayes_aux_override', False)
-        if not (getattr(self, 'ai_auxiliary_available', False) and _aux_wanted):
-            return {}
-
+        # ALG-02：门控整体内移入 try（A25：门控求值等任何异常都不得击穿融合流程，
+        # 一律降级为 {} 并保持原后验概率不变）
         try:
+            ai_enabled = self.config.get_global_param('enable_ai_model', True)
+            _aux_wanted = ai_enabled or getattr(
+                self, '_bayes_aux_override', False)
+            if not (getattr(self, 'ai_auxiliary_available', False)
+                    and _aux_wanted):
+                return {}
+
             pos_names = self.position_names
             posterior_summary = []
             for pos in range(self.positions):
