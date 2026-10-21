@@ -1,0 +1,26 @@
+ALG-04 S4/S5: Feature cache & incremental computation
+
+Summary:
+- Implemented P5FeatureCache (process LRU, capacity 8, threading.RLock)
+- Added compute_history_fingerprint with blake2b + windows parameter
+- Integrated cache layer into extract_all_features (hit refresh extract_time, deepcopy isolation)
+- FEATURE_CACHE_CONFIG in config.py (enabled via FEATURE_CACHE_ENABLED/CAPACITY env)
+- A28: bench 5-round median reduction 91.1% >= 80% target
+- A29: 3 invalidation scenarios + isolation + windows fingerprint all pass
+- 110/110 pytest regression passed across 4 test files
+
+Files modified:
+- modules/features.py (cache infra + extract_all_features integration)
+- config.py (FEATURE_CACHE_CONFIG)
+- tests/test_features.py (16 pycodestyle fixes + 12 ALG-04 unit tests)
+- scripts/diagnose/bench_feature_cache.py (A28 benchmark script)
+
+Verification:
+- A28: cold→hot median 93ms→8ms, reduction 91.1%
+- A29: test_single_digit_change_invalidates_cache
+- A29: test_removed_issue_invalidates_cache  
+- A29: test_changed_issue_without_number_change_invalidates
+- A29: test_different_windows_do_not_share_cache
+- A29: test_returned_features_are_isolated_from_cache
+- A29: test_lru_eviction_order
+- All 12 ALG-04 test cases passed

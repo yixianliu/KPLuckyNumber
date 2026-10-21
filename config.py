@@ -136,6 +136,22 @@ AI_CALL_BUDGET = {
     'per_run_max_calls': _get_env_int('AI_PER_RUN_MAX_CALLS', 2),
 }
 
+# ============ 特征工程缓存配置（v5.2 ALG-04：指纹复用） ============
+# 依据项目升级方案 PUP-20261019-013100 ALG-04：
+#   - modules/features.py extract_all_features 外层加指纹缓存
+#     （history 指纹 = 行数+期号+逐位数字强校验和 + windows 参数），
+#     同一 history + 同一 windows 的重复抽取直接复用（A28：第二次调用
+#     耗时降幅 ≥80%）；history 任意 1 期变动指纹必变、缓存必失（A29）；
+#   - P5FeatureCache 为进程内 LRU，容量默认 8，跨 P5Features 实例共享
+#     （pipeline/scheduler 每任务新建实例、ALG-05 回测按窗口切片调用，
+#     per-instance 缓存将失效）；
+#   - enabled=false 为应急禁用通道（怀疑缓存异常时一键回到全量重算，
+#     仅损失性能，不影响特征正确性）。
+FEATURE_CACHE_CONFIG = {
+    'enabled': _get_env_bool('FEATURE_CACHE_ENABLED', True),
+    'capacity': _get_env_int('FEATURE_CACHE_CAPACITY', 8),
+}
+
 # ============ AGNES AI 提示词配置 ============
 # §6.1.2 / §6.1.4：prompt 相关可调项统一在此，AI 仅作为「辅助解读」，
 # 不得声称超越随机基线。历史期数越小 token 越少，可按需收敛。

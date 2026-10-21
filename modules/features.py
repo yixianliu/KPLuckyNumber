@@ -10,14 +10,171 @@
 4. 交叉特征：位置关联、组合约束、位置链关联、形态标记、时序特征、交互特征、状态特征、上下文特征、数字特性、频率分布、趋势关联、约束相关、位置对特征
 """
 
+import copy
+import hashlib
 import logging
 import math
+import threading
 import numpy as np
-from collections import defaultdict, Counter
+from collections import OrderedDict, defaultdict, Counter
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+# ==================== 特征缓存基础设施（v5.2 ALG-04） ====================
+
+def _load_feature_cache_config() -> Dict[str, Any]:
+    """读取特征缓存配置（延迟 import config，规避模块级循环依赖）。
+
+    返回:
+        {'enabled': bool, 'capacity': int}；config 不可用或键缺失时
+        回退安全默认（开启缓存、容量 8，与 config.py 默认口径一致）。
+    """
+    try:
+        from config import FEATURE_CACHE_CONFIG as _cfg
+        enabled = bool(_cfg.get('enabled', True))
+        capacity = int(_cfg.get('capacity', 8))
+    except Exception:
+        # config 未加载/键缺失：保持保守默认，不影响特征正确性
+        enabled = True
+        capacity = 8
+    return {'enabled': enabled, 'capacity': max(1, capacity)}
+
+
+class P5FeatureCache:
+    """
+    进程内 LRU 特征缓存（v5.2 ALG-04）
+
+    设计要点:
+      - 容量默认 8（方案口径）：覆盖单次预测/回测中常见的一组活跃
+        history 指纹，超出容量按 LRU 淘汰，避免长任务内存无界增长;
+      - 线程安全: 所有读写经 RLock 保护, GUI 后台任务/流水线多线程
+        并发调用 extract_all_features 时不产生竞态;
+      - 存取深拷贝: put 存原件, get 返回 deepcopy 副本, 调用方对返回值
+        的就地修改不会污染缓存（ALG-01 缓存污染教训的复用）;
+      - 命中统计: hits/misses 计数器供埋点与 A28/A29 验收使用。
+    """
+
+    def __init__(self, capacity: int = 8):
+        """初始化 LRU 缓存
+
+        参数:
+            capacity: 最大缓存条数（<1 时强制为 1，防退化为无缓存）
+        """
+        self._capacity = max(1, int(capacity))
+        self._lock = threading.RLock()
+        # OrderedDict 实现 LRU：最新访问/写入的条目移至末端，淘汰取首端
+        self._entries: 'OrderedDict[str, Dict[str, Any]]' = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, fingerprint: str) -> Optional[Dict[str, Any]]:
+        """按指纹读取缓存；命中返回深拷贝副本并使条目标记为最新"""
+        with self._lock:
+            entry = self._entries.get(fingerprint)
+            if entry is None:
+                self._misses += 1
+                return None
+            self._entries.move_to_end(fingerprint)
+            self._hits += 1
+            return copy.deepcopy(entry)
+
+    def put(self, fingerprint: str, value: Dict[str, Any]) -> None:
+        """写入缓存（存原件）；超出容量时淘汰最久未使用条目"""
+        with self._lock:
+            self._entries[fingerprint] = value
+            self._entries.move_to_end(fingerprint)
+            while len(self._entries) > self._capacity:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        """清空缓存与统计（应急通道/测试隔离用）"""
+        with self._lock:
+            self._entries.clear()
+            self._hits = 0
+            self._misses = 0
+
+    def stats(self) -> Dict[str, int]:
+        """返回缓存统计快照（命中/未命中/当前条数/容量）"""
+        with self._lock:
+            return {
+                'hits': self._hits,
+                'misses': self._misses,
+                'size': len(self._entries),
+                'capacity': self._capacity,
+            }
+
+
+def compute_history_fingerprint(
+        data: List[Dict], windows: List[int]) -> Optional[str]:
+    """
+    计算 history 输入指纹（v5.2 ALG-04）
+
+    覆盖要素（与方案「行数+期号+逐位数字校验和」对齐，并使用 blake2b
+    强哈希替代简单加性校验和——加性校验和存在对冲式碰撞风险，例如两期
+    号码做 +1/-1 对冲变动，校验和不变但内容已变）:
+      1. 行数（len(data)）；
+      2. 每期期号（issue，字符串化后混入摘要）；
+      3. 每期 5 位开奖号码逐位混入摘要（位序敏感）；
+      4. windows 参数元组（防不同窗口配置间串缓存）。
+
+    参数:
+        data: 按期号正序排列的历史开奖数据列表
+        windows: extract_all_features 的滑动窗口配置
+
+    返回:
+        十六进制摘要字符串；输入结构异常（非列表/条目缺 numbers 或
+        位数不符）时返回 None，由调用方跳过缓存以保特征正确性
+        （宁可漏命中，不可错命中——错命中等于用错数据出特征）。
+    """
+    if not isinstance(data, list):
+        return None
+    hasher = hashlib.blake2b(digest_size=16)
+    # 行数 + windows 元组：窗口特征直接消费 windows，必须防串配置
+    hasher.update(str(len(data)).encode('utf-8'))
+    hasher.update(repr(tuple(windows)).encode('utf-8'))
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        numbers = item.get('numbers', [])
+        if not isinstance(numbers, (list, tuple)) or len(numbers) != 5:
+            return None
+        hasher.update(str(item.get('issue', '')).encode('utf-8'))
+        for num in numbers:
+            try:
+                # 逐位数字混入：位序敏感，防同数字不同位的碰撞
+                hasher.update(str(int(num)).encode('utf-8'))
+            except (TypeError, ValueError):
+                return None
+    return hasher.hexdigest()
+
+
+# 进程级共享缓存单例：跨 P5Features 实例复用（pipeline/scheduler 每个
+# 任务新建 P5Features 实例、ALG-05 回测按窗口切片调用，per-instance
+# 缓存将完全失效，故提升为模块级单例，延迟构造）。
+_feature_cache_lock = threading.Lock()
+_shared_feature_cache: Optional[P5FeatureCache] = None
+
+
+def _get_feature_cache() -> P5FeatureCache:
+    """获取进程级共享特征缓存（双重检查锁延迟构造）"""
+    global _shared_feature_cache
+    if _shared_feature_cache is None:
+        with _feature_cache_lock:
+            if _shared_feature_cache is None:
+                _shared_feature_cache = P5FeatureCache(
+                    _load_feature_cache_config()['capacity'])
+    return _shared_feature_cache
+
+
+def reset_feature_cache() -> None:
+    """重建共享缓存实例（容量变更/测试隔离/应急刷新用）"""
+    global _shared_feature_cache
+    with _feature_cache_lock:
+        _shared_feature_cache = P5FeatureCache(
+            _load_feature_cache_config()['capacity'])
 
 
 class P5Features:
@@ -2543,6 +2700,25 @@ class P5Features:
         Returns:
             完整特征字典
         """
+        # v5.2 ALG-04：指纹缓存层。同一 history + 同一 windows 的重复
+        # 抽取直接复用缓存（A28：第二次调用耗时降幅 ≥80%）；history
+        # 任意 1 期变动都会改变指纹导致缓存失效（A29）。缓存经
+        # config.py FEATURE_CACHE_CONFIG['enabled'] 或环境变量
+        # FEATURE_CACHE_ENABLED=false 一键禁用（应急通道，仅损失性能，
+        # 不影响特征正确性）。
+        cache_cfg = _load_feature_cache_config()
+        fingerprint = None
+        if cache_cfg['enabled']:
+            fingerprint = compute_history_fingerprint(data, windows)
+        if fingerprint is not None:
+            cached = _get_feature_cache().get(fingerprint)
+            if cached is not None:
+                # 命中：extract_time 刷新为本次调用时刻，保持对外时间
+                # 语义不变；data_count 同指纹下必然一致。返回的已是
+                # 深拷贝副本，调用方就地修改不会污染缓存。
+                cached['extract_time'] = datetime.now().isoformat()
+                return cached
+
         logger.info('开始提取所有特征...')
 
         all_features = {
@@ -2615,7 +2791,11 @@ class P5Features:
         all_features['trend_association'] = self.calculate_trend_association_features(data)
 
         logger.info('特征提取完成')
-        return all_features
+        if fingerprint is not None:
+            _get_feature_cache().put(fingerprint, all_features)
+        # 对外返回深拷贝：调用方（pipeline/scheduler 等）可能就地改写
+        # 结果，不隔离会污染缓存原件（ALG-01 缓存污染教训复用）
+        return copy.deepcopy(all_features)
 
     def calculate_bayesian_features(self, data, prior_weights=None, window=30):
         """贝叶斯特征计算 (v3.0 新增)
