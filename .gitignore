@@ -22,5 +22,6 @@ __pycache__
 .workbuddy
 modules/__pycache__
 data
+models/
 maint/
 docs

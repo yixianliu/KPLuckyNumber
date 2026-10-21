@@ -32,8 +32,20 @@ ml_predictor.py - 多源数据监督学习预测器（排列5）
 注意：本模块已改为纯 numpy 实现，不再依赖 sklearn，任何 Python 环境均可运行。
 """
 from typing import Optional, List, Dict, Any, Tuple
-import numpy as np
+import hashlib
+import inspect
+import os
 import traceback
+from datetime import datetime, timezone
+
+import numpy as np
+
+try:  # joblib 随 scikit-learn 依赖树分发；缺失时缓存层静默降级为「不缓存」
+    import joblib
+    _JOBLIB_AVAILABLE = True
+except Exception:  # pragma: no cover - 极端无 sklearn 环境
+    joblib = None
+    _JOBLIB_AVAILABLE = False
 
 logger = None  # 延迟初始化，避免循环导入
 
@@ -49,6 +61,16 @@ def _get_logger():
 POS = ['wan', 'qian', 'bai', 'shi', 'ge']
 NUM = list(range(10))
 ML_MIN_SAMPLES = 160  # GBRT 有效训练所需最少期数（warmup 60 + 特征样本 100）
+
+# ----------------------------------------------------------------------------
+# ALG-01 模型持久化缓存（PUP-20261019-013100 v5.2）
+# ----------------------------------------------------------------------------
+# 指纹 = history 行数 + 最新期号 + 特征 schema 源码 hash；fp 命中即跳过
+# 5 位 GBDT 全量重训；同版本目录滚动保留 MODEL_CACHE_KEEP 版（mtime 淘汰）。
+# 缓存内容为 5 位概率分布快照（软模型）+ 指纹/元数据，joblib 序列化。
+MODEL_CACHE_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'models')
+MODEL_CACHE_KEEP = 3
 
 # ----------------------------------------------------------------------------
 # v3.70 (roadmap 1.3) sklearn 条件激活
@@ -198,6 +220,193 @@ def _parse_history(sorted_data: List[Dict]) -> Tuple[List[str], Dict[str, List[i
         hz_val = row.get('hezhi')
         hezhi.append(int(hz_val) if hz_val is not None else sum(num))
     return issues, digits, hezhi
+
+
+# ----------------------------------------------------------------------------
+# ALG-01 模型持久化层（缓存 / 指纹 / 滚动版本管理）
+# ----------------------------------------------------------------------------
+# 设计动机（PUP-20261019-013100 L397）：predict_next 原先每期对 5 位各做一次
+# 全量 GBRT 训练（A18 = 5 次/期）。相同「历史 + 最新期号 + 特征 schema」下训练
+# 结果完全确定，故缓存 5 位分布快照，指纹命中即跳过训练（A18 命中 = 0 次）。
+#
+# 失效策略：
+#   1. 新期数据落库 → history 行数 / 最新期号变 → 指纹变 → 重训并落盘；
+#   2. _build_feature 源码变更（特征 schema 演进）→ 源码 hash 变 → 重训；
+#   3. 同版本目录滚动保留 MODEL_CACHE_KEEP=3 版，超出按 mtime 淘汰最旧。
+#
+# 安全边界：指纹只为「同数据 → 同结果」的工程去重，不构成任何预测能力增强；
+# 训练样本窗口仍由既有 _assert_no_leak / walk-forward 守卫约束（无前视引入）。
+# ----------------------------------------------------------------------------
+_ML_CACHE_STATS = {
+    'train_invocations': 0,  # _train_gbml_model 实际入口调用次数（A18 埋点）
+    'cache_hits': 0,         # 指纹命中次数
+    'cache_misses': 0,       # 指纹未命中次数
+    'cache_saves': 0,        # 成功落盘次数
+    'cache_evictions': 0,    # 滚动淘汰次数
+}
+
+
+def _reset_ml_cache_stats() -> None:
+    """清零缓存统计（供测试/埋点单轮读取）。"""
+    for _k in _ML_CACHE_STATS:
+        _ML_CACHE_STATS[_k] = 0
+
+
+def _feature_schema_hash() -> str:
+    """_build_feature 源码 sha256 前 16 位。
+
+    特征构造逻辑（维度、口径、多源接入方式）随代码演进时 hash 随之变化，
+    使旧缓存自动失效——不需要人工维护 schema 版本号。
+    """
+    src = inspect.getsource(_build_feature)
+    return hashlib.sha256(src.encode('utf-8')).hexdigest()[:16]
+
+
+def _resolve_history(sorted_data: List[Dict]):
+    """parse + 样本不足时从数据库补全全量历史（predict_next / 指纹共用）。
+
+    与原 predict_next 内联逻辑等价（含日志），保证指纹计算与实际训练
+    看到的永远是同一份「最终生效历史」。
+
+    Returns:
+        (issues, digits, hezhi)
+    """
+    issues, digits, hezhi = _parse_history(sorted_data)
+    n = len(issues)
+    if n < ML_MIN_SAMPLES:
+        _get_logger().info(
+            '[ml_predictor] 传入样本 %d 期不足 %d 期，尝试从数据库补全全量历史...',
+            n, ML_MIN_SAMPLES)
+        conn_full = _connect_db()
+        if conn_full is not None:
+            try:
+                full_data = _load_full_history(conn_full)
+                if full_data and len(full_data) >= ML_MIN_SAMPLES:
+                    _get_logger().info(
+                        '[ml_predictor] 数据库补全成功: %d 期，重新解析...',
+                        len(full_data))
+                    issues, digits, hezhi = _parse_history(full_data)
+            except Exception as e:
+                _get_logger().warning('[ml_predictor] 数据库补全失败: %s', e)
+            finally:
+                try:
+                    conn_full.close()
+                except Exception:
+                    pass
+    return issues, digits, hezhi
+
+
+def _model_fingerprint(sorted_data: List[Dict],
+                       target_issue: Optional[str] = None) -> str:
+    """模型缓存指纹（ALG-01）。
+
+    指纹 = history 行数 + 最新期号 + 特征 schema hash，
+    sha256 后取前 32 位十六进制。target_issue 仅参与日志，不进指纹
+    （目标期号不影响训练内容，只影响报告标注）。
+
+    Args:
+        sorted_data: 按 issue 正序的历史数据。
+        target_issue: 目标期号（可选，仅日志用）。
+
+    Returns:
+        32 位十六进制指纹字符串；空历史时以 '0' 段兜底（调用方另有样本量校验）。
+    """
+    issues, _digits, _hezhi = _resolve_history(sorted_data)
+    n = len(issues)
+    latest = issues[-1] if issues else ''
+    schema = _feature_schema_hash()
+    raw = f'{n}|{latest}|{schema}'
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]
+
+
+def _app_version_cache_key() -> str:
+    """version.APP_VERSION 的 {major.minor} 段（缓存子目录名）；异常兜底 0.0。"""
+    try:
+        from version import APP_VERSION as _av
+        parts = _av.lstrip('v').split('.')
+    except Exception:
+        return '0.0'
+    return '.'.join(parts[:2]) if len(parts) >= 2 else '0.0'
+
+
+def _model_cache_dir() -> str:
+    """models/v{major.minor}/ 绝对路径（不存在则创建）。"""
+    path = os.path.join(MODEL_CACHE_ROOT, 'v' + _app_version_cache_key())
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass  # 只读文件系统等场景下退化为「不落盘」，load 自然 miss
+    return path
+
+
+def _cache_path(fp: str) -> str:
+    return os.path.join(_model_cache_dir(), fp + '.joblib')
+
+
+def _load_cached_model(fp: str) -> Optional[Dict]:
+    """按指纹读取缓存 bundle；损坏 / 字段缺失 / 指纹不符一律视为未命中。"""
+    if not _JOBLIB_AVAILABLE:
+        return None
+    path = _cache_path(fp)
+    if not os.path.exists(path):
+        return None
+    try:
+        bundle = joblib.load(path)
+    except Exception as e:
+        _get_logger().warning(
+            '[ml_predictor] 缓存文件损坏，按未命中处理: %s (%s)', path, e)
+        return None
+    if not isinstance(bundle, dict) or bundle.get('fingerprint') != fp:
+        return None
+    positions = bundle.get('positions')
+    if not isinstance(positions, dict):
+        return None
+    if any(p not in positions for p in POS):
+        _get_logger().warning('[ml_predictor] 缓存缺位(%s），按未命中处理。',
+                              [p for p in POS if p not in positions])
+        return None
+    return bundle
+
+
+def _evict_old_models() -> None:
+    """同版本目录按 mtime 升序淘汰最旧，滚动保留 MODEL_CACHE_KEEP 版。"""
+    try:
+        files = [f for f in os.listdir(_model_cache_dir())
+                 if f.endswith('.joblib')]
+    except OSError:
+        return
+    paths = sorted(
+        (os.path.join(_model_cache_dir(), f) for f in files),
+        key=os.path.getmtime)
+    while len(paths) > MODEL_CACHE_KEEP:
+        victim = paths.pop(0)
+        try:
+            os.remove(victim)
+            _ML_CACHE_STATS['cache_evictions'] += 1
+            _get_logger().info('[ml_predictor] 缓存滚动淘汰: %s', victim)
+        except OSError:
+            pass
+
+
+def _save_model(fp: str, bundle: Dict) -> None:
+    """原子写入缓存（tmp + os.replace）并执行滚动淘汰。joblib 缺失时静默跳过。"""
+    if not _JOBLIB_AVAILABLE:
+        _get_logger().debug('[ml_predictor] joblib 不可用，跳过模型缓存写入。')
+        return
+    path = _cache_path(fp)
+    tmp = path + '.tmp'
+    try:
+        joblib.dump(bundle, tmp)
+        os.replace(tmp, path)
+        _ML_CACHE_STATS['cache_saves'] += 1
+        _evict_old_models()
+    except Exception as e:
+        _get_logger().warning('[ml_predictor] 模型缓存写入失败: %s', e)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 # ----------------------------------------------------------------------------
@@ -486,8 +695,12 @@ def predict_next(sorted_data: List[Dict], target_issue: Optional[str] = None,
       - 每位置独立训练一个 One-vs-Rest GBDT，输出 softmax 概率向量。
       - v3.70 (1.3): 优先使用 sklearn GradientBoostingClassifier（若已安装），
         缺失或异常时自动降级回纯 numpy GBRT 路径并记录降级日志，保证降级保底。
+      - ALG-01 (v5.2): 模型指纹（history 行数 + 最新期号 + 特征 schema hash）
+        命中时直接返回缓存的 5 位分布快照，跳过 5 位全量重训（A18 命中=0 次）；
+        未命中走训练并原子落盘，同版本目录滚动保留 3 版。
       - 串行训练 5 位，异常时自动降级为均匀分布。
-      - 诚实声明：公平摇号下该模型期望命中率 = 随机基线（Top-1 ≈ 10%）。
+      - 诚实声明：公平摇号下该模型期望命中率 = 随机基线（Top-1 ≈ 10%），
+        缓存仅为「同数据 → 同结果」的工程去重，不增强任何预测能力。
 
     Args:
         sorted_data: 按 issue 正序排列的历史数据。
@@ -498,33 +711,25 @@ def predict_next(sorted_data: List[Dict], target_issue: Optional[str] = None,
         List[Dict[int, float]]（5 个位置，每位 {0..9: 概率} 且和为 1）；
         若数据不足或训练失败，返回 None。
     """
-    issues, digits, hezhi = _parse_history(sorted_data)
+    # ALG-01：先算指纹查缓存，命中即跳过训练与多源 DB 加载（省时主路径）
+    fp = _model_fingerprint(sorted_data, target_issue)
+    cached = _load_cached_model(fp)
+    if cached is not None:
+        _ML_CACHE_STATS['cache_hits'] += 1
+        _get_logger().info(
+            '[ml_predictor] 模型缓存命中 fp=%s（目标期 %s），跳过 %d 位训练。',
+            fp[:12], target_issue, len(POS))
+        # dict 拷贝防调用方改动磁盘快照的共享引用
+        return [dict(cached['positions'][p]) for p in POS]
+    _ML_CACHE_STATS['cache_misses'] += 1
+
+    issues, digits, hezhi = _resolve_history(sorted_data)
     _get_logger().info('[ml_predictor] _parse_history 返回: issues=%d, digits 类型=%s, hezhi=%d',
                        len(issues), type(digits).__name__, len(hezhi))
     if not isinstance(digits, dict):
         _get_logger().error('[ml_predictor] digits 不是字典！类型=%s, 值=%s', type(digits).__name__, digits)
         return None
     n = len(issues)
-    if n < ML_MIN_SAMPLES:
-        # 调用方传入数据不足（如 pipeline 默认 data_limit=60），自动从数据库补全全量历史
-        _get_logger().info(
-            '[ml_predictor] 传入样本 %d 期不足 %d 期，尝试从数据库补全全量历史...', n, ML_MIN_SAMPLES)
-        conn_full = _connect_db()
-        if conn_full is not None:
-            try:
-                full_data = _load_full_history(conn_full)
-                if full_data and len(full_data) >= ML_MIN_SAMPLES:
-                    _get_logger().info(
-                        '[ml_predictor] 数据库补全成功: %d 期，重新解析...', len(full_data))
-                    issues, digits, hezhi = _parse_history(full_data)
-                    n = len(issues)
-            except Exception as e:
-                _get_logger().warning('[ml_predictor] 数据库补全失败: %s', e)
-            finally:
-                try:
-                    conn_full.close()
-                except Exception:
-                    pass
     if n < ML_MIN_SAMPLES:
         _get_logger().warning('[ml_predictor] 历史样本不足(%d < %d)，跳过。', n, ML_MIN_SAMPLES)
         return None
@@ -541,14 +746,19 @@ def predict_next(sorted_data: List[Dict], target_issue: Optional[str] = None,
 
     result: List[Dict[int, float]] = []
     DEFAULT_DIST = {d: 0.1 for d in NUM}
+    trained_ok = 0  # ALG-01：仅当 5 位全部真实训练成功才落盘，防失败位污染缓存
 
     # ---- 纯 numpy GBRT 路径（无 sklearn 依赖，串行训练避免 Windows daemon 限制）----
     for p_idx, p in enumerate(POS):
         try:
             _get_logger().debug('[ml_predictor] 开始训练 %s 位，digits 长度=%d, n=%d', p, len(digits[p]), n)
+            # ALG-01 A18 埋点：每次发起训练即计数（缓存命中不走本循环）；
+            # 埋点在调用侧而非 _train_gbml_model 内部——测试可桩替换训练函数
+            _ML_CACHE_STATS['train_invocations'] += 1
             dist = _train_gbml_model(p, issues, digits, hezhi, pos_trend, spj, hz, n)
             if dist is not None:
                 result.append(dist)
+                trained_ok += 1
                 if progress_callback:
                     progress_callback(1, f'监督模型[{p}]完成（GBRT-numpy）')
             else:
@@ -557,6 +767,22 @@ def predict_next(sorted_data: List[Dict], target_issue: Optional[str] = None,
         except Exception as e:
             result.append(DEFAULT_DIST)
             _get_logger().error('[ml_predictor] %s 位训练异常: %s\n%s', p, e, traceback.format_exc())
+
+    # ALG-01：全位成功才落盘（失败位若入缓存，环境异常期会持续返回伪训练结果）
+    if result and trained_ok == len(POS):
+        bundle = {
+            'fingerprint': fp,
+            'schema_hash': _feature_schema_hash(),
+            'positions': {p: dist for p, dist in zip(POS, result)},
+            'meta': {
+                'history_rows': n,
+                'latest_issue': issues[-1] if issues else '',
+                'target_issue': target_issue,
+                'app_version': _app_version_cache_key(),
+                'saved_at': datetime.now(timezone.utc).isoformat(),
+            },
+        }
+        _save_model(fp, bundle)
 
     _get_logger().info('[ml_predictor] 多源监督模型预测完成（目标期 %s）。', target_issue)
     return result if result else None
