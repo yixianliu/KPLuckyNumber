@@ -13,12 +13,20 @@ backtest_multisource.py - 排列5 多源数据 走窗回测（诚实基线对照
 用法：python scripts/backtest_multisource.py
 依赖：Anaconda python (含 sklearn)
 """
+import os
+import sys
 import pymysql
 import math
 import numpy as np
-from math import sqrt
 from collections import Counter
 from sklearn.ensemble import GradientBoostingClassifier
+
+# scripts/ 直跑时把项目根加入 sys.path，保证 modules.* 可导入（ALG-06）
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+# Wilson 95% CI 单一实现（ALG-06 收敛，PUP-20261019-013100）
+from modules.stats_utils import wilson_ci  # noqa: E402
 
 POS = ['wan', 'qian', 'bai', 'shi', 'ge']
 NUM = list(range(10))
@@ -133,13 +141,9 @@ def current_fusion_topk(digits_pos, i, k):
     return order[:k]
 
 # ---------- 走窗回测 ----------
-def wilson_ci(success, n, z=1.96):
-    if n == 0: return (0, 0)
-    p = success / n
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = z * sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return (max(0, center - half), min(1, center + half))
+# Wilson 95% CI 已收敛至 modules/stats_utils.wilson_ci 单一实现
+# （ALG-06 / PUP-20261019-013100），经文件头部 sys.path hack 导入；
+# 原版 n==0 返回整型 (0, 0)，单一实现统一为浮点 (0.0, 0.0)，调用点无行为差异。
 
 def evaluate(issues, digits, hezhi, split_frac=0.6, retrain=200):
     """

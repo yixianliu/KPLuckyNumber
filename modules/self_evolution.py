@@ -29,6 +29,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from modules.evolution_tuner import (
     DeepTuner, build_walkforward_windows, _row_to_sorted, _score,
 )
+# Wilson 95% CI 单一实现（ALG-06 收敛，PUP-20261019-013100）
+from modules.stats_utils import wilson_ci
 
 logger = logging.getLogger(__name__)
 
@@ -167,22 +169,9 @@ def _atomic_write_json(path: str, data: Any) -> None:
 
 
 # =====================================================================
-# Wilson 95% 置信区间 + CI 重叠闸门（诚实边界核心）
+# CI 重叠闸门（诚实边界核心；Wilson 95% CI 计算已收敛至
+# modules/stats_utils.wilson_ci 单一实现，ALG-06 / PUP-20261019-013100）
 # =====================================================================
-import math
-
-def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """Wilson score interval for binomial proportion.
-    
-    Returns (lower, upper) bounds clamped to [0, 1].
-    """
-    if n == 0:
-        return (0.0, 0.0)
-    p = successes / n
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = (z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
-    return (max(0.0, center - half), min(1.0, center + half))
 
 
 def ci_overlap(a: tuple[float, float], b: tuple[float, float]) -> bool:

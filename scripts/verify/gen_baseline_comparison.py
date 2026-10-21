@@ -6,6 +6,7 @@
 诚信约束：仅展示已实证数据，明确标注"系统实测落在随机基线 95% CI 内，无统计显著差异"。
 """
 import os
+import sys
 
 import matplotlib
 
@@ -21,6 +22,10 @@ plt.rcParams['axes.unicode_minus'] = False
 fm._rebuild() if hasattr(fm, '_rebuild') else None
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# scripts/ 直跑时把项目根加入 sys.path，保证 modules.* 可导入（ALG-06）
+sys.path.insert(0, ROOT)
+# Wilson 95% CI 单一实现（ALG-06 收敛，PUP-20261019-013100）
+from modules.stats_utils import wilson_ci  # noqa: E402
 OUT_DIR = os.path.join(ROOT, 'reports', 'figures')
 os.makedirs(OUT_DIR, exist_ok=True)
 OUT_PNG = os.path.join(OUT_DIR, 'baseline_comparison.png')
@@ -29,13 +34,9 @@ OUT_PNG = os.path.join(OUT_DIR, 'baseline_comparison.png')
 N = 1000
 
 
-def wilson_ci(pct, n=N, z=1.96):
-    """Wilson 95% 置信区间（输入/输出均为百分数）。"""
-    p = pct / 100.0
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = (z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
-    return (center - half) * 100.0, (center + half) * 100.0
+# Wilson 95% CI 口径换算：百分数 → 成功计数（v*N/100）→ stats_utils 单一实现
+# → ×100 还原百分数；较原内嵌实现存在 ~1ulp 浮点差异，绘图层无感
+# （ALG-06 / PUP-20261019-013100）
 
 
 # ---- 数据（来源：reports/diagnosis/hitrate_root_cause.md §2/§3，可回溯） ----
@@ -43,10 +44,10 @@ labels = ['Top-1\n(首推号精确匹配)', 'Top-3', 'Top-5']
 system = np.array([9.2, 30.0, 45.0])      # 系统实测（v3.67 严格口径）
 baseline = np.array([10.0, 30.0, 50.0])    # 随机基线常量
 
-sys_lo = [wilson_ci(v)[0] for v in system]
-sys_hi = [wilson_ci(v)[1] for v in system]
-base_lo = [wilson_ci(v)[0] for v in baseline]
-base_hi = [wilson_ci(v)[1] for v in baseline]
+sys_lo = [wilson_ci(v * N / 100.0, N)[0] * 100.0 for v in system]
+sys_hi = [wilson_ci(v * N / 100.0, N)[1] * 100.0 for v in system]
+base_lo = [wilson_ci(v * N / 100.0, N)[0] * 100.0 for v in baseline]
+base_hi = [wilson_ci(v * N / 100.0, N)[1] * 100.0 for v in baseline]
 sys_err = [[v - lo for v, lo in zip(system, sys_lo)],
            [hi - v for v, hi in zip(system, sys_hi)]]
 base_err = [[v - lo for v, lo in zip(baseline, base_lo)],

@@ -821,6 +821,8 @@ class DashboardMixin:
             import matplotlib.pyplot as plt
             import numpy as np
             import os
+            # Wilson 95% CI 单一实现（ALG-06 收敛，PUP-20261019-013100）
+            from modules.stats_utils import wilson_ci
             
             # 中文字体配置
             plt.rcParams['font.sans-serif'] = [
@@ -829,15 +831,11 @@ class DashboardMixin:
             
             # 代表性评估窗口数（用于 Wilson 95% CI 宽度）
             N = 1000
-            
-            def wilson_ci(pct, n=N, z=1.96):
-                """Wilson 95% 置信区间（输入/输出均为百分数）。"""
-                p = pct / 100.0
-                denom = 1 + z * z / n
-                center = (p + z * z / (2 * n)) / denom
-                half = (z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
-                return (center - half) * 100.0, (center + half) * 100.0
-            
+
+            # 口径换算：百分数 → 成功计数（v*N/100）→ stats_utils 单一实现
+            # → ×100 还原百分数；较原内嵌实现存在 ~1ulp 浮点差异，绘图层无感
+            # （ALG-06 / PUP-20261019-013100）
+
             # 数据（来源：reports/diagnosis/hitrate_root_cause.md §2/§3）
             labels = ['Top-1\n(首推号精确匹配)', 'Top-3', 'Top-5']
             # 从数据库获取实际的系统实测数据
@@ -853,11 +851,14 @@ class DashboardMixin:
             system = np.array([system_top1, system_top3, system_top5])
             baseline = np.array([10.0, 30.0, 50.0])    # 随机基线常量
             
-            # 计算置信区间
-            sys_lo = [wilson_ci(v)[0] for v in system]
-            sys_hi = [wilson_ci(v)[1] for v in system]
-            base_lo = [wilson_ci(v)[0] for v in baseline]
-            base_hi = [wilson_ci(v)[1] for v in baseline]
+            # 计算置信区间（百分数经 v*N/100 换算为计数口径，由 stats_utils
+            # 单一实现计算后 ×100 还原为百分数，ALG-06 / PUP-20261019-013100）
+            sys_lo = [wilson_ci(v * N / 100.0, N)[0] * 100.0 for v in system]
+            sys_hi = [wilson_ci(v * N / 100.0, N)[1] * 100.0 for v in system]
+            base_lo = [wilson_ci(v * N / 100.0, N)[0] * 100.0
+                       for v in baseline]
+            base_hi = [wilson_ci(v * N / 100.0, N)[1] * 100.0
+                       for v in baseline]
             sys_err = [[v - lo for v, lo in zip(system, sys_lo)],
                        [hi - v for v, hi in zip(system, sys_hi)]]
             base_err = [[v - lo for v, lo in zip(baseline, base_lo)],

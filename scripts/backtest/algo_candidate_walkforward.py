@@ -52,6 +52,9 @@ from datetime import datetime
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
+# Wilson 95% CI 单一实现（ALG-06 收敛，PUP-20261019-013100）
+from modules.stats_utils import wilson_ci  # noqa: E402
+
 POS = ['wan', 'qian', 'bai', 'shi', 'ge']
 POS_NAMES = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
 NUM = list(range(10))
@@ -70,21 +73,9 @@ ELO_K = 4.0       # Elo K 因子（评分以概率尺度表达，增益收敛快
 
 
 # ---------------------------------------------------------------- 统计工具
-
-def wilson_ci(success, n, z=1.96):
-    """
-    Wilson 得分区间：小样本与极端比例下比正态近似更稳健。
-
-    防御：success 超出 [0, n] 时把比例钳到 [0, 1]，否则 p*(1-p) 为负会触发
-    math domain error。调用方传入越界计数时不应让整份报告中断。
-    """
-    if n == 0:
-        return (0.0, 0.0)
-    p = min(1.0, max(0.0, success / n))
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return (max(0.0, center - half), min(1.0, center + half))
+# Wilson 95% CI 已收敛至 modules/stats_utils.wilson_ci 单一实现
+# （ALG-06 / PUP-20261019-013100）；原实现的 p 越界钳制防御随单一实现保留，
+# 对合法输入数值逐位一致。
 
 
 def pct(x):
