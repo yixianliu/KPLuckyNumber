@@ -134,7 +134,8 @@ class Validator:
             return []
         
         try:
-            pending = self.db.get_pending_predictions()
+            # 全量验证：显式传 limit=None，避免默认 500 条上限静默漏验历史积压
+            pending = self.db.get_pending_predictions(limit=None)
             results = []
             
             for record in pending:
@@ -213,12 +214,16 @@ class Validator:
         finally:
             self.db.disconnect()
     
-    def get_pending_predictions(self) -> List[Dict[str, Any]]:
+    def get_pending_predictions(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
-        获取所有待验证的预测记录列表
+        获取待验证的预测记录列表（按数值期号倒序）
 
         从数据库查询status='pending'的AI预测记录，
         这些记录已生成预测但尚未与实际开奖结果比对。
+
+        Args:
+            limit: 返回条数上限。默认 None（不限），保持 GUI 展示的既有全量语义；
+                需要限制内存/传输量时可显式传入（DB 层默认 500）。
 
         Returns:
             待验证预测列表，每项包含report_uuid/target_issue/预测号码等
@@ -229,7 +234,7 @@ class Validator:
             return []
         
         try:
-            return self.db.get_pending_predictions()
+            return self.db.get_pending_predictions(limit=limit)
         except Exception as e:
             logger.error(f'获取待验证预测失败: {e}')
             return []
@@ -275,11 +280,13 @@ class Validator:
 一、整体统计
 ----------------------------------------
 总预测次数: {stats['total']}
-完全猜中次数: {stats['total_matched']}
+宽松口径·完全猜中次数（集合包含+±1容错，非预测力）: {stats['total_matched']}
 平均命中位数: {stats['avg_match']}/5
-平均准确率: {stats['avg_accuracy']}%
+宽松口径平均准确率（集合包含+±1容错，非预测力）: {stats['avg_accuracy']}%
+说明: 真实预测力请以 Top-1 精确口径为准（随机基线 10%，Top-3 基线 30%），
+      上列宽松口径天然高于 Top-1，不可当作命中率提升结论。
 
-二、各位置命中率
+二、各位置命中率（宽松口径·非预测力）
 ----------------------------------------
 万位命中率: {stats['wan_accuracy']}%
 千位命中率: {stats['qian_accuracy']}%
@@ -287,11 +294,11 @@ class Validator:
 十位命中率: {stats['shi_accuracy']}%
 个位命中率: {stats['ge_accuracy']}%
 
-三、综合评估
+三、综合评估（宽松口径·非预测力）
 ----------------------------------------
-整体命中率: {stats['overall_accuracy']}%
+宽松口径整体命中率: {stats['overall_accuracy']}%
 
-四、命中率分级
+四、宽松口径等级参考（非预测力）
 ----------------------------------------
 """
         
@@ -305,8 +312,9 @@ class Validator:
         else:
             level = '待提升'
         
-        report += f"预测准确率等级: {level}\n"
-        report += f"命中率说明: 命中位数占总位数的百分比\n"
+        report += f"宽松口径参考等级: {level}\n"
+        report += ("说明: 上列等级按宽松口径计算，真实预测力请以 Top-1 精确口径"
+                   "（随机基线 10%）为准\n")
         
         report += """
 五、性能趋势
@@ -324,8 +332,9 @@ class Validator:
         report += """
 ========================================
 说明：
-- 完全猜中：5个位置全部命中
-- 命中率：命中位数 / 5 * 100%
+- 宽松口径·完全猜中：预测集合包含实际号且偏差≤1（非预测力）
+- 宽松口径命中率：命中位数 / 5 * 100%（非预测力）
+- 真实预测力：Top-1 精确口径（每期仅首推号），随机基线 10%
 - 数据基于历史预测验证结果统计
 ========================================
 """

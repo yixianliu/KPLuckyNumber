@@ -1,0 +1,120 @@
+2026-11-04 10:01:12 | INFO     | root | 日志系统初始化完成: level=INFO, json=False
+2026-11-04 10:01:21 | INFO     | ModelMonitor | 模型监控反馈机制初始化完成
+2026-11-04 10:01:21 | INFO     | modules.monitor_feedback | 模型监控建议型回灌已接入（feedback_callback 已注入）
+2026-11-04 10:01:21 | INFO     | modules.perf_monitor | [PerfMonitor] 性能监控守护线程已启动（interval=1.0s）
+2026-11-04 10:01:21 | INFO     | modules.task_manager | TaskManager 初始化完成: workers=4, queue_size=100
+2026-11-04 10:01:21 | INFO     | __main__ | [GUI] _ui_scheduler 已启动：单一 100ms tick 循环接管轮询
+2026-11-04 10:01:21 | INFO     | modules.perf_monitor | [PerfMonitor] psutil 已就绪（CPU/内存指标启用）
+2026-11-04 10:01:22 | WARNING  | __main__ | [首次运行] 已生成 config/.env 空白模板: D:\PythonProject\KPLuckyNumber\dist\KPLuckyNumber\config\.env，请填写 DB_PASSWORD 与 AGNES_API_KEY 后重启程序
+2026-11-04 10:01:22 | INFO     | modules.self_evolution | [self_evolution] _run 主循环开始（线程=Thread-2 (_run)）
+2026-11-04 10:01:22 | INFO     | modules.self_evolution | [self_evolution] 引擎已启动，后台线程 Thread-2 (_run) 开始执行
+2026-11-04 10:01:22 | INFO     | __main__ | [GUI] 自我进化引擎已初始化并启动，注册轮询定时器
+2026-11-04 10:01:22 | INFO     | modules.self_evolution | [self_evolution] 检查点状态: 已加载=False, 当前阶段=collect, 检查点键=无
+2026-11-04 10:01:22 | INFO     | modules.self_evolution | [self_evolution] 将从索引 0 继续（总阶段数=6）
+2026-11-04 10:01:22 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 0/5: collect
+2026-11-04 10:01:22 | INFO     | modules.self_evolution | [self_evolution] _phase_collect 开始
+2026-11-04 10:01:25 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:25 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:01:28 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:28 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:01:28 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:31 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:31 | WARNING  | modules.self_evolution | [self_evolution] 数据库连接失败（返回 None）
+2026-11-04 10:01:31 | WARNING  | modules.self_evolution | [self_evolution] _phase_collect: 数据库连接失败（_connect_db 返回 None）
+2026-11-04 10:01:31 | INFO     | modules.self_evolution | [self_evolution] <<< 阶段 collect 执行完毕，检查点=['phase', 'history_count', 'latest_issue']
+2026-11-04 10:01:31 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 1/5: baseline
+2026-11-04 10:01:31 | INFO     | modules.self_evolution | [self_evolution] _phase_baseline 开始
+2026-11-04 10:01:33 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:33 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:01:36 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:36 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:01:36 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:36 | WARNING  | modules.self_evolution | [self_evolution] 数据库连接失败（返回 None）
+2026-11-04 10:01:39 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:39 | WARNING  | modules.self_evolution | [self_evolution] 数据库连接失败（返回 None）
+2026-11-04 10:01:39 | INFO     | modules.self_evolution | [self_evolution] _phase_baseline: 历史版本总数=0, active版本数=0
+2026-11-04 10:01:39 | INFO     | modules.self_evolution | [self_evolution] _phase_baseline: 无历史 active 版本，以随机基线为参照
+2026-11-04 10:01:39 | INFO     | modules.self_evolution | [self_evolution] _phase_baseline 结束
+2026-11-04 10:01:39 | INFO     | modules.self_evolution | [self_evolution] <<< 阶段 baseline 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline']
+2026-11-04 10:01:39 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 2/5: evolve
+2026-11-04 10:01:39 | INFO     | modules.self_evolution | [self_evolution] _phase_evolve 开始
+2026-11-04 10:01:39 | INFO     | modules.self_evolution | [MLPredictorPool] Windows 平台，跳过 multiprocessing.Pool 创建，直接进程内执行
+2026-11-04 10:01:39 | INFO     | modules.self_evolution | [self_evolution] ML 子进程池创建成功（max_workers=2, timeout=60s）
+2026-11-04 10:01:39 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:39 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:01:39 | INFO     | modules.predictor | 预测配置已加载: 启用8个算法, 总权重0.94
+2026-11-04 10:01:42 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:43 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:43 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:01:46 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:46 | INFO     | modules.predictor | AI调用预算: enabled=True, soft=20.0s, hard=30.0s, per_run_max_calls=2, run_budget=60s
+2026-11-04 10:01:46 | WARNING  | modules.predictor | API密钥未配置，AI模型分析将被跳过
+2026-11-04 10:01:46 | INFO     | modules.self_evolution | [self_evolution] 权重快照已采集: weights=None, lookback=None
+2026-11-04 10:01:46 | INFO     | modules.self_evolution | [self_evolution] 搜索后端: both
+2026-11-04 10:01:46 | INFO     | modules.self_evolution | [self_evolution] 样本量=0, auto=True, auto_full=True, eval_periods=15
+2026-11-04 10:01:46 | INFO     | modules.self_evolution | [self_evolution] 样本量 0 < 最小要求 61，跳过深度调优
+2026-11-04 10:01:46 | INFO     | modules.self_evolution | [self_evolution] ML 重训跳过：样本量 0 < 最小要求 61
+2026-11-04 10:01:46 | INFO     | modules.self_evolution | [self_evolution] _phase_evolve 结束
+2026-11-04 10:01:46 | INFO     | modules.self_evolution | [self_evolution] <<< 阶段 evolve 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics']
+2026-11-04 10:01:46 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 3/5: evaluate
+2026-11-04 10:01:48 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:48 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:01:50 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:50 | WARNING  | modules.self_evolution | [self_evolution] 数据库连接失败（返回 None）
+2026-11-04 10:01:50 | INFO     | modules.self_evolution | [self_evolution] <<< 阶段 evaluate 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics', 'eval_metrics', 'beat_baseline']
+2026-11-04 10:01:50 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 4/5: persist
+2026-11-04 10:01:50 | INFO     | modules.self_evolution | [self_evolution] _phase_persist 开始
+2026-11-04 10:01:50 | INFO     | modules.self_evolution | [self_evolution] 准备持久化版本: tag=evo_20261104_100150, status=active
+2026-11-04 10:01:50 | WARNING  | root | _safe_subprocess_run: 命令执行失败 ['git', 'rev-parse', '--short', 'HEAD']: subprocess.run() got multiple values for keyword argument 'capture_output'
+2026-11-04 10:01:50 | INFO     | modules.self_evolution | [ExperimentTracker] 实验已记录: evo_20261104_100150 (active), git=unknown
+2026-11-04 10:02:16 | INFO     | root | 日志系统初始化完成: level=INFO, json=False
+2026-11-04 10:02:18 | INFO     | ModelMonitor | 模型监控反馈机制初始化完成
+2026-11-04 10:02:18 | INFO     | modules.monitor_feedback | 模型监控建议型回灌已接入（feedback_callback 已注入）
+2026-11-04 10:02:18 | INFO     | modules.perf_monitor | [PerfMonitor] 性能监控守护线程已启动（interval=1.0s）
+2026-11-04 10:02:18 | INFO     | modules.task_manager | TaskManager 初始化完成: workers=4, queue_size=100
+2026-11-04 10:02:18 | INFO     | __main__ | [GUI] _ui_scheduler 已启动：单一 100ms tick 循环接管轮询
+2026-11-04 10:02:18 | INFO     | modules.perf_monitor | [PerfMonitor] psutil 已就绪（CPU/内存指标启用）
+2026-11-04 10:02:20 | WARNING  | __main__ | [首次运行] 已生成 config/.env 空白模板: D:\PythonProject\KPLuckyNumber\dist\KPLuckyNumber\config\.env，请填写 DB_PASSWORD 与 AGNES_API_KEY 后重启程序
+2026-11-04 10:02:20 | INFO     | modules.self_evolution | [self_evolution] _run 主循环开始（线程=Thread-2 (_run)）
+2026-11-04 10:02:20 | INFO     | modules.self_evolution | [self_evolution] 引擎已启动，后台线程 Thread-2 (_run) 开始执行
+2026-11-04 10:02:20 | INFO     | __main__ | [GUI] 自我进化引擎已初始化并启动，注册轮询定时器
+2026-11-04 10:02:20 | INFO     | modules.self_evolution | [self_evolution] 检查点状态: 已加载=True, 当前阶段=persist, 检查点键=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics', 'eval_metrics', 'beat_baseline']
+2026-11-04 10:02:20 | INFO     | modules.self_evolution | [self_evolution] 将从索引 4 继续（总阶段数=6）
+2026-11-04 10:02:20 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 4/5: persist
+2026-11-04 10:02:20 | INFO     | modules.self_evolution | [self_evolution] _phase_persist 开始
+2026-11-04 10:02:20 | INFO     | modules.self_evolution | [self_evolution] 准备持久化版本: tag=evo_20261104_100220, status=active
+2026-11-04 10:02:24 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:24 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:02:28 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:28 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:02:28 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:30 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:30 | WARNING  | modules.self_evolution | [self_evolution] 数据库连接失败（返回 None）
+2026-11-04 10:02:30 | WARNING  | root | _safe_subprocess_run: 命令执行失败 ['git', 'rev-parse', '--short', 'HEAD']: subprocess.run() got multiple values for keyword argument 'capture_output'
+2026-11-04 10:02:30 | INFO     | modules.self_evolution | [ExperimentTracker] 实验已记录: evo_20261104_100220 (active), git=unknown
+2026-11-04 10:02:31 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:31 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:02:33 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:34 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:34 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:02:37 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:37 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:02:37 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:37 | WARNING  | modules.self_evolution | [self_evolution] 数据库连接失败（返回 None）
+2026-11-04 10:02:39 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:39 | WARNING  | modules.self_evolution | [self_evolution] 数据库连接失败（返回 None）
+2026-11-04 10:02:39 | INFO     | modules.self_evolution | [self_evolution] 版本持久化成功: evo_20261104_100220 [active]
+2026-11-04 10:02:39 | INFO     | modules.self_evolution | [self_evolution] _phase_persist 结束
+2026-11-04 10:02:39 | INFO     | modules.self_evolution | [self_evolution] <<< 阶段 persist 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics', 'eval_metrics', 'beat_baseline']
+2026-11-04 10:02:39 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 5/5: done
+2026-11-04 10:02:39 | INFO     | modules.self_evolution | [self_evolution] _phase_done 开始
+2026-11-04 10:02:39 | INFO     | modules.self_evolution | [self_evolution] 改进建议: 共 1 条
+2026-11-04 10:02:42 | ERROR    | modules.database | 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:42 | WARNING  | modules.database | 连接池不可用，回退到单连接模式
+2026-11-04 10:02:44 | ERROR    | modules.database | MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:44 | WARNING  | modules.self_evolution | [self_evolution] 数据库连接失败（返回 None）
+2026-11-04 10:02:44 | INFO     | modules.self_evolution | [self_evolution] _phase_done 结束
+2026-11-04 10:02:44 | INFO     | modules.self_evolution | [self_evolution] <<< 阶段 done 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics', 'eval_metrics', 'beat_baseline']
+2026-11-04 10:02:44 | INFO     | modules.self_evolution | [self_evolution] 六阶段主循环全部结束，清空检查点并标记调度完成
+2026-11-04 10:02:44 | INFO     | modules.self_evolution | [self_evolution] 引擎完成，发送 done 消息
+2026-11-04 10:02:44 | INFO     | modules.self_evolution | [self_evolution] _run 主循环结束（线程=Thread-2 (_run)）

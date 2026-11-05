@@ -336,3 +336,351 @@ def batch_insert_position_data(cursor, position: str, data: List[Dict[str, Any]]
     except Exception as e:
         logger.error(f'批量插入{position}位数据失败: {e}')
         return 0, len(data)
+
+
+# ============================================================================
+# C4 期号主链关联查询接口（数据关联分析，非破坏性新增）
+# ----------------------------------------------------------------------------
+# 目的：为「多维度数据联合分析」提供按期号对齐的统一查询层，消除散落 JOIN。
+# 设计原则：
+#   * 纯函数 + 参数化 + 白名单校验（沿用本模块安全惯例），不引入物理视图
+#     （MySQL 8.0.12 对视图/CHECK 支持有限，纯 Python 层更稳、可移植）。
+#   * 所有方法异常兜底返回空/None，绝不向上抛错，与既有 query 层语义一致。
+#   * 不改动任何既有写入/读取路径，仅做加法，保证兼容性。
+# ============================================================================
+
+# 期号主链：核心表 + 关联表（表名均在 ALLOWED_TABLES 白名单内）
+_ISSUE_CHAIN_TABLES: Tuple[str, ...] = (
+    'p5_history_data',
+    'p5_wan_trend_data', 'p5_qian_trend_data', 'p5_bai_trend_data',
+    'p5_shi_trend_data', 'p5_ge_trend_data',
+    'p5_spjzs_data', 'p5_hzzst_data', 'p5_sum_end_trend_data',
+    'p5_back_three_trend_data',
+)
+
+# 各位置走势表 → 号码列
+_POSITION_NUMBER_COL: Dict[str, str] = {
+    'wan': 'wan_number', 'qian': 'qian_number', 'bai': 'bai_number',
+    'shi': 'shi_number', 'ge': 'ge_number',
+}
+
+
+def get_issue_unified(cursor, issue: str) -> Optional[Dict[str, Any]]:
+    """按期号对齐读取「主链全量」数据（开奖 + 五走势 + 特殊走势）。
+
+    Args:
+        cursor: 数据库游标（来自 P5Database.cursor 或独立连接）。
+        issue: 目标期号（如 '2026290'）。
+
+    Returns:
+        统一字典，键为各表语义段：
+            history: p5_history_data 行
+            trends: {wan/qian/bai/shi/ge: {number, draw_date, omission, ...}}
+            special: {spjzs, hzzst, sum_end, back_three}
+        任一段缺失时置 None；整体异常返回 None。
+    """
+    try:
+        issue = str(issue).strip()
+        if not issue:
+            return None
+        result: Dict[str, Any] = {'history': None, 'trends': {}, 'special': {}}
+
+        # 1) 历史开奖
+        cursor.execute(
+            'SELECT * FROM p5_history_data WHERE issue = %s', (issue,))
+        result['history'] = cursor.fetchone()
+
+        # 2) 五位置走势
+        for pos, table in (('wan', 'p5_wan_trend_data'), ('qian', 'p5_qian_trend_data'),
+                           ('bai', 'p5_bai_trend_data'), ('shi', 'p5_shi_trend_data'),
+                           ('ge', 'p5_ge_trend_data')):
+            cursor.execute(
+                f'SELECT * FROM {table} WHERE issue = %s', (issue,))
+            result['trends'][pos] = cursor.fetchone()
+
+        # 3) 特殊走势
+        for key, table in (('spjzs', 'p5_spjzs_data'), ('hzzst', 'p5_hzzst_data'),
+                           ('sum_end', 'p5_sum_end_trend_data'),
+                           ('back_three', 'p5_back_three_trend_data')):
+            try:
+                cursor.execute(
+                    f'SELECT * FROM {table} WHERE issue = %s', (issue,))
+                result['special'][key] = cursor.fetchone()
+            except Exception:  # noqa: BLE001
+                result['special'][key] = None
+
+        return result
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[DB-utils] get_issue_unified 失败 issue=%s: %s', issue, e)
+        return None
+
+
+def get_issue_chain_range(cursor, start_issue: str, end_issue: str) -> List[Dict[str, Any]]:
+    """按期号范围批量读取主链（用于联合分析 / 特征窗口构建）。
+
+    Args:
+        cursor: 数据库游标。
+        start_issue: 起始期号（含）。
+        end_issue: 结束期号（含）。
+
+    Returns:
+        列表，每个元素是 get_issue_unified 的统一字典；异常返回 []。
+    """
+    if not start_issue or not end_issue:
+        return []
+    try:
+        cursor.execute(
+            'SELECT issue FROM p5_history_data WHERE issue BETWEEN %s AND %s '
+            'ORDER BY issue ASC',
+            (str(start_issue), str(end_issue)))
+        issues = [r['issue'] for r in cursor.fetchall()] if cursor.description else []
+        return [get_issue_unified(cursor, i) for i in issues if i]
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[DB-utils] get_issue_chain_range 失败: %s', e)
+        return []
+
+
+def get_position_number_cross(cursor, position: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """按位置聚合号码-期号交叉分布（供多维联合分析/可视化）。
+
+    Args:
+        cursor: 数据库游标。
+        position: 位置标识（wan/qian/bai/shi/ge），白名单校验。
+        limit: 返回最大期数（按期号倒序）。
+
+    Returns:
+        列表：[{issue, number, omission, draw_date}, ...]；异常返回 []。
+    """
+    try:
+        position = str(position).lower()
+        if position not in _POSITION_NUMBER_COL:
+            raise ValueError(f'非法位置: {position}')
+        number_col = _POSITION_NUMBER_COL[position]
+        table = f'p5_{position}_trend_data'
+        assert_safe_table(table)
+        assert_safe_column(number_col)
+        sql = (
+            f'SELECT issue, {number_col} AS number, omission, draw_date '
+            f'FROM {table} ORDER BY issue DESC LIMIT %s'
+        )
+        cursor.execute(sql, (int(limit),))
+        return [dict(r) for r in (cursor.fetchall() or [])]
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[DB-utils] get_position_number_cross 失败 pos=%s: %s', position, e)
+        return []
+
+
+def _parse_issue_parts(iss: Any) -> Optional[Tuple[int, int]]:
+    """安全解析期为 (年, 年内天数)。
+
+    排列5 期号为 7 位数字 YYYYDDD（如 2024001 = 2024年 第 1 天），
+    由 data_fetcher 以 datetime.now().strftime('%Y%j') 生成。解析失败返回
+    None（由调用方过滤，避免误判）。
+    """
+    try:
+        s = str(iss).strip()
+        if len(s) != 7 or not s.isdigit():
+            return None
+        year = int(s[:4])
+        day = int(s[4:])
+        if year < 2000 or day < 1 or day > 366:
+            return None
+        return (year, day)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_issue_num(iss: Any) -> int:
+    """安全解析期号为整数（用于兼容既有 pipeline 语义）。
+
+    返回年*1000+day 的单调整数（2024001 → 2024001，2024999 → 2024999），
+    便于同年内数值排序与差值计算。解析失败返回 0。
+    """
+    parts = _parse_issue_parts(iss)
+    if parts is None:
+        return 0
+    return parts[0] * 1000 + parts[1]
+
+
+def detect_issue_gaps(issue_list: List[Any]) -> Dict[str, Any]:
+    """从期号列表检测中间缺失段与最大连续段（数据完整性审计）。
+
+    纯计算、无 DB 依赖、可单测。期号按 (年, 年内天数) 解析；**同年**内
+    day 差 > 1 判为缺失，**跨年**边界不判缺失（年末天数不定，宁可漏检，
+    不可错检）。非格式期号被剔除。
+
+    Args:
+        issue_list: 期号列表（顺序无关，内部按 (年, 天内) 排序）。
+
+    Returns:
+        {missing_issues: [...], max_consecutive_run: int, gap_count: int}。
+        missing_issues 为同年内缺失期号的整数表达（年*1000+day）升序列表。
+        max_consecutive_run 为同年内最长连续段（跨年重置）。
+    """
+    parts = {
+        _parse_issue_parts(i) for i in issue_list
+        if i is not None and str(i).strip() != ''
+    }
+    parts = sorted(p for p in parts if p is not None)
+    if len(parts) < 2:
+        return {'missing_issues': [], 'max_consecutive_run': len(parts), 'gap_count': 0}
+
+    missing = []
+    max_run = 1
+    cur_run = 1
+    for j in range(1, len(parts)):
+        prev_year, prev_day = parts[j - 1]
+        year, day = parts[j]
+        if year == prev_year:
+            gap = day - prev_day
+            if gap == 1:
+                cur_run += 1
+                max_run = max(max_run, cur_run)
+            elif gap > 1:
+                # 同年缺失
+                for m in range(prev_day + 1, day):
+                    missing.append(year * 1000 + m)
+                cur_run = 1
+            else:
+                cur_run = 1
+        else:
+            # 跨年：不判缺失（年末天数不定），连续段重置
+            cur_run = 1
+
+    return {
+        'missing_issues': missing,
+        'max_consecutive_run': max_run,
+        'gap_count': len(missing),
+    }
+
+
+def get_issue_consistency_report(cursor) -> Dict[str, Any]:
+    """生成期号一致性报告（各主链表与 p5_history_data 的期号集合对齐校验）。
+
+    Args:
+        cursor: 数据库游标。
+
+    Returns:
+        {table: {count, orphan, min_issue, max_issue}}；异常返回 {}。
+        p5_history_data 额外含 missing_issues / max_consecutive_run / gap_count
+        （C5 数据完整性审计：区间内缺失期号与最长连续段）。
+    """
+    report: Dict[str, Any] = {}
+    try:
+        cursor.execute(
+            'SELECT MIN(issue) AS mn, MAX(issue) AS mx, COUNT(*) AS c '
+            'FROM p5_history_data')
+        base = cursor.fetchone() or {}
+        report['p5_history_data'] = {
+            'count': base.get('c', 0),
+            'min_issue': base.get('mn'),
+            'max_issue': base.get('mx'),
+            'orphan': 0,
+        }
+        # C5：读取实际期号集合做连续性审计（纯增量字段，不影响既有契约）
+        try:
+            cursor.execute('SELECT issue FROM p5_history_data ORDER BY issue ASC')
+            if cursor.description:
+                issue_list = [r['issue'] for r in cursor.fetchall()]
+                gap_info = detect_issue_gaps(issue_list)
+                report['p5_history_data'].update(gap_info)
+            else:
+                report['p5_history_data'].update(
+                    {'missing_issues': [], 'max_consecutive_run': 0, 'gap_count': 0})
+        except Exception as e:  # noqa: BLE001
+            logger.warning('[DB-utils] 期号连续性检测失败: %s', e)
+            report['p5_history_data'].update(
+                {'missing_issues': [], 'max_consecutive_run': 0, 'gap_count': 0})
+        for table in _ISSUE_CHAIN_TABLES:
+            if table == 'p5_history_data':
+                continue
+            try:
+                cursor.execute(
+                    f'SELECT MIN(issue) AS mn, MAX(issue) AS mx, COUNT(*) AS c '
+                    f'FROM {table}')
+                agg = cursor.fetchone() or {}
+                cursor.execute(
+                    f'SELECT COUNT(*) AS c FROM {table} '
+                    f'WHERE issue NOT IN (SELECT issue FROM p5_history_data)')
+                orph = (cursor.fetchone() or {}).get('c', 0)
+                report[table] = {
+                    'count': agg.get('c', 0),
+                    'min_issue': agg.get('mn'),
+                    'max_issue': agg.get('mx'),
+                    'orphan': orph,
+                }
+            except Exception:  # noqa: BLE001
+                report[table] = {'count': 0, 'min_issue': None, 'max_issue': None, 'orphan': -1}
+        return report
+    except Exception as e:  # noqa: BLE001
+        logger.warning('[DB-utils] get_issue_consistency_report 失败: %s', e)
+        return {}
+
+
+# ============================================================================
+# C3 应用层数据校验（MySQL 8.0.12 不支持原生 CHECK 约束，≥8.0.16 才生效）
+# ----------------------------------------------------------------------------
+# 务实替代：在写入/回测数据预检路径调用本组校验函数，保证范围合法性，
+# 避免脏数据写入。函数纯计算、无 DB 依赖、异常兜底返回 False。
+# ============================================================================
+
+# 校验范围常量（与 database.sql 中拟加的 CHECK 约束一致）
+_DIGIT_MIN, _DIGIT_MAX = 0, 9        # 单号码
+_HEZHI_MIN, _HEZHI_MAX = 0, 45       # 五位和值
+_SPAN_MIN, _SPAN_MAX = 0, 9          # 跨度
+_ACC_MIN, _ACC_MAX = 0.0, 100.0      # 命中率
+
+
+def validate_history_record(record: Dict[str, Any]) -> bool:
+    """校验一条历史开奖记录的数字范围合法性（号码/和值/跨度）。
+
+    校验项：
+        - 五个号码均在 [0,9]；
+        - hezhi（若提供）在 [0,45] 且等于五位之和；
+        - span（若提供）在 [0,9] 且等于 max-min。
+
+    Args:
+        record: 含 wan/qian/bai/shi/ge（可含 hezhi/span）的字典。
+
+    Returns:
+        True 合法；False 非法（任一校验失败）。
+    """
+    try:
+        nums = [record.get(k) for k in ('wan', 'qian', 'bai', 'shi', 'ge')]
+        if any(n is None for n in nums):
+            return False
+        nums = [int(n) for n in nums]
+        if any(n < _DIGIT_MIN or n > _DIGIT_MAX for n in nums):
+            return False
+        total = sum(nums)
+        if record.get('hezhi') is not None:
+            if int(record['hezhi']) != total:
+                return False
+        if record.get('span') is not None:
+            span = max(nums) - min(nums)
+            if int(record['span']) != span:
+                return False
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def validate_accuracy_rate(value: Any) -> bool:
+    """校验命中率字段范围 [0,100]。"""
+    try:
+        v = float(value)
+        return _ACC_MIN <= v <= _ACC_MAX
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_position_numbers(position: str, numbers: List[Any]) -> bool:
+    """校验某位置号码序列均在 [0,9] 且位号合法。"""
+    try:
+        position = str(position).lower()
+        if position not in _POSITION_NUMBER_COL:
+            return False
+        return all(n is not None and int(n) >= _DIGIT_MIN and int(n) <= _DIGIT_MAX
+                   for n in numbers)
+    except (TypeError, ValueError):
+        return False

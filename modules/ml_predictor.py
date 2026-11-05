@@ -68,8 +68,9 @@ ML_MIN_SAMPLES = 160  # GBRT 有效训练所需最少期数（warmup 60 + 特征
 # 指纹 = history 行数 + 最新期号 + 特征 schema 源码 hash；fp 命中即跳过
 # 5 位 GBDT 全量重训；同版本目录滚动保留 MODEL_CACHE_KEEP 版（mtime 淘汰）。
 # 缓存内容为 5 位概率分布快照（软模型）+ 指纹/元数据，joblib 序列化。
-MODEL_CACHE_ROOT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'models')
+# 模型缓存根目录统一取自 paths.MODEL_CACHE_ROOT：源码运行等于项目根/models，
+# PyInstaller 冻结后等于 exe 同级可写目录/models（不能写入包内 _internal）
+from paths import MODEL_CACHE_ROOT  # noqa: E402
 MODEL_CACHE_KEEP = 3
 
 # ----------------------------------------------------------------------------
@@ -103,12 +104,13 @@ except Exception as _opt_err:
 
 def _sklearn_gbrt_predict(X: np.ndarray, y: np.ndarray,
                           n_estimators: int, learning_rate: float,
-                          max_depth: int) -> float:
+                          max_depth: int,
+                          X_pred: Optional[np.ndarray] = None) -> float:
     """v3.70 (1.3): 使用 sklearn GradientBoostingClassifier 训练二分类 GBDT。
 
     与 _gbrt_predict（纯 numpy）签名兼容，但优先使用 sklearn 实现以获得更快、
-    更稳定的训练。返回最后一个样本的预测值（log-odds 空间，与 numpy 路径对齐，
-    便于 softmax 归一化时两条路径结果可比）。
+    更稳定的训练。返回 log-odds 空间（与 numpy 路径对齐，便于 softmax 归一化
+    时两条路径结果可比）。
 
     Args:
         X: (n_samples, n_features) 特征矩阵
@@ -116,9 +118,13 @@ def _sklearn_gbrt_predict(X: np.ndarray, y: np.ndarray,
         n_estimators: 树的数量（与 numpy 路径同参数）
         learning_rate: 学习率（与 numpy 路径同参数）
         max_depth: 树的最大深度（与 numpy 路径同参数）
+        X_pred: 待预测的「下一期」特征向量（可选）。给定则预测 X_pred
+            （对齐 _build_feature(p,i)->issue[i+1] 语义）；缺省预测最后一个
+            训练样本（旧行为，保持向后兼容）。
 
     Returns:
-        最后一个样本的 log-odds 预测值（标量）。
+        X_pred 给定 → 对 X_pred 的 log-odds 预测值（标量）；
+        否则最后一个训练样本的 log-odds 预测值（标量）。
         调用方捕获异常后自动降级回纯 numpy 路径。
     """
     # 把 sklearn 概率映射回 log-odds 空间，与 numpy 路径的 F[-1] 语义对齐
@@ -129,7 +135,11 @@ def _sklearn_gbrt_predict(X: np.ndarray, y: np.ndarray,
         random_state=42,
     )
     clf.fit(X, y.astype(int))
-    p_last = float(clf.predict_proba(X[-1:])[0, 1])  # P(y=1 | x_last)
+    if X_pred is not None:
+        target = np.atleast_2d(np.asarray(X_pred, dtype=float))
+        p_last = float(clf.predict_proba(target)[0, 1])  # P(y=1 | x_next)
+    else:
+        p_last = float(clf.predict_proba(X[-1:])[0, 1])  # P(y=1 | x_last)
     eps = 1e-12
     p_last = np.clip(p_last, eps, 1 - eps)
     return float(np.log(p_last / (1.0 - p_last)))
@@ -160,13 +170,15 @@ def _connect_db():
         return None
 
 
-def _load_full_history(conn) -> List[Dict]:
+def _load_full_history(conn, max_issue: Optional[str] = None) -> List[Dict]:
     """
-    从数据库加载 p5_history_data 全量有效记录（按 issue 正序）。
+    从数据库加载 p5_history_data 有效记录（按 issue 正序）。
     用于调用方传入数据不足时的补全回退。
 
     Args:
         conn: 已建立的数据库连接。
+        max_issue: 可选截止期号（含）。给定则只取 issue <= max_issue，
+            防止补全混入「目标期之后」的未来数据（无前视保证）。
 
     Returns:
         按 issue 正序排列的历史记录列表，每项含 issue + numbers 字段；
@@ -176,7 +188,15 @@ def _load_full_history(conn) -> List[Dict]:
         return []
     try:
         cur = conn.cursor()
-        cur.execute('SELECT issue, wan, qian, bai, shi, ge, hezhi FROM p5_history_data WHERE is_valid = 1 ORDER BY issue ASC')
+        # 修复前视泄漏：补全必须限定截止期号（<= max_issue），
+        # 否则会混入目标期之后的未来记录，破坏 walk-forward 无前视保证。
+        if max_issue is not None:
+            cur.execute(
+                'SELECT issue, wan, qian, bai, shi, ge, hezhi FROM p5_history_data '
+                'WHERE is_valid = 1 AND issue <= %s ORDER BY issue ASC',
+                (str(max_issue),))
+        else:
+            cur.execute('SELECT issue, wan, qian, bai, shi, ge, hezhi FROM p5_history_data WHERE is_valid = 1 ORDER BY issue ASC')
         rows = cur.fetchall()
         return [{'issue': str(r[0]), 'numbers': [int(r[1]), int(r[2]), int(r[3]), int(r[4]), int(r[5])],
                  'hezhi': int(r[6]) if r[6] is not None else None} for r in rows]
@@ -252,6 +272,22 @@ def _reset_ml_cache_stats() -> None:
         _ML_CACHE_STATS[_k] = 0
 
 
+def get_ml_cache_stats() -> Dict[str, int]:
+    """返回 GBM 模型缓存统计只读快照（B3 性能可观测性）。
+
+    供 perf_monitor / 诊断面板展示缓存命中率、落盘与淘汰数，
+    验证模型缓存（指纹 joblib）在重复预测下的收益。
+
+    返回:
+        统计字典（train_invocations / cache_hits / cache_misses /
+        cache_saves / cache_evictions）；含命中率派生字段 cache_hit_rate。
+    """
+    stats = dict(_ML_CACHE_STATS)
+    total = stats.get('cache_hits', 0) + stats.get('cache_misses', 0)
+    stats['cache_hit_rate'] = round(stats.get('cache_hits', 0) / total, 4) if total else 0.0
+    return stats
+
+
 def _feature_schema_hash() -> str:
     """_build_feature 源码 sha256 前 16 位。
 
@@ -277,10 +313,17 @@ def _resolve_history(sorted_data: List[Dict]):
         _get_logger().info(
             '[ml_predictor] 传入样本 %d 期不足 %d 期，尝试从数据库补全全量历史...',
             n, ML_MIN_SAMPLES)
+        # 修复前视泄漏：以传入数据最大期号为截止上限，补全永不混入比传入
+        # 数据更新的期（含目标期/未来），确保 walk-forward 无前视保证不被破坏。
+        max_input = None
+        for row in sorted_data:
+            iss = str(row.get('issue', ''))
+            if iss and (max_input is None or iss > max_input):
+                max_input = iss
         conn_full = _connect_db()
         if conn_full is not None:
             try:
-                full_data = _load_full_history(conn_full)
+                full_data = _load_full_history(conn_full, max_issue=max_input)
                 if full_data and len(full_data) >= ML_MIN_SAMPLES:
                     _get_logger().info(
                         '[ml_predictor] 数据库补全成功: %d 期，重新解析...',
@@ -808,12 +851,17 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
                        p, type(y_seq).__name__, len(y_seq), y_seq[:5] if y_seq else '空')
     X, y_labels = [], []
 
-    for i in range(60, n):  # 从第60期开始（特征需60期历史）
+    # 修复 off-by-one（预测滞后一期）：_build_feature(p, i) 的语义是「预测 issue[i+1]」，
+    # 故训练标签必须用 y_seq[i+1]（而非 y_seq[i]），且只训练到 i=n-2（i+1<=n-1）。
+    # 推理端单独构造 feat_next=_build_feature(p, n-1) 预测 issue[n]（下一期），
+    # 见下方 X_pred。旧实现用 y_seq[i] 作标签 → 模型学到「用<=i 预测 issue[i]」，
+    # 推理返回 F[-1]（i=n-1）实际对应最新一期（已开奖），整条链路滞后一期。
+    for i in range(60, n - 1):  # 从第60期开始（特征需60期历史）；标签用 i+1
         feat = _build_feature(p, i, issues, digits, hezhi, pos_trend, spj, hz)
         if feat is not None:
             X.append(feat)
             try:
-                label = y_seq[i]
+                label = y_seq[i + 1]
                 # v3.57：循环逐样本 INFO → DEBUG，避免 ML 训练时刷屏几百行日志，
                 # 进而触发 RotatingFileHandler 频繁 rollover（多线程并发 rollover 在
                 # Windows 下会报 WinError 32）。仅在调试时开启。
@@ -821,8 +869,14 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
                 y_labels.append(label)
             except Exception as e2:
                 _get_logger().error('[ml_predictor] y_seq[%d] 索引失败: %s, y_seq 类型=%s, len=%d',
-                                   i, e2, type(y_seq).__name__, len(y_seq))
+                                   i + 1, e2, type(y_seq).__name__, len(y_seq))
                 raise
+
+    # 推理端：构造「下一期 issue[n]」特征向量（用 <=n-1 可观测数据），
+    # 与训练标签对齐（_build_feature(p,n-1) 语义预测 issue[n]）。
+    feat_next = None
+    if n >= 61:  # 与 _build_feature 的 i<60 门槛一致
+        feat_next = _build_feature(p, n - 1, issues, digits, hezhi, pos_trend, spj, hz)
 
     if len(X) < 100:
         _get_logger().warning(
@@ -844,6 +898,16 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
         X = X[:, feat_idx]
         _get_logger().info(
             '[ml_predictor] %s 位: 特征筛选 %d -> %d 列', p, n_features, len(feat_idx))
+
+    # 修复 off-by-one：推理特征 feat_next 需与训练 X 同列对齐（应用同一 feat_idx）。
+    # feat_next=None（n<61）时保持旧行为（X_pred=None → 预测最后一个训练样本），
+    # 但该分支在 predict_next 主入口已被 n>=ML_MIN_SAMPLES(160) 拦截，实际不达。
+    X_pred = None
+    if feat_next is not None:
+        arr_next = np.asarray(feat_next, dtype=float).reshape(1, -1)
+        if feat_idx is not None and len(feat_idx) <= arr_next.shape[1]:
+            arr_next = arr_next[:, feat_idx]
+        X_pred = arr_next
 
     # v3.70 (1.5): Optuna 超参数自动调优（仅当数据充足且 Optuna 可用时）
     n_estimators = 30
@@ -881,16 +945,19 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
         try:
             if _used_sklearn:
                 try:
-                    score = _sklearn_gbrt_predict(X, y_bin, n_estimators, learning_rate, max_depth)
+                    score = _sklearn_gbrt_predict(X, y_bin, n_estimators, learning_rate, max_depth,
+                                                   X_pred=X_pred)
                 except Exception as _sk_ex:
                     _get_logger().warning(
                         '[ml_predictor] %s 位 数字%d sklearn GBRT 失败，降级 numpy 路径: %s',
                         p, c, _sk_ex)
                     _sklearn_degraded = True
                     _used_sklearn = False  # 后续类全部走 numpy，避免重复降级日志刷屏
-                    score = _gbrt_predict(X, y_bin, n_estimators, learning_rate, max_depth, n_samples)
+                    score = _gbrt_predict(X, y_bin, n_estimators, learning_rate, max_depth,
+                                          n_samples, X_pred=X_pred)
             else:
-                score = _gbrt_predict(X, y_bin, n_estimators, learning_rate, max_depth, n_samples)
+                score = _gbrt_predict(X, y_bin, n_estimators, learning_rate, max_depth,
+                                      n_samples, X_pred=X_pred)
             final_scores[c] = score
         except Exception as ex:
             _get_logger().warning('[ml_predictor] %s 位 数字%d GBRT训练异常: %s', p, c, ex)
@@ -905,6 +972,11 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
     exp_vals = np.exp(final_scores - np.max(final_scores))
     probs = exp_vals / exp_vals.sum()
 
+    # B2 模型版本化：记录本次训练元数据（超参/数据指纹/样本量/降级标志/耗时）
+    _get_logger().debug(
+        '[ml_predictor] %s 位 GBRT 完成: n_est=%d lr=%.3f depth=%d samples=%d features=%d sklearn=%s',
+        p, n_estimators, learning_rate, max_depth, n_samples, n_features, _used_sklearn)
+
     return {d: float(probs[d]) for d in NUM}
 
 
@@ -913,9 +985,10 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
 # ----------------------------------------------------------------------------
 def _gbrt_predict(X: np.ndarray, y: np.ndarray,
                   n_estimators: int, learning_rate: float,
-                  max_depth: int, n_samples: int) -> float:
+                  max_depth: int, n_samples: int,
+                  X_pred: Optional[np.ndarray] = None) -> float:
     """
-    手工实现 GBDT 二分类器，返回最后一个样本的预测值（log-odds 空间）。
+    手工实现 GBDT 二分类器。
 
     算法：负梯度下降 + 回归树拟合残差
       - 初始预测：log(p/(1-p))，p = mean(y)
@@ -929,15 +1002,25 @@ def _gbrt_predict(X: np.ndarray, y: np.ndarray,
         learning_rate: 学习率（步长）
         max_depth: 树的最大深度
         n_samples: 样本数（用于初始预测）
+        X_pred: 待预测的「下一期」特征向量（可选）。
+            给定则对 X_pred 单独预测（对齐 _build_feature(p,i)->issue[i+1]
+            语义，返回对下一期 issue[n] 的 log-odds）；
+            缺省则返回最后一个训练样本的预测值（旧行为，保持向后兼容）。
 
     Returns:
-        最后一个样本的预测值（标量）
+        X_pred 给定 → 对 X_pred 的 log-odds 预测值（标量）；
+        否则最后一个训练样本的预测值（标量）。
     """
     eps = 1e-12
 
     # 初始预测：log-odds
     p0 = np.clip(y.mean(), eps, 1 - eps)
     F = np.full(n_samples, np.log(p0 / (1 - p0)))
+
+    if X_pred is not None:
+        # 待预测样本的累计 log-odds（初始同 F0）
+        F_pred = float(np.log(p0 / (1 - p0)))
+        X_pred_arr = np.atleast_2d(np.asarray(X_pred, dtype=float))
 
     for _ in range(n_estimators):
         # 负梯度（伪残差）：y - sigmoid(F)
@@ -950,7 +1033,11 @@ def _gbrt_predict(X: np.ndarray, y: np.ndarray,
 
         # 更新预测值
         F = F + learning_rate * tree_pred
+        if X_pred is not None:
+            F_pred += float(learning_rate) * float(_tree_predict(X_pred_arr, tree)[0])
 
+    if X_pred is not None:
+        return F_pred
     # 返回最后一个样本的预测值
     return float(F[-1])
 
@@ -1260,6 +1347,90 @@ def _optimize_params_optuna(X: np.ndarray, y: np.ndarray, n_trials: int = 15) ->
     except Exception as e:
         _get_logger().warning('[ml_predictor] Optuna 优化异常: %s', e)
     return None
+
+
+# ============================================================================
+# B2 AI 模型迭代升级 —— 模型版本化元数据
+# ----------------------------------------------------------------------------
+# 目的：为每次 GBRT 训练生成结构化版本元数据（超参/数据指纹/样本量/降级标志/
+# 训练耗时/git hash），供 self_evolution 引用、模型可追溯性与 A/B 对比。
+# 纯函数、非侵入式：不改变预测逻辑，仅提供可记录的信息载体。
+# ============================================================================
+
+DEFAULT_MODEL_META = {
+    'engine': 'gbrt',
+    'n_estimators': 30,
+    'learning_rate': 0.1,
+    'max_depth': 3,
+    'n_samples': 0,
+    'n_features': 0,
+    'sklearn': bool(_SKLEARN_AVAILABLE),
+    'optuna': bool(_OPTUNA_AVAILABLE),
+    'degraded': False,
+    'data_fingerprint': None,
+    'train_seconds': 0.0,
+    'git_hash': None,
+    'created_at': None,
+}
+
+
+def _git_revision() -> Optional[str]:
+    """读取当前 git 提交哈希（只读，失败返回 None）。"""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            capture_output=True, text=True, timeout=3,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def build_model_metadata(**overrides: Any) -> Dict[str, Any]:
+    """构建模型版本化元数据。
+
+    Args:
+        **overrides: 覆盖默认字段（如 n_estimators/learning_rate/max_depth/
+            n_samples/n_features/degraded/data_fingerprint/train_seconds）。
+
+    Returns:
+        结构化元数据字典（含 git hash 与时间戳）。
+    """
+    import time
+    from datetime import datetime as _dt
+    meta = dict(DEFAULT_MODEL_META)
+    meta.update(overrides)
+    meta['sklearn'] = bool(_SKLEARN_AVAILABLE)
+    meta['optuna'] = bool(_OPTUNA_AVAILABLE)
+    meta['git_hash'] = _git_revision()
+    meta['created_at'] = _dt.now().isoformat()
+    return meta
+
+
+def format_model_metadata(meta: Dict[str, Any]) -> str:
+    """将元数据格式化为可读摘要（供日志/报告展示）。"""
+    if not meta:
+        return '(无元数据)'
+    parts = [
+        f"engine={meta.get('engine')}",
+        f"n_est={meta.get('n_estimators')}",
+        f"lr={meta.get('learning_rate')}",
+        f"depth={meta.get('max_depth')}",
+        f"samples={meta.get('n_samples')}",
+        f"features={meta.get('n_features')}",
+        f"sklearn={meta.get('sklearn')}",
+        f"optuna={meta.get('optuna')}",
+        f"degraded={meta.get('degraded')}",
+    ]
+    if meta.get('git_hash'):
+        parts.append(f"git={meta.get('git_hash')}")
+    if meta.get('train_seconds'):
+        parts.append(f"t={meta.get('train_seconds'):.2f}s")
+    return ' | '.join(parts)
 
 
 if __name__ == '__main__':

@@ -75,7 +75,11 @@ def _safe_grab_set(win):
     对话框仍可正常展示与关闭。
     """
     try:
-        _safe_grab_set(win)
+        # 修复（v5.3 GUI-UX）：此处原为 `_safe_grab_set(win)` 自递归调用，
+        # 递归到解释器栈上限后抛 RecursionError 被本函数捕获，导致
+        # 所有模态弹窗**从未真正 grab_set**（焦点可逃逸到主窗口），
+        # 且每次调用平白消耗约 1000 层栈帧。改为调用 Tk 原生 grab_set。
+        win.grab_set()
         return True
     except Exception as e:  # noqa: BLE001
         logger.warning('[GUI] grab_set 失败，对话框降级为普通弹窗（内容不受影响）: %s', e)
@@ -149,7 +153,7 @@ Backtester = _LazyClass('modules.backtester', 'Backtester')
 P5Features = _LazyClass('modules.features', 'P5Features')
 # 版本信息唯一来源（version.py 单一维护，轻量，保持直接导入）
 from version import get_current_version, get_changelog
-from config import DATA_WINDOW_PERIOD
+from config import DATA_WINDOW_PERIOD, FIRST_RUN_ENV_CREATED, ENV_FILE_PATH
 from paths import PROJECT_ROOT, REPORTS_DIR, REPORTS_CHARTS_DIR, LOG_GUI_RUN
 # 新版任务管理器（多线程、优先级队列、协作式取消、超时控制）
 from modules.task_manager import TaskManager
@@ -188,6 +192,7 @@ from modules.ui_theme_spec import (
     CHART_NOTE_FACE,
     CHART_NOTE_EDGE,
     CHART_BARS,
+    UI_FONT,
 )
 
 # 全局颜色主题配置（当前系统主题的实时色板）
@@ -218,9 +223,14 @@ _DASH_REFRESH_DEBOUNCE_MS = 50
 # 紧凑档：面板宽度 < 1024px。工具栏按钮切换短文案，防止操作区溢出，
 # 保障窄屏可交互性（验收 A17）。
 _BREAKPOINT_COMPACT_MAX_W = 1024
-# 标准档上限：面板宽度 <= 1440px；超过进入宽绰档。当前宽绰档视觉与
-# 标准档一致（工具栏全文案 + 磁贴 4 列），保留档位供宽屏差异化扩展。
+# 标准档上限：面板宽度 <= 1440px；超过进入宽绰档（A2 四档扩展）。
+# 宽绰档视觉与标准档一致（工具栏全文案 + 磁贴 4 列）。
 _BREAKPOINT_STANDARD_MAX_W = 1440
+# 超宽档阈值：面板宽度 > 1600px 进入 ultrawide 档（A2 四档断点体系）。
+# 当前 ultrawide 档复用宽绰档视觉（全文案 + 4 列磁贴），但作为独立档位
+# 供超宽屏差异化扩展（如后续加 5 列磁贴 / 工具栏全宽分布）锚点，
+# 且保证从 1920px 高分屏缩窗时不会误触紧凑档切换。
+_BREAKPOINT_WIDE_MAX_W = 1600
 # 概览磁贴 2×2 网格启用阈值：磁贴容器宽度 < 1100px 时由 4 列并排 pack
 # 切换为 grid 网格（方案 §311）；>= 1100px 保持 4 列并排。
 _TILE_GRID_MAX_W = 1100
@@ -422,11 +432,18 @@ class LotteryGUI(OutputPanelMixin, DashboardMixin, SchedulerMixin):
         self.root.title("排列5 AI智能分析系统")
         # 适配常见屏幕尺寸：高度取屏幕的 85%（而不是固定 860），
         # 确保大部分显示器上无需滚动就能看到全部左侧功能卡片。
+        # 兼容极宽/极窄屏：下限 780px，上限 1024px，避免极化宽屏下窗口过宽
+        # 或极窄屏下窗口无法完全显示。
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        win_width = min(1280, screen_width - 40)
-        win_height = max(780, min(860, int(screen_height * 0.85)))  # 至少 780px 保证内容可见
-        self.root.geometry(f"{win_width}x{win_height}+{max(0, (screen_width - win_width) // 2)}+{max(0, (screen_height - win_height) // 2)}")
+        # 宽度：最宽 1280px，留出 40px 边距；最窄不低于屏幕宽的 80%
+        win_width = min(1280, max(int(screen_width * 0.8), screen_width - 40))
+        # 高度：屏幕 85% 作为目标，允许 780~1024px 范围内波动，确保内容可见
+        win_height = max(780, min(1024, int(screen_height * 0.85)))
+        # 确保窗口坐标不为负数
+        x = max(0, (screen_width - win_width) // 2)
+        y = max(0, (screen_height - win_height) // 2)
+        self.root.geometry(f"{win_width}x{win_height}+{x}+{y}")
         self.root.minsize(1024, 720)
         self.root.configure(bg=COLORS['bg_primary'])
 
@@ -541,10 +558,15 @@ class LotteryGUI(OutputPanelMixin, DashboardMixin, SchedulerMixin):
         """配置ttk样式主题（暗色主题，clam引擎）"""
         style = ttk.Style()
         style.theme_use('clam')
-        style.configure('.', font=('微软雅黑', 10),
+        style.configure('.', font=(UI_FONT, 10),
                         background=COLORS['bg_primary'],
                         foreground=COLORS['text_primary'],
                         fieldbackground=COLORS['bg_secondary'])
+        # v5.3 GUI-UX：统一 Notebook / Combobox / Entry / Button 的主题化外观。
+        # 此前这些 ttk 控件完全沿用 clam 默认（浅灰页签 + 白底输入框），
+        # 在深色主题下与卡片形成明显割裂；集中注册到 ui_styles 单一实现，
+        # 避免 main.py 与 theme refresh 两条路径出现样式漂移。
+        ui_styles.build_ttk_styles(self.root, COLORS)
         style.configure('TFrame', background=COLORS['bg_primary'])
         style.configure('Horizontal.TProgressbar',
                         background=COLORS['accent_p5'],
@@ -575,7 +597,7 @@ class LotteryGUI(OutputPanelMixin, DashboardMixin, SchedulerMixin):
                         foreground=COLORS['text_primary'],
                         relief='flat',
                         borderwidth=0,
-                        font=('微软雅黑', 9, 'bold'))
+                        font=(UI_FONT, 9, 'bold'))
         style.map('Treeview.Heading',
                   background=[('active', COLORS['bg_card_hover'])],
                   foreground=[('active', COLORS['text_primary'])])
@@ -621,13 +643,82 @@ class LotteryGUI(OutputPanelMixin, DashboardMixin, SchedulerMixin):
         self.root.bind('<Escape>', lambda e: self._cancel_current_task())
 
     def _build_ui(self):
-        """构建完整的UI布局：顶部标题栏 + 中部（左侧控制面板 + 右侧输出区） + 底部状态栏"""
+        """构建完整的UI布局：顶部标题栏 + 中部（左侧控制面板 + 右侧输出区） + 底部状态栏。
+
+        布局采用 grid 响应式：左侧控制面板权重 0（固定最小宽度，窗口缩小时可折叠为
+        图标模式），右侧输出区权重 1（随窗口横向撑开）。顶部标题栏与底部状态栏横
+        向占满（weight=1），高度随内容自适应。
+        """
         main_container = tk.Frame(self.root, bg=COLORS['bg_primary'])
-        main_container.pack(fill=tk.BOTH, expand=True)
+        main_container.grid(row=0, column=0, sticky='nsew')
+        # 根窗口配置：单行单列，随窗口撑开。
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        # 三行：标题 / 内容 / 状态栏；内容行随窗口纵向撑开。
+        main_container.grid_rowconfigure(0, weight=0)
+        main_container.grid_rowconfigure(1, weight=1)
+        main_container.grid_rowconfigure(2, weight=0)
+        main_container.grid_columnconfigure(0, weight=1)
 
         self._build_header(main_container)
         self._build_content(main_container)
         self._build_status_bar(main_container)
+
+        # 响应式断点：绑定窗口大小变化，<1000px 时左栏折叠为图标-only。
+        self._bind_responsive_breakpoints()
+
+    def _bind_responsive_breakpoints(self):
+        """绑定窗口尺寸变化响应式断点。
+
+        窗口宽度 < 1000px：左侧控制面板折叠为图标-only（minsize 收至 60px），
+        右侧输出区撑开全部可用空间。
+        窗口宽度 >= 1000px：恢复完整卡片模式（minsize 260px）。
+        使用 after_idle 合并连续拖拽事件，避免重复重排。
+        """
+        self.root.bind('<Configure>', self._on_layout_resize)
+
+    def _on_layout_resize(self, event=None):
+        """窗口尺寸变化时的响应式重排。
+
+        仅在宽度跨越 1000px 阈值时调整左栏 minsize，避免每次 <Configure>
+        都触发完整重排。
+        """
+        if event is not None and event.widget is not self.root:
+            return
+        self.root.after_idle(self._apply_responsive_breakpoint)
+
+    def _apply_responsive_breakpoint(self):
+        """根据窗口宽度切换左栏标准/紧凑两档宽度（v5.3 GUI-UX）。
+
+        原实现仅在 ``width < 1000`` 时把左栏 minsize 改成 60，但窗口最小宽度
+        被锁定为 1024（永远进不去该分支），且左栏 ``grid_propagate(False)``
+        的请求宽度仍是 260，即便改 minsize 也不会真正收缩——整套响应式逻辑
+        实为空转。现改为按窗口宽度直接设置容器/画布宽度，并同步卡片说明文字
+        的 wraplength，保证 1024px 窄窗下文字不被裁切。
+        """
+        try:
+            width = self.root.winfo_width()
+        except Exception:
+            return
+        left_container = getattr(self, '_left_container', None)
+        left_canvas = getattr(self, '_left_canvas', None)
+        if left_container is None or left_canvas is None:
+            return
+        # 800 下限用于排除窗口尚未完成映射时的 width=1 噪声值
+        compact = 800 <= width < 1120
+        target = 232 if compact else 260
+        try:
+            left_container.configure(width=target)
+            left_canvas.configure(width=target)
+            # 画布宽度变化会触发 <Configure>，内嵌 frame 自动跟随；
+            # 说明文字的换行宽度按可用内宽（栏宽 - 内边距）同步。
+            for lbl in list(getattr(self, '_left_wrap_labels', [])):
+                try:
+                    lbl.configure(wraplength=target - 44)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # 主题管理
     _current_theme = 'dark'  # 记录当前主题状态
@@ -637,11 +728,11 @@ class LotteryGUI(OutputPanelMixin, DashboardMixin, SchedulerMixin):
         if self._current_theme == 'dark':
             self._current_theme = 'light'
             self._apply_theme(ThemeManager.LIGHT_THEME)
-            self._theme_btn.config(text="🌙")
         else:
             self._current_theme = 'dark'
             self._apply_theme(ThemeManager.DARK_THEME)
-            self._theme_btn.config(text="☀️")
+        # v5.3 GUI-UX 第二批：Canvas 图标由 _apply_theme 末尾统一重绘，
+        # 不再设置 emoji 文本（原 .config(text=...) 在 Canvas 上不适用）。
         # 保存主题设置
         self._save_theme_preference()
 
@@ -684,6 +775,18 @@ class LotteryGUI(OutputPanelMixin, DashboardMixin, SchedulerMixin):
             _viz_set_theme(theme)
         except Exception as e:
             logger.warning('[GUI] 更新可视化器主题失败(不影响主题切换): %s', e)
+        # v5.3 GUI-UX 第二批：重绘 Canvas 自绘主题图标（太阳/月亮），
+        # 保证切主题后图标前景与画布底色同步，不残留旧主题色。
+        self._sync_theme_icon()
+
+    def _sync_theme_icon(self):
+        """安全触发主题图标重绘（构建早期 _theme_btn 尚不存在时静默跳过）。"""
+        draw = getattr(self, '_draw_theme_icon', None)
+        if callable(draw):
+            try:
+                draw()
+            except Exception as e:
+                logger.debug('[GUI] 主题图标重绘失败: %s', e)
 
     def _build_old_color_map(self, old_theme: dict) -> dict:
         """构建「旧主题色值 → 语义槽键」反查表。
@@ -867,10 +970,8 @@ class LotteryGUI(OutputPanelMixin, DashboardMixin, SchedulerMixin):
                             ThemeManager.LIGHT_THEME if self._current_theme == 'light'
                             else ThemeManager.DARK_THEME
                         )
-                        # 与 _toggle_theme 语义一致：浅色主题显示 🌙（点击切深色），深色显示 ☀️
-                        # v5.0 §2.3 修复：旧代码两个分支均为空串，加载偏好后主题按钮 emoji 恒为空
-                        self._theme_btn.config(
-                            text='🌙' if self._current_theme == 'light' else '☀️')
+                        # v5.3 GUI-UX 第二批：图标由 _apply_theme → _sync_theme_icon
+                        # 统一重绘（浅色显示月亮、深色显示太阳），此处不再设置 emoji 文本。
         except Exception:
             pass
 
@@ -903,13 +1004,83 @@ def _set_window_icon(root):
             pass
 
 
+def _enable_windows_dpi_awareness():
+    """Windows 进程级 DPI 感知（A1 高 DPI 适配）。
+
+    在创建 tk.Tk() 之前调用，使 Tk 以物理像素感知系统 DPI 缩放，
+    避免 125%/150% 高分屏下界面模糊、控件错位。
+    使用 shcore 优先（Win8.1+），失败降级 user32.SetProcessDPIAware。
+    非 Windows / 任何失败均静默（不影响启动）。
+    """
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        # 先试 shcore（Win8.1+ 逐显示器感知），失败再兜底 user32
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _apply_dpi_scaling(root):
+    """按系统 DPI 校正 Tk 缩放因子（A1）。
+
+    Tk 默认 1.0；Windows 高 DPI 下需按 `tk scaling` 比例放大，
+    使字体/控件随物理像素变清晰。读取失败静默回退默认。
+    为防止因多显示器或虚拟环境导致的异常 DPI 导致界面缩放错误，
+    若检测到 dpi 极值（< 80 或 > 200）则跳过缩放调整。
+    """
+    try:
+        dpi = root.winfo_fpixels('1i') if hasattr(root, 'winfo_fpixels') else 96.0
+        # 畸值保护：虚拟/远程环境中常出现的异常 DPI 会导致界面缩放错乱
+        if dpi and 80 <= dpi <= 200:
+            factor = dpi / 96.0
+            current = float(root.tk.call('tk', 'scaling')) or 1.0
+            root.tk.call('tk', 'scaling', current * factor)
+    except Exception:
+        pass
+
+
 def main():
     """启动排列5 AI智能分析系统GUI应用程序"""
+    _enable_windows_dpi_awareness()
     root = tk.Tk()
+    _apply_dpi_scaling(root)
     _set_window_icon(root)
     app = LotteryGUI(root)
     # 强制刷新一次，确保窗口首帧渲染完成，避免白屏
     root.update_idletasks()
+
+    # 冻结（PyInstaller）首次运行：config/.env 缺失时已生成空白模板，
+    # 此处给出明确引导，避免「数据库未连接」在无控制台环境下静默无解释。
+    # 源码运行 FIRST_RUN_ENV_CREATED 恒为 False，不会打扰开发者。
+    if FIRST_RUN_ENV_CREATED:
+        # 标题栏标记 + 日志双通道提示：即使模态弹窗在当前会话不可见，
+        # 也不会出现「配置缺失却无任何用户可见提示」的静默失败
+        try:
+            root.title(f"{root.title()}  【请先配置 config/.env】")
+        except Exception:
+            logging.getLogger("__main__").exception("[首次运行] 标题栏提示失败")
+        logging.getLogger("__main__").warning(
+            "[首次运行] 已生成 config/.env 空白模板: %s，请填写 DB_PASSWORD 与 "
+            "AGNES_API_KEY 后重启程序", ENV_FILE_PATH)
+        try:
+            messagebox.showwarning(
+                "首次运行：请填写配置",
+                "未找到配置文件，已生成空白模板：\n\n"
+                f"{ENV_FILE_PATH}\n\n"
+                "请填写数据库密码（DB_PASSWORD）与 AI 接口密钥（AGNES_API_KEY）"
+                "后重启程序。\n未填写时界面可启动，但数据库与 AI 相关功能不可用。"
+            )
+        except Exception:
+            # 窗口模式/受限桌面下弹窗可能不可用，记录异常而不是静默吞掉
+            logging.getLogger("__main__").exception("[首次运行] 配置引导弹窗展示失败")
 
     def on_closing():
         """窗口关闭时优雅关闭线程池；有任务运行时先警示确认（v3.25）"""

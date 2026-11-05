@@ -14,6 +14,7 @@ import copy
 import hashlib
 import logging
 import math
+import os
 import threading
 import numpy as np
 from collections import OrderedDict, defaultdict, Counter
@@ -30,16 +31,16 @@ def _load_feature_cache_config() -> Dict[str, Any]:
 
     返回:
         {'enabled': bool, 'capacity': int}；config 不可用或键缺失时
-        回退安全默认（开启缓存、容量 8，与 config.py 默认口径一致）。
+        回退安全默认（开启缓存、容量 256，与 config.py 默认口径一致）。
     """
     try:
         from config import FEATURE_CACHE_CONFIG as _cfg
         enabled = bool(_cfg.get('enabled', True))
-        capacity = int(_cfg.get('capacity', 8))
+        capacity = int(_cfg.get('capacity', 256))
     except Exception:
         # config 未加载/键缺失：保持保守默认，不影响特征正确性
         enabled = True
-        capacity = 8
+        capacity = 256
     return {'enabled': enabled, 'capacity': max(1, capacity)}
 
 
@@ -48,8 +49,9 @@ class P5FeatureCache:
     进程内 LRU 特征缓存（v5.2 ALG-04）
 
     设计要点:
-      - 容量默认 8（方案口径）：覆盖单次预测/回测中常见的一组活跃
-        history 指纹，超出容量按 LRU 淘汰，避免长任务内存无界增长;
+      - 容量默认 256（单条约 72KB，满载约 18MB）：覆盖回测重跑/断点重试的
+        典型窗口数，超出容量按 LRU 淘汰，避免长任务内存无界增长;
+        顺序 walk-forward 每窗口指纹唯一，首次运行命中率为 0（见 benchmark）;
       - 线程安全: 所有读写经 RLock 保护, GUI 后台任务/流水线多线程
         并发调用 extract_all_features 时不产生竞态;
       - 存取深拷贝: put 存原件, get 返回 deepcopy 副本, 调用方对返回值
@@ -57,7 +59,7 @@ class P5FeatureCache:
       - 命中统计: hits/misses 计数器供埋点与 A28/A29 验收使用。
     """
 
-    def __init__(self, capacity: int = 8):
+    def __init__(self, capacity: int = 256):
         """初始化 LRU 缓存
 
         参数:
@@ -366,22 +368,39 @@ class P5Features:
         Returns:
             各号码的历史最大遗漏
         """
+        # 等价重构：旧版每处理一期都对 10 个号码逐个「自增/清零」（O(10N)）；
+        # 本版只在该位置实际出现的号码上结算一次间隔（O(N)），常数缩小约 10 倍，
+        # 且与旧语义逐值等价：
+        #   - 首次出现前的空窗 = 首次索引（prev 初值 -1 → idx - prev - 1）
+        #   - 两次出现之间的空窗 = idx - prev - 1
+        #   - 末尾未回补空窗 = total - 1 - prev（从未出现时恰为 total）
         max_omissions = {num: 0 for num in self.number_range}
-        current_omissions = {num: 0 for num in self.number_range}
+        prev_idx = {num: -1 for num in self.number_range}
+        # 只统计「有效行」（旧版对缺失 numbers 的行直接跳过、不累加计数器），
+        # 因此用有效行序号而非原始下标计算间隔，保证与旧语义逐值等价
+        total = 0
 
         for item in data:
             numbers = item.get('numbers', [])
             if len(numbers) == self.positions:
-                num = int(numbers[position])
+                idx = total
+                total += 1
+                try:
+                    num = int(numbers[position])
+                except (TypeError, ValueError):
+                    continue
+                # 越界号码旧版按「非该号」处理（所有计数器自增），与这里的跳过等价
+                if num in prev_idx:
+                    gap = idx - prev_idx[num] - 1
+                    if gap > max_omissions[num]:
+                        max_omissions[num] = gap
+                    prev_idx[num] = idx
 
-                # 更新最大遗漏
-                for n in self.number_range:
-                    if n == num:
-                        current_omissions[n] = 0
-                    else:
-                        current_omissions[n] += 1
-                        if current_omissions[n] > max_omissions[n]:
-                            max_omissions[n] = current_omissions[n]
+        # 结算末尾未回补空窗
+        for num in self.number_range:
+            trailing = total - 1 - prev_idx[num]
+            if trailing > max_omissions[num]:
+                max_omissions[num] = trailing
 
         return max_omissions
 
@@ -3135,6 +3154,238 @@ class P5Features:
             return int(data[idx - 1]['numbers'][0])
 
         return None
+
+
+# ============================================================================
+# B1 特征工程体系重构 —— 特征注册表 + 去共线开关 + 标准化
+# ----------------------------------------------------------------------------
+# 设计原则（非侵入式）：
+#   * 不改变 extract_all_features 的既有行为与返回结构；
+#   * 提供集中式元数据注册表：分组名 → 类别 / 共线标记 / 是否数值；
+#   * 标准化：数值特征 Z-score（供 ml_predictor 提升 GBM 训练稳定性）；
+#   * 去共线开关：DROP_COLLINEAR 默认 False（默认不改变行为），
+#     开启后剔除与 frequency 高度共线的分组（避免重复计数）。
+# ============================================================================
+
+# 特征分组注册表（B1 核心元数据）
+# key: extract_all_features 输出中的分组名
+# value: {category, numeric, collinear_with_frequency, description}
+FEATURE_GROUP_REGISTRY: Dict[str, Dict[str, Any]] = {
+    'frequency': {'category': 'basic', 'numeric': True, 'collinear_with_frequency': True,
+                  'description': '基础频率分布（热冷号）'},
+    'omission': {'category': 'basic', 'numeric': True, 'collinear_with_frequency': False,
+                 'description': '遗漏统计'},
+    'road_012': {'category': 'advanced', 'numeric': True, 'collinear_with_frequency': False,
+                 'description': '012路分布'},
+    'consecutive': {'category': 'advanced', 'numeric': True, 'collinear_with_frequency': False,
+                    'description': '连号特征'},
+    'repeat': {'category': 'advanced', 'numeric': True, 'collinear_with_frequency': False,
+               'description': '重号特征'},
+    'interval': {'category': 'advanced', 'numeric': True, 'collinear_with_frequency': False,
+                 'description': '间隔特征'},
+    'sliding_window': {'category': 'time_series', 'numeric': True, 'collinear_with_frequency': False,
+                       'description': '滑动窗口统计'},
+    'trend': {'category': 'time_series', 'numeric': True, 'collinear_with_frequency': False,
+              'description': '趋势动量'},
+    'rolling_statistics': {'category': 'time_series', 'numeric': True, 'collinear_with_frequency': False,
+                           'description': '滚动统计特征'},
+    'cross_position': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                       'description': '位置交叉特征'},
+    'sum_span': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                 'description': '和值跨度特征'},
+    'position_chain': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                       'description': '位置链关联'},
+    'recent_form': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                    'description': '近期形态标记'},
+    'timing': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+               'description': '时序特征'},
+    'interaction': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                    'description': '交互特征'},
+    'position_pair': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                      'description': '位置对特征'},
+    'state': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+              'description': '状态特征'},
+    'contextual': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                   'description': '上下文特征'},
+    'constraint_correlation': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                               'description': '组合约束交叉'},
+    'digit_characteristic': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                             'description': '数字特性'},
+    'joint_frequency': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': True,
+                        'description': '频率分布交叉（与频率潜在共线）'},
+    'trend_association': {'category': 'cross', 'numeric': True, 'collinear_with_frequency': False,
+                          'description': '趋势关联'},
+}
+
+
+# 去共线开关：默认 False（不改变现有行为）；由 config 环境变量覆盖
+def get_drop_collinear() -> bool:
+    """读取去共线开关（默认 False；FEATURE_DROP_COLLINEAR=1 或 config 覆盖开启）。"""
+    try:
+        if os.environ.get('FEATURE_DROP_COLLINEAR', '').strip() in ('1', 'true', 'True'):
+            return True
+        from config import FEATURE_DROP_COLLINEAR
+        return bool(FEATURE_DROP_COLLINEAR)
+    except Exception:
+        return False
+
+
+def drop_collinear_groups(group_names: List[str]) -> List[str]:
+    """按去共线开关过滤特征分组（剔除与 frequency 共线的分组）。
+
+    Args:
+        group_names: 现有分组名列表（extract_all_features 的键）。
+
+    Returns:
+        过滤后的分组名列表；开关关闭时原样返回（默认行为不变）。
+    """
+    if not get_drop_collinear():
+        return list(group_names)
+    result = []
+    for name in group_names:
+        meta = FEATURE_GROUP_REGISTRY.get(name, {})
+        # 只剔除"非基础"且与 frequency 共线的分组（保留 frequency 本身与基础统计）
+        if meta.get('collinear_with_frequency') and meta.get('category') != 'basic':
+            continue
+        result.append(name)
+    return result
+
+
+def standardize_feature_vector(
+    features: Dict[str, Any],
+    group_names: Optional[List[str]] = None,
+    eps: float = 1e-8,
+) -> Dict[str, Any]:
+    """数值特征 Z-score 标准化（B1，供 ml_predictor 消费）。
+
+    对每个特征分组内可转数值的叶子做标准化（-mean）/（std+eps），
+    提升 GBM 等基于梯度的方法在量纲差异大时的训练稳定性。
+
+    Args:
+        features: extract_all_features 输出。
+        group_names: 参与标准化的分组名（None = 全部注册表分组）。
+        eps: 防除零。
+
+    Returns:
+        新字典（不修改入参）；仅含可数值化的叶子，分类/字符串保留原样。
+    """
+    if group_names is None:
+        group_names = list(FEATURE_GROUP_REGISTRY.keys())
+    result: Dict[str, Any] = {}
+
+    def _standardize_leaf(val: Any) -> Any:
+        """单叶子：数值→Z-score；dict/list 递归；其他原样。"""
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, dict):
+            return {k: _standardize_leaf(v) for k, v in val.items()}
+        if isinstance(val, list):
+            return [_standardize_leaf(v) for v in val]
+        return val
+
+    for name in group_names:
+        if name not in features:
+            continue
+        group = features[name]
+        result[name] = group
+
+    # 第二遍：对数值叶子做 Z-score（基于分组内同类叶子集合）
+    # 简化实现：对每个数值叶子先收集同类集合再标准化，避免逐叶子孤立标准化
+    # 破坏分布。这里采用"分组内所有数值叶子统一 mean/std"。
+    for name in group_names:
+        if name not in features:
+            continue
+        group = features[name]
+        # 收集分组内全部数值叶子
+        num_leaves: List[float] = []
+
+        def _collect(v: Any) -> None:
+            if isinstance(v, bool):
+                return
+            if isinstance(v, (int, float)):
+                num_leaves.append(float(v))
+            elif isinstance(v, dict):
+                for vv in v.values():
+                    _collect(vv)
+            elif isinstance(v, list):
+                for vv in v:
+                    _collect(vv)
+        _collect(group)
+
+        if not num_leaves:
+            continue
+        arr = np.array(num_leaves, dtype=float)
+        mean = float(arr.mean())
+        std = float(arr.std())
+        if std < eps:
+            continue  # 常量特征跳过
+
+        result[name] = _standardize_group(group, mean, std)
+
+    return result
+
+
+def _standardize_group(group: Any, mean: float, std: float) -> Any:
+    """对分组内数值叶子应用 Z-score（递归）。"""
+    if isinstance(group, bool):
+        return group
+    if isinstance(group, (int, float)):
+        return round((float(group) - mean) / std, 6)
+    if isinstance(group, dict):
+        return {k: _standardize_group(v, mean, std) for k, v in group.items()}
+    if isinstance(group, list):
+        return [_standardize_group(v, mean, std) for v in group]
+    return group
+
+
+def feature_group_categories() -> Dict[str, str]:
+    """返回分组名 → 类别映射（供可视化/报告用）。"""
+    return {k: v.get('category', 'other') for k, v in FEATURE_GROUP_REGISTRY.items()}
+
+
+def measure_feature_extraction_perf(
+    data: List[Dict],
+    windows: List[int] = [5, 10, 20, 50],
+    repeat: int = 2,
+) -> Dict[str, Any]:
+    """测量特征提取性能（B3 性能可观测性）。
+
+    对同一 history 先做首次全量提取（冷），再重复提取以测缓存命中
+    收益（热），输出首次/命中耗时与缓存降幅。供诊断/报告消费，
+    不修改任何全局状态（缓存按指纹幂等，重复调用命中既有缓存）。
+
+    参数:
+        data: 历史数据列表
+        windows: 滑动窗口
+        repeat: 缓存命中重复次数（>=1）
+
+    返回:
+        {first_ms, hit_ms, speedup_pct, cache_hit: bool}
+    """
+    import time
+    fe = P5Features()
+    t0 = time.perf_counter()
+    fe.extract_all_features(data, windows=windows)
+    first_ms = (time.perf_counter() - t0) * 1000.0
+
+    # 热路径：再次调用应命中指纹缓存
+    t0 = time.perf_counter()
+    for _ in range(max(1, repeat)):
+        fe.extract_all_features(data, windows=windows)
+    hit_ms = (time.perf_counter() - t0) * 1000.0 / max(1, repeat)
+
+    speedup_pct = 0.0
+    if first_ms > 0:
+        speedup_pct = round((1.0 - hit_ms / first_ms) * 100.0, 1)
+    return {
+        'first_ms': round(first_ms, 1),
+        'hit_ms': round(hit_ms, 1),
+        'speedup_pct': speedup_pct,
+        'cache_hit': speedup_pct > 50.0,
+    }
+
 
 if __name__ == '__main__':
     # 测试特征工程

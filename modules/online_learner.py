@@ -348,14 +348,46 @@ class OnlineLearner:
             logger.warning(f'estimate_attribution_coverage 异常: {e}')
             return _empty
 
+    @staticmethod
+    def _normalize_fused_probs(fused_probs: Any) -> List[Dict[int, float]]:
+        """把 fused_probabilities 统一归一为 [{int: float}]，并丢弃非法项。
+
+        根因：p5_prediction_record.fused_probabilities 与 AI 报告均以 JSON 落库，
+        JSON 对象的键一律被序列化为字符串（'0'..'9'）。从库/JSON 回读后再与
+        int 型开奖号码比较，会恒不相等，使 Top-1 / Top-3 命中恒为 0（隐性问题）。
+        本方法只做键/值规范化，对内存态（int 键）输入结果完全等价。
+        """
+        if not isinstance(fused_probs, (list, tuple)):
+            return []
+        normalized: List[Dict[int, float]] = []
+        for pos_probs in fused_probs:
+            if not isinstance(pos_probs, dict):
+                normalized.append({})
+                continue
+            pos: Dict[int, float] = {}
+            for num, prob in pos_probs.items():
+                try:
+                    n = int(num)
+                    p = float(prob)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= n <= 9 and p == p and abs(p) != float('inf'):
+                    pos[n] = p
+            normalized.append(pos)
+        return normalized
+
     def _calculate_hits(self, prediction_record: Dict, actual_numbers: List[int]) -> Dict[str, Any]:
         """计算基础命中统计（双口径分离）
 
-        口径说明（v3.67）：
-        - partial_hits : 覆盖口径（Top-3 集合包含），仅作"宽松参考"，保留旧语义
+        口径说明（docs/hitrate_spec.md §3 为唯一权威）：
+        - partial_hits : Top-3 覆盖口径（实际号落入该位置概率前 3 集合），5 位累加
         - top1_hits    : Top-1 真实口径（首推号精确命中），反映真实预测力
+        - exact_match  : 推荐组合 5 位全等（仅作展示）
         - recommendation_quality : 改由 Top-1 口径评级，避免被覆盖口径虚高污染
           下游 _update_trend_knowledge_model / _update_hit_rate_statistics 自强化
+        修复：旧实现会在推荐组合 match_count>=3 时用 max() 抬升 partial_hits，
+        使「覆盖口径」混入组合匹配信号、破坏 partial_hits 的唯一定义；
+        现仅保留 Top-3 单元覆盖，保证 partial_hits >= top1_hits 不变量。
         """
         result = {
             'target_issue': prediction_record.get('target_issue'),
@@ -368,10 +400,19 @@ class OnlineLearner:
             'recommendation_quality': 'unknown'
         }
         
-        # 检查各位置命中
-        fused_probs = prediction_record.get('fused_probabilities', [])
+        # 检查各位置命中（JSON 回读的字符串键在此统一转 int，避免命中断言恒 False）
+        fused_probs = self._normalize_fused_probs(
+            prediction_record.get('fused_probabilities', []))
         top_combos = prediction_record.get('top_combinations', [])
-        
+
+        # 防御：开奖号码不足 5 位时直接返回 unknown，避免逐位索引抛 IndexError
+        # 使整条「验证→学习」闭环中断（数据缺失应显式可见，而非静默记 0 命中）。
+        if not isinstance(actual_numbers, (list, tuple)) or len(actual_numbers) < 5:
+            logger.warning(
+                f'命中计算跳过: 开奖号码不足5位 (issue={prediction_record.get("target_issue")}, '
+                f'actual={actual_numbers})')
+            return result
+
         for pos_idx in range(5):
             pos_name = ['万位', '千位', '百位', '十位', '个位'][pos_idx]
             actual_num = actual_numbers[pos_idx]
@@ -397,14 +438,20 @@ class OnlineLearner:
             if pos_top1_hit:
                 result['top1_hits'] += 1
         
-        # 检查推荐组合
+        # 检查推荐组合（组合号码同样可能来自 JSON，统一转 int 后逐位精确比对）
         for combo in top_combos[:5]:
+            if not isinstance(combo, dict):
+                continue
             combo_nums = combo.get('numbers', [])
+            try:
+                combo_nums = [int(n) for n in combo_nums]
+            except (TypeError, ValueError):
+                continue
             match_count = sum(1 for i in range(5) if i < len(combo_nums) and combo_nums[i] == actual_numbers[i])
             if match_count == 5:
+                # 仅完全命中计入 exact_match；部分命中（含 >=3 位）不再抬升 partial_hits，
+                # 否则同一字段同时承载「单元覆盖」与「组合匹配」两种信号（spec §3 禁止）。
                 result['exact_match'] += 1
-            elif match_count >= 3:
-                result['partial_hits'] = max(result['partial_hits'], match_count)
         
         # 评估推荐质量 —— 改用 Top-1 真实口径评级（覆盖口径虚高会误判为 good/fair）
         # 排列5 公平摇号, Top-1 理论基线≈10%/位, exact_match 全中≈10^-5 级
@@ -645,8 +692,11 @@ class OnlineLearner:
             'common_failure_types': []
         }
         
-        fused_probs = prediction_record.get('fused_probabilities', [])
-        
+        fused_probs = self._normalize_fused_probs(
+            prediction_record.get('fused_probabilities', []))
+        if not isinstance(actual_numbers, (list, tuple)) or len(actual_numbers) < 5:
+            return patterns
+
         for pos_idx in range(5):
             actual_num = actual_numbers[pos_idx]
             pos_probs = fused_probs[pos_idx] if pos_idx < len(fused_probs) else {}

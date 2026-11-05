@@ -38,6 +38,9 @@ from modules import ui_styles
 from modules.ui_theme_spec import (
     SUCCESS_STATIC,
     WHITE,
+    SPACING,
+    UI_FONT,
+    MONO_FONT,
     button_style_map,
 )
 from version import get_current_version
@@ -50,7 +53,9 @@ if "main" not in _sys.modules:
     _host = _sys.modules.get("__main__")
     _host_file = str(getattr(_host, "__file__", "") or "").replace(
         "\\", "/")
-    if _host_file.endswith("/main.py"):
+    # 冻结（PyInstaller）后 __main__.__file__ 指向 exe 而非 main.py，
+    # 必须同样注册别名，否则 `import main` 会二次导入失败/产生双实例
+    if _host_file.endswith("/main.py") or getattr(_sys, 'frozen', False):
         _sys.modules["main"] = _host
 # S1 实测：经 setdefault 注册后同一模块实例（含 rebind 后新 COLORS）
 import main as _main_mod  # noqa: E402  双模块陷阱破解后的正式引用
@@ -63,21 +68,20 @@ class OutputPanelMixin:
     自身不构造 tk 视图、不持有状态（状态仍在 main.LotteryGUI）。
     """
     def _build_header(self, parent):
-        """构建顶部标题栏（Logo + 系统名称 + 副标题 + 版本号 + 实时时钟）
+        """构建顶部标题栏（Logo + 系统名称 + 副标题 + 版本号 + 实时时钟）。
 
-        修复说明(v3.8):
-        - 原 header 高度固定 50px 且 pack_propagate(False)，在 Windows 高 DPI
-          缩放下标题(13pt)+副标题(8pt)实际像素增高，导致副标题底部被裁切。
-        - 现将高度提升到 60px 并收紧内边距，保证副标题完整可见。
-        - 右侧新增版本号显示（get_current_version()），与时钟纵向排列，风格统一。
+        布局采用 grid：左侧 Logo+标题（weight=0），右侧风险徽章+版本+主题+时钟（weight=1）。
+        顶部高度固定 60px，横向占满。
         """
         COLORS = _main_mod.COLORS
         header = tk.Frame(parent, bg=COLORS['bg_secondary'], height=60)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
+        header.grid(row=0, column=0, sticky='ew')
+        header.grid_propagate(False)
+        header.grid_columnconfigure(0, weight=0)
+        header.grid_columnconfigure(1, weight=1)
 
         left = tk.Frame(header, bg=COLORS['bg_secondary'])
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=12)
+        left.grid(row=0, column=0, sticky='w', padx=12)
 
         # Logo: Canvas 圆角渐变色块 + 文字，优化视觉
         icon = tk.Canvas(left, width=40, height=40, bg=COLORS['bg_secondary'],
@@ -87,70 +91,209 @@ class OutputPanelMixin:
         icon.create_oval(4, 4, 36, 36, fill=COLORS['accent_p5'], outline='', width=0)
         # 内层 AI 紫叠加
         icon.create_oval(8, 8, 32, 32, fill=COLORS['accent_ai'], outline='', width=0)
-        icon.create_text(20, 20, text='5', font=('Consolas', 16, 'bold'), fill=WHITE)
+        icon.create_text(20, 20, text='5', font=(MONO_FONT, 16, 'bold'), fill=WHITE)
 
         title_box = tk.Frame(left, bg=COLORS['bg_secondary'])
         title_box.pack(side=tk.LEFT, padx=(10, 0), pady=0)
 
         tk.Label(title_box, text="排列5 AI智能分析系统",
-                 font=('微软雅黑', 14, 'bold'),
+                 font=(UI_FONT, 14, 'bold'),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_primary']).pack(anchor=tk.W)
 
         tk.Label(title_box, text="七算法融合 · 概率建模 · 诚实边界",
-                 font=('微软雅黑', 9),
+                 font=(UI_FONT, 9),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_muted']).pack(anchor=tk.W)
 
-        # 右侧：版本号 + 实时时钟（纵向排列）
+        # v5.3 GUI-UX：右侧信息区由「纵向 4 项」改为「横向单行」。
+        # 原实现 4 个控件纵向 pady 累加后请求高度 114px，而 header 固定
+        # 60px 且 grid_propagate(False)，导致时钟/版本被裁掉一半；
+        # 单行后请求高度约 35px，在 60px 内垂直居中，宽屏/窄屏均不溢出。
         right = tk.Frame(header, bg=COLORS['bg_secondary'])
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=12)
+        right.grid(row=0, column=1, sticky='e', padx=12)
 
-        # 风险提示徽章：圆角胶囊样式
+        # 风险提示徽章：描边胶囊，点击展开完整免责声明
         risk_badge = tk.Canvas(right, width=60, height=22, bg=COLORS['bg_secondary'], highlightthickness=0)
         risk_badge.create_rectangle(1, 1, 59, 21, fill=COLORS['bg_secondary'], outline=COLORS['accent_warning'], width=1)
-        risk_badge.create_text(30, 11, text='⚠ 随机事件', font=('微软雅黑', 8, 'bold'), fill=COLORS['accent_warning'])
-        risk_badge.pack(anchor=tk.E, pady=(6, 2))
+        risk_badge.create_text(30, 11, text='⚠ 随机事件', font=(UI_FONT, 8, 'bold'), fill=COLORS['accent_warning'])
+        risk_badge.pack(side=tk.LEFT, padx=(0, 10))
         risk_badge.bind('<Button-1>', lambda e: messagebox.showinfo('风险提示', '排列五开奖为完全随机的概率事件，历史数据不影响未来开奖结果，本系统所有统计分析与模拟号码仅供娱乐与学术研究，不构成任何购彩建议。请理性购彩，量力而行。'))
 
-        self.version_label = tk.Label(right, text=f"v{get_current_version()}",
-                 font=('微软雅黑', 9, 'bold'),
+        # 版本号：get_current_version() 已带 'v' 前缀，原 f"v{...}" 渲染为 "vv5.1"
+        self.version_label = tk.Label(right, text=get_current_version(),
+                 font=(UI_FONT, 9, 'bold'),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['accent_p5'])
-        self.version_label.pack(anchor=tk.E, pady=(2, 0))
+        self.version_label.pack(side=tk.LEFT, padx=(0, 8))
 
-        # 主题切换按钮：显示 emoji
-        self._theme_btn = tk.Button(right, text="☀️",
-                                    font=('微软雅黑', 12),
+        # 主题切换按钮（v5.3 GUI-UX 第二批）：由 emoji 改为 Canvas 自绘图标。
+        # 原因：☀️/🌙 在 Windows/macOS/Linux 分别走 Segoe UI Emoji / Apple Color
+        # Emoji / Noto Color Emoji，字形、基线、彩色程度差异明显；Canvas 线条
+        # 绘制只依赖 Tk 原生图元，三平台形状与尺寸完全一致，且不新增依赖。
+        # 图标语义：显示「点击后将切换到的目标主题」——浅色时画月亮，深色时画太阳。
+        self._theme_btn = tk.Canvas(right, width=32, height=28,
                                     bg=COLORS['bg_secondary'],
-                                    fg=COLORS['text_secondary'],
-                                    relief='flat',
-                                    cursor='hand2',
-                                    padx=4, pady=0,
-                                    command=self._toggle_theme)
-        self._theme_btn.pack(anchor=tk.E, pady=(2, 0))
+                                    highlightthickness=1,
+                                    highlightbackground=COLORS['border'],
+                                    highlightcolor=COLORS['accent_p5'],
+                                    cursor='hand2', takefocus=1,
+                                    bd=0)
+        self._theme_btn.pack(side=tk.LEFT)
+        # 键盘可访问：Tab 聚焦后 Enter / 空格均可切换；Tk 无跨平台
+        # accessible-name API，这里用 tooltip + 键盘绑定 + 焦点描边提供等价语义。
+        self._theme_btn._a11y_label = '切换主题（浅色/深色）'
+        self._theme_btn.bind('<Button-1>', self._on_theme_btn_click)
+        self._theme_btn.bind('<Return>', self._on_theme_btn_click)
+        self._theme_btn.bind('<space>', self._on_theme_btn_click)
+        self._theme_btn.bind('<FocusIn>', lambda e: self._theme_btn.configure(
+            highlightbackground=_main_mod.COLORS['accent_p5']))
+        self._theme_btn.bind('<FocusOut>', lambda e: self._theme_btn.configure(
+            highlightbackground=_main_mod.COLORS['border']))
+        self._bind_theme_tooltip()
+        self._draw_theme_icon()
 
         self.time_label = tk.Label(right, text="",
-                                   font=('Consolas', 9),
+                                   font=(MONO_FONT, 9),
                                    bg=COLORS['bg_secondary'],
                                    fg=COLORS['text_secondary'])
-        self.time_label.pack(anchor=tk.E, pady=(2, 0))
+        self.time_label.pack(side=tk.LEFT, padx=(10, 0))
         self._update_time()
 
+    def _on_theme_btn_click(self, _event=None):
+        """主题图标按钮的统一入口：鼠标 / Enter / 空格共用。"""
+        try:
+            self._hide_theme_tip_now()
+            self._theme_btn.focus_set()
+            self._toggle_theme()
+        except Exception:
+            pass
+        return 'break'
+
+    def _draw_theme_icon(self):
+        """按当前主题重绘 Canvas 自绘图标（v5.3 GUI-UX 第二批）。
+
+        - 当前浅色 → 画「月亮」，表示点击后切到深色；
+        - 当前深色 → 画「太阳」，表示点击后切到浅色。
+        所有几何坐标固定，不依赖字体，保证三平台字形完全一致；
+        切换主题后由 main._apply_theme 末尾的 _sync_theme_icon 重新调用。
+        """
+        cv = getattr(self, '_theme_btn', None)
+        if cv is None:
+            return
+        try:
+            if not cv.winfo_exists():
+                return
+        except Exception:
+            return
+        COLORS = _main_mod.COLORS
+        try:
+            cv.delete('icon')
+            cv.configure(bg=COLORS['bg_secondary'])
+            if self._current_theme == 'dark':
+                # 太阳：实心圆 + 8 道短射线
+                self._theme_icon_state = 'sun'
+                fill = COLORS['accent_warning']
+                for x1, y1, x2, y2 in (
+                    (16, 2, 16, 6), (16, 22, 16, 26),
+                    (4, 14, 8, 14), (24, 14, 28, 14),
+                    (8, 6, 11, 9), (21, 9, 24, 6),
+                    (8, 22, 11, 19), (21, 19, 24, 22),
+                ):
+                    cv.create_line(x1, y1, x2, y2, fill=fill,
+                                   width=2, capstyle=tk.ROUND, tags='icon')
+                cv.create_oval(11, 9, 21, 19, fill=fill, outline='', tags='icon')
+            else:
+                # 月亮：实心圆用背景色再挖出一个偏移圆，形成月牙
+                self._theme_icon_state = 'moon'
+                cv.create_oval(9, 5, 23, 19, fill=COLORS['text_secondary'],
+                               outline='', tags='icon')
+                cv.create_oval(15, 2, 29, 16, fill=COLORS['bg_secondary'],
+                               outline='', tags='icon')
+        except Exception:
+            pass
+
+    def _bind_theme_tooltip(self):
+        """为主题图标绑定轻量 tooltip（350ms 延迟，纯 Tk Toplevel）。"""
+        self._theme_tip = None
+        self._theme_tip_after = None
+
+        def _hide(_event=None):
+            if self._theme_tip_after:
+                try:
+                    self.root.after_cancel(self._theme_tip_after)
+                except Exception:
+                    pass
+                self._theme_tip_after = None
+            if self._theme_tip is not None:
+                try:
+                    self._theme_tip.destroy()
+                except Exception:
+                    pass
+                self._theme_tip = None
+
+        def _popup():
+            self._theme_tip_after = None
+            try:
+                if not self._theme_btn.winfo_exists():
+                    return
+                COLORS = _main_mod.COLORS
+                tip = tk.Toplevel(self.root)
+                tip.wm_overrideredirect(True)
+                try:
+                    tip.attributes('-topmost', True)
+                except Exception:
+                    pass
+                x = self._theme_btn.winfo_rootx() + 16
+                y = self._theme_btn.winfo_rooty() + self._theme_btn.winfo_height() + 6
+                tip.geometry(f'+{x}+{y}')
+                tk.Label(tip, text='切换主题：浅色 / 深色\nTab 聚焦后可按 Enter 或空格',
+                         font=(UI_FONT, 9), bg=COLORS['bg_card'],
+                         fg=COLORS['text_primary'],
+                         highlightbackground=COLORS['accent_p5'],
+                         highlightthickness=1, padx=8, pady=5,
+                         justify=tk.LEFT).pack()
+                self._theme_tip = tip
+            except Exception:
+                self._theme_tip = None
+
+        def _show(_event=None):
+            _hide()
+            self._theme_tip_after = self.root.after(350, _popup)
+
+        self._theme_btn.bind('<Enter>', _show)
+        self._theme_btn.bind('<Leave>', _hide)
+        self._theme_btn.bind('<Button-1>', _hide, add='+')
+        self._theme_btn.bind('<Destroy>', _hide, add='+')
+        # 用独立属性名，避免覆盖类方法；供点击入口主动收起 tooltip。
+        self._hide_theme_tip_now = _hide
+
     def _build_content(self, parent):
-        """构建中部内容区：左侧控制面板（可滚动，280px）+ 右侧输出面板（自适应）"""
+        """构建中部内容区：左侧控制面板（可滚动，固定最小宽度）+ 右侧输出面板（自适应）。
+
+        响应式 grid 布局：左栏 weight=0（固定 minsize 260，窗口<1000px 时折叠），
+        右栏 weight=1（随窗口横向撑开）。
+        """
         COLORS = _main_mod.COLORS
         content = tk.Frame(parent, bg=COLORS['bg_primary'])
-        content.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        # 【BUGFIX】原代码缺少此行，导致 content.Frame 未被 grid 到 parent，
+        # 中部内容区（左栏+右栏+Notebook）全部 1x1 不可见。
+        content.grid(row=1, column=0, sticky='nsew')
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(0, weight=0)  # 左栏固定宽度
+        content.grid_columnconfigure(1, weight=1)  # 右栏自适应撑开
 
-        # 左侧控制面板（可滚动，固定宽度280px）
-        left_container = tk.Frame(content, bg=COLORS['bg_primary'], width=280)
-        left_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
-        left_container.pack_propagate(False)
+        # 左侧控制面板（可滚动，固定最小宽度 260px）
+        left_container = tk.Frame(content, bg=COLORS['bg_primary'], width=260)
+        left_container.grid(row=0, column=0, sticky='ns', padx=(0, 8))
+        left_container.grid_propagate(False)
+        left_container.grid_rowconfigure(0, weight=1)
+        left_container.grid_columnconfigure(0, weight=1)
+        left_container.grid_columnconfigure(1, weight=0)
 
         # 创建Canvas+Scrollbar实现左侧面板滚动
         left_canvas = tk.Canvas(left_container, bg=COLORS['bg_primary'],
-                                highlightthickness=0, width=280)
+                                highlightthickness=0, width=260)
         left_scrollbar = tk.Scrollbar(left_container, orient='vertical',
                                       command=left_canvas.yview, width=10,
                                       bg=COLORS['bg_card'],
@@ -159,7 +302,13 @@ class OutputPanelMixin:
         left_canvas.configure(yscrollcommand=left_scrollbar.set)
 
         left_inner = tk.Frame(left_canvas, bg=COLORS['bg_primary'])
-        left_canvas.create_window((0, 0), window=left_inner, anchor='nw', width=270)
+        left_canvas.create_window((0, 0), window=left_inner, anchor='nw', width=250)
+        # v5.3 GUI-UX：登记响应式断点所需引用。原 `_apply_responsive_breakpoint`
+        # 通过 getattr(self, '_left_container') 取容器，但构建期从未赋值，
+        # 断点分支恒为空转（窗口缩放完全没有布局响应）。此处补登记。
+        self._left_container = left_container
+        self._left_canvas = left_canvas
+        self._left_wrap_labels = []  # 卡片内需要随栏宽更新 wraplength 的说明文字
 
         # 让内部Frame自适应Canvas宽度
         def _on_left_configure(event):
@@ -195,14 +344,14 @@ class OutputPanelMixin:
         left_canvas.bind('<Enter>', lambda e: left_canvas.bind_all('<MouseWheel>', _on_mousewheel))
         left_canvas.bind('<Leave>', lambda e: left_canvas.unbind_all('<MouseWheel>'))
 
-        left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        left_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        left_canvas.grid(row=0, column=0, sticky='nsew')
+        left_scrollbar.grid(row=0, column=1, sticky='ns')
 
         self._build_control_panel(left_inner)
 
         # 右侧输出面板（自适应宽度）
         right = tk.Frame(content, bg=COLORS['bg_primary'])
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right.grid(row=0, column=1, sticky='nsew')
 
         # 绑定窗口大小变化事件，优化布局响应
         def _on_resize(event):
@@ -264,7 +413,7 @@ class OutputPanelMixin:
         _crawl_status_row = tk.Frame(crawl_card, bg=COLORS['bg_secondary'])
         _crawl_status_row.pack(fill=tk.X, padx=10, pady=(6, 2))
         tk.Label(_crawl_status_row, textvariable=self.crawl_db_status_var,
-                 font=('微软雅黑', 8), bg=COLORS['bg_secondary'],
+                 font=(UI_FONT, 8), bg=COLORS['bg_secondary'],
                  fg=COLORS['text_secondary']).pack(side=tk.LEFT)
         self._create_toolbar_button(_crawl_status_row, " 数据概览", self._show_data_overview, 'secondary').pack(side=tk.RIGHT, padx=(0, 4))
         self.root.after(1500, self._refresh_crawl_status)
@@ -281,13 +430,14 @@ class OutputPanelMixin:
             lambda: self._on_button_click("智能分析", self._execute_unified_analysis),
             color_token='accent_p5')
 
-        tk.Label(p5_card,
-                 text="开始分析: 完整流程（含验证/学习/AI解读）",
-                 font=('微软雅黑', 8),
-                 bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_muted'],
-                 wraplength=240, justify=tk.CENTER
-                 ).pack(pady=(0, 8))
+        _p5_hint = tk.Label(p5_card,
+                            text="开始分析: 完整流程（含验证/学习/AI解读）",
+                            font=(UI_FONT, 8),
+                            bg=COLORS['bg_secondary'],
+                            fg=COLORS['text_muted'],
+                            wraplength=240, justify=tk.CENTER)
+        _p5_hint.pack(pady=(0, 8))
+        self._left_wrap_labels.append(_p5_hint)
 
         # 进度展示合并进智能分析中心卡片底部
         progress_row = tk.Frame(p5_card, bg=COLORS['bg_secondary'])
@@ -295,7 +445,7 @@ class OutputPanelMixin:
         self.progress = ttk.Progressbar(progress_row, mode='determinate', maximum=100)
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self.progress_label = tk.Label(progress_row, text="0%",
-                                       font=('Consolas', 11, 'bold'),
+                                       font=(MONO_FONT, 11, 'bold'),
                                        bg=COLORS['bg_secondary'],
                                        fg=COLORS['accent_p5'], width=4)
         self.progress_label.pack(side=tk.LEFT)
@@ -305,7 +455,7 @@ class OutputPanelMixin:
         # 反转管理；初始为灰化禁用态，空闲时不可点击。
         self._cancel_btn = tk.Button(progress_row, text="取消",
                                      command=self._cancel_current_task,
-                                     font=('微软雅黑', 9),
+                                     font=(UI_FONT, 9),
                                      bg=COLORS['bg_input'],
                                      fg=COLORS['text_disabled'],
                                      activebackground=COLORS['accent_danger'],
@@ -329,7 +479,7 @@ class OutputPanelMixin:
         self._update_card_badge(p5_card, "就绪", "badge_trial")
 
         self.task_status_label = tk.Label(p5_card, text="就绪",
-                                          font=('微软雅黑', 8),
+                                          font=(UI_FONT, 8),
                                           bg=COLORS['bg_secondary'],
                                           fg=COLORS['text_muted'])
         self.task_status_label.pack(anchor=tk.W, padx=10, pady=(4, 8))
@@ -342,7 +492,7 @@ class OutputPanelMixin:
 
         # 综合验证与分析按钮（一键执行「分析工具」全部子功能：验证→命中率→性能→回测→特征→报告）
         tk.Button(analysis_card, text=" 综合验证与分析",
-                  font=('微软雅黑', 10, 'bold'),
+                  font=(UI_FONT, 10, 'bold'),
                   bg=COLORS['accent_p5_light'], fg=WHITE,
                   activebackground=COLORS['accent_p5'], activeforeground=WHITE,
                   relief='flat', cursor='hand2',
@@ -352,13 +502,14 @@ class OutputPanelMixin:
                   padx=20, pady=8
                   ).pack(fill=tk.X, padx=10, pady=6)
 
-        tk.Label(analysis_card,
-                 text="一键执行：验证 · 统计 · 回测 · 特征 · 报告",
-                 font=('微软雅黑', 8),
-                 bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_muted'],
-                 wraplength=240, justify=tk.CENTER
-                 ).pack(pady=(0, 6))
+        _verify_hint = tk.Label(analysis_card,
+                                text="一键执行：验证 · 统计 · 回测 · 特征 · 报告",
+                                font=(UI_FONT, 8),
+                                bg=COLORS['bg_secondary'],
+                                fg=COLORS['text_muted'],
+                                wraplength=240, justify=tk.CENTER)
+        _verify_hint.pack(pady=(0, 6))
+        self._left_wrap_labels.append(_verify_hint)
 
         # 快捷入口：历史命中率
         quick_row = tk.Frame(analysis_card, bg=COLORS['bg_secondary'])
@@ -366,7 +517,7 @@ class OutputPanelMixin:
         for txt, cmd in [
             ("查看命中率", lambda: self._on_button_click("查看命中率", self._show_data_overview)),
         ]:
-            btn = tk.Button(quick_row, text=txt, font=('微软雅黑', 8),
+            btn = tk.Button(quick_row, text=txt, font=(UI_FONT, 8),
                             bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
                             relief='flat', cursor='hand2', command=cmd)
             btn.pack(side=tk.LEFT, padx=(0, 6))
@@ -395,30 +546,32 @@ class OutputPanelMixin:
             tk.Frame: 卡片框架
         """
         COLORS = _main_mod.COLORS
+        _sp = SPACING  # 间距栅格 token（xs4/sm8/md12/lg16/xl24）
         card = tk.Frame(parent, bg=COLORS['bg_secondary'],
                         highlightbackground=COLORS['border'],
                         highlightthickness=1,
                         relief='solid')
 
-        # 顶部彩色装饰条（3px高度，增强视觉层次）
+        # 顶部彩色装饰条（3px高度，增强视觉层次；装饰条为专用视觉参数，非间距）
         top_bar = tk.Frame(card, bg=accent_color, height=3)
         top_bar.pack(fill=tk.X)
         top_bar.pack_propagate(False)
 
         # 标题行（彩色圆点 + 标题文字 + 状态徽章占位）
+        # P2 收口：间距接入 SPACING 栅格（md 横向 / sm 纵向，贴合 4-8-12-16-24）
         title_frame = tk.Frame(card, bg=COLORS['bg_secondary'])
-        title_frame.pack(fill=tk.X, padx=10, pady=(8, 6))
+        title_frame.pack(fill=tk.X, padx=_sp.get('md', 12), pady=(_sp.get('sm', 8), _sp.get('xs', 4)))
 
-        dot = tk.Canvas(title_frame, width=8, height=8,
+        dot = tk.Canvas(title_frame, width=_sp.get('sm', 8), height=_sp.get('sm', 8),
                         bg=COLORS['bg_secondary'], highlightthickness=0)
-        dot.pack(side=tk.LEFT, padx=(0, 6))
+        dot.pack(side=tk.LEFT, padx=(0, _sp.get('xs', 4)))
         _dot_item = dot.create_oval(1, 1, 7, 7, fill=accent_color, outline='')
         # Canvas 绘图项不经控件树反查刷新：登记 token，切换主题后重放（GUI-06）
         if accent_token:
             self._register_theme_canvas_item(dot, _dot_item, accent_token)
 
         tk.Label(title_frame, text=title,
-                 font=('微软雅黑', 11, 'bold'),
+                 font=(UI_FONT, 11, 'bold'),
                  bg=COLORS['bg_secondary'],
                  fg=COLORS['text_primary']).pack(side=tk.LEFT)
 
@@ -430,11 +583,16 @@ class OutputPanelMixin:
         card._badge_placeholder = badge_placeholder
         card._card_title = title
 
-        # 卡片悬停微动效：仅改变边框高亮色，避免子控件背景覆盖问题
+        # 卡片悬停微动效：仅改变边框高亮色，避免子控件背景覆盖问题。
+        # v5.3 GUI-UX：hover 时按卡片自身 accent_token 实时取值，而不是统一
+        # 用 accent_p5（原实现所有卡片悬停都是绿色，与各自的装饰条语义冲突），
+        # 同时解决闭包捕获创建期 COLORS 快照、切换主题后 hover 色残留的问题。
         def _on_card_enter(e):
-            card.config(highlightbackground=COLORS['accent_p5'])
+            _c = _main_mod.COLORS
+            card.config(highlightbackground=_c.get(accent_token, accent_color)
+                        if accent_token else accent_color)
         def _on_card_leave(e):
-            card.config(highlightbackground=COLORS['border'])
+            card.config(highlightbackground=_main_mod.COLORS['border'])
         card.bind('<Enter>', _on_card_enter)
         card.bind('<Leave>', _on_card_leave)
 
@@ -462,7 +620,7 @@ class OutputPanelMixin:
             fg = COLORS['badge_trial_fg']
         
         badge = tk.Label(card._badge_placeholder, text=text,
-                        font=('微软雅黑', 8),
+                        font=(UI_FONT, 8),
                         bg=bg, fg=fg,
                         padx=6, pady=2)
         badge.pack(side=tk.RIGHT)
@@ -486,12 +644,16 @@ class OutputPanelMixin:
         btn_frame = tk.Frame(parent, bg=COLORS['bg_secondary'])
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
 
+        # v5.3 GUI-UX：前景色按背景亮度自适应。原实现固定用 text_primary：
+        # 深色主题下该值是近白，叠在琥珀色 #f59e0b 按钮上对比度仅约 2.2:1，
+        # 按钮文字几乎糊掉；现在琥珀底用深墨字、绿/紫底用白字，两主题一致。
+        _btn_fg = ui_styles.readable_text_color(color, COLORS)
         btn = tk.Button(btn_frame, text=text,
-                        font=('微软雅黑', 11, 'bold'),
+                        font=(UI_FONT, 11, 'bold'),
                         bg=color,
-                        fg=COLORS['text_primary'],
+                        fg=_btn_fg,
                         activebackground=self._lighten_color(color, 1.15),
-                        activeforeground=COLORS['text_primary'],
+                        activeforeground=_btn_fg,
                         relief='flat',
                         cursor='hand2',
                         command=command,
@@ -511,7 +673,9 @@ class OutputPanelMixin:
         # （否则还原的仍是创建时的旧主题色 → 明暗不一致）；color_token 显式提供时
         # 优先（v5.2 GUI-06：「同值多键」反查依赖兜底插入序，显式 token 根除脆弱性）
         _bg_token = color_token or ui_styles.token_for_color(color, COLORS)
-        ui_styles.remember_button_normal(btn, _bg_token, 'text_primary')
+        # 前景存静态自适应色（不存 'text_primary' token），否则主题刷新会把
+        # 琥珀底按钮重新刷回近白色文字，抵消本处对比度修复。
+        ui_styles.remember_button_normal(btn, _bg_token, _btn_fg)
         # hover（Enter/Leave）委托中央样式工厂，禁用守卫由工厂统一处理；
         # hover 色不传创建时快照 hex，由工厂按当前主题自适应派生（暗变亮/亮变暗），
         # 主题切换后 hover 亦无残留（v5.2 GUI-06）
@@ -544,7 +708,7 @@ class OutputPanelMixin:
         btn_frame.pack(fill=tk.X, padx=10, pady=2)
 
         btn = tk.Button(btn_frame, text=text,
-                        font=('微软雅黑', 9),
+                        font=(UI_FONT, 9),
                         bg=COLORS['bg_card'],
                         fg=COLORS['text_primary'],
                         activebackground=color,
@@ -585,7 +749,7 @@ class OutputPanelMixin:
         """
         COLORS = _main_mod.COLORS
         btn = tk.Button(parent, text=text,
-                        font=('微软雅黑', 8),
+                        font=(UI_FONT, 8),
                         bg=COLORS['bg_card'],
                         fg=COLORS['text_primary'],
                         activebackground=color,
@@ -700,7 +864,7 @@ class OutputPanelMixin:
         title_frame = tk.Frame(toolbar, bg=COLORS['bg_card'])
         title_frame.pack(side=tk.LEFT, padx=16, pady=8)
         tk.Label(title_frame, text=" 预测结果",
-                 font=('微软雅黑', 12, 'bold'),
+                 font=(UI_FONT, 12, 'bold'),
                  bg=COLORS['bg_card'],
                  fg=COLORS['text_primary']).pack(anchor=tk.W)
 
@@ -742,7 +906,7 @@ class OutputPanelMixin:
         self.result_category_var = tk.StringVar(value="全部")
         cat_combo = ttk.Combobox(btn_frame, textvariable=self.result_category_var,
                                  values=["全部", "预测结论", "分位信号", "算法依据"],
-                                 state='readonly', width=10, font=('微软雅黑', 9))
+                                 state='readonly', width=10, font=(UI_FONT, 9))
         cat_combo.pack(side=tk.LEFT, padx=(0, 6))
         cat_combo.bind('<<ComboboxSelected>>',
                        lambda e: self._apply_result_category(self.result_category_var.get()))
@@ -812,44 +976,77 @@ class OutputPanelMixin:
         self.result_dash.pack_forget()
 
         # ---- 4) 空态占位（尚无预测结果时展示）----
-        self._result_placeholder = tk.Frame(self.dash_inner, bg=COLORS['bg_primary'])
-        ph_card = tk.Frame(self._result_placeholder, bg=COLORS['bg_card'],
-                           highlightbackground=COLORS['border'],
-                           highlightthickness=1, relief='flat')
-        ph_card.pack(fill=tk.BOTH, expand=True, padx=2, pady=20)
-        ph_inner = tk.Frame(ph_card, bg=COLORS['bg_card'])
-        ph_inner.pack(expand=True, pady=40)
-        # 图标：圆角卡片样式，统一空态视觉
-        icon_canvas = tk.Canvas(ph_inner, width=64, height=64, bg=COLORS['bg_card'], highlightthickness=0)
-        icon_canvas.create_oval(8, 8, 56, 56, fill=COLORS['accent_p5'], outline='', width=0)
-        icon_canvas.create_text(32, 32, text='5', font=('Consolas', 24, 'bold'), fill=WHITE)
-        icon_canvas.pack(pady=(0, 12))
-        tk.Label(ph_inner, text="暂无预测结果",
-                 font=('微软雅黑', 15, 'bold'),
-                 bg=COLORS['bg_card'], fg=COLORS['text_primary']).pack()
-        tk.Label(ph_inner,
-                 text="点击左侧「开始分析」运行完整流程\n预测结论将在此处以仪表盘形式呈现",
-                 font=('微软雅黑', 10), justify=tk.CENTER,
-                 bg=COLORS['bg_card'], fg=COLORS['text_secondary']).pack(pady=(6, 0))
-        self._result_placeholder.pack(fill=tk.BOTH, expand=True)
-        # Loading indicator
+        # A3 DRY：统一走 _build_empty_state 工厂，与日志/评估等面板空态视觉一致。
+        self._result_placeholder = self._build_empty_state(
+            self.dash_inner,
+            title="暂无预测结果",
+            hint="点击左侧「开始分析」运行完整流程\n预测结论将在此处以仪表盘形式呈现",
+            icon_text='5',
+            padx=2, pady=20,
+        )
+        # Loading indicator（v5.3 GUI-UX 第二批：静态文案 + 安全帧动画）
         self._loading_indicator = tk.Frame(self.dash_inner, bg=COLORS["bg_primary"])
-        loading_label = tk.Label(self._loading_indicator, text="正在分析，请稍候...",
-                                 font=("微软雅黑", 10),
-                                 bg=COLORS["bg_primary"],
-                                 fg=COLORS["text_primary"])
-        loading_label.pack(expand=True)
+        self._loading_label = tk.Label(
+            self._loading_indicator, text=self._LOADING_BASE_TEXT,
+            font=(UI_FONT, 10), bg=COLORS["bg_primary"],
+            fg=COLORS["text_primary"], justify=tk.CENTER)
+        self._loading_label.pack(expand=True)
         self._loading_indicator.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._loading_indicator.place_forget()
+        self._loading_visible = False
+        self._loading_dots = 0
+        self._loading_anim_after = None
+        # 生命周期兜底：遮罩被销毁（窗口关闭/布局重建）时立即取消 after 定时器
+        self._loading_indicator.bind('<Destroy>', lambda e: self._stop_loading_animation())
+
+    _LOADING_BASE_TEXT = "正在分析，请稍候\n可查看左侧进度条；按 Esc 可取消"
 
     def _show_loading_indicator(self):
-        """显示加载指示器"""
+        """显示加载指示器并启动 350ms 帧动画。"""
         self._loading_indicator.lift()  # 确保在最上层
         self._loading_indicator.place(relx=0, rely=0, relwidth=1, relheight=1)
+        if not self._loading_visible:
+            self._loading_visible = True
+            self._loading_dots = 0
+            self._tick_loading_animation()
+
+    def _tick_loading_animation(self):
+        """遮罩帧动画：仅循环省略号，不创建新控件、不触碰后台线程。"""
+        if not getattr(self, '_loading_visible', False):
+            return
+        try:
+            if not self._loading_indicator.winfo_exists():
+                return
+            self._loading_dots = (self._loading_dots + 1) % 4
+            self._loading_label.config(
+                text=self._LOADING_BASE_TEXT + ("." * self._loading_dots))
+            self._loading_anim_after = self.root.after(
+                350, self._tick_loading_animation)
+        except Exception:
+            self._loading_anim_after = None
+
+    def _stop_loading_animation(self):
+        """停止并清理遮罩动画定时器（可重复调用）。"""
+        self._loading_visible = False
+        after_id = getattr(self, '_loading_anim_after', None)
+        self._loading_anim_after = None
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        try:
+            self._loading_label.config(text=self._LOADING_BASE_TEXT)
+        except Exception:
+            pass
 
     def _hide_loading_indicator(self):
-        """隐藏加载指示器"""
-        self._loading_indicator.place_forget()
+        """隐藏加载指示器（任务结束/取消/异常三路径共用）。"""
+        self._stop_loading_animation()
+        try:
+            self._loading_indicator.place_forget()
+        except Exception:
+            pass
 
     # =========================================================================
     # 自我进化（v3.55）：标签页 + 引擎接线 + 实时可视化
@@ -891,12 +1088,12 @@ class OutputPanelMixin:
         grad_bar.pack(side=tk.LEFT, padx=(0, 10))
 
         # 标题文字
-        tk.Label(hdr, text="自我进化引擎", font=('微软雅黑', 13, 'bold'),
+        tk.Label(hdr, text="自我进化引擎", font=(UI_FONT, 13, 'bold'),
                  bg=COLORS['bg_card'],
                  fg=COLORS['accent_ai_bright']).pack(side=tk.LEFT)
 
         # 状态徽章（动态更新）
-        self.evo_status_badge = tk.Label(hdr, text="● 就绪", font=('微软雅黑', 9),
+        self.evo_status_badge = tk.Label(hdr, text="● 就绪", font=(UI_FONT, 9),
                                          bg=COLORS['bg_input'],
                                          fg=COLORS['accent_p5_light'],
                                          padx=10, pady=3, relief='flat')
@@ -916,16 +1113,16 @@ class OutputPanelMixin:
             self._register_theme_canvas_item(dot, _dot_item, 'text_muted')
             dot.pack(side=tk.LEFT, padx=4)
             self.evo_phase_indicators.append(dot)
-            tk.Label(phase_frame, text=phase_name, font=('微软雅黑', 8),
+            tk.Label(phase_frame, text=phase_name, font=(UI_FONT, 8),
                      bg=COLORS['bg_card'], fg=COLORS['text_muted']).pack(side=tk.LEFT, padx=2)
             if i < 5:
-                tk.Label(phase_frame, text="─", font=('微软雅黑', 8),
+                tk.Label(phase_frame, text="─", font=(UI_FONT, 8),
                          bg=COLORS['bg_card'], fg=COLORS['text_muted']).pack(side=tk.LEFT, padx=1)
 
         # 概览描述
         self.evo_overview_var = tk.StringVar(
             value="系统正在后台自动学习历史开奖规律，持续优化预测模型...")
-        tk.Label(ov, textvariable=self.evo_overview_var, font=('微软雅黑', 9),
+        tk.Label(ov, textvariable=self.evo_overview_var, font=(UI_FONT, 9),
                  bg=COLORS['bg_card'], fg=COLORS['text_secondary'], wraplength=600,
                  justify=tk.LEFT).pack(anchor=tk.W, padx=14, pady=(0, 8))
 
@@ -945,9 +1142,9 @@ class OutputPanelMixin:
                            highlightbackground=COLORS['border'], highlightthickness=1,
                            relief='solid')
             tile.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, pady=2)
-            tk.Label(tile, text=label, font=('微软雅黑', 9),
+            tk.Label(tile, text=label, font=(UI_FONT, 9),
                      bg=COLORS['bg_card'], fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=10, pady=(6, 2))
-            val_label = tk.Label(tile, text=initial, font=('Consolas', 14, 'bold'),
+            val_label = tk.Label(tile, text=initial, font=(MONO_FONT, 14, 'bold'),
                                 bg=COLORS['bg_card'], fg=color)
             val_label.pack(anchor=tk.W, padx=10, pady=(0, 6))
             self.evo_metric_tiles.append(val_label)
@@ -963,9 +1160,9 @@ class OutputPanelMixin:
         # 状态行
         st_hdr = tk.Frame(st, bg=COLORS['bg_card'])
         st_hdr.pack(fill=tk.X, padx=12, pady=(8, 4))
-        tk.Label(st_hdr, text="当前阶段", font=('微软雅黑', 10, 'bold'),
+        tk.Label(st_hdr, text="当前阶段", font=(UI_FONT, 10, 'bold'),
                  bg=COLORS['bg_card'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
-        self.evo_tab_status = tk.Label(st_hdr, text="就绪", font=('微软雅黑', 9),
+        self.evo_tab_status = tk.Label(st_hdr, text="就绪", font=(UI_FONT, 9),
                                        bg=COLORS['bg_card'], fg=COLORS['accent_ai_light'])
         self.evo_tab_status.pack(side=tk.RIGHT)
 
@@ -1000,7 +1197,7 @@ class OutputPanelMixin:
         # ── 进化日志（代码风格文本框）────────────────────────────────
         log_label = tk.Frame(f, bg=COLORS['bg_primary'])
         log_label.pack(fill=tk.X, padx=12, pady=(0, 4))
-        tk.Label(log_label, text="进化日志", font=('微软雅黑', 10, 'bold'),
+        tk.Label(log_label, text="进化日志", font=(UI_FONT, 10, 'bold'),
                  bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(anchor=tk.W)
 
         log_frame = tk.Frame(f, bg=COLORS['bg_panel'],
@@ -1008,7 +1205,7 @@ class OutputPanelMixin:
         log_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
 
         # 日志文本框（等宽字体，类终端风格）
-        self.evo_log = tk.Text(log_frame, wrap=tk.WORD, font=('Consolas', 9),
+        self.evo_log = tk.Text(log_frame, wrap=tk.WORD, font=(MONO_FONT, 9),
                                bg=COLORS['bg_panel'], fg=COLORS['text_secondary'],
                                relief='flat', padx=12, pady=10, state=tk.NORMAL,
                                undo=True,
@@ -1025,20 +1222,20 @@ class OutputPanelMixin:
         # 日志标签颜色（终端风格）
         self.evo_log.tag_config(
             'section', foreground=COLORS['accent_ai_light'],
-            font=('微软雅黑', 10, 'bold'))
+            font=(UI_FONT, 10, 'bold'))
         self.evo_log.tag_config(
             'success', foreground=COLORS['accent_p5_light'],
-            font=('微软雅黑', 9))
+            font=(UI_FONT, 9))
         self.evo_log.tag_config(
             'warning', foreground=COLORS['accent_warning_light'],
-            font=('微软雅黑', 9))
+            font=(UI_FONT, 9))
         self.evo_log.tag_config(
             'error', foreground=COLORS['accent_danger_light'],
-            font=('微软雅黑', 9, 'bold'))
+            font=(UI_FONT, 9, 'bold'))
         self.evo_log.tag_config('info', foreground=COLORS['badge_trial_fg'],
-                               font=('Consolas', 9))
+                               font=(MONO_FONT, 9))
         self.evo_log.tag_config('dim', foreground=COLORS['text_disabled'],
-                               font=('Consolas', 9))
+                               font=(MONO_FONT, 9))
         # Text tag 色不经控件树反查刷新：登记 token，切换主题后重放（GUI-06）
         self._register_theme_tags(self.evo_log, {
             'section': {'foreground': 'accent_ai_light'},
@@ -1057,9 +1254,9 @@ class OutputPanelMixin:
         vt_hdr = tk.Frame(vt_frame, bg=COLORS['bg_card'],
                          highlightbackground=COLORS['border'], highlightthickness=1)
         vt_hdr.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(vt_hdr, text="进化版本记录", font=('微软雅黑', 10, 'bold'),
+        tk.Label(vt_hdr, text="进化版本记录", font=(UI_FONT, 10, 'bold'),
                  bg=COLORS['bg_card'], fg=COLORS['text_primary']).pack(anchor=tk.W, padx=10, pady=6)
-        tk.Label(vt_hdr, text="（双击行可查看版本详情 | 右键可回滚）", font=('微软雅黑', 8),
+        tk.Label(vt_hdr, text="（双击行可查看版本详情 | 右键可回滚）", font=(UI_FONT, 8),
                  bg=COLORS['bg_card'], fg=COLORS['text_muted']).pack(anchor=tk.E, padx=10, pady=6)
 
         cols = ('版本标签', '状态', 'Top-1', 'Top-3', 'Top-5', '父版本', '创建时间')
@@ -1077,7 +1274,7 @@ class OutputPanelMixin:
         # 一并登记，主题切换后 tag_configure 重放）
         self.evo_version_tree.tag_configure(
             'active', foreground=COLORS['accent_p5'],
-            font=('微软雅黑', 9, 'bold'))
+            font=(UI_FONT, 9, 'bold'))
         self.evo_version_tree.tag_configure('trial', foreground=COLORS['text_muted'])
         self.evo_version_tree.tag_configure(
             'rolledback', foreground=COLORS['accent_warning'])
@@ -1090,6 +1287,13 @@ class OutputPanelMixin:
             'rolledback': {'foreground': 'accent_warning'},
         })
         self.evo_version_tree.pack(fill=tk.BOTH, expand=True)
+        # v5.3 GUI-UX 第二批：登记列宽会话记忆（不落盘）
+        self._bind_tree_width_memory(self.evo_version_tree, 'evolution_versions')
+        # 首帧空态：刷新回调延迟 1.5s，先给一行说明避免表格空白
+        self.evo_version_tree.insert('', tk.END, values=(
+            '暂无版本记录', '等待首次进化', '—', '—', '—', '—',
+            '点击「启动进化」或等待自动进化',
+        ), tags=('odd',))
         # 绑定双击事件查看版本详情
         self.evo_version_tree.bind('<Double-1>', self._on_version_row_double_click)
         # 绑定右键菜单（回滚功能）
@@ -1110,16 +1314,16 @@ class OutputPanelMixin:
         # ── 工具栏（清空 / 自动滚动）────────────────────────────────
         tb = tk.Frame(f, bg=COLORS['bg_primary'])
         tb.pack(fill=tk.X, padx=12, pady=(8, 4))
-        tk.Label(tb, text="命令行实时输出", font=('微软雅黑', 10, 'bold'),
+        tk.Label(tb, text="命令行实时输出", font=(UI_FONT, 10, 'bold'),
                  bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
         # 关键字过滤框（Phase 4：复用已渲染文本 + 内存缓冲，大小写不敏感）
         self._cli_filter_var = tk.StringVar()
         self._cli_filter_var.trace_add('write', self._apply_cli_filter)
-        tk.Label(tb, text="过滤", font=('微软雅黑', 9),
+        tk.Label(tb, text="过滤", font=(UI_FONT, 9),
                  bg=COLORS['bg_primary'], fg=COLORS['text_muted']).pack(
             side=tk.LEFT, padx=(12, 4))
         tk.Entry(tb, textvariable=self._cli_filter_var, width=18,
-                 font=('Consolas', 9), bg=COLORS['bg_card'],
+                 font=(MONO_FONT, 9), bg=COLORS['bg_card'],
                  fg=COLORS['text_primary'], relief='flat',
                  insertbackground=COLORS['accent_ai']).pack(
             side=tk.LEFT, padx=(0, 10))
@@ -1132,14 +1336,14 @@ class OutputPanelMixin:
         tk.Button(tb, text="🗑️ 清空", command=self._clear_cli_log,
                   bg=COLORS['bg_card'], fg=COLORS['text_primary'],
                   activebackground=COLORS['bg_secondary'], relief='flat',
-                  font=('微软雅黑', 9), padx=10, pady=3).pack(side=tk.RIGHT)
+                  font=(UI_FONT, 9), padx=10, pady=3).pack(side=tk.RIGHT)
 
         # ── 日志文本框（等宽字体，类终端风格，与进化日志一致）──────────
         log_frame = tk.Frame(f, bg=COLORS['bg_panel'],
                              highlightbackground=COLORS['border'], highlightthickness=1)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
 
-        self.cli_log_text = tk.Text(log_frame, wrap=tk.WORD, font=('Consolas', 9),
+        self.cli_log_text = tk.Text(log_frame, wrap=tk.WORD, font=(MONO_FONT, 9),
                                     bg=COLORS['bg_panel'],
                                     fg=COLORS['text_secondary'],
                                     relief='flat', padx=12, pady=10,
@@ -1155,18 +1359,18 @@ class OutputPanelMixin:
 
         # 日志级别颜色（终端风格）
         self.cli_log_text.tag_config(
-            'info', foreground=COLORS['badge_trial_fg'], font=('Consolas', 9))
+            'info', foreground=COLORS['badge_trial_fg'], font=(MONO_FONT, 9))
         self.cli_log_text.tag_config(
             'success', foreground=COLORS['accent_p5_light'],
-            font=('Consolas', 9))
+            font=(MONO_FONT, 9))
         self.cli_log_text.tag_config(
             'warning', foreground=COLORS['accent_warning_light'],
-            font=('Consolas', 9))
+            font=(MONO_FONT, 9))
         self.cli_log_text.tag_config(
             'error', foreground=COLORS['accent_danger_light'],
-            font=('Consolas', 9, 'bold'))
+            font=(MONO_FONT, 9, 'bold'))
         self.cli_log_text.tag_config(
-            'dim', foreground=COLORS['text_disabled'], font=('Consolas', 9))
+            'dim', foreground=COLORS['text_disabled'], font=(MONO_FONT, 9))
         # Text tag 色不经控件树反查刷新：登记 token，切换主题后重放（GUI-06）
         self._register_theme_tags(self.cli_log_text, {
             'info': {'foreground': 'badge_trial_fg'},
@@ -1196,14 +1400,57 @@ class OutputPanelMixin:
         tile = tk.Frame(parent, bg=COLORS['bg_secondary'],
                         highlightbackground=COLORS['border'], highlightthickness=1)
         tile.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8), ipadx=10, ipady=2)
-        tk.Label(tile, text=label, font=('微软雅黑', 8),
+        tk.Label(tile, text=label, font=(UI_FONT, 8),
                  bg=COLORS['bg_secondary'], fg=COLORS['text_muted']).pack(anchor=tk.W, padx=10, pady=(8, 0))
-        tk.Label(tile, text=value, font=('Consolas', 15, 'bold'),
+        tk.Label(tile, text=value, font=(MONO_FONT, 15, 'bold'),
                  bg=COLORS['bg_secondary'], fg=value_color).pack(anchor=tk.W, padx=10, pady=(0, 8 if not sub else 0))
         if sub:
-            tk.Label(tile, text=sub, font=('微软雅黑', 8),
+            tk.Label(tile, text=sub, font=(UI_FONT, 8),
                      bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']).pack(anchor=tk.W, padx=10, pady=(0, 8))
         return tile
+
+    def _build_empty_state(self, parent, title, hint, icon_text='5',
+                           padx=2, pady=20):
+        """统一空态占位工厂（A3）。
+
+        生成「圆角图标 + 标题 + 引导文案」的空态卡片，用于结果页 / 日志 /
+        评估等面板无数据时的友好引导，替代各自散落的空白区。
+
+        参数:
+            parent: 父容器
+            title: 空态主标题
+            hint: 引导文案（可含换行）
+            icon_text: 圆形图标内文字
+            padx/pady: 卡片外边距（默认对齐结果页原值）
+
+        返回:
+            tk.Frame: 空态容器句柄（调用方用于 pack/place 显隐）
+        """
+        COLORS = _main_mod.COLORS
+        # WHITE 为模块级常量（modules.ui_theme_spec），与 _build_empty_state
+        # 外部的既有空态用色一致；不依赖 _main_mod.WHITE（避免同源漂移）。
+        placeholder = tk.Frame(parent, bg=COLORS['bg_primary'])
+        ph_card = tk.Frame(placeholder, bg=COLORS['bg_card'],
+                           highlightbackground=COLORS['border'],
+                           highlightthickness=1, relief='flat')
+        ph_card.pack(fill=tk.BOTH, expand=True, padx=padx, pady=pady)
+        ph_inner = tk.Frame(ph_card, bg=COLORS['bg_card'])
+        ph_inner.pack(expand=True, pady=40)
+        # 图标：圆角卡片样式，统一空态视觉
+        icon_canvas = tk.Canvas(ph_inner, width=64, height=64,
+                                bg=COLORS['bg_card'], highlightthickness=0)
+        icon_canvas.create_oval(8, 8, 56, 56, fill=COLORS['accent_p5'],
+                                outline='', width=0)
+        icon_canvas.create_text(32, 32, text=icon_text,
+                                font=(MONO_FONT, 24, 'bold'), fill=WHITE)
+        icon_canvas.pack(pady=(0, 12))
+        tk.Label(ph_inner, text=title,
+                 font=(UI_FONT, 15, 'bold'),
+                 bg=COLORS['bg_card'], fg=COLORS['text_primary']).pack()
+        tk.Label(ph_inner, text=hint,
+                 font=(UI_FONT, 10), justify=tk.CENTER,
+                 bg=COLORS['bg_card'], fg=COLORS['text_secondary']).pack(pady=(6, 0))
+        return placeholder
 
     def _create_ov_tile(self, parent, label, value, value_color, sub=None):
         """创建概览指标磁贴（v4.0 §2.4）：小标签 + 大数值 + 可选副信息。
@@ -1227,15 +1474,21 @@ class OutputPanelMixin:
         # 4 列并排布局统一入口（v5.2 GUI-07：窄屏 grid 切回复用同参）
         self._pack_ov_tile_row(tile)
 
-        tk.Label(tile, text=label, font=('微软雅黑', 8),
+        tk.Label(tile, text=label, font=(UI_FONT, 8),
                  bg=COLORS['bg_secondary'], fg=COLORS['text_muted']
                  ).pack(anchor=tk.W, padx=10, pady=(8, 0))
-        val_color = COLORS.get(value_color, COLORS['text_primary'])
-        val_label = tk.Label(tile, text=value, font=('Consolas', 15, 'bold'),
+        # 修复（v5.3 GUI-UX）：value_color 多数调用点传的是 hex 色值（如
+        # COLORS['accent_p5']），原 `COLORS.get(hex, ...)` 必然未命中并回退
+        # text_primary，导致四块概览数值全部同色、语义色失效。改为先按 token
+        # 解析，hex 直接使用，仅非法值才回退。
+        val_color = ui_styles.resolve_color_token(value_color, COLORS)
+        if not (isinstance(val_color, str) and val_color.startswith('#')):
+            val_color = COLORS['text_primary']
+        val_label = tk.Label(tile, text=value, font=(MONO_FONT, 15, 'bold'),
                              bg=COLORS['bg_secondary'], fg=val_color)
         val_label.pack(anchor=tk.W, padx=10, pady=(0, 4 if sub else 8))
         if sub:
-            tk.Label(tile, text=sub, font=('微软雅黑', 8),
+            tk.Label(tile, text=sub, font=(UI_FONT, 8),
                      bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']
                      ).pack(anchor=tk.W, padx=10, pady=(0, 8))
         return val_label
@@ -1264,16 +1517,27 @@ class OutputPanelMixin:
         tile.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
 
     def _build_status_bar(self, parent):
-        """构建底部状态栏（状态指示灯 + 状态文字 + 数据库状态）"""
+        """构建底部状态栏（状态指示灯 + 状态文字 + 数据库状态）。
+
+        布局采用 grid：左侧状态灯+状态文（weight=0），右侧数据库状态+版本（weight=1）。
+        底部高度固定 28px，横向占满。
+        """
         COLORS = _main_mod.COLORS
         status_bar = tk.Frame(parent, bg=COLORS['bg_secondary'], height=28)
-        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
-        status_bar.pack_propagate(False)
+        status_bar.grid(row=2, column=0, sticky='ew')
+        status_bar.grid_propagate(False)
+        # v5.3 GUI-UX：三列布局（灯 / 状态文字 / 右侧信息区）。
+        # 原实现把「状态灯、状态文字、竖分隔线」全部放在 row0/col0，
+        # 又把「数据库状态」「版本信息」同时放 row0/col1 sticky='e'，
+        # 同格控件互相覆盖——状态灯压在文字上、版本号盖住数据库状态。
+        status_bar.grid_columnconfigure(0, weight=0)
+        status_bar.grid_columnconfigure(1, weight=1)
+        status_bar.grid_columnconfigure(2, weight=0)
 
         self.status_dot = tk.Canvas(status_bar, width=14, height=14,
                                     bg=COLORS['bg_secondary'],
                                     highlightthickness=0)
-        self.status_dot.pack(side=tk.LEFT, padx=(12, 5), pady=7)
+        self.status_dot.grid(row=0, column=0, padx=(12, 6), pady=7)
         # 内外双层圆模拟发光效果
         self.status_dot.create_oval(0, 0, 14, 14, fill=COLORS['bg_secondary'], outline='')
         self._status_dot_id = self.status_dot.create_oval(2, 2, 12, 12,
@@ -1281,24 +1545,31 @@ class OutputPanelMixin:
 
         self.status_var = tk.StringVar(value="✓ 就绪")
         tk.Label(status_bar, textvariable=self.status_var,
-                 font=('微软雅黑', 9),
+                 font=(UI_FONT, 9),
                  bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_secondary']).pack(side=tk.LEFT, padx=5, pady=4)
+                 fg=COLORS['text_secondary']).grid(row=0, column=1, sticky='w', pady=4)
 
-        tk.Frame(status_bar, bg=COLORS['border'], width=1).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=5)
+        # 右侧信息区：数据库状态 + 竖分隔线 + 运行时版本（单行 pack，不再叠放）
+        right = tk.Frame(status_bar, bg=COLORS['bg_secondary'])
+        right.grid(row=0, column=2, sticky='e', padx=(6, 12))
 
-        # 数据库状态标签
         self.db_status_var = tk.StringVar(value="数据库：检测中")
-        tk.Label(status_bar, textvariable=self.db_status_var,
-                 font=('微软雅黑', 9),
+        tk.Label(right, textvariable=self.db_status_var,
+                 font=(UI_FONT, 9),
                  bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_muted']).pack(side=tk.RIGHT, padx=5, pady=4)
+                 fg=COLORS['text_muted']).pack(side=tk.LEFT)
 
-        # 版本信息
-        tk.Label(status_bar, text=f"Python 3.9 | v{get_current_version()}",
-                 font=('微软雅黑', 9),
+        tk.Frame(right, bg=COLORS['border'], width=1, height=13).pack(
+            side=tk.LEFT, padx=8)
+
+        # 版本信息：修正硬编码 "Python 3.9"（实际运行解释器版本随环境变化），
+        # 并去掉 get_current_version() 已含 'v' 前缀导致的 "vv5.1" 重复。
+        tk.Label(right,
+                 text=f"Python {_sys.version_info[0]}.{_sys.version_info[1]}"
+                      f" | {get_current_version()}",
+                 font=(UI_FONT, 9),
                  bg=COLORS['bg_secondary'],
-                 fg=COLORS['text_muted']).pack(side=tk.RIGHT, padx=5, pady=4)
+                 fg=COLORS['text_muted']).pack(side=tk.LEFT)
 
         # 30s 轮询数据库状态
         self.root.after(30000, self._refresh_db_status)
@@ -1332,7 +1603,12 @@ class OutputPanelMixin:
                         padx=10, 
                         pady=4, 
                         cursor='hand2',
-                        highlightthickness=0,
+                        # A4 无障碍：焦点环。highlightthickness=1 使 Tab 聚焦时
+                        # 出现 1px 高亮描边（highlightcolor），未聚焦时为边框色
+                        # （highlightbackground），键盘用户可见焦点位置。
+                        highlightthickness=1,
+                        highlightbackground=COLORS['border'],
+                        highlightcolor=COLORS['accent_p5'],
                         takefocus=True)  # v5.0 §2.1 可访问性：允许 Tab 聚焦
         
         # 记录正常态配色（v4.0 §2.4：token 化，主题切换后还原仍正确，不泄漏旧色）
@@ -1381,44 +1657,43 @@ class OutputPanelMixin:
         if str(button['state']) == 'disabled':
             button.config(bg=COLORS['bg_input'], fg=COLORS['text_disabled'])
 
-    def _setup_loading_animation(self):
-        """设置加载动画效果"""
-        COLORS = _main_mod.COLORS
-        self._loading_frame = tk.Frame(self.dash_container, bg=COLORS['bg_card'])
-        self._loading_label = tk.Label(self._loading_frame, 
-                                       text="",
-                                       font=('Consolas', 12),
-                                       bg=COLORS['bg_card'],
-                                       fg=COLORS['accent_p5'])
-        self._loading_label.pack(pady=16)
-        self._loading_frame.pack_forget()
-        self._loading_active = False
-        self._loading_dots = 0
+    def _bind_tree_width_memory(self, tree, panel_key):
+        """登记 Treeview 列宽的会话级记忆（v5.3 GUI-UX 第二批）。
 
-    def _start_loading(self, message="分析中"):
-        """启动加载动画"""
-        self._loading_active = True
-        self._loading_dots = 0
-        self._loading_frame.pack(fill=tk.X)
-        self._update_loading_text(message)
+        需求边界：仅在同一进程/会话内按面板 key 记住用户拖动后的列宽，
+        **不写入任何配置文件、不跨重启持久化**。实现方式：
+        - 用户在列分隔线拖动结束必然触发 <ButtonRelease-1>，此刻快照全部列宽；
+        - 行的普通单击也会触发，但快照幂等，不会产生副作用；
+        - 面板若因布局重建再次调用本函数，会先恢复该面板的上次列宽。
+        当前两个常驻表本身由 Tk 保留列宽，本记忆主要服务于未来面板重建/复用。
+        """
+        try:
+            memory = getattr(self, '_tree_width_memory', None)
+            if memory is None:
+                memory = {}
+                self._tree_width_memory = memory
+            saved = memory.get(panel_key)
+            if saved:
+                columns = set(tree['columns'])
+                for col, width in saved.items():
+                    if col in columns:
+                        tree.column(col, width=int(width))
 
-    def _stop_loading(self):
-        """停止加载动画"""
-        self._loading_active = False
-        self._loading_frame.pack_forget()
+            def _remember(_event=None):
+                try:
+                    memory[panel_key] = {
+                        col: int(tree.column(col, 'width'))
+                        for col in tree['columns']
+                    }
+                except Exception as e:
+                    logger.debug('[GUI] 记录列宽失败(%s): %s', panel_key, e)
 
-    def _update_loading_text(self, base_message):
-        """更新加载动画文本（带动态圆点效果）"""
-        if not self._loading_active:
-            return
-        
-        self._loading_dots = (self._loading_dots + 1) % 4
-        dots = "." * self._loading_dots
-        self._loading_label.config(text=f"{base_message}{dots}")
-        
-        if self._loading_active:
-            self.root.after(300, lambda: self._update_loading_text(base_message))
+            tree.bind('<ButtonRelease-1>', _remember, add='+')
+        except Exception as e:
+            logger.debug('[GUI] 登记列宽记忆失败(%s): %s', panel_key, e)
 
+    # 保留待接线：当前未挂载到任何页签（历史命中率信息已由概览/验证面板覆盖），
+    # 但包含完整的真实验证数据渲染逻辑，先保留以备后续恢复独立页签，勿当作死代码删除。
     def _build_hit_rate_tab(self, parent):
         """构建『历史命中率』常驻标签页：真实验证数据(不编造), 启动即填充, 预测/切页时刷新。"""
         COLORS = _main_mod.COLORS
@@ -1426,11 +1701,11 @@ class OutputPanelMixin:
         f.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
 
         tk.Label(f, text=" 历史命中率概览（真实验证数据）",
-                 font=('微软雅黑', 12, 'bold'),
+                 font=(UI_FONT, 12, 'bold'),
                  bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(anchor=tk.W, pady=(0, 6))
 
         self.hr_summary_var = tk.StringVar(value="（加载中…）")
-        tk.Label(f, textvariable=self.hr_summary_var, font=('微软雅黑', 10),
+        tk.Label(f, textvariable=self.hr_summary_var, font=(UI_FONT, 10),
                  bg=COLORS['bg_primary'], fg=COLORS['text_secondary']).pack(anchor=tk.W, pady=(0, 8))
 
         self.hr_pos_vars = {}
@@ -1440,13 +1715,13 @@ class OutputPanelMixin:
         for cn, key in pos_keys:
             row = tk.Frame(f, bg=COLORS['bg_primary'])
             row.pack(fill=tk.X, pady=3)
-            tk.Label(row, text=cn, width=6, anchor=tk.W, font=('微软雅黑', 10),
+            tk.Label(row, text=cn, width=6, anchor=tk.W, font=(UI_FONT, 10),
                      bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
             pb = ttk.Progressbar(row, orient=tk.HORIZONTAL, length=220,
                                  mode='determinate', maximum=100)
             pb.pack(side=tk.LEFT, padx=8)
             var = tk.StringVar(value="--")
-            tk.Label(row, textvariable=var, width=12, anchor=tk.W, font=('微软雅黑', 10),
+            tk.Label(row, textvariable=var, width=12, anchor=tk.W, font=(UI_FONT, 10),
                      bg=COLORS['bg_primary'], fg=COLORS['text_secondary']).pack(side=tk.LEFT)
             self.hr_pos_bars[key] = pb
             self.hr_pos_vars[key] = var
@@ -1467,10 +1742,10 @@ class OutputPanelMixin:
         explanation_header = tk.Frame(self.hr_explanation_frame, bg=COLORS['bg_primary'])
         explanation_header.pack(fill=tk.X)
         tk.Label(explanation_header, text=" 命中率说明：", 
-                 font=('微软雅黑', 9, 'bold'),
+                 font=(UI_FONT, 9, 'bold'),
                  bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
         self.hr_explanation_toggle = tk.Label(explanation_header, text=" [显示]", 
-                                            font=('微软雅黑', 8),
+                                            font=(UI_FONT, 8),
                                             bg=COLORS['bg_primary'], fg=COLORS['text_secondary'],
                                             cursor="hand2")
         self.hr_explanation_toggle.pack(side=tk.RIGHT)
@@ -1481,7 +1756,7 @@ class OutputPanelMixin:
                                           text="• 容错命中(±1)：号码偏差1以内也算命中，数据偏高\n"
                                                "• 严格命中（精确）：仅完全匹配才算命中，更真实反映预测能力\n"
                                                "数据来源：p5_prediction_record 已验证记录（真实、不编造）。",
-                                          font=('微软雅黑', 9), bg=COLORS['bg_primary'], fg=COLORS['text_muted'],
+                                          font=(UI_FONT, 9), bg=COLORS['bg_primary'], fg=COLORS['text_muted'],
                                           wraplength=420, justify=tk.LEFT)
         # 初始隐藏说明文字
         self.hr_explanation_text.pack_forget()
@@ -1492,16 +1767,16 @@ class OutputPanelMixin:
         rec_head = tk.Frame(f, bg=COLORS['bg_primary'])
         rec_head.pack(fill=tk.X, pady=(16, 4))
         tk.Label(rec_head, text=" 历史预测记录明细（最近已验证）",
-                 font=('微软雅黑', 11, 'bold'),
+                 font=(UI_FONT, 11, 'bold'),
                  bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
         self.hr_records_hint = tk.StringVar(value="（加载中…）")
-        tk.Label(rec_head, textvariable=self.hr_records_hint, font=('微软雅黑', 9),
+        tk.Label(rec_head, textvariable=self.hr_records_hint, font=(UI_FONT, 9),
                  bg=COLORS['bg_primary'], fg=COLORS['text_muted']).pack(side=tk.RIGHT)
         # 筛选开关——只看命中≥3 的记录
         self.hr_filter_var = tk.BooleanVar(value=False)
         tk.Checkbutton(rec_head, text="只看命中≥3", variable=self.hr_filter_var,
                        command=self._apply_records_filter,
-                       font=('微软雅黑', 9), bg=COLORS['bg_primary'],
+                       font=(UI_FONT, 9), bg=COLORS['bg_primary'],
                        fg=COLORS['text_secondary'],
                        activebackground=COLORS['bg_primary'],
                        selectcolor=COLORS.get('bg_input', WHITE),
@@ -1558,80 +1833,7 @@ class OutputPanelMixin:
         # 双击某行 → 查看该期完整 AI 报告
         self.hr_records_tree.bind('<Double-1>', self._on_record_double_click)
         tk.Label(f, text=" 双击任一行可查看该期完整 AI 预测详情；点击「期号/命中位数/准确率/验证时间」列头可排序。",
-                 font=('微软雅黑', 8), bg=COLORS['bg_primary'],
+                 font=(UI_FONT, 8), bg=COLORS['bg_primary'],
                  fg=COLORS['text_muted']).pack(anchor=tk.W, pady=(4, 0))
-
-        # ================================================================
-        # 历史预测记录一览表（真实验证明细, 可回溯）
-        # ================================================================
-        rec_head = tk.Frame(f, bg=COLORS['bg_primary'])
-        rec_head.pack(fill=tk.X, pady=(16, 4))
-        tk.Label(rec_head, text=" 历史预测记录明细（最近已验证）",
-                 font=('微软雅黑', 11, 'bold'),
-                 bg=COLORS['bg_primary'], fg=COLORS['text_primary']).pack(side=tk.LEFT)
-        self.hr_records_hint = tk.StringVar(value="（加载中…）")
-        tk.Label(rec_head, textvariable=self.hr_records_hint, font=('微软雅黑', 9),
-                 bg=COLORS['bg_primary'], fg=COLORS['text_muted']).pack(side=tk.RIGHT)
-        # 筛选开关——只看命中≥3 的记录
-        self.hr_filter_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(rec_head, text="只看命中≥3", variable=self.hr_filter_var,
-                       command=self._apply_records_filter,
-                       font=('微软雅黑', 9), bg=COLORS['bg_primary'],
-                       fg=COLORS['text_secondary'],
-                       activebackground=COLORS['bg_primary'],
-                       selectcolor=COLORS.get('bg_input', WHITE),
-                       cursor='hand2').pack(side=tk.RIGHT, padx=(0, 10))
-
-        table_wrap = tk.Frame(f, bg=COLORS['bg_primary'])
-        table_wrap.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
-
-        cols = ('issue', 'pred', 'actual', 'hit', 'acc', 'time')
-        self.hr_records_tree = ttk.Treeview(table_wrap, columns=cols,
-                                            show='headings', height=8)
-        # 列头文案（供排序箭头指示恢复使用）
-        self._hr_col_titles = {'issue': '期号', 'pred': '预测号码',
-                               'actual': '开奖号码', 'hit': '命中位数',
-                               'acc': '准确率', 'time': '验证时间'}
-        # 可排序列（号码列排序无意义, 不参与）
-        sortable = {'issue', 'hit', 'acc', 'time'}
-        headers = [('issue', 78), ('pred', 100), ('actual', 100),
-                   ('hit', 68), ('acc', 68), ('time', 130)]
-        for key, w in headers:
-            if key in sortable:
-                self.hr_records_tree.heading(
-                    key, text=self._hr_col_titles[key],
-                    command=lambda c=key: self._sort_records_by(c))
-            else:
-                self.hr_records_tree.heading(key, text=self._hr_col_titles[key])
-            anchor = tk.W if key in ('issue', 'time') else tk.CENTER
-            self.hr_records_tree.column(key, width=w, anchor=anchor,
-                                        stretch=(key == 'time'))
-        vsb = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL,
-                            command=self.hr_records_tree.yview)
-        self.hr_records_tree.configure(yscrollcommand=vsb.set)
-        self.hr_records_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        # 行配色标签（暗色主题）：每行只挂一个标签，避免多标签同属性优先级歧义。
-        # 组合 = 隔行底色 × 是否命中高亮，前景一律保证与底色有足够对比。
-        self.hr_records_tree.tag_configure('row_even',
-                                           background=COLORS['bg_card'],
-                                           foreground=COLORS['text_primary'])
-        self.hr_records_tree.tag_configure('row_odd',
-                                           background=COLORS['bg_secondary'],
-                                           foreground=COLORS['text_primary'])
-        self.hr_records_tree.tag_configure('row_even_hit',
-                                           background=COLORS['bg_card'],
-                                           foreground=COLORS['accent_p5_bright'])
-        self.hr_records_tree.tag_configure('row_odd_hit',
-                                           background=COLORS['bg_secondary'],
-                                           foreground=COLORS['accent_p5_bright'])
-        self.hr_records_tree.tag_configure('hit_full',
-                                           background=COLORS.get('success', SUCCESS_STATIC),
-                                           foreground=WHITE)
-        # 排序状态: (列key, 是否降序)
-        self._hr_sort_state = (None, False)
-        # 双击某行 → 查看该期完整 AI 报告
-        self.hr_records_tree.bind('<Double-1>', self._on_record_double_click)
-        tk.Label(f, text=" 双击任一行可查看该期完整 AI 预测详情；点击「期号/命中位数/准确率/验证时间」列头可排序。",
-                 font=('微软雅黑', 8), bg=COLORS['bg_primary'],
-                 fg=COLORS['text_muted']).pack(anchor=tk.W, pady=(4, 0))
+        # v5.3 GUI-UX 第二批：登记列宽会话记忆（不落盘）
+        self._bind_tree_width_memory(self.hr_records_tree, 'hit_records')

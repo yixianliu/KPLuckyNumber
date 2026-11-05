@@ -161,7 +161,6 @@ def test_race_condition_fix():
     assert result_after_sync, "同步后复制操作应成功"
 
     print("\n✅ 测试 1 通过：竞态条件修复有效（同步后状态正确）")
-    return True
 
 
 def test_immediate_click():
@@ -202,7 +201,6 @@ def test_immediate_click():
     assert result_after, "同步后复制操作应成功"
 
     print("\n✅ 测试 2 通过：极端竞态场景处理正确")
-    return True
 
 
 def test_normal_flow():
@@ -237,7 +235,6 @@ def test_normal_flow():
     assert result, "复制操作应成功"
 
     print("\n✅ 测试 3 通过：正常流程工作正常")
-    return True
 
 
 def test_concurrent_clicks():
@@ -284,7 +281,6 @@ def test_concurrent_clicks():
     assert success_count == 5, f"所有并发点击应成功，实际 {success_count}/5"
 
     print("\n✅ 测试 4 通过：并发场景处理正确")
-    return True
 
 
 def main():

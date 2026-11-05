@@ -46,8 +46,10 @@ class RedisBackend:
     """Redis 存储后端实现"""
     
     def __init__(self):
-        from modules.cache import RedisCache
-        self._cache = RedisCache()
+        # 修复：cache.py 的客户端类名为 CacheClient（不存在 RedisCache），
+        # 原 from modules.cache import RedisCache 会导致 ImportError（get_storage() 默认 Redis 后端崩溃）。
+        from modules.cache import CacheClient
+        self._cache = CacheClient()
         if not self._cache.is_connected():
             logger.warning('[Storage] RedisBackend 初始化：Redis 未连接')
     

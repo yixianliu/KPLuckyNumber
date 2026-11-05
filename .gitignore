@@ -25,3 +25,11 @@ data
 models/
 maint/
 docs
+# ============ 敏感配置：真实密钥/密码绝不入库 ============
+.env
+.env.*
+!.env.example
+config/.env
+config/.env.*
+!config/.env.example
+tests

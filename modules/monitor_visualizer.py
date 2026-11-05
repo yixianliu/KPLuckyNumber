@@ -115,6 +115,7 @@ class MonitorVisualizer:
         elif chart_type == 'response_time':
             return {
                 'line': theme['warning'],
+                'line_warning': theme['warning'],
                 'line_danger': theme['danger'],
                 'background': theme['bg_card'],
                 'grid': theme['grid'],
@@ -124,6 +125,8 @@ class MonitorVisualizer:
         elif chart_type == 'training_stability':
             return {
                 'line': theme['danger'],
+                'line_warning': theme['warning'],
+                'line_danger': theme['danger'],
                 'background': theme['bg_card'],
                 'grid': theme['grid'],
                 'text': theme['text_primary'],

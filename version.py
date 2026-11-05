@@ -24,12 +24,14 @@ import os
 import json
 import importlib
 
+from paths import PROJECT_ROOT as _PROJECT_ROOT
+
 # ---------------------------------------------------------------------------
 # 基础版本信息
 # ---------------------------------------------------------------------------
 APP_NAME = "排列5 AI智能分析系统"
-APP_VERSION = "v5.1"
-APP_RELEASE_DATE = "2026-10-18"
+APP_VERSION = "v5.2"
+APP_RELEASE_DATE = "2026-11-04"
 
 # ---------------------------------------------------------------------------
 # 变更日志（从新到旧）
@@ -41,6 +43,36 @@ APP_RELEASE_DATE = "2026-10-18"
 #   fixes    : 已知问题修复列表
 # ---------------------------------------------------------------------------
 CHANGELOG = [
+    {
+        "version": "v5.2",
+        "date": "2026-11-04",
+        "summary": "KPLuckyNumber v5.2：核心算法/查询口径修复、协作取消终态、AI 预算配置恢复与界面主题化打磨",
+        "features": [
+            "界面主题化：ttk.Notebook / Combobox 跟随全局主题，Canvas 图标按主题切换",
+            "界面反馈：按钮前景按 WCAG 对比度自适应，卡片 hover 与概览区语义色统一",
+            "界面适配：四档断点布局测试校准，状态栏/顶栏叠压与文本裁切修复",
+            "界面健壮性：空数据态占位提示、列宽会话记忆、遮罩动画过渡",
+            "验证口径：Top-3 命中率严格按 docs/hitrate_spec.md §3 口径输出，并与 Top-1 双口径同屏展示"
+        ],
+        "fixes": [
+            "修复 JSON 键归一缺失导致 Top-1/Top-3 命中率恒为 0：在线学习命中计算前统一归一化融合概率键（int/str/中文位名）",
+            "修复验证闭环 N+1 查询：待验证记录与开奖结果由逐条查询改为一次 LEFT JOIN 批量装配，批量验证耗时随记录数线性下降",
+            "修复协作式取消缺终态：任务取消后状态机补齐 cancelled 终态与锁内状态收敛，避免任务卡在 running",
+            "修复遗漏特征 O(10N)：遗漏值计算由每位独立扫描改为单次线性扫描，实测约 10.38ms→2.65ms/次",
+            "修复 Top-3 口径与 spec 不一致：删除推荐组合 match_count>=3 时用 max() 抬升 partial_hits 的分支，partial_hits 仅统计 Top-3 单元覆盖，保持 partial_hits >= top1_hits",
+            "修复待验证预测查询无上限且按期号字典序排序：新增 limit（默认 500，显式 None 不限）+ CAST 数值期号排序 + Python 数值 key 兜底，达上限时告警；全量验证链路显式传 None",
+            "删除 backtester.py 中未接线的死代码 _validate_resume_cache（引用未定义 _signature，调用必 NameError）",
+            "修复模态窗口 grab_set 自递归：打开/关闭时避免对自身重复 grab，消除界面假死",
+            "修复 overall_score 文档与实现不一致：docstring 由 /5 更正为 /3（满分 100），评分算法不变"
+        ],
+        "notes": [
+            "版本发布：APP_VERSION 由 v5.1 提升至 v5.2，APP_RELEASE_DATE 同步为 2026-11-04，CHANGELOG 首条与版本号对齐",
+            "行为变化（预期）：partial_hits 展示值小幅下降（不再吸收组合匹配抬升）；实测最近 1000 条已验证记录均值 1.436→1.433（0.2% 记录受影响，单条最大降 2）",
+            "诚实边界不变：排列5 为公平摇号，Top-1/Top-3 随机基线仍为 10%/30%，任何命中率表述须同时给出 Wilson 95% CI；本升级不修改冻结权重",
+            "集成验证：全仓 212 个 .py py_compile 通过；tests/ 1256 passed / 0 failed / 0 skipped；scripts/tests 360 passed / 0 failed（排除 3 个既有导入错误的历史脚本）",
+            "工程清理：删除已被遮罩动画取代的 loading 旧实现（_setup_loading_animation/_start_loading/_stop_loading/_update_loading_text），消除 _loading_dots/_loading_label 双动画互踩隐患"
+        ]
+    },
     {
         "version": "v5.1",
         "date": "2026-10-18",
@@ -867,7 +899,7 @@ KNOWN_ISSUES = [
 ]
 
 # 外部更新日志覆盖文件路径（可选）：若存在则优先使用，便于非开发者维护
-_CHANGELOG_OVERRIDE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "changelog.json")
+_CHANGELOG_OVERRIDE_PATH = os.path.join(_PROJECT_ROOT, "data", "changelog.json")
 
 
 def get_current_version():

@@ -1,0 +1,121 @@
+﻿python : [DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+所在位置 行:15 字符: 4348
++ ... uckyNumber; $env:PYTHONUNBUFFERED='1'; python -u main.py 2>&1 | Tee-O ...
++                                            ~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([DLL固定] 检测到项目目录...\KP-AI-FENGSHUI:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+22:43:55 | INFO     | root | 日志系统初始化完成: level=INFO, json=False
+22:43:56 | INFO     | ModelMonitor | 模型监控反馈机制初始化完成
+22:43:56 | INFO     | modules.monitor_feedback | 模型监控建议型回灌已接入（feedback_callback 已注入）
+22:43:56 | INFO     | modules.perf_monitor | [PerfMonitor] 性能监控守护线程已启动（interval=1.0s）
+22:43:56 | INFO     | modules.task_manager | TaskManager 初始化完成: workers=4, queue_size=100
+22:43:56 | INFO     | __main__ | [GUI] _ui_scheduler 已启动：单一 100ms tick 循环接管轮询
+22:43:56 | INFO     | modules.perf_monitor | [PerfMonitor] psutil 已就绪（CPU/内存指标启用）
+22:43:57 | INFO     | modules.self_evolution | [self_evolution] _run 主循环开始（线程=Thread-1 (_run)）
+22:43:57 | INFO     | modules.self_evolution | [self_evolution] 引擎已启动，后台线程 Thread-1 (_run) 开始执行
+22:43:57 | INFO     | __main__ | [GUI] 自我进化引擎已初始化并启动，注册轮询定时器
+22:43:57 | INFO     | modules.self_evolution | [self_evolution] 检查点状态: 已加载=True, 当前阶段=evolve, 检查点键=['phase', 'latest_is
+sue', 'history_count', 'baseline', 'weight_snapshot', 'algorithm_search_plan']
+22:43:57 | INFO     | modules.self_evolution | [self_evolution] 将从索引 2 继续（总阶段数=6）
+22:43:57 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 2/5: evolve
+22:43:57 | INFO     | modules.self_evolution | [self_evolution] _phase_evolve 开始
+22:43:57 | INFO     | modules.self_evolution | [MLPredictorPool] Windows 平台，跳过 multiprocessing.Pool 创建，直接进程内执行
+22:43:57 | INFO     | modules.self_evolution | [self_evolution] ML 子进程池创建成功（max_workers=2, timeout=60s）
+22:43:57 | INFO     | modules.predictor | 预测配置已加载: 启用8个算法, 总权重0.94
+22:43:59 | INFO     | modules.smart_cache | 缓存已清除
+22:43:59 | WARNING  | modules.perf_monitor | [PerfMonitor] 资源压力 86% 越限，已清理全局预测缓存（默认优化）
+22:44:02 | INFO     | modules.database | MySQL连接池初始化成功 (min=2, max=10)
+22:44:02 | INFO     | modules.predictor | 自适应权重: 回放 140 条权重历史产物完成
+22:44:02 | INFO     | modules.predictor | AI调用预算: enabled=True, soft=20.0s, hard=30.0s, per_run_max_calls=2, run_budget
+=60s
+22:44:02 | INFO     | modules.predictor | AI模型配置加载成功: model=agnes-3.0-flash, backup=agnes-2.5-flash, timeout=60s
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 权重快照已采集: weights=None, lookback=None
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 搜索后端: both
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 样本量=1111, auto=True, auto_full=True, eval_periods=15
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 样本量充足，开始构造训练窗口（eval_periods=15）
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 窗口构造完成: 有效窗口数=7, 总样本=1111, 有效样本=1111
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 窗口构造完成: 有效窗口数=7, 数据质量={'total_rows': 1111, 'valid_rows'
+: 1111, 'invalid_rows': 0}
+22:44:02 | INFO     | modules.predictor | 预测配置已加载: 启用8个算法, 总权重0.94
+22:44:02 | INFO     | modules.predictor | 自适应权重: 回放 140 条权重历史产物完成
+22:44:02 | INFO     | modules.predictor | AI调用预算: enabled=True, soft=20.0s, hard=30.0s, per_run_max_calls=2, run_budget
+=60s
+22:44:02 | INFO     | modules.predictor | AI模型配置加载成功: model=agnes-3.0-flash, backup=agnes-2.5-flash, timeout=60s
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 当前统计权重: {'frequency_weighted': 0.723404255319149, 'omis
+sion_regression': 0.0, 'trend_momentum': 0.010638297872340425, 'markov_transition': 0.005319148936170213, 'pattern_cont
+inuation': 0.0031914893617021275, 'bayesian_inference': 0.10638297872340426, 'feature_engineering': 0.00212765957446808
+5}
+22:44:02 | INFO     | modules.predictor | 预测配置已加载: 启用8个算法, 总权重0.94
+22:44:02 | INFO     | modules.predictor | 自适应权重: 回放 140 条权重历史产物完成
+22:44:02 | INFO     | modules.predictor | AI调用预算: enabled=True, soft=20.0s, hard=30.0s, per_run_max_calls=2, run_budget
+=60s
+22:44:02 | INFO     | modules.predictor | AI模型配置加载成功: model=agnes-3.0-flash, backup=agnes-2.5-flash, timeout=60s
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 候选算法维度搜索: enabled=False | 未配置 algorithm_candidates，候选算法
+维度搜索默认关闭（不自动提升任何候选）
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 启动坐标下降搜索
+22:44:02 | INFO     | modules.evolution_tuner | [DeepTuner] 开始调优: windows=7, base_lookback=60, max_rounds=6
+22:44:02 | INFO     | modules.evolution_tuner | [DeepTuner] 当前权重: {'frequency_weighted': 0.8500000000000001, 'omission_
+regression': 0.0, 'trend_momentum': 0.012499999999999999, 'markov_transition': 0.0062499999999999995, 'pattern_continua
+tion': 0.00375, 'bayesian_inference': 0.125, 'feature_engineering': 0.0025}
+22:44:02 | INFO     | modules.predictor | 从 p5_prediction_record 加载 1034 条验证记录
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.evolution_tuner | [DeepTuner] 基线评估完成: {'tested': 7, 'top1': 14.286, 'top3': 37.143, 'top5
+': 51.429}
+22:44:02 | INFO     | modules.evolution_tuner | [DeepTuner] 坐标下降完成: 候选=15, 最优指标={'tested': 7, 'top1': 14.286, 'top3': 3
+7.143, 'top5': 51.429}
+22:44:02 | INFO     | modules.evolution_tuner | [DeepTuner] 开始 lookback 搜索: 候选=[40, 60, 80]
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.evolution_tuner | [DeepTuner]   lookback=40: {'tested': 7, 'top1': 14.286, 'top3': 37.143
+, 'top5': 51.429}
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.evolution_tuner | [DeepTuner]   lookback=80: {'tested': 7, 'top1': 14.286, 'top3': 37.143
+, 'top5': 51.429}
+22:44:02 | INFO     | modules.evolution_tuner | [DeepTuner] 调优完成: 总候选=18, 缓存命中=63, 缓存未命中=21, 耗时=547.98ms, 优化=False
+22:44:02 | INFO     | modules.self_evolution | [self_evolution] 启动遗传算法搜索
+22:44:02 | INFO     | modules.self_evolution | [GA] 开始遗传算法搜索: pop=12, gen=20, mut=0.15
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:02 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80
+22:44:03 | INFO     | modules.predictor | 贝叶斯推断算法执行完成: 使用60条验证记录, posterior_weight=0.92, beta_alpha=0.80

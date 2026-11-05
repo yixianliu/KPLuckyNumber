@@ -50,6 +50,8 @@ from modules.pipeline import run_four_step_pipeline
 from modules.ui_theme_spec import (
     button_style_map,
     WHITE,
+    UI_FONT,
+    MONO_FONT,
 )
 from modules.visualizer import visualizer
 from paths import REPORTS_DIR
@@ -61,7 +63,9 @@ if "main" not in _sys.modules:
     _host = _sys.modules.get("__main__")
     _host_file = str(getattr(_host, "__file__", "") or "").replace(
         "\\", "/")
-    if _host_file.endswith("/main.py"):
+    # 冻结（PyInstaller）后 __main__.__file__ 指向 exe 而非 main.py，
+    # 必须同样注册别名，否则 `import main` 会二次导入失败/产生双实例
+    if _host_file.endswith("/main.py") or getattr(_sys, 'frozen', False):
         _sys.modules["main"] = _host
 # 经 setdefault 注册后同一模块实例（含 rebind 后新 COLORS）
 import main as _main_mod  # noqa: E402  双模块陷阱破解后的正式引用
@@ -247,8 +251,9 @@ class SchedulerMixin:
             # 添加关闭按钮
             close_btn = tk.Button(img_window, text="关闭", 
                                  command=img_window.destroy,
-                                 bg=COLORS['accent_p5'], fg='white',
-                                 font=('微软雅黑', 10, 'bold'))
+                                 bg=COLORS['accent_p5'], fg=WHITE,
+                                 activebackground=COLORS.get('accent_p5_active', COLORS['accent_p5']),
+                                 font=(UI_FONT, 10, 'bold'))
             close_btn.pack(pady=10)
             
         except ImportError:
@@ -329,6 +334,9 @@ class SchedulerMixin:
         values = tree.item(item)['values']
         version_tag = str(values[0]) if values else ''
         status = str(values[1]) if len(values) > 1 else ''
+        # 空态占位行（暂无版本记录）不提供回滚/详情操作
+        if version_tag.startswith('暂无'):
+            return
         if status != 'active' and version_tag:
             menu.add_command(label=f"回滚到此版本 ({version_tag})",
                             command=lambda v=version_tag: self._on_evo_rollback_to(v))
@@ -642,6 +650,9 @@ class SchedulerMixin:
             return
         version_tag = str(values[0])
         status = str(values[1])
+        # 空态占位行（暂无版本记录）不是真实版本，双击不弹详情
+        if version_tag.startswith('暂无'):
+            return
         top1 = values[2] if len(values) > 2 else '—'
         top3 = values[3] if len(values) > 3 else '—'
         top5 = values[4] if len(values) > 4 else '—'
@@ -734,14 +745,14 @@ class SchedulerMixin:
         hdr = tk.Frame(win, bg=COLORS['accent_ai'], height=36)
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
-        tk.Label(hdr, text="进化版本详情", font=('微软雅黑', 10, 'bold'),
+        tk.Label(hdr, text="进化版本详情", font=(UI_FONT, 10, 'bold'),
                  bg=COLORS['accent_ai'], fg=WHITE).pack(side=tk.LEFT, padx=12, pady=9)
-        tk.Button(hdr, text="✕", font=('微软雅黑', 9),
+        tk.Button(hdr, text="✕", font=(UI_FONT, 9),
                   bg=COLORS['accent_ai'], fg=WHITE, relief='flat',
                   command=win.destroy).pack(side=tk.RIGHT, padx=10, pady=6)
 
         # 内容区
-        txt = tk.Text(win, wrap=tk.WORD, font=('Consolas', 9),
+        txt = tk.Text(win, wrap=tk.WORD, font=(MONO_FONT, 9),
                       bg=bg, fg=fg_pri, relief='flat',
                       padx=14, pady=12, state=tk.NORMAL)
         txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=(8, 0))
@@ -754,12 +765,12 @@ class SchedulerMixin:
 
         # 回滚按钮（非 active 状态显示）
         if status != 'active':
-            tk.Button(btn_frame, text="回滚到此版本", font=('微软雅黑', 9),
+            tk.Button(btn_frame, text="回滚到此版本", font=(UI_FONT, 9),
                       bg=COLORS['accent_warning'], fg=WHITE, relief='flat',
                       activebackground=COLORS['accent_warning_active'],
                       command=lambda vt=version_tag: self._on_evo_rollback_to(vt)).pack(side=tk.LEFT, padx=(0, 8))
 
-        tk.Button(btn_frame, text="关闭", font=('微软雅黑', 9),
+        tk.Button(btn_frame, text="关闭", font=(UI_FONT, 9),
                   bg=COLORS['accent_p5'], fg=WHITE, relief='flat',
                   activebackground=COLORS['accent_p5_active'],
                   command=win.destroy).pack(side=tk.RIGHT)
@@ -781,6 +792,10 @@ class SchedulerMixin:
             return
         version_tag = str(values[0])
         status = str(values[1])
+        # 空态占位行不可回滚
+        if version_tag.startswith('暂无'):
+            self._show_toast('暂无可回滚的版本', COLORS['warning'], duration=1500)
+            return
         if status == 'active':
             self._show_toast('当前已是 active 版本，无需回滚', COLORS['accent_info'], duration=1500)
             return
@@ -831,6 +846,8 @@ class SchedulerMixin:
             tree.heading(c, text=c)
             tree.column(c, width=120 if c != '标题' else 240, anchor=tk.W)
         tree.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 8))
+        # 会话级列宽记忆：窗口每次打开都是新 Treeview，需从内存恢复上次拖动结果
+        self._bind_tree_width_memory(tree, 'evolution_suggestions')
         for r in rows:
             tree.insert('', tk.END, values=(
                 str(r.get('created_at', ''))[:19],
@@ -875,9 +892,9 @@ class SchedulerMixin:
         hdr = tk.Frame(win, bg=COLORS['accent_ai'], height=36)
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
-        tk.Label(hdr, text="联动状态", font=('微软雅黑', 10, 'bold'),
+        tk.Label(hdr, text="联动状态", font=(UI_FONT, 10, 'bold'),
                  bg=COLORS['accent_ai'], fg=WHITE).pack(side=tk.LEFT, padx=12, pady=9)
-        tk.Button(hdr, text="✕", font=('微软雅黑', 9),
+        tk.Button(hdr, text="✕", font=(UI_FONT, 9),
                   bg=COLORS['accent_ai'], fg=WHITE, relief='flat',
                   command=win.destroy).pack(side=tk.RIGHT, padx=10, pady=6)
 
@@ -941,7 +958,7 @@ class SchedulerMixin:
 
         txt = "\n".join(lines)
 
-        text_widget = tk.Text(content, wrap=tk.WORD, font=('Consolas', 9),
+        text_widget = tk.Text(content, wrap=tk.WORD, font=(MONO_FONT, 9),
                               bg=COLORS['bg_card'], fg=COLORS['text_primary'],
                               relief='flat', padx=12, pady=10, state=tk.NORMAL)
         text_widget.pack(fill=tk.BOTH, expand=True)
@@ -949,7 +966,7 @@ class SchedulerMixin:
         text_widget.config(state=tk.DISABLED)
 
         # 关闭按钮
-        tk.Button(win, text="关闭", font=('微软雅黑', 9),
+        tk.Button(win, text="关闭", font=(UI_FONT, 9),
                   bg=COLORS['accent_p5'], fg=WHITE, relief='flat',
                   activebackground=COLORS['accent_p5_active'],
                   command=win.destroy).pack(pady=(8, 0))
@@ -982,6 +999,12 @@ class SchedulerMixin:
                     r.get('parent_tag', '') or '—',
                     str(r.get('created_at', ''))[:19],
                 ), tags=(tag,))
+            if not rows:
+                # v5.3 GUI-UX 第二批：无版本时给出空态说明，避免表格空白
+                tree.insert('', tk.END, values=(
+                    '暂无版本记录', '等待首次进化', '—', '—', '—', '—',
+                    '点击「启动进化」或等待自动进化',
+                ), tags=('odd',))
             if rows:
                 top = rows[0]
                 if hasattr(self, 'evo_overview_var'):
@@ -2165,7 +2188,7 @@ class SchedulerMixin:
             # 添加图标前缀区分状态（图标解析收敛至 v5.2 GUI-10 契约纯函数）
             icon = ui_toast.toast_icon_for(bg, COLORS)
             tk.Label(frame, text=f"{icon}  {text}", bg=bg, fg=WHITE,
-                     font=('微软雅黑', 11, 'bold'),
+                     font=(UI_FONT, 11, 'bold'),
                      padx=22, pady=12).pack()
 
             toast.update_idletasks()
@@ -2545,7 +2568,7 @@ class SchedulerMixin:
         connected = db.connect()
         status_txt = "数据库：已连接" if connected else "数据库：未连接"
         status_fg = COLORS['success'] if connected else COLORS['accent_danger_light']
-        tk.Label(top, text=status_txt, font=('微软雅黑', 10, 'bold'),
+        tk.Label(top, text=status_txt, font=(UI_FONT, 10, 'bold'),
                  bg=COLORS['bg_primary'], fg=status_fg).pack(anchor=tk.W, padx=14, pady=(10, 4))
 
         cols = ('数据表', '说明', '记录数')
@@ -2555,6 +2578,8 @@ class SchedulerMixin:
             tree.column(c, width=(260 if c == '数据表' else (200 if c == '说明' else 120)),
                         anchor=tk.W)
         tree.pack(fill=tk.BOTH, expand=True, padx=14, pady=(4, 10))
+        # 会话级列宽记忆：弹窗重建时恢复用户上次调整的列宽（不落盘）
+        self._bind_tree_width_memory(tree, 'db_table_overview')
 
         tables = [
             ('p5_history_data', '历史开奖数据(核心)'),
@@ -2732,9 +2757,15 @@ class SchedulerMixin:
         if stats_result.get('status') == 'success':
             stats = stats_result.get('current_stats', {})
             task_mgr.log(f"\n性能统计更新完成:")
-            task_mgr.log(f"  总预测次数: {stats.get('total', 0)}")
-            task_mgr.log(f"  完全猜中: {stats.get('total_matched', 0)}")
-            task_mgr.log(f"  平均准确率: {stats.get('avg_accuracy', 0)}%")
+            _total_n = int(stats.get('total', 0) or 0)
+            task_mgr.log(f"  总预测次数: {_total_n}")
+            if _total_n:
+                task_mgr.log(f"  宽松口径·完全猜中（候选集包含+±1容错，非预测力）: "
+                             f"{stats.get('total_matched', 0)} 期")
+                task_mgr.log(f"  宽松口径平均准确率（非预测力）: "
+                             f"{stats.get('avg_accuracy', 0)}%")
+            else:
+                task_mgr.log("  暂无已验证数据（需等待开奖后自动验证）")
 
         task_mgr.progress(100, "完成")
         task_mgr.log("\n预测验证流程结束")
@@ -2790,12 +2821,13 @@ class SchedulerMixin:
             
             task_mgr.log(f"总预测期数: {total} 期")
             if total > 0:
-                task_mgr.log(f"完全命中:   {total_matched} 期 ({total_matched/total*100:.1f}%)")
+                task_mgr.log(f"宽松口径·完全命中（候选集包含+±1容错）: "
+                             f"{total_matched} 期 ({total_matched/total*100:.1f}%)")
             else:
-                task_mgr.log(f"完全命中:   0 期 (0.0%)")
+                task_mgr.log(f"宽松口径·完全命中: 0 期 (0.0%)")
             task_mgr.log(f"平均命中位数: {avg_match:.2f}/5")
-            task_mgr.log(f"平均准确率: {avg_accuracy:.2f}%")
-            task_mgr.log("  ↑ 以上为「集合包含+±1容错」宽松口径（候选集~5个，天然虚高）")
+            task_mgr.log(f"宽松口径平均准确率（集合包含+±1容错，非预测力）: {avg_accuracy:.2f}%")
+            task_mgr.log("  ↑ 仅作历史对照；真实预测力请看下方 Top-1 精确口径（随机基线 10%）")
             
             # ── Top-1 真实预测力口径（v3.67）──
             task_mgr.append_section_header(" ★ Top-1 真实预测力（首推号精确命中）")
@@ -3663,7 +3695,8 @@ class SchedulerMixin:
             task_mgr.append_section_header(" 诚实声明")
             task_mgr.append_info("  • relative_hotness 为归一化打分（相对热度），非命中概率")
             task_mgr.append_info("  • 排列5公平摇号，历史走势无法稳定超越随机基线（Top-1≈10%）")
-            task_mgr.append_info("  • 300期walk-forward回测: 融合命中率50.07%≈随机50%，信号源价值有限")
+            task_mgr.append_info("  • 300期walk-forward回测: 每位多候选（宽松集合）命中率50.07%≈该集合随机基线50%，"
+                                 "属宽松口径、非 Top-1 预测力；Top-1 精确口径随机基线为 10%")
             task_mgr.append_info("  • 本视图用于数据探索与信号分解，不承诺预测准确性")
 
             # 复用命中率概览（真实验证数据）
@@ -5169,16 +5202,16 @@ class SchedulerMixin:
         # 注意 get_verification_stats() 返回的是 *_accuracy 百分比，
         # 不含 *_hits 计数——早期误读 *_hits 会导致各位置恒显示 0%。
         task_mgr.log(f"\n  【验证统计】已验证 {total} 期（按期号去重）")
-        task_mgr.log(f"    严格口径（精确匹配）: 完全命中 "
+        task_mgr.log(f"    Top-1 精确口径: 完全命中 "
                      f"{stats.get('strict_full_matches', 0)} 期    "
                      f"平均命中 {stats.get('strict_avg_match', 0)}/5    "
-                     f"准确率 {stats.get('strict_avg_accuracy', 0)}%")
-        task_mgr.log(f"    容错口径（±1 偏差）: 完全命中 "
+                     f"平均准确率 {stats.get('strict_avg_accuracy', 0)}%")
+        task_mgr.log(f"    宽松口径（集合包含+±1 容错·非预测力）: 完全命中 "
                      f"{stats.get('total_matched', 0)} 期    "
                      f"平均命中 {stats.get('avg_match', 0)}/5    "
-                     f"准确率 {stats.get('avg_accuracy', 0)}%")
+                     f"平均准确率 {stats.get('avg_accuracy', 0)}%")
 
-        task_mgr.log(f"\n  【各位置命中率】严格口径 ┃ 容错口径")
+        task_mgr.log(f"\n  【各位置命中率】Top-1 精确口径 ┃ 宽松口径")
         pos_names = ['万位', '千位', '百位', '十位', '个位']
         pos_keys = ['wan', 'qian', 'bai', 'shi', 'ge']
         for name, key in zip(pos_names, pos_keys):
@@ -5188,7 +5221,9 @@ class SchedulerMixin:
             bar = '█' * bar_len + '░' * (20 - bar_len)
             task_mgr.log(f"    {name}: {strict:5.1f}% [{bar}] ┃ {tol:5.1f}%")
         task_mgr.append_info(
-            "    随机基线: 每位约 50%（每位预测 5 个号码 / 共 10 个）")
+            "    随机基线: 核心指标为 Top-1 精确口径 = 10%（k=1/10）；"
+            "宽松口径（每位多个候选）的基线仅对该宽松集合成立，"
+            "不能换算为 Top-1 命中率提升")
 
         try:
             perf_history = db.get_performance_history(limit=5)

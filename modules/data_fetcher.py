@@ -19,6 +19,18 @@ from typing import List, Dict, Any, Optional, Tuple
 from paths import LOGS_DIR
 from modules import database_utils
 
+# 单一数据源：爬虫请求间隔/重试/超时统一由 config.SPIDER_CONFIG 决定，
+# 避免 config.py 改「改了 config 却无效」的问题（此前 _get_page 硬编码
+# delay=(2,5)/retry=3/timeout=30，与 SPIDER_CONFIG(delay=3-6/timeout=15) 不一致）。
+try:
+    from config import SPIDER_CONFIG
+except Exception:
+    # config 不可用时保守回退内置默认（不阻断爬虫，仅失去集中配置）
+    SPIDER_CONFIG = {
+        'pages': 10, 'timeout': 30, 'retry_count': 3,
+        'delay_min': 2, 'delay_max': 5,
+    }
+
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
@@ -193,25 +205,32 @@ class P5Spider:
         ])
         return headers
     
-    def _get_page(self, url, max_retries=3, delay_range=(2, 5)):
+    def _get_page(self, url, max_retries=None, delay_range=None):
         """
         获取网页内容
         
         Args:
             url: 目标网页URL
-            max_retries: 最大重试次数
-            delay_range: 请求间隔范围（秒）
+            max_retries: 最大重试次数（None 则用 config.SPIDER_CONFIG.retry_count）
+            delay_range: 请求间隔范围（秒，None 则用 config.SPIDER_CONFIG.delay_min/max）
         
         Returns:
             网页HTML内容，失败返回None
         """
+        # 单一数据源：未显式传参时统一用 SPIDER_CONFIG（此前硬编码 3/(2,5) 与配置不一致）
+        if max_retries is None:
+            max_retries = int(SPIDER_CONFIG.get('retry_count', 3))
+        if delay_range is None:
+            delay_range = (float(SPIDER_CONFIG.get('delay_min', 2)),
+                           float(SPIDER_CONFIG.get('delay_max', 5)))
         for attempt in range(max_retries):
             try:
                 delay = random.uniform(*delay_range)
                 time.sleep(delay)
                 
                 self.session.headers.update(self._get_random_headers())
-                response = self.session.get(url, timeout=30)
+                response = self.session.get(
+                    url, timeout=int(SPIDER_CONFIG.get('timeout', 30)))
                 # B4 修复：原为写死的 'utf-8'（55128.cn 为 GBK 会乱码）；
                 # 改为优先探测响应编码，回退 utf-8
                 response.encoding = response.apparent_encoding or 'utf-8'
@@ -225,7 +244,8 @@ class P5Spider:
             except requests.exceptions.RequestException as e:
                 logger.error(f'请求异常: {e}, 尝试: {attempt + 1}/{max_retries}')
                 if attempt < max_retries - 1:
-                    backoff_delay = random.uniform(3, 6) * (attempt + 1)
+                    # 退避间隔与请求间隔同源（SPIDER_CONFIG.delay_min/max），递增乘数
+                    backoff_delay = random.uniform(*delay_range) * (attempt + 1)
                     time.sleep(backoff_delay)
         
         logger.error(f'多次请求失败，已达到最大重试次数: {url}')
@@ -1877,7 +1897,8 @@ class P5Spider:
             headers['X-Requested-With'] = 'XMLHttpRequest'
 
             # 1) GET 页面: 拿到隐藏 input(lot_code/miss_arr/limit) 与 session cookie
-            r = self.session.get(page_url, headers=headers, timeout=25)
+            r = self.session.get(page_url, headers=headers,
+                                 timeout=int(SPIDER_CONFIG.get('timeout', 25)))
             if r.status_code != 200:
                 logger.warning(f'获取{tb_code}页面失败, 状态码{r.status_code}')
                 return []
@@ -1896,7 +1917,7 @@ class P5Spider:
                 'https://chart.ydniu.com/graphql/trend/',
                 data={'query': query},
                 headers={**headers, 'Content-Type': 'application/x-www-form-urlencoded'},
-                timeout=25,
+                timeout=int(SPIDER_CONFIG.get('timeout', 25)),
             )
             if resp.status_code != 200:
                 logger.warning(f'GraphQL {tb_code} 请求失败, 状态码{resp.status_code}')

@@ -17,6 +17,50 @@ import logging
 import platform
 
 
+def _pick_font_family(system: str) -> str:
+    """按操作系统选择界面正文字体族（v5.3 GUI-UX 跨平台一致性）。
+
+    背景：原界面全量硬编码 ``微软雅黑``，该字体仅 Windows 自带；
+    macOS / Linux 下 Tk 会静默回退到系统默认字体，导致字号观感、
+    控件高度与换行宽度与 Windows 不一致。此处集中给出各平台
+    原生无衬线中文字体，Tk 找不到时仍由系统兜底，不抛异常。
+
+    参数:
+        system: platform.system() 返回值（'Windows' / 'Darwin' / 'Linux'）
+
+    返回:
+        str: 字体族名
+    """
+    if system == 'Darwin':
+        return 'PingFang SC'        # macOS 原生中文黑体
+    if system == 'Windows':
+        return '微软雅黑'            # Windows 自带中文无衬线
+    return 'Noto Sans CJK SC'       # Linux 主流发行版中文无衬线
+
+
+def _pick_mono_font_family(system: str) -> str:
+    """按操作系统选择等宽字体族（日志 / 期号 / 百分比数字）。
+
+    参数:
+        system: platform.system() 返回值
+
+    返回:
+        str: 等宽字体族名
+    """
+    if system == 'Darwin':
+        return 'Menlo'
+    if system == 'Windows':
+        return 'Consolas'
+    return 'DejaVu Sans Mono'
+
+
+_SYSTEM = platform.system()
+# 界面字体 token（单一来源）：构建层所有 font= 元组统一引用此处，
+# 避免跨平台字体名散落硬编码（v5.3 GUI-UX）。
+UI_FONT = _pick_font_family(_SYSTEM)
+MONO_FONT = _pick_mono_font_family(_SYSTEM)
+
+
 def _safe_subprocess_run(args, timeout=2, **kwargs):
     """
     安全执行 subprocess 命令，统一参数校验与超时控制。
@@ -277,18 +321,18 @@ def button_style_map(colors):
             'bg': colors['accent_p5'],
             'fg': WHITE,
             'active_bg': colors['accent_p5_light'],
-            'font': ('微软雅黑', 9, 'bold'),
+            'font': (UI_FONT, 9, 'bold'),
         },
         'secondary': {
             'bg': colors['bg_card'],
             'fg': colors['text_secondary'],
             'active_bg': colors['bg_card_hover'],
-            'font': ('微软雅黑', 9),
+            'font': (UI_FONT, 9),
         },
         'danger': {
             'bg': colors['bg_card'],
             'fg': colors['accent_danger_light'],
             'active_bg': colors['accent_danger'],
-            'font': ('微软雅黑', 9),
+            'font': (UI_FONT, 9),
         },
     }

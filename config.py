@@ -33,17 +33,90 @@
 """
 
 import os
+import sys
+import logging
 from pathlib import Path
+
+from paths import PROJECT_ROOT, BUNDLE_ROOT
+
+logger = logging.getLogger(__name__)
+
+# 冻结环境标识与首次运行引导状态（源码运行恒为 False，GUI 启动提示据此判断）
+IS_FROZEN = bool(getattr(sys, 'frozen', False))
+ENV_FILE_PATH = os.path.join(PROJECT_ROOT, 'config', '.env')
+FIRST_RUN_ENV_CREATED = False
+
+# 首次启动生成的空白配置模板：不含任何真实密钥，空值由用户自行填写
+_ENV_TEMPLATE = """\
+# KPLuckyNumber 运行配置（首次启动自动生成）
+# 本文件位于程序目录下的 config/.env，属于包外可写持久配置，不随程序升级被覆盖。
+# 敏感值（数据库密码 / AI API Key）只写在本文件或系统环境变量中，安装包内不内嵌密钥。
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=
+DB_NAME=lucky_number
+DB_CHARSET=utf8mb4
+AGNES_API_URL=https://api.agnes-ai.cn/v1/chat/completions
+AGNES_API_KEY=
+AGNES_MODEL_NAME=agnes-3.0-flash
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+"""
+
+
+def _bootstrap_frozen_env() -> None:
+    """冻结后首次启动：在包外可写目录生成 config/.env 空白模板（不内嵌密钥）。"""
+    global FIRST_RUN_ENV_CREATED
+    if not IS_FROZEN or os.path.isfile(ENV_FILE_PATH):
+        return
+    try:
+        _cfg_dir = os.path.dirname(ENV_FILE_PATH)
+        os.makedirs(_cfg_dir, exist_ok=True)
+        # 同步释放配置模板便于对照填写（仅首次生成，不覆盖已有文件）
+        _example_src = os.path.join(BUNDLE_ROOT, 'config', '.env.example')
+        _example_dst = os.path.join(_cfg_dir, '.env.example')
+        if os.path.isfile(_example_src) and not os.path.isfile(_example_dst):
+            import shutil
+            shutil.copyfile(_example_src, _example_dst)
+        with open(ENV_FILE_PATH, 'w', encoding='utf-8') as _f:
+            _f.write(_ENV_TEMPLATE)
+        FIRST_RUN_ENV_CREATED = True
+        logger.error('[配置] 未找到 config/.env，已生成空白模板: %s'
+                     '（请填写数据库密码与 AI Key 后重启程序）', ENV_FILE_PATH)
+    except Exception as _e:
+        logger.error('[配置] 生成 config/.env 模板失败（目录不可写？）: %s', _e)
+
+
+_bootstrap_frozen_env()
 
 # 尝试加载 .env 文件（可选依赖，不强制要求 python-dotenv）
 try:
     from dotenv import load_dotenv
     # 依次尝试项目根目录 .env 和 config/.env（后者为当前项目实际位置）
-    _root = Path(__file__).parent
+    # 移除 break，确保 config/.env 也能被加载（优先级：config/.env 覆盖根 .env）
+    # 根 .env 为通用配置，config/.env 为关键数据库配置，必须确保后者生效
+    _root = Path(PROJECT_ROOT)
     for _env_path in [_root / '.env', _root / 'config' / '.env']:
         if _env_path.is_file():
             load_dotenv(_env_path, override=False)
-            break
+    # 关键：若加载了两个 .env，config/.env 的变量会自动覆盖根 .env（dotenv 行为）
+    # 但如果只加载了其中之一，确保关键 DB 配置不为空
+    # 若 root .env 存在但缺少 DB_PASSWORD，尝试从 config/.env 手动回退
+    import os
+    _db_pass = os.getenv('DB_PASSWORD', '')
+    if not _db_pass:
+        # 回退：尝试从 config/.env 手动读取（兼容旧项目结构）
+        _cfg_env = _root / 'config' / '.env'
+        if _cfg_env.is_file():
+            with open(_cfg_env, 'r', encoding='utf-8') as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line.startswith('DB_PASSWORD='):
+                        _db_pass = _line.split('=', 1)[1].strip()
+                        os.environ['DB_PASSWORD'] = _db_pass
+                        break
 except Exception:
     # python-dotenv 未安装或 .env 不存在，忽略，使用系统环境变量
     pass
@@ -133,9 +206,15 @@ AI_CALL_BUDGET = {
     'enabled': _get_env_bool('ENABLE_AI_BUDGET', True),
     'soft_timeout': float(_get_env('AI_SOFT_TIMEOUT', '20')),
     'hard_timeout': float(_get_env('AI_HARD_TIMEOUT', '30')),
+    # 单期 AI 调用次数上限：predictor 实例化时仍读取该键并与本地默认值合并，
+    # 删除会导致环境变量 AI_PER_RUN_MAX_CALLS 失效、预算熔断退回硬编码 2 次，
+    # 与上方 A23 注释（per_run_max_calls × hard_timeout）不一致，故恢复配置项。
     'per_run_max_calls': _get_env_int('AI_PER_RUN_MAX_CALLS', 2),
 }
 
+# ALG-07: walk-forward 评估常量（提升至配置中心，便于调优与复现）
+WF_MAX_TRAIN = 10       # 单次 walk-forward 最大训练轮数（模型护栏）
+ML_EVAL_MIN = 161       # walk-forward 评估最小样本阈值（见 self_evolution ML_EVAL_MIN 定义，供向后兼用）
 # ============ 特征工程缓存配置（v5.2 ALG-04：指纹复用） ============
 # 依据项目升级方案 PUP-20261019-013100 ALG-04：
 #   - modules/features.py extract_all_features 外层加指纹缓存
@@ -149,7 +228,11 @@ AI_CALL_BUDGET = {
 #     仅损失性能，不影响特征正确性）。
 FEATURE_CACHE_CONFIG = {
     'enabled': _get_env_bool('FEATURE_CACHE_ENABLED', True),
-    'capacity': _get_env_int('FEATURE_CACHE_CAPACITY', 8),
+    # 容量 256：单条特征约 72KB，满载约 18MB；覆盖回测重跑/断点重试的
+    # 典型窗口数（基准实测 41 窗口重跑时容量 8 命中 0 次、256 命中 41 次）。
+    # 注意：顺序 walk-forward 每窗口指纹唯一，首次运行命中率仍为 0，
+    # 该容量只降低「重复窗口」的重复计算，不改变单次回测耗时。
+    'capacity': _get_env_int('FEATURE_CACHE_CAPACITY', 256),
 }
 
 # ============ AGNES AI 提示词配置 ============
@@ -170,6 +253,9 @@ AGNES_AI_PROMPT_CONFIG = {
     'history_periods_min': _get_env_int('AGNES_HISTORY_PERIODS_MIN', 5),
     'history_periods_max': _get_env_int('AGNES_HISTORY_PERIODS_MAX', 60),
 }
+
+# ALG-09: 提示词版本号。随配置变更自增，用于评估报告中的 _prompt_version 字段，实现配置变更可追溯。
+PROMPT_VERSION = "2026-10-22-v1"
 
 # ============ 爬虫配置 ============
 SPIDER_CONFIG = {
@@ -275,7 +361,7 @@ def _load_self_evo_config_file() -> dict:
     """
     import json
     try:
-        _cfg_path = Path(__file__).parent / 'data' / 'self_evolution_config.json'
+        _cfg_path = Path(PROJECT_ROOT) / 'data' / 'self_evolution_config.json'
         if _cfg_path.is_file():
             with open(_cfg_path, 'r', encoding='utf-8') as _f:
                 _data = json.load(_f)

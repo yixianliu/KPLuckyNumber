@@ -8,3 +8,8 @@ psutil>=5.9.0
 redis>=5.0.0
 PyYAML>=6.0
 DBUtils>=3.0       # MySQL 连接池
+numpy>=1.26.0      # 数值计算（modules/features、ml_predictor、backtester 等 10 个模块硬依赖）
+scikit-learn>=1.4.0  # 机器学习（modules/ml_predictor GradientBoostingClassifier）
+joblib>=1.3.0      # 模型持久化（modules/ml_predictor）
+# 可选：python-dotenv（config.py 已 try/except 可选加载，未安装时用系统环境变量）
+# python-dotenv>=1.0.0

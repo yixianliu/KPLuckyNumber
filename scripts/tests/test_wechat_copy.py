@@ -56,7 +56,6 @@ def test_wechat_format():
         ("超长行", "这是" + "A" * 100 + "测试超长行"),
     ]
 
-    all_passed = True
     for name, test_input in test_cases:
         print(f"\n测试: {name}")
         print(f"输入: {repr(test_input[:50])}...")
@@ -64,14 +63,13 @@ def test_wechat_format():
         result = _format_for_wechat(test_input)
         print(f"输出: {repr(result[:50])}...")
 
-        # 验证
-        if '\\u200b' in repr(result) or '\\u200c' in repr(result):
-            print(f"  ✗ 零宽字符未完全移除")
-            all_passed = False
-        elif '━━━━━━━━━━━━━━' in result or '━━━━━━' in result:
-            print(f"  ✓ 特殊字符替换成功")
-        else:
-            print(f"  ✓ 格式转换成功")
+        # 真实断言（原脚本仅打印结果，pytest 无法感知失败）
+        assert '\u200b' not in result and '\u200c' not in result, \
+            f'{name}: 零宽字符未完全移除'
+        assert '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' not in result, \
+            f'{name}: 超长分隔线未被替换'
+        assert result.strip(), f'{name}: 格式化结果为空'
+        print(f"  ✓ {name} 通过")
 
     # 模拟实际复制内容
     print("\n" + "-"*60)
@@ -117,26 +115,22 @@ def test_wechat_format():
     print("\n格式化后的内容:")
     print(formatted)
 
-    # 验证关键要求
-    checks = [
-        ("无零宽字符", '\u200b' not in formatted and '\u200c' not in formatted),
-        ("分隔线缩短", '━━━━━━━━━━━━━━' not in formatted),
-        ("无多余空行", '\n\n\n' not in formatted),
-        ("UTF-8编码", all(ord(c) < 128 or c.isprintable() for c in formatted)),
-    ]
+    # 验证关键要求（上方 asserts 已逐项断言，此处保留可读输出）
 
     print("\n" + "="*60)
     print("验证结果:")
     print("="*60)
-    for check_name, passed in checks:
-        status = "✓" if passed else "✗"
-        print(f"  {status} {check_name}")
-        if not passed:
-            all_passed = False
-
-    return all_passed
+    assert '\u200b' not in formatted and '\u200c' not in formatted, \
+        '实际复制内容仍含零宽字符'
+    assert '━━━━━━━━━━━━━━' not in formatted, '实际复制内容分隔线未缩短'
+    assert '\n\n\n' not in formatted, '实际复制内容存在多余空行'
+    assert all(ord(c) < 128 or c.isprintable() for c in formatted), \
+        '实际复制内容包含不可打印字符'
+    print("  ✓ 无零宽字符")
+    print("  ✓ 分隔线缩短")
+    print("  ✓ 无多余空行")
+    print("  ✓ UTF-8编码")
 
 
 if __name__ == '__main__':
-    success = test_wechat_format()
-    sys.exit(0 if success else 1)
+    test_wechat_format()

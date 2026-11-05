@@ -1,0 +1,58 @@
+[2026-11-04 10:01:22] [INFO] [Thread-2 (_run)] [self_evolution] _run 主循环开始（线程=Thread-2 (_run)）
+[2026-11-04 10:01:22] [INFO] [MainThread] [self_evolution] 引擎已启动，后台线程 Thread-2 (_run) 开始执行
+[2026-11-04 10:01:22] [INFO] [Thread-2 (_run)] [self_evolution] 检查点状态: 已加载=False, 当前阶段=collect, 检查点键=无
+[2026-11-04 10:01:22] [INFO] [Thread-2 (_run)] [self_evolution] 将从索引 0 继续（总阶段数=6）
+[2026-11-04 10:01:22] [INFO] [Thread-2 (_run)] [self_evolution] >>> 进入阶段 0/5: collect
+[2026-11-04 10:01:22] [INFO] [Thread-2 (_run)] [self_evolution] _phase_collect 开始
+[2026-11-04 10:01:31] [WARNING] [Thread-2 (_run)] [self_evolution] 数据库连接失败（返回 None）
+[2026-11-04 10:01:31] [WARNING] [Thread-2 (_run)] [self_evolution] _phase_collect: 数据库连接失败（_connect_db 返回 None）
+[2026-11-04 10:01:31] [INFO] [Thread-2 (_run)] [self_evolution] <<< 阶段 collect 执行完毕，检查点=['phase', 'history_count', 'latest_issue']
+[2026-11-04 10:01:31] [INFO] [Thread-2 (_run)] [self_evolution] >>> 进入阶段 1/5: baseline
+[2026-11-04 10:01:31] [INFO] [Thread-2 (_run)] [self_evolution] _phase_baseline 开始
+[2026-11-04 10:01:36] [WARNING] [MainThread] [self_evolution] 数据库连接失败（返回 None）
+[2026-11-04 10:01:39] [WARNING] [Thread-2 (_run)] [self_evolution] 数据库连接失败（返回 None）
+[2026-11-04 10:01:39] [INFO] [Thread-2 (_run)] [self_evolution] _phase_baseline: 历史版本总数=0, active版本数=0
+[2026-11-04 10:01:39] [INFO] [Thread-2 (_run)] [self_evolution] _phase_baseline: 无历史 active 版本，以随机基线为参照
+[2026-11-04 10:01:39] [INFO] [Thread-2 (_run)] [self_evolution] _phase_baseline 结束
+[2026-11-04 10:01:39] [INFO] [Thread-2 (_run)] [self_evolution] <<< 阶段 baseline 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline']
+[2026-11-04 10:01:39] [INFO] [Thread-2 (_run)] [self_evolution] >>> 进入阶段 2/5: evolve
+[2026-11-04 10:01:39] [INFO] [Thread-2 (_run)] [self_evolution] _phase_evolve 开始
+[2026-11-04 10:01:39] [INFO] [Thread-2 (_run)] [MLPredictorPool] Windows 平台，跳过 multiprocessing.Pool 创建，直接进程内执行
+[2026-11-04 10:01:39] [INFO] [Thread-2 (_run)] [self_evolution] ML 子进程池创建成功（max_workers=2, timeout=60s）
+[2026-11-04 10:01:46] [INFO] [Thread-2 (_run)] [self_evolution] 权重快照已采集: weights=None, lookback=None
+[2026-11-04 10:01:46] [INFO] [Thread-2 (_run)] [self_evolution] 搜索后端: both
+[2026-11-04 10:01:46] [INFO] [Thread-2 (_run)] [self_evolution] 样本量=0, auto=True, auto_full=True, eval_periods=15
+[2026-11-04 10:01:46] [INFO] [Thread-2 (_run)] [self_evolution] 样本量 0 < 最小要求 61，跳过深度调优
+[2026-11-04 10:01:46] [INFO] [Thread-2 (_run)] [self_evolution] ML 重训跳过：样本量 0 < 最小要求 61
+[2026-11-04 10:01:46] [INFO] [Thread-2 (_run)] [self_evolution] _phase_evolve 结束
+[2026-11-04 10:01:46] [INFO] [Thread-2 (_run)] [self_evolution] <<< 阶段 evolve 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics']
+[2026-11-04 10:01:46] [INFO] [Thread-2 (_run)] [self_evolution] >>> 进入阶段 3/5: evaluate
+[2026-11-04 10:01:50] [WARNING] [Thread-2 (_run)] [self_evolution] 数据库连接失败（返回 None）
+[2026-11-04 10:01:50] [INFO] [Thread-2 (_run)] [self_evolution] <<< 阶段 evaluate 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics', 'eval_metrics', 'beat_baseline']
+[2026-11-04 10:01:50] [INFO] [Thread-2 (_run)] [self_evolution] >>> 进入阶段 4/5: persist
+[2026-11-04 10:01:50] [INFO] [Thread-2 (_run)] [self_evolution] _phase_persist 开始
+[2026-11-04 10:01:50] [INFO] [Thread-2 (_run)] [self_evolution] 准备持久化版本: tag=evo_20261104_100150, status=active
+[2026-11-04 10:01:50] [INFO] [Thread-2 (_run)] [ExperimentTracker] 实验已记录: evo_20261104_100150 (active), git=unknown
+[2026-11-04 10:02:20] [INFO] [Thread-2 (_run)] [self_evolution] _run 主循环开始（线程=Thread-2 (_run)）
+[2026-11-04 10:02:20] [INFO] [MainThread] [self_evolution] 引擎已启动，后台线程 Thread-2 (_run) 开始执行
+[2026-11-04 10:02:20] [INFO] [Thread-2 (_run)] [self_evolution] 检查点状态: 已加载=True, 当前阶段=persist, 检查点键=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics', 'eval_metrics', 'beat_baseline']
+[2026-11-04 10:02:20] [INFO] [Thread-2 (_run)] [self_evolution] 将从索引 4 继续（总阶段数=6）
+[2026-11-04 10:02:20] [INFO] [Thread-2 (_run)] [self_evolution] >>> 进入阶段 4/5: persist
+[2026-11-04 10:02:20] [INFO] [Thread-2 (_run)] [self_evolution] _phase_persist 开始
+[2026-11-04 10:02:20] [INFO] [Thread-2 (_run)] [self_evolution] 准备持久化版本: tag=evo_20261104_100220, status=active
+[2026-11-04 10:02:30] [WARNING] [Thread-2 (_run)] [self_evolution] 数据库连接失败（返回 None）
+[2026-11-04 10:02:30] [INFO] [Thread-2 (_run)] [ExperimentTracker] 实验已记录: evo_20261104_100220 (active), git=unknown
+[2026-11-04 10:02:37] [WARNING] [MainThread] [self_evolution] 数据库连接失败（返回 None）
+[2026-11-04 10:02:39] [WARNING] [Thread-2 (_run)] [self_evolution] 数据库连接失败（返回 None）
+[2026-11-04 10:02:39] [INFO] [Thread-2 (_run)] [self_evolution] 版本持久化成功: evo_20261104_100220 [active]
+[2026-11-04 10:02:39] [INFO] [Thread-2 (_run)] [self_evolution] _phase_persist 结束
+[2026-11-04 10:02:39] [INFO] [Thread-2 (_run)] [self_evolution] <<< 阶段 persist 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics', 'eval_metrics', 'beat_baseline']
+[2026-11-04 10:02:39] [INFO] [Thread-2 (_run)] [self_evolution] >>> 进入阶段 5/5: done
+[2026-11-04 10:02:39] [INFO] [Thread-2 (_run)] [self_evolution] _phase_done 开始
+[2026-11-04 10:02:39] [INFO] [Thread-2 (_run)] [self_evolution] 改进建议: 共 1 条
+[2026-11-04 10:02:44] [WARNING] [Thread-2 (_run)] [self_evolution] 数据库连接失败（返回 None）
+[2026-11-04 10:02:44] [INFO] [Thread-2 (_run)] [self_evolution] _phase_done 结束
+[2026-11-04 10:02:44] [INFO] [Thread-2 (_run)] [self_evolution] <<< 阶段 done 执行完毕，检查点=['phase', 'history_count', 'latest_issue', 'baseline', 'weight_snapshot', 'ml_metrics', 'eval_metrics', 'beat_baseline']
+[2026-11-04 10:02:44] [INFO] [Thread-2 (_run)] [self_evolution] 六阶段主循环全部结束，清空检查点并标记调度完成
+[2026-11-04 10:02:44] [INFO] [Thread-2 (_run)] [self_evolution] 引擎完成，发送 done 消息
+[2026-11-04 10:02:44] [INFO] [Thread-2 (_run)] [self_evolution] _run 主循环结束（线程=Thread-2 (_run)）

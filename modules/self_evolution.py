@@ -874,6 +874,7 @@ class SelfEvolutionEngine:
         self.auto = auto
         self.auto_full = auto_full
         self._running = False
+        self._shutdown = False  # shutdown() 后置 True，阻止定时器/线程被重新拉起
         self._run_lock = threading.Lock()  # 保护 _running 标志，防止双线程并发执行
         self._thread: Optional[threading.Thread] = None
         self.queue: queue.Queue = queue.Queue()
@@ -943,6 +944,9 @@ class SelfEvolutionEngine:
     # ------------------------------------------------------------------
     def start(self):
         """启动引擎（非阻塞，后台线程）。"""
+        if self._shutdown:
+            logger.info('[self_evolution] start 被调用但引擎已 shutdown，忽略')
+            return
         if self._running:
             logger.info('[self_evolution] start 被调用但已在运行中，忽略')
             return
@@ -976,7 +980,9 @@ class SelfEvolutionEngine:
         return False
 
     def shutdown(self):
-        """优雅关闭（停止线程 + 子进程池）。"""
+        """优雅关闭（停止线程 + 定时器 + 子进程池）。"""
+        # 先置 shutdown 标志：阻止定时器 tick 结束后再次重排、阻止 start() 复活
+        self._shutdown = True
         self._running = False
         self.stop_silent_timer()
         if self._ml_pool is not None:
@@ -1322,6 +1328,10 @@ class SelfEvolutionEngine:
     # 定时器（v3.52 AutoEvoScheduler）
     # ------------------------------------------------------------------
     def start_silent_timer(self, delay: Optional[float] = None):
+        # shutdown 后禁止复活：拦截 tick 重排与外部直接调用两条路径
+        if self._shutdown:
+            logger.debug('[self_evolution] 引擎已 shutdown，忽略定时器启动')
+            return
         self.stop_silent_timer()
         if delay is None:
             delay = 60.0
@@ -1397,6 +1407,10 @@ class SelfEvolutionEngine:
         """
         next_delay = 60.0
         try:
+            # shutdown 后即使定时器仍在飞行中也直接退出，避免再触发一轮进化
+            if self._shutdown:
+                logger.debug('[self_evolution] 定时器 tick：引擎已 shutdown，跳过本轮')
+                return
             if self._scheduler_paused:
                 if self._is_link_state_stale():
                     logger.warning(
@@ -1445,14 +1459,35 @@ class SelfEvolutionEngine:
             logger.warning('[self_evolution] 定时器 tick 异常: %s', e)
             next_delay = 300.0
         finally:
-            # 确保定时器始终被重建，即使异常也继续调度
-            self.start_silent_timer(delay=next_delay)
+            # 仅在未 shutdown 时重建定时器：避免 shutdown() 后本 tick 的 finally
+            # 把定时器重新拉起，导致关闭后继续触发额外进化。
+            if not self._shutdown:
+                self.start_silent_timer(delay=next_delay)
 
     # ------------------------------------------------------------------
     # 主循环（六阶段）
     # ------------------------------------------------------------------
     def _run(self):
-        """六阶段主循环（在后台线程执行）。"""
+        """六阶段主循环入口：异常/中止路径下也复位 _running 与锁状态。
+
+        历史缺陷：_run 只在正常结束处把 _running 置 False；_load_checkpoint、
+        _save_checkpoint、_scheduler.mark_run 等抛出异常时后台线程直接退出，
+        引擎永久停留在「运行中」，后续 start()/定时器再也无法拉起。
+        这里只做状态复位与异常兜底，不改六阶段业务编排。
+        """
+        try:
+            self._run_impl()
+        except Exception as e:  # noqa: BLE001
+            logger.error('[self_evolution] _run 未捕获异常: %s', e, exc_info=True)
+            self._emit('error', f'自我进化异常终止: {e}')
+        finally:
+            with self._run_lock:
+                self._running = False
+            logger.info('[self_evolution] _running 已在 finally 复位（线程=%s）',
+                        threading.current_thread().name)
+
+    def _run_impl(self):
+        """六阶段主循环实现（由 _run 包裹状态复位）。"""
         logger.info('[self_evolution] _run 主循环开始（线程=%s）', threading.current_thread().name)
         # 加载检查点：若存在未完成检查点则从断点续跑
         self._load_checkpoint()

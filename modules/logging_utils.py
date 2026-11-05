@@ -286,7 +286,10 @@ class ColorConsoleFormatter(logging.Formatter):
             fmt='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
             datefmt='%H:%M:%S'
         )
-        self.use_colors = use_colors and sys.stderr.isatty()
+        # 打包为窗口模式（PyInstaller console=False / pythonw）时 sys.stderr 为 None，
+        # 必须先判空再取 isatty，否则启动期直接 AttributeError 崩溃
+        self.use_colors = bool(
+            use_colors and sys.stderr is not None and sys.stderr.isatty())
     
     def format(self, record: logging.LogRecord) -> str:
         # 注入上下文到 message
@@ -364,8 +367,8 @@ def configure_logging(
     for h in root_logger.handlers[:]:
         root_logger.removeHandler(h)
     
-    # 控制台 handler
-    if console_output:
+    # 控制台 handler（窗口模式下 sys.stderr 为 None，跳过以避免 StreamHandler 持有空流）
+    if console_output and sys.stderr is not None:
         console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setLevel(level)
         console_handler.setFormatter(ColorConsoleFormatter(use_colors=True))

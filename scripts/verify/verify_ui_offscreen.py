@@ -168,7 +168,11 @@ def run():
     check(not any(str(b.cget('fg')) == old_text_primary for b in token_btns),
           'C7 切换后无按钮残留旧主题 text_primary（文字可见）')
     check(str(root.cget('bg')) == m.COLORS['bg_primary'], 'C8 根窗口 bg 跟随新主题')
-    check(gui._theme_btn.cget('text') in ('☀️', '🌙'), 'C9 主题按钮 emoji 已更新')
+    # v5.3 GUI-UX 第二批：主题按钮改为 Canvas 自绘图标，不再用 emoji 文本。
+    # 语义：浅色 → 月亮（点击切深色）；深色 → 太阳（点击切浅色）。
+    _expect_icon = 'moon' if gui._current_theme == 'light' else 'sun'
+    check(getattr(gui, '_theme_icon_state', None) == _expect_icon,
+          f'C9 主题图标已更新({getattr(gui, "_theme_icon_state", "missing")}/期望 {_expect_icon})')
 
     gui._toggle_theme()  # 切回
     root.update_idletasks()

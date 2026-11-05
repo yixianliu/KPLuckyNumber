@@ -8,9 +8,12 @@
 import sys
 import os
 import time
-sys.path.append(os.path.join(os.path.dirname(__file__), 'modules'))
+# 项目根目录（scripts/tests → scripts → 项目根），保证 modules.* 可导入
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
 
-from model_monitor import ModelMonitor, record_prediction_metrics, start_model_monitoring, stop_model_monitoring
+from modules.model_monitor import (ModelMonitor, record_prediction_metrics,
+                                   start_model_monitoring, stop_model_monitoring)
 import json
 
 def test_model_monitor():
@@ -50,7 +53,7 @@ def test_model_monitor():
         print("✓ 预测结果记录成功")
     except Exception as e:
         print(f"✗ 预测结果记录失败: {e}")
-        return False
+        raise AssertionError('模型监控测试步骤失败（详见上方日志）')
     
     # 测试监控状态
     print("\n2. 测试监控状态...")
@@ -62,7 +65,7 @@ def test_model_monitor():
         print(f"  最新值: 命中率={status['latest_values'].get('hit_rate', 'N/A'):.4f}")
     except Exception as e:
         print(f"✗ 监控状态获取失败: {e}")
-        return False
+        raise AssertionError('模型监控测试步骤失败（详见上方日志）')
     
     # 测试启动/停止监控
     print("\n3. 测试启动/停止监控...")
@@ -73,9 +76,11 @@ def test_model_monitor():
         
         monitor.stop_monitoring()
         print("✓ 监控停止成功")
+        # 反馈回调通路验证（原脚本仅打印，改为显式断言）
+        assert feedback_received, '监控停止后未收到任何反馈数据'
     except Exception as e:
         print(f"✗ 监控启动/停止测试失败: {e}")
-        return False
+        raise AssertionError('模型监控测试步骤失败（详见上方日志）')
     
     # 测试数据导出
     print("\n4. 测试数据导出...")
@@ -89,18 +94,20 @@ def test_model_monitor():
             print(f"  导出数据包含: {list(exported_data.keys())}")
         else:
             print("✗ 监控数据导出失败")
-            return False
+            raise AssertionError('模型监控测试步骤失败（详见上方日志）')
     except Exception as e:
         print(f"✗ 监控数据导出测试失败: {e}")
-        return False
+        raise AssertionError('模型监控测试步骤失败（详见上方日志）')
     
     # 测试便捷函数
     print("\n5. 测试便捷函数...")
     try:
-        # 重置反馈接收
-        feedback_received.clear()
-        
-        # 使用便捷函数记录预测
+        # 便捷函数写入的是模块级全局监控器（非上面的局部实例），
+        # 故按全局实例的状态增量验证，而不是继续看局部回调。
+        from modules import model_monitor as _mm
+        global_monitor = _mm.get_model_monitor()
+        before = global_monitor.get_current_status()['data_points']['hit_rates']
+
         record_prediction_metrics(
             'convenience_test',
             0.12,  # 命中率
@@ -109,22 +116,19 @@ def test_model_monitor():
             1,     # 训练错误
             {'test_feature': 0.9}
         )
-        
-        time.sleep(0.1)  # 等待反馈处理
-        
-        if feedback_received:
-            print("✓ 便捷函数测试成功")
-        else:
-            print("! 便捷函数未触发反馈（可能数据不足）")
-            
+
+        after = global_monitor.get_current_status()
+        assert after['data_points']['hit_rates'] == before + 1, \
+            '便捷函数未写入全局监控器'
+        assert abs(after['latest_values']['hit_rate'] - 0.12) < 1e-9, \
+            '便捷函数写入的命中率与入参不一致'
+        print("✓ 便捷函数测试成功（已写入全局监控器）")
     except Exception as e:
         print(f"✗ 便捷函数测试失败: {e}")
-        return False
-    
+        raise AssertionError('模型监控测试步骤失败（详见上方日志）')
+
     print(f"\n=== 测试完成 ===")
-    print(f"共收到 {len(feedback_received)} 条反馈数据")
-    return True
+    print(f"局部监控器累计反馈 {len(feedback_received)} 条（第 5 步前已清零）")
 
 if __name__ == '__main__':
-    success = test_model_monitor()
-    sys.exit(0 if success else 1)
+    test_model_monitor()

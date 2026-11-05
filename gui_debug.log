@@ -1,0 +1,15 @@
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+22:35:54 | INFO     | root | 日志系统初始化完成: level=INFO, json=False
+22:35:55 | INFO     | ModelMonitor | 模型监控反馈机制初始化完成
+22:35:55 | INFO     | modules.monitor_feedback | 模型监控建议型回灌已接入（feedback_callback 已注入）
+22:35:55 | INFO     | modules.perf_monitor | [PerfMonitor] 性能监控守护线程已启动（interval=1.0s）
+22:35:55 | INFO     | modules.task_manager | TaskManager 初始化完成: workers=4, queue_size=100
+22:35:55 | INFO     | __main__ | [GUI] _ui_scheduler 已启动：单一 100ms tick 循环接管轮询
+22:35:55 | INFO     | modules.perf_monitor | [PerfMonitor] psutil 已就绪（CPU/内存指标启用）
+22:35:56 | INFO     | modules.self_evolution | [self_evolution] _run 主循环开始（线程=Thread-1 (_run)）
+22:35:56 | INFO     | modules.self_evolution | [self_evolution] 引擎已启动，后台线程 Thread-1 (_run) 开始执行
+22:35:56 | INFO     | __main__ | [GUI] 自我进化引擎已初始化并启动，注册轮询定时器
+22:35:56 | INFO     | modules.self_evolution | [self_evolution] 检查点状态: 已加载=True, 当前阶段=collect, 检查点键=['phase']
+22:35:56 | INFO     | modules.self_evolution | [self_evolution] 将从索引 0 继续（总阶段数=6）
+22:35:56 | INFO     | modules.self_evolution | [self_evolution] >>> 进入阶段 0/5: collect
+22:35:56 | INFO     | modules.self_evolution | [self_evolution] _phase_collect 开始

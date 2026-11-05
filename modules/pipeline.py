@@ -347,9 +347,21 @@ class Pipeline:
 
         # --- Gate 4: CONSECUTIVE_GAPS ---
         def _parse_issue_num(iss: str) -> int:
-            """安全解析期号为整数，用于间隙检测。"""
+            """安全解析期号为单调整数，用于间隙检测。
+
+            期号格式 YYYYDDD（年 + 年内第几天，共 7 位）。返回 年*366+day，
+            使「同年 day 差」与「跨年边界」都等于真实期数差：
+              - 同年相邻（2024356→2024357）：366 权重相消，差 = day差 = 1
+              - 跨年相邻（2024366→2025001）：2024*366+366 vs 2025*366+1，差 = 1
+            旧实现 `int(s) % 1000000` 丢失年份权重，跨年时差 = 635（误判「>5期间断」、
+            误报「数据过时」）。解析失败返回 0（防御性，正常数据永不触发）。
+            """
             try:
                 s = str(iss).strip()
+                if len(s) == 7 and s.isdigit():
+                    year = int(s[:4])
+                    day = int(s[4:])
+                    return year * 366 + day
                 return int(s) % 1000000
             except (ValueError, TypeError):
                 return 0
@@ -401,7 +413,10 @@ class Pipeline:
         recentness_msg = '数据新鲜度正常'
         recentness_details = {}
         if target_issue and issue_values:
-            latest_issue_str = issue_values[0]  # 列表已是 DESC 顺序
+            # 取最大期号（顺序无关）：实时路径 history_data 为 DESC（issue_values[0]=最新），
+            # 但回测/其他调用方可能传 ASC 正序；原 `issue_values[0]` 在 ASC 下取到最旧期，
+            # 导致 RECENTNESS 误报「数据过时」。用 _parse_issue_num 取单调整数最大者。
+            latest_issue_str = max(issue_values, key=_parse_issue_num)
             latest_parsed = _parse_issue_num(latest_issue_str)
             target_parsed = _parse_issue_num(target_issue)
             age = abs(target_parsed - latest_parsed)
@@ -4168,12 +4183,17 @@ class Pipeline:
             latest_issue = int(row['issue'])
 
             # 2. 待验证候选集：pending 且 期号已开奖
+            # 一次 JOIN 取回待验证记录与对应开奖号码，替代循环内逐条 SELECT
+            # （原实现 N 条待验证 → N 次查询，历史积压时验证闭环明显变慢）。
+            # LEFT JOIN 语义与原先「逐条 WHERE issue = %s」完全一致：匹配不到即 wan 为 NULL。
             db.cursor.execute('''
-                SELECT id, report_uuid, target_issue, predicted_numbers
-                FROM p5_prediction_record
-                WHERE verification_status = 'pending'
-                  AND CAST(target_issue AS UNSIGNED) <= %s
-                ORDER BY target_issue ASC, id ASC
+                SELECT r.id, r.report_uuid, r.target_issue, r.predicted_numbers,
+                       h.wan, h.qian, h.bai, h.shi, h.ge
+                FROM p5_prediction_record r
+                LEFT JOIN p5_history_data h ON h.issue = r.target_issue
+                WHERE r.verification_status = 'pending'
+                  AND CAST(r.target_issue AS UNSIGNED) <= %s
+                ORDER BY r.target_issue ASC, r.id ASC
             ''', (latest_issue,))
             pending = db.cursor.fetchall()
             result['total_scanned'] = len(pending)
@@ -4186,20 +4206,15 @@ class Pipeline:
             for rec in pending:
                 ti = rec['target_issue']
                 try:
-                    # 拉取实开号码
-                    db.cursor.execute(
-                        'SELECT wan, qian, bai, shi, ge FROM p5_history_data WHERE issue = %s',
-                        (ti,)
-                    )
-                    act = db.cursor.fetchone()
-                    if not act:
+                    # 实开号码已由候选集 LEFT JOIN 一并取回；wan 为 None 表示该期缺开奖数据
+                    if rec.get('wan') is None:
                         # 该期号历史数据中缺失（异常），跳过避免卡死
                         result['skipped'] += 1
                         logger.warning(f'验证闭环: 期号 {ti} 无开奖数据, 跳过')
                         continue
                     actual_numbers = [
-                        int(act['wan']), int(act['qian']), int(act['bai']),
-                        int(act['shi']), int(act['ge'])
+                        int(rec['wan']), int(rec['qian']), int(rec['bai']),
+                        int(rec['shi']), int(rec['ge'])
                     ]
                     vr = db.update_prediction_verification(
                         rec['report_uuid'], ti, actual_numbers, ti

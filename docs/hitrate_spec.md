@@ -39,7 +39,7 @@
 
 ## 3. Top-1 真实口径 / Top-3 覆盖口径（双口径分离）
 
-定义源码锚点：`modules/online_learner.py::_calculate_hits`（L351）：
+定义源码锚点：`modules/online_learner.py::_calculate_hits`（L379）：
 
 | 口径 | 字段 | 语义 | 定位 |
 | ---- | ---- | ---- | ---- |
@@ -50,14 +50,19 @@
 
 不变量：`partial_hits >= top1_hits`（覆盖口径是真实口径的超集）。
 
+实现约束：`partial_hits` **只统计 Top-3 单元覆盖**，不得混入推荐组合的部分
+命中信号。旧实现曾在推荐组合 `match_count >= 3` 时用 `max()` 抬升
+`partial_hits`，导致同一字段承载两种语义；已删除该分支，组合仅保留
+`exact_match`（5 位全等）。
+
 ## 4. overall_score 公式（只读登记，禁止擅改）
 
 源码锚点：`modules/backtester.py`：
 
-- `_evaluate_prediction`（L485）实际计算：`overall_score = round((top1_hits * 40 + top3_hits * 20) / 3, 2)`（L568）
-- 同方法 docstring（L498）写 `/ 5`，为**过期文档**（/3 时理论满分恰为 100，与
-  docstring「满分 100」自洽）；docstring 与代码不一致，**本次仅登记不修复**。
-- `_calculate_overall_stats`（L598）按记录 `overall_score` 求均值。
+- `_evaluate_prediction`（L494）实际计算：`overall_score = round((top1_hits * 40 + top3_hits * 20) / 3, 2)`（L599）
+- 同方法 docstring（L506）已由 `/ 5` 更正为 `/ 3`（/3 时理论满分恰为 100，与
+  docstring「满分 100」自洽）；**已于本轮对齐，代码算法未改**。
+- `_calculate_overall_stats`（L629）按记录 `overall_score` 求均值。
 
 权重语义：Top-1 命中权重 40 >> Top-3 权重 20，强调「精准命中头号推荐」更重要。
 任何调整必须先在本文档登记并经评审，不允许代码先行。

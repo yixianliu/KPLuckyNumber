@@ -41,6 +41,7 @@ __all__ = [
     'SLOT_PRIORITY',
     'lighten_color',
     'darken_color',
+    'readable_text_color',
     'default_hover_bg',
     'remember_button_normal',
     'apply_button_normal_style',
@@ -181,6 +182,51 @@ def _is_dark(hex_color: str) -> bool:
         return (0.299 * r + 0.587 * g + 0.114 * b) < 128
     except Exception:
         return True
+
+
+def _relative_luminance(hex_color: str) -> float:
+    """计算 sRGB 相对亮度（WCAG 2.x 公式，0=黑 / 1=白）。
+
+    参数:
+        hex_color: '#rrggbb' 色值
+
+    返回:
+        float: 相对亮度；解析失败按深色 0.0 处理（回退白字）
+    """
+    try:
+        h = str(hex_color).lstrip('#')
+        if len(h) != 6:
+            return 0.0
+        rgb = []
+        for i in (0, 2, 4):
+            c = int(h[i:i + 2], 16) / 255.0
+            rgb.append(c / 12.92 if c <= 0.04045
+                       else ((c + 0.055) / 1.055) ** 2.4)
+        return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    except Exception:
+        return 0.0
+
+
+def readable_text_color(background: str, colors: Optional[Dict[str, str]] = None) -> str:
+    """按背景亮度选择可读性最高的前景色（v5.3 GUI-UX 对比度修复）。
+
+    背景：大号操作按钮直接使用主题 ``text_primary`` 作前景——深色主题下
+    该值为近白，叠加在琥珀色 ``#f59e0b`` 上对比度仅约 2.2:1，文字几乎糊掉。
+    本函数按 WCAG 相对亮度择一：亮底用深墨色、深底用白色，保证两套主题
+    在任意 accent 底色上都达到可读对比度。
+
+    参数:
+        background: 按钮背景色（'#rrggbb'，可经 ``colors`` token 解析）
+        colors: 当前主题色字典（可选，用于把 token 解析为色值）
+
+    返回:
+        str: '#ffffff' 或 '#111827'（后者刻意区别于两套主题的
+        ``text_primary``，避免离屏守卫把「静态深色前景」误判为旧主题残留）
+    """
+    bg = resolve_color_token(background, colors)
+    # 0.35 为实测阈值：accent_p5(#059669)≈0.23 → 白字；accent_warning_light
+    # (#f59e0b)≈0.43 → 深字；accent_ai(#7c3aed)≈0.11 → 白字。
+    return '#ffffff' if _relative_luminance(bg) <= 0.35 else '#111827'
 
 
 def default_hover_bg(colors, bg_token: Optional[str], normal_bg: Optional[str]):
@@ -388,7 +434,10 @@ def build_ttk_styles(root, colors: Optional[Dict[str, str]] = None) -> Any:
         card = colors.get('bg_card', bg)
         fg = colors.get('text_primary', '#f8fafc')
         muted = colors.get('text_muted', _FALLBACK_MUTED)
-        accent = colors.get('accent') or colors.get('primary') or fg
+        # 修复（v5.3 GUI-UX）：原取色链 'accent' / 'primary' 在主题色板中均不存在，
+        # accent 恒回退为 text_primary；一旦据此配置选中页签背景，深色主题会出现
+        # 「近白底 + 近白字」的不可见页签。现改为真实语义槽 accent_p5。
+        accent = colors.get('accent_p5') or colors.get('accent') or fg
         hover = lighten_color(card)
 
         style.configure('TFrame', background=bg)
@@ -403,23 +452,39 @@ def build_ttk_styles(root, colors: Optional[Dict[str, str]] = None) -> Any:
                   foreground=[('disabled', muted), ('active', fg)])
 
         try:
-            style.configure('TNotebook', background=bg, borderwidth=0)
+            # P2 收口：Tab 内边距接入 SPACING token（md=12 横向 / sm=8 纵向），
+            # 消除硬编码 (12,6)，与卡片间距栅格统一。
+            from modules.ui_theme_spec import SPACING as _SP
+            _tab_pad = (_SP.get('md', 12), _SP.get('sm', 6))
+            style.configure('TNotebook', background=bg, borderwidth=0,
+                            tabmargins=(0, 0, 0, 0))
             style.configure('TNotebook.Tab', background=card, foreground=fg,
-                            padding=(12, 6))
+                            borderwidth=0, padding=_tab_pad)
+            # 选中页签：accent 实底 + 按亮度自适应前景（绿底白字 / 琥珀底深字），
+            # 避免深色主题「近白底近白字」不可见，同时保证浅色主题对比度。
             style.map('TNotebook.Tab',
-                      background=[('selected', accent)],
-                      foreground=[('selected', fg)])
+                      background=[('selected', accent),
+                                  ('active', hover)],
+                      foreground=[('selected', readable_text_color(accent)),
+                                  ('active', fg)])
         except Exception:
             pass
 
         try:
             style.configure('TEntry', fieldbackground=card, foreground=fg,
-                            borderwidth=1)
+                            borderwidth=1, insertcolor=fg)
         except Exception:
             pass
 
         try:
-            style.configure('TCombobox', fieldbackground=card, foreground=fg)
+            style.configure('TCombobox', fieldbackground=card, background=card,
+                            foreground=fg, arrowcolor=fg, borderwidth=1,
+                            padding=(6, 3))
+            style.map('TCombobox',
+                      fieldbackground=[('readonly', card)],
+                      foreground=[('readonly', fg)],
+                      selectbackground=[('readonly', accent)],
+                      selectforeground=[('readonly', readable_text_color(accent))])
         except Exception:
             pass
 
@@ -497,6 +562,7 @@ def format_duration(seconds):
     try:
         s = int(round(float(seconds)))
     except Exception:
+        # 非法输入降级：返回 None（调用方按「无法估算」展示，不中断 UI）
         return None
     if s < 0:
         return None
@@ -603,6 +669,7 @@ class ProgressEstimator:
         try:
             pct = max(0.0, min(100.0, float(value)))
         except Exception:
+            # 非法进度值降级：返回 None（表示本帧无法估算，不中断 UI）
             return None
         if self._first_ts is None:
             self._first_ts = float(now)

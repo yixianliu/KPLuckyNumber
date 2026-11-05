@@ -70,9 +70,30 @@ class MySQLStorageManager:
                 return
 
         try:
-            self.db.create_kv_table()
+            # P5Database 未继承 KVStoreTableMixin，这里显式绑定已连接的 connection/cursor，
+            # 复用 Mixin 的建表 DDL（兼容属性式游标，见 _cursor 说明）
+            creator = KVStoreTableMixin()
+            creator.connection = self.db.connection
+            creator.cursor = self._cursor()
+            creator.create_kv_table()
         except Exception as e:
             logger.error(f"创建存储表失败: {e}")
+
+    def _cursor(self):
+        """统一获取游标对象。
+
+        P5Database 暴露的 ``cursor`` 是 SteadyDBCursor 属性对象（不可调用），
+        其他实现可能提供 ``cursor()`` 方法。此处显式兼容两种接线方式；
+        无法识别时抛错而不是把 TypeError 交给宽泛 except 吞掉。
+        """
+        if self.db is None:
+            raise RuntimeError('数据库未连接')
+        cursor_attr = getattr(self.db, 'cursor', None)
+        if callable(cursor_attr):
+            return cursor_attr()
+        if cursor_attr is not None and hasattr(cursor_attr, 'execute'):
+            return cursor_attr
+        raise TypeError('数据库对象缺少可用游标：cursor 既不可调用也不具备 execute 方法')
 
     def _get_table_for_key(self, key: str) -> Tuple[str, str]:
         """
@@ -151,14 +172,14 @@ class MySQLStorageManager:
             # 使用INSERT...ON DUPLICATE KEY UPDATE
             sql = f'''
                 INSERT INTO {table_name}
-                (key, field, value_json, expire_at)
+                (`key`, field, value_json, expire_at)
                 VALUES (%s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     value_json = VALUES(value_json),
                     expire_at = VALUES(expire_at)
             '''
 
-            cursor = self.db.cursor()
+            cursor = self._cursor()
             cursor.execute(sql, (key, field, value_json, expire_at))
             self.db.connection.commit()
 
@@ -203,16 +224,27 @@ class MySQLStorageManager:
 
             table_name, _ = self._get_table_for_key(key)
 
-            sql = f"SELECT value_json, expire_at FROM {table_name} WHERE key = %s"
+            sql = f"SELECT value_json, expire_at FROM {table_name} WHERE `key` = %s"
             params = [key]
 
             if field:
                 sql += " AND field = %s"
                 params.append(field)
             else:
-                params.append(None)
+                # field=NULL 场景修复（方案 C，读路径）：
+                # 唯一索引 uk_key_field(`key`, field) 对 NULL 不生效，历史 set() 每次都会
+                # 新增一行（而非覆盖），因此同一 key 下可能同时存在多条物理行。
+                # 旧实现无排序直接 fetchone()，被 InnoDB 按索引序返回最早插入行，
+                # 常命中已过期旧值。这里先过滤掉已过期行，再按
+                # 「永久态(NULL expire_at)优先 → 过期时间倒序 → id 倒序」取唯一最新行。
+                # 写入端重复行仍会继续增长，待 A 方案（field 归一化 + NOT NULL 唯一键）根治。
+                sql += (" AND field IS NULL"
+                        " AND (expire_at IS NULL OR expire_at > %s)"
+                        " ORDER BY (expire_at IS NULL) DESC, expire_at DESC, id DESC"
+                        " LIMIT 1")
+                params.append(datetime.now())
 
-            cursor = self.db.cursor()
+            cursor = self._cursor()
             cursor.execute(sql, params)
             result = cursor.fetchone()
 
@@ -258,14 +290,18 @@ class MySQLStorageManager:
             value_json = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
 
             sql = f'''
-                INSERT INTO {table_name} (key, field, value_json, expire_at)
+                INSERT INTO {table_name} (`key`, field, value_json, expire_at)
                 VALUES (%s, NULL, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     value_json = VALUES(value_json),
                     expire_at = VALUES(expire_at)
             '''
+            # 注意（已知缺陷）：`field` 列为 NULL 时，唯一索引 uk_key_field(`key`, field)
+            # 不生效（MySQL 认为多个 NULL 互不相等），ON DUPLICATE KEY 永远不会触发，
+            # 因此每次 set() 都会新增一条物理重复行；读路径已做「取最新有效行」兜底，
+            # 但重复行仍会继续增长，待 A 方案（field 归一化 + NOT NULL 唯一键）根治。
 
-            cursor = self.db.cursor()
+            cursor = self._cursor()
             cursor.execute(sql, (key, value_json, expire_at))
             self.db.connection.commit()
 
@@ -283,9 +319,9 @@ class MySQLStorageManager:
                 return False
 
             table_name, _ = self._get_table_for_key(key)
-            sql = f"DELETE FROM {table_name} WHERE key = %s"
+            sql = f"DELETE FROM {table_name} WHERE `key` = %s"
 
-            cursor = self.db.cursor()
+            cursor = self._cursor()
             cursor.execute(sql, (key,))
             self.db.connection.commit()
 
@@ -302,9 +338,9 @@ class MySQLStorageManager:
                 return False
 
             table_name, _ = self._get_table_for_key(key)
-            sql = f"SELECT 1 FROM {table_name} WHERE key = %s AND (expire_at IS NULL OR expire_at > %s)"
+            sql = f"SELECT 1 FROM {table_name} WHERE `key` = %s AND (expire_at IS NULL OR expire_at > %s)"
 
-            cursor = self.db.cursor()
+            cursor = self._cursor()
             cursor.execute(sql, (key, datetime.now()))
             result = cursor.fetchone()
 
@@ -382,16 +418,35 @@ class MySQLStorageManager:
     # ==================== 统计方法 ====================
 
     def get_kv_store_stats(self) -> Dict[str, Any]:
-        """获取存储统计信息"""
+        """获取存储统计信息
+
+        计数口径修正（配合读路径方案 C）：
+            field=NULL 的唯一键失效会导致同一逻辑键存在多条物理行，旧实现按物理行
+            COUNT(*)，数字被重复行放大。这里按逻辑键 (`key`, COALESCE(field, ''))
+            分组，每个逻辑键只计一次：
+              - total_keys   = 逻辑键数量
+              - active_keys  = 至少存在一条未过期（expire_at IS NULL 或 > NOW()）逻辑键数
+              - expired_keys = 全部物理行均已过期的逻辑键数
+        该口径为统计展示用途；若 p5_kv_store 规模很大，分组查询成本会上升，
+        可待 A 方案根治重复行后简化为 COUNT(*)（届时一逻辑键只剩一行）。
+        """
         try:
             sql = """
-                SELECT 
-                    COUNT(*) as total_keys,
-                    SUM(CASE WHEN expire_at IS NOT NULL AND expire_at > NOW() THEN 1 ELSE 0 END) as active_keys,
-                    SUM(CASE WHEN expire_at IS NOT NULL AND expire_at <= NOW() THEN 1 ELSE 0 END) as expired_keys
-                FROM p5_kv_store
+                SELECT
+                    COUNT(*) AS total_keys,
+                    SUM(CASE WHEN has_active = 1 THEN 1 ELSE 0 END) AS active_keys,
+                    SUM(CASE WHEN has_active = 0 AND has_expired = 1 THEN 1 ELSE 0 END) AS expired_keys
+                FROM (
+                    SELECT
+                        `key`,
+                        COALESCE(field, '') AS logical_field,
+                        MAX(CASE WHEN expire_at IS NULL OR expire_at > NOW() THEN 1 ELSE 0 END) AS has_active,
+                        MAX(CASE WHEN expire_at IS NOT NULL AND expire_at <= NOW() THEN 1 ELSE 0 END) AS has_expired
+                    FROM p5_kv_store
+                    GROUP BY `key`, COALESCE(field, '')
+                ) AS t
             """
-            cursor = self.db.cursor()
+            cursor = self._cursor()
             cursor.execute(sql)
             return cursor.fetchone() or {}
         except Exception as e:
@@ -405,7 +460,7 @@ class MySQLStorageManager:
                 return 0
 
             sql = "DELETE FROM p5_kv_store WHERE expire_at IS NOT NULL AND expire_at <= NOW() LIMIT %s"
-            cursor = self.db.cursor()
+            cursor = self._cursor()
             cursor.execute(sql, (batch_size,))
             self.db.connection.commit()
 
@@ -434,14 +489,14 @@ class KVStoreTableMixin:
             sql = '''
                 CREATE TABLE IF NOT EXISTS p5_kv_store (
                     id INT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
-                    key VARCHAR(255) NOT NULL COMMENT '存储键',
+                    `key` VARCHAR(255) NOT NULL COMMENT '存储键',
                     field VARCHAR(100) NULL DEFAULT NULL COMMENT '字段(用于Hash存储)',
                     value_json LONGTEXT NULL DEFAULT NULL COMMENT '存储值(JSON)',
                     expire_at DATETIME NULL DEFAULT NULL COMMENT '过期时间',
                     created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                     PRIMARY KEY (id) USING BTREE,
-                    UNIQUE INDEX uk_key_field (key ASC, field ASC) USING BTREE,
-                    INDEX idx_key (key ASC) USING BTREE,
+                    UNIQUE INDEX uk_key_field (`key` ASC, field ASC) USING BTREE,
+                    INDEX idx_key (`key` ASC) USING BTREE,
                     INDEX idx_expire_at (expire_at ASC) USING BTREE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='通用键值存储表(替代Redis)';
             '''

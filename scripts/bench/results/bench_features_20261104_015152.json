@@ -1,0 +1,81 @@
+{
+  "generated_at": "2026-11-04T01:48:39",
+  "machine": "Windows-11-10.0.26200-SP0",
+  "python": "3.13.5",
+  "db_host": "localhost",
+  "db_valid_rows": 1114,
+  "sizes": [
+    {
+      "n": 200,
+      "data_source": "real",
+      "extract_cold_s": 0.1357,
+      "extract_warm_s": 0.0083,
+      "feature_payload_kb": 71.8
+    },
+    {
+      "n": 500,
+      "data_source": "real",
+      "extract_cold_s": 0.1163,
+      "extract_warm_s": 0.0078,
+      "feature_payload_kb": 71.8
+    },
+    {
+      "n": 1000,
+      "data_source": "real",
+      "extract_cold_s": 0.1564,
+      "extract_warm_s": 0.021,
+      "feature_payload_kb": 71.8
+    },
+    {
+      "n": 2000,
+      "data_source": "synthetic-extended",
+      "extract_cold_s": 0.5199,
+      "extract_warm_s": 0.0152,
+      "feature_payload_kb": 70.2
+    }
+  ],
+  "cache": {
+    "capacity_8": {
+      "hits": 0,
+      "misses": 82,
+      "size": 8,
+      "capacity": 8
+    },
+    "capacity_256": {
+      "hits": 41,
+      "misses": 41,
+      "size": 41,
+      "capacity": 256
+    }
+  },
+  "e2e": [
+    {
+      "test_count": 2,
+      "status": "success",
+      "elapsed_s": 32.679,
+      "per_window_ms": 16339.7,
+      "n": 200,
+      "data_source": "real"
+    },
+    {
+      "test_count": 2,
+      "status": "success",
+      "elapsed_s": 47.643,
+      "per_window_ms": 23821.7,
+      "n": 500,
+      "data_source": "real"
+    },
+    {
+      "test_count": 2,
+      "status": "success",
+      "elapsed_s": 85.583,
+      "per_window_ms": 42791.5,
+      "n": 1000,
+      "data_source": "real"
+    },
+    {
+      "n": 2000,
+      "skipped": "真实库存不足，端到端不跑合成数据"
+    }
+  ]
+}

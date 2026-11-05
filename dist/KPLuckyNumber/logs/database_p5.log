@@ -1,0 +1,39 @@
+2026-11-04 10:01:25,498 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:25,500 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:01:28,080 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:28,082 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:01:28,464 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:31,638 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:33,390 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:33,392 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:01:36,734 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:36,735 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:01:36,907 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:39,305 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:39,657 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:39,659 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:01:42,780 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:43,534 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:43,536 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:01:46,141 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:48,328 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:01:48,329 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:01:50,122 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:24,989 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:24,991 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:02:28,029 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:28,032 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:02:28,312 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:30,786 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:31,398 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:31,401 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:02:33,977 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:34,554 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:34,557 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:02:37,255 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:37,257 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:02:37,514 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:39,258 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:42,309 - modules.database - ERROR - 连接池初始化失败，回退到单连接模式: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")
+2026-11-04 10:02:42,311 - modules.database - WARNING - 连接池不可用，回退到单连接模式
+2026-11-04 10:02:44,260 - modules.database - ERROR - MySQL数据库连接失败: (1045, "Access denied for user 'root'@'localhost' (using password: NO)")

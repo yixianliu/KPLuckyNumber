@@ -41,8 +41,11 @@ import time
 from datetime import datetime
 
 from paths import REPORTS_CHARTS_DIR, REPORTS_DIR
+from modules.stats_utils import wilson_ci
 from modules.ui_theme_spec import (
     WHITE,
+    UI_FONT,
+    MONO_FONT,
     HIT_FG,
     TOP3_FG,
     MISS_FG,
@@ -68,7 +71,9 @@ if "main" not in _sys.modules:
     _host = _sys.modules.get("__main__")
     _host_file = str(getattr(_host, "__file__", "") or "").replace(
         "\\", "/")
-    if _host_file.endswith("/main.py"):
+    # 冻结（PyInstaller）后 __main__.__file__ 指向 exe 而非 main.py，
+    # 必须同样注册别名，否则 `import main` 会二次导入失败/产生双实例
+    if _host_file.endswith("/main.py") or getattr(_sys, 'frozen', False):
         _sys.modules["main"] = _host
 # 经 setdefault 注册后同一模块实例（含 rebind 后新 COLORS）
 import main as _main_mod  # noqa: E402  双模块陷阱破解后的正式引用
@@ -330,21 +335,24 @@ class DashboardMixin:
 
     @staticmethod
     def _classify_breakpoint(panel_width: int) -> str:
-        """按输出面板宽度划分三档断点（v5.2 GUI-07，方案 §311）。
+        """按输出面板宽度划分四档断点（A2 四档扩展，方案 §311）。
 
         参数:
             panel_width: 输出面板（output_nb）当前实际宽度（像素）
 
         返回:
             str: 'compact'（<1024 紧凑）/ 'standard'（1024-1440 标准）
-                 / 'wide'（>1440 宽绰）
+                 / 'wide'（1440-1600 宽绰）/ 'ultrawide'（>1600 超宽）
         """
         _BREAKPOINT_COMPACT_MAX_W = _main_mod._BREAKPOINT_COMPACT_MAX_W
         _BREAKPOINT_STANDARD_MAX_W = _main_mod._BREAKPOINT_STANDARD_MAX_W
+        _BREAKPOINT_WIDE_MAX_W = getattr(_main_mod, '_BREAKPOINT_WIDE_MAX_W', 1600)
         if panel_width < _BREAKPOINT_COMPACT_MAX_W:
             return 'compact'
         if panel_width <= _BREAKPOINT_STANDARD_MAX_W:
             return 'standard'
+        if panel_width > _BREAKPOINT_WIDE_MAX_W:
+            return 'ultrawide'
         return 'wide'
 
     def _set_toolbar_mode(self, bp: str) -> None:
@@ -488,13 +496,25 @@ class DashboardMixin:
                         if row and row.get('target_issue'):
                             issue_text = str(row['target_issue'])
                             issue_raw = issue_text
-                        # 已验证期数 + 历史命中率（Top-1 真实口径）
+                        # 已验证期数 + 历史命中率（Top-1 真实口径 + Wilson 95% CI）
                         stats = db.get_verification_stats()
                         total = int(stats.get('total', 0) or 0)
                         if total > 0:
                             verified_text = f"{total} 期"
-                            top1 = stats.get('top1_avg_accuracy', stats.get('avg_accuracy', 0)) or 0
-                            hit_text = f"{float(top1):.1f}%"
+                            if ('top1_avg_accuracy' in stats
+                                    or 'strict_avg_accuracy' in stats):
+                                top1 = float(stats.get(
+                                    'top1_avg_accuracy',
+                                    stats.get('strict_avg_accuracy', 0)) or 0)
+                                top1_hits = int(stats.get(
+                                    'top1_total_matched',
+                                    stats.get('strict_total_matched', 0)) or 0)
+                                _lo, _hi = wilson_ci(top1_hits, total * 5)
+                                hit_text = (f"{top1:.1f}% "
+                                            f"[{_lo * 100:.1f}, {_hi * 100:.1f}]")
+                            else:
+                                # 键缺失不回退宽松口径 avg_accuracy，明确提示无 Top-1 数据
+                                hit_text = "—（无 Top-1 数据）"
                         total_raw = total
                         # 历史数据量
                         cnt = db.get_history_data_count()
@@ -554,11 +574,11 @@ class DashboardMixin:
             win.transient(self.root)
             _safe_grab_set(win)
 
-            tk.Label(win, text=f"期号: {target_issue}", font=('微软雅黑', 11, 'bold'),
+            tk.Label(win, text=f"期号: {target_issue}", font=(UI_FONT, 11, 'bold'),
                      bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).pack(pady=(10, 4))
 
             loading_var = tk.StringVar(value=" 正在加载该期预测数据…")
-            loading_lbl = tk.Label(win, textvariable=loading_var, font=('微软雅黑', 10),
+            loading_lbl = tk.Label(win, textvariable=loading_var, font=(UI_FONT, 10),
                                    bg=COLORS['bg_secondary'], fg=COLORS['text_muted'])
             loading_lbl.pack(pady=16)
 
@@ -664,11 +684,11 @@ class DashboardMixin:
                 tk.Label(grid, text="", width=8, bg=COLORS['bg_secondary']
                          ).grid(row=0, column=0)
                 for ci, (pk, pn) in enumerate(pos_keys):
-                    tk.Label(grid, text=pn, width=6, font=('微软雅黑', 9),
+                    tk.Label(grid, text=pn, width=6, font=(UI_FONT, 9),
                              bg=COLORS['bg_secondary'], fg=COLORS['text_muted']
                              ).grid(row=0, column=ci + 1)
                 # 预测首选行（按命中状态标色）
-                tk.Label(grid, text="预测首选", width=8, font=('微软雅黑', 9),
+                tk.Label(grid, text="预测首选", width=8, font=(UI_FONT, 9),
                          bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']
                          ).grid(row=1, column=0, sticky=tk.W)
                 hit_cnt = 0
@@ -684,25 +704,25 @@ class DashboardMixin:
                     else:
                         fg, note = MISS_FG, '' # 未含
                     tk.Label(grid, text=f"{top1 if top1 is not None else '-'} {note}",
-                             width=6, font=('Consolas', 11, 'bold'),
+                             width=6, font=(MONO_FONT, 11, 'bold'),
                              bg=COLORS['bg_secondary'], fg=fg
                              ).grid(row=1, column=ci + 1)
                 # 实际开奖行
-                tk.Label(grid, text="实际开奖", width=8, font=('微软雅黑', 9),
+                tk.Label(grid, text="实际开奖", width=8, font=(UI_FONT, 9),
                          bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']
                          ).grid(row=2, column=0, sticky=tk.W)
                 for ci, (pk, pn) in enumerate(pos_keys):
                     tk.Label(grid, text=str(actual.get(pk)), width=6,
-                             font=('Consolas', 11, 'bold'),
+                             font=(MONO_FONT, 11, 'bold'),
                              bg=COLORS['bg_secondary'], fg=COLORS['text_primary']
                              ).grid(row=2, column=ci + 1)
                 tk.Label(cmp_panel,
                 text=f"首选命中 {hit_cnt}/5 图例: 首选命中 Top-3含开奖 未含",
-                         font=('微软雅黑', 8), bg=COLORS['bg_secondary'],
+                         font=(UI_FONT, 8), bg=COLORS['bg_secondary'],
                          fg=COLORS['text_muted']).pack(anchor=tk.W, pady=(4, 0))
             else:
                 tk.Label(cmp_panel, text="该期尚未开奖或开奖数据未入库，暂无对照。",
-                         font=('微软雅黑', 9), bg=COLORS['bg_secondary'],
+                         font=(UI_FONT, 9), bg=COLORS['bg_secondary'],
                          fg=COLORS['text_muted']).pack(anchor=tk.W)
 
             # ---------- 各位置推荐号码（命中的号码高亮） ----------
@@ -713,7 +733,7 @@ class DashboardMixin:
                 nums = (trend.get(pk) or {}).get('numbers', [])
                 line = tk.Frame(panel, bg=COLORS['bg_secondary'])
                 line.pack(anchor=tk.W)
-                tk.Label(line, text=f"{pn}: ", font=('Consolas', 9),
+                tk.Label(line, text=f"{pn}: ", font=(MONO_FONT, 9),
                          bg=COLORS['bg_secondary'], fg=COLORS['text_primary']
                          ).pack(side=tk.LEFT)
                 act = None
@@ -724,7 +744,7 @@ class DashboardMixin:
                 for n in nums[:3]:
                     is_hit = (act is not None and n is not None and int(n) == act)
                     tk.Label(line, text=str(n),
-                             font=('Consolas', 9, 'bold' if is_hit else 'normal'),
+                             font=(MONO_FONT, 9, 'bold' if is_hit else 'normal'),
                              bg=HIT_ROW_BG if is_hit else COLORS['bg_secondary'],
                              fg=HIT_ROW_FG if is_hit else COLORS['text_primary']
                              ).pack(side=tk.LEFT, padx=3)
@@ -739,7 +759,7 @@ class DashboardMixin:
             combo_panel.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
             combo_text = tk.Text(combo_panel, height=8, wrap=tk.WORD,
-                                 font=('Consolas', 9),
+                                 font=(MONO_FONT, 9),
                                  bg=COLORS['bg_input'], fg=COLORS['text_primary'],
                                  relief='flat')
             combo_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
@@ -756,7 +776,7 @@ class DashboardMixin:
                     combo_text.insert(tk.END, f"{i+1}. {c}\n", '')
 
             combo_text.config(state=tk.DISABLED)
-            tk.Button(win, text="关闭", font=('微软雅黑', 9),
+            tk.Button(win, text="关闭", font=(UI_FONT, 9),
                       bg=COLORS['accent_p5'], fg=WHITE, relief='flat',
                       command=win.destroy).pack(pady=(0, 8))
 
@@ -921,66 +941,6 @@ class DashboardMixin:
             logger.debug(f'生成基线对照图表失败: {e}')
             self.root.after(0, lambda: self._update_chart_image(None))
 
-    def _update_hit_rate_tab(self, stats):
-        """（主线程）用 stats 刷新命中率面板控件。
-
-        改用严格命中率（无容错）作为主指标，同时显示容错数据供对比。
-        """
-        if not hasattr(self, 'hr_summary_var') or not stats:
-            return
-        try:
-            total = stats.get('total', 0)
-            if not total:
-                self.hr_summary_var.set("（暂无验证数据）")
-                for key in self.hr_pos_vars:
-                    self.hr_pos_vars[key].set("--")
-                    self.hr_pos_bars[key]['value'] = 0
-                return
-
-            merged = int(stats.get('merged_duplicates', 0) or 0)
-            self._hr_merged_duplicates = merged
-            merge_txt = f" | 已合并重复记录 {merged} 条" if merged else ""
-
-            # Top-1 真实口径（首推号精确命中, v3.67: strict_* 已改为真实预测力指标）
-            # 随机基线: 排列5 公平摇号, 每位 Top-1 理论 = 10%, 系统无法稳定超越
-            top1_avg = float(stats.get('top1_avg_accuracy', stats.get('strict_avg_accuracy', 0)) or 0)
-            top1_full = int(stats.get('top1_full_matches', stats.get('strict_full_matches', 0)) or 0)
-            top1_total = int(stats.get('top1_total_matched', stats.get('strict_total_matched', 0)) or 0)
-
-            # 集合包含参考口径（候选集~5, 宽松, 仅作对照, 非真实预测力）
-            loose_avg = float(stats.get('avg_accuracy', 0) or 0)
-            loose_matched = int(stats.get('total_matched', 0) or 0)
-
-            # 随机基线对照
-            _delta_pp = top1_avg - 10.0
-            _verdict = "略高于随机" if _delta_pp > 0 else ("接近随机" if abs(_delta_pp) <= 1.0 else "低于随机")
-
-            self.hr_summary_var.set(
-                f"已验证 {total} 期（按期号去重）\n"
-                f"★ Top-1 真实命中（首推号精确）: 全中 {top1_full} 期 | 平均 {top1_avg:.1f}%\n"
-                f"   随机基线 = 10% → 系统{_verdict}（Δ{_delta_pp:+.1f}pp）\n"
-                f"集合包含参考（宽松口径·非预测力）: 全中 {loose_matched} 期 | 平均 {loose_avg:.1f}%"
-                f"{merge_txt}"
-            )
-
-            # 更新进度条：显示 Top-1 真实命中率
-            top1_keys = ('top1_wan_accuracy', 'top1_qian_accuracy', 'top1_bi_accuracy',
-                        'top1_shi_accuracy', 'top1_ge_accuracy')
-            for key in top1_keys:
-                rate = float(stats.get(key, stats.get(key.replace('top1_', 'strict_'), 0)) or 0)
-                pos_name = key.replace('top1_', '').replace('_accuracy', '')
-                var_key = f'{pos_name}_accuracy'
-                if var_key in self.hr_pos_vars:
-                    self.hr_pos_vars[var_key].set(f"{rate:.1f}%")
-                    self.hr_pos_bars[var_key]['value'] = max(0.0, min(100.0, rate))
-
-            # 不再自动加载图表（已改为手动触发基线对照图表）
-            # 可通过定时器或手动触发 _load_and_draw_baseline_chart() 来更新基线对照图表
-            # 同时更新基线对照图表以反映最新的验证统计
-            self._load_and_draw_baseline_chart()
-        except Exception:
-            pass
-
     def _sort_records_by(self, col):
         """点击列头排序：同列点击升/降切换，列头带 / 指示，保留行高亮标签。"""
         try:
@@ -1031,17 +991,25 @@ class DashboardMixin:
         except Exception:
             pass
 
+    # 唯一有效定义：旧版同名方法（原 931-993 行）曾被本定义覆盖，属死代码，
+    # 已删除；此处是命中率面板的实际执行入口（Top-1 + Wilson CI，ALG-06）。
+    # 口径分离说明：旧「集合包含参考（候选集~5）」仅作对照, 非真实预测力，
+    # 已停止在面板展示，避免与 Top-1 精确口径混用。
     def _update_hit_rate_tab(self, stats):
         """（主线程）用 stats 刷新命中率面板控件。
 
-        改用严格命中率（无容错）作为主指标，同时显示容错数据供对比。
+        口径（唯一权威 docs/hitrate_spec.md / ALG-06）：
+            仅展示 Top-1（首推号精确命中）点估计 + Wilson 95% CI；
+            随机基线 = 10%（k/10）。旧「集合包含参考 / ±1 容错」不属于 ALG-06，
+            已停止展示（不再作为平均准确率出现），改为明确说明文案。
         """
         if not hasattr(self, 'hr_summary_var') or not stats:
             return
         try:
             total = stats.get('total', 0)
             if not total:
-                self.hr_summary_var.set("（暂无验证数据）")
+                self.hr_summary_var.set(
+                    "（暂无验证数据 · 请先点击左侧「开始分析」，开奖后自动统计）")
                 for key in self.hr_pos_vars:
                     self.hr_pos_vars[key].set("--")
                     self.hr_pos_bars[key]['value'] = 0
@@ -1057,23 +1025,24 @@ class DashboardMixin:
             top1_full = int(stats.get('top1_full_matches', stats.get('strict_full_matches', 0)) or 0)
             top1_total = int(stats.get('top1_total_matched', stats.get('strict_total_matched', 0)) or 0)
 
-            # 集合包含参考口径（候选集~5, 宽松, 仅作对照, 非真实预测力）
-            loose_avg = float(stats.get('avg_accuracy', 0) or 0)
-            loose_matched = int(stats.get('total_matched', 0) or 0)
+            from modules.stats_utils import wilson_ci
 
-            # 随机基线对照
-            _delta_pp = top1_avg - 10.0
-            _verdict = "略高于随机" if _delta_pp > 0 else ("接近随机" if abs(_delta_pp) <= 1.0 else "低于随机")
+            # 随机基线对照 + Wilson 95% CI：分母为「期数 × 5 位」位置单位；基线固定 10%（k/10）
+            _n_units = int(total) * 5
+            _t1_lo, _t1_hi = wilson_ci(top1_total, _n_units)
+            _verdict = self._ci_vs_baseline(_t1_lo, _t1_hi, 0.10)
 
             self.hr_summary_var.set(
                 f"已验证 {total} 期（按期号去重）\n"
-                f"★ Top-1 真实命中（首推号精确）: 全中 {top1_full} 期 | 平均 {top1_avg:.1f}%\n"
-                f"   随机基线 = 10% → 系统{_verdict}（Δ{_delta_pp:+.1f}pp）\n"
-                f"集合包含参考（宽松口径·非预测力）: 全中 {loose_matched} 期 | 平均 {loose_avg:.1f}%"
-                f"{merge_txt}"
+                f"★ Top-1 真实命中（首推号精确）: 全中 {top1_full} 期 | "
+                f"{top1_total}/{_n_units} 位置单位 = {top1_avg:.1f}%\n"
+                f"   95% Wilson CI [{_t1_lo * 100:.1f}%, {_t1_hi * 100:.1f}%]；"
+                f"随机基线 10%（k/10）→ {_verdict}\n"
+                f"（旧「集合包含参考 / ±1 容错」不属于 ALG-06，已停止展示；"
+                f"Top-1 / Top-3 单口径明细见分析日志）{merge_txt}"
             )
 
-            # 更新进度条：显示 Top-1 真实命中率
+            # 更新进度条：显示 Top-1 真实命中率（点估计 + 95% CI）
             top1_keys = ('top1_wan_accuracy', 'top1_qian_accuracy', 'top1_bai_accuracy',
                         'top1_shi_accuracy', 'top1_ge_accuracy')
             for key in top1_keys:
@@ -1081,7 +1050,10 @@ class DashboardMixin:
                 pos_name = key.replace('top1_', '').replace('_accuracy', '')
                 var_key = f'{pos_name}_accuracy'
                 if var_key in self.hr_pos_vars:
-                    self.hr_pos_vars[var_key].set(f"{rate:.1f}%")
+                    _hits = round(rate / 100.0 * total)
+                    _lo, _hi = wilson_ci(_hits, int(total))
+                    self.hr_pos_vars[var_key].set(
+                        f"{rate:.1f}% [{_lo * 100:.1f}, {_hi * 100:.1f}]")
                     self.hr_pos_bars[var_key]['value'] = max(0.0, min(100.0, rate))
 
         except Exception:
@@ -1218,10 +1190,11 @@ class DashboardMixin:
                 self._chart_photo = None  # 防止GC
             
             if img_path is None or not os.path.exists(img_path):
-                # 无数据时显示提示标签
-                self.chart_label.configure(text="暂无可用数据", 
-                                          font=('微软雅黑', 10, 'italic'),
-                                          fg=COLORS['text_muted'])
+                # 无数据时显示「原因 + 下一步操作」，避免纯空白区域
+                self.chart_label.configure(
+                    text="暂无可用数据\n请先运行「开始分析」生成走势与对比图表",
+                    font=(UI_FONT, 10, 'italic'), justify=tk.CENTER,
+                    fg=COLORS['text_muted'])
                 return
             
             # 加载新图片
@@ -1307,7 +1280,8 @@ class DashboardMixin:
                 pass
             records = getattr(self, '_hr_records_cache', []) or []
             if not records:
-                self.hr_records_hint.set("暂无已验证记录")
+                self.hr_records_hint.set(
+                    "暂无已验证记录 · 请先运行「开始分析」，开奖后自动生成")
                 return
             filter_on = False
             try:
@@ -1357,7 +1331,8 @@ class DashboardMixin:
             merge_txt = f" · 本表另合并重复 {dropped} 条" if dropped else ""
             if filter_on:
                 if shown == 0:
-                    self.hr_records_hint.set(f"{len(records)} 期 · 无命中≥3的记录{merge_txt}")
+                    self.hr_records_hint.set(
+                        f"{len(records)} 期 · 无命中≥3的记录，可取消勾选「只看命中≥3」{merge_txt}")
                 else:
                     self.hr_records_hint.set(f"{len(records)} 期 · 筛选后 {shown} 期{merge_txt}")
             else:
@@ -1399,52 +1374,161 @@ class DashboardMixin:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    @staticmethod
+    def _summarize_top_hit_counts(records, learner):
+        """按 ALG-06 单口径汇总 Top-1/Top-3 命中计数（复用 online_learner._calculate_hits）。
+
+        说明：
+            - 库内只存 predicted_numbers（按概率降序的候选列表），此处按该顺序重建
+              fused_probabilities 后交给 _calculate_hits，避免在展示层复制命中算法；
+            - 分母仅统计「5 位开奖号码 + 各位置候选列表均可用」的有效位置单位；
+            - 返回各位置 Top-1 命中数、Top-1/Top-3 总命中数与有效位置单位数。
+        """
+        positions = ['wan', 'qian', 'bai', 'shi', 'ge']
+        labels = dict(zip(positions, ['万', '千', '百', '十', '个']))
+        stats = {
+            'valid_positions': 0, 'skipped_records': 0,
+            'top1_hits': 0, 'top3_hits': 0,
+            'per_pos_top1': {p: 0 for p in positions},
+        }
+        # 中文位置名 -> 位置键（_calculate_hits 内部使用「万位/千位/...」）
+        cn_to_pos = {f'{label}位': pos for pos, label in labels.items()}
+        for rec in records:
+            try:
+                pred = json.loads(rec.get('predicted_numbers') or '{}')
+                actual = json.loads(rec.get('actual_numbers') or '[]')
+            except (TypeError, ValueError, json.JSONDecodeError):
+                stats['skipped_records'] += 1
+                continue
+            if not isinstance(pred, dict) or not isinstance(actual, (list, tuple)) or len(actual) < 5:
+                stats['skipped_records'] += 1
+                continue
+            fused = []
+            usable = True
+            for pos in positions:
+                nums = pred.get(pos) or []
+                try:
+                    nums = [int(n) for n in nums[:5]]
+                except (TypeError, ValueError):
+                    usable = False
+                    break
+                # 按库内候选顺序构造单调递减分数，保证 _calculate_hits 排序后与原顺序一致
+                fused.append({n: 1.0 - i * 0.1 for i, n in enumerate(nums)})
+            if not usable or not any(fused):
+                stats['skipped_records'] += 1
+                continue
+            try:
+                actual_nums = [int(x) for x in actual[:5]]
+            except (TypeError, ValueError):
+                stats['skipped_records'] += 1
+                continue
+            hits = learner._calculate_hits(
+                {'fused_probabilities': fused, 'top_combinations': []}, actual_nums)
+            stats['valid_positions'] += 5
+            stats['top1_hits'] += int(hits.get('top1_hits', 0))
+            stats['top3_hits'] += int(hits.get('partial_hits', 0))
+            for cn_name, info in (hits.get('position_hits') or {}).items():
+                pos = cn_to_pos.get(cn_name)
+                if pos is None:
+                    continue
+                if info.get('top1_hit'):
+                    stats['per_pos_top1'][pos] += 1
+        return stats
+
+    @staticmethod
+    def _ci_vs_baseline(lower, upper, baseline):
+        """按 Wilson CI 与随机基线的关系给出如实结论（不写提升/超越）。"""
+        if upper < baseline:
+            return '低于随机基线（CI 未覆盖基线）'
+        if lower > baseline:
+            return '高于随机基线（CI 未覆盖基线）'
+        return 'CI 与随机基线重叠，无统计显著超额'
+
     def _append_hit_rate_overview(self, task_mgr):
-        """预测后: 日志留精简摘要 + 主线程刷新常驻命中率面板(真实数据不编造)。"""
+        """预测后: 日志留精简摘要 + 主线程刷新常驻命中率面板。
+
+        口径（唯一权威 docs/hitrate_spec.md / ALG-06）：
+            Top-1 = 首推号精确命中，Top-3 = 实际号落入该位置概率前 3 集合；
+            随机基线 Top-1=10% / Top-3=30%（k/10）；命中率必须同时给点估计与
+            Wilson 95% CI。旧「候选集包含 + ±1 容错」不再作为准确率展示。
+        """
         P5Database = _main_mod.P5Database
+        from modules.stats_utils import wilson_ci
         try:
             db = P5Database()
             if not db.connect():
+                task_mgr.append_info("  （数据库不可用，命中率概览留空；恢复连接后重试即可）")
                 return
             try:
                 stats = db.get_verification_stats()
+                records = (db.get_verified_predictions(days=3650, limit=2000)
+                           if stats and stats.get('total', 0) else [])
+                # 复用在线学习的命中算法（不复制实现）；构造开销很小，且只在有记录时发生
+                learner = None
+                if records:
+                    from modules.online_learner import OnlineLearner
+                    learner = OnlineLearner(db)
             finally:
                 db.disconnect()
-            if not stats or stats.get('total', 0) == 0:
-                task_mgr.append_info("  （暂无验证数据, 命中率面板留空）")
+
+            total = int((stats or {}).get('total', 0) or 0)
+            if total == 0:
+                task_mgr.append_info("  （暂无验证数据，命中率概览留空；完成一次开奖验证后自动生成）")
+                task_mgr.append_info(" 历史命中率不代表未来表现；排列5为公平摇号，无法预测开奖结果。")
                 return
-            total = stats.get('total', 0)
-            task_mgr.append_section_header(" 历史命中率概览（真实验证数据）")
+
+            task_mgr.append_section_header(" 历史命中率概览（ALG-06 单口径：Top-1 / Top-3 单位置覆盖）")
             task_mgr.append_info(f"  已验证 {total} 期（按期号去重）")
 
-            # 严格命中率
-            strict_avg = stats.get('strict_avg_accuracy', 0) or 0
-            strict_full = stats.get('strict_full_matches', 0) or 0
-            task_mgr.append_info(f"  严格命中（精确匹配）: 完全命中 {strict_full} 期 | 平均准确率 {strict_avg:.1f}%")
+            if not records:
+                task_mgr.append_info("  （已验证记录缺少 predicted_numbers/actual_numbers，"
+                                     "无法按 Top-1/Top-3 单口径计算；请重新验证后再查看）")
+                task_mgr.append_info(" 历史命中率不代表未来表现；排列5为公平摇号，无法预测开奖结果。")
+                self.root.after(0, self._update_hit_rate_tab, stats)
+                return
 
-            # 容错命中率
-            tol_avg = stats.get('avg_accuracy', 0) or 0
-            tol_matched = stats.get('total_matched', 0) or 0
-            task_mgr.append_info(f"  容错命中（±1偏差）: 完全命中 {tol_matched} 期 | 平均准确率 {tol_avg:.1f}%")
+            summary = self._summarize_top_hit_counts(records, learner)
+            n_pos = summary['valid_positions']
+            if n_pos == 0:
+                task_mgr.append_info("  （有效样本为 0：现有记录的候选/开奖号码不完整，暂无法计算命中率）")
+                task_mgr.append_info(" 历史命中率不代表未来表现；排列5为公平摇号，无法预测开奖结果。")
+                self.root.after(0, self._update_hit_rate_tab, stats)
+                return
 
-            # 各位置严格命中率
-            positions = [
-                ('万', stats.get('strict_wan_accuracy', 0)),
-                ('千', stats.get('strict_qian_accuracy', 0)),
-                ('百', stats.get('strict_bai_accuracy', 0)),
-                ('十', stats.get('strict_shi_accuracy', 0)),
-                ('个', stats.get('strict_ge_accuracy', 0)),
-            ]
-            task_mgr.append_info(f"  各位置严格命中率: 万 {positions[0][1]:.1f}% / 千 {positions[1][1]:.1f}% / "
-                               f"百 {positions[2][1]:.1f}% / 十 {positions[3][1]:.1f}% / 个 {positions[4][1]:.1f}%")
+            if summary['skipped_records']:
+                task_mgr.append_info(
+                    f"  有效样本 {n_pos} 个位置单位（{summary['skipped_records']} 期因号码不完整未计入）")
+            else:
+                task_mgr.append_info(f"  有效样本 {n_pos} 个位置单位（{n_pos // 5} 期 × 5 位）")
 
-            # 随机基线对比
-            task_mgr.append_info(f"  随机基线: 每位置约 50%（预测5个号码/位，总范围10个）")
-            task_mgr.append_info(" 历史命中率不代表未来表现；排列5为公平摇号。")
+            for name, hits, baseline in (
+                    ('Top-1（首推号精确命中）', summary['top1_hits'], 0.10),
+                    ('Top-3（实际号落入该位置前3集合）', summary['top3_hits'], 0.30)):
+                rate = hits / n_pos
+                lower, upper = wilson_ci(hits, n_pos)
+                task_mgr.append_info(
+                    f"  {name}: {rate * 100:.1f}%（{hits}/{n_pos}），"
+                    f"95% Wilson CI [{lower * 100:.1f}%, {upper * 100:.1f}%]；"
+                    f"随机基线 {baseline * 100:.1f}% —— {self._ci_vs_baseline(lower, upper, baseline)}")
+
+            per_pos_text = []
+            _valid_records = max(1, n_pos // 5)  # 各位置命中数以「有效期数」为分母
+            for pos in ('wan', 'qian', 'bai', 'shi', 'ge'):
+                hits = summary['per_pos_top1'][pos]
+                lower, upper = wilson_ci(hits, _valid_records)
+                per_pos_text.append(
+                    f"{ {'wan': '万', 'qian': '千', 'bai': '百', 'shi': '十', 'ge': '个'}[pos] } "
+                    f"{hits / _valid_records * 100:.1f}% [{lower * 100:.1f}%, {upper * 100:.1f}%]")
+            task_mgr.append_info("  各位置 Top-1（点估计 [95% CI]）: " + ' / '.join(per_pos_text))
+
+            task_mgr.append_info("  口径说明: 旧「容错命中（±1偏差）/平均准确率」不属于 ALG-06，"
+                                 "已停止展示；本概览不使用候选集包含或±1容错。")
+            task_mgr.append_info(" 历史命中率不代表未来表现；排列5为公平摇号，无法预测开奖结果。")
             # 主线程刷新常驻面板(避免工作线程直接碰控件)
             self.root.after(0, self._update_hit_rate_tab, stats)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 显式提示而非静默吞掉：概览失败不能伪装成「无数据」
+            task_mgr.append_info(f"  （命中率概览生成失败: {type(exc).__name__}；请查看日志）")
 
     def _toggle_detail(self):
         """展开/收起「详细分析」折叠区"""
@@ -1531,7 +1615,7 @@ class DashboardMixin:
         _emit('hdr', 'lbl_ai', 'label', parent='hdr::left',
               pack={'anchor': tk.W},
               props={'text': ' AI智能预测', 'bg': COLORS['accent_p5'],
-                     'fg': WHITE, 'font': ('微软雅黑', 12, 'bold')})
+                     'fg': WHITE, 'font': (UI_FONT, 12, 'bold')})
         # 最近一次分析时间标记（副标题, 让结论有明确的时间归属）
         _ana_t = getattr(self, '_last_analysis_time', None)
         if _ana_t is not None:
@@ -1542,7 +1626,7 @@ class DashboardMixin:
                   pack={'anchor': tk.W},
                   props={'text': f' 最近分析 {_tstr}',
                          'bg': COLORS['accent_p5'], 'fg': ACCENT_P5_SOFT_FG,
-                         'font': ('微软雅黑', 8)})
+                         'font': (UI_FONT, 8)})
         _emit('hdr', 'right', 'frame', parent='hdr::canvas',
               pack={'side': tk.RIGHT, 'padx': 8, 'pady': 6},
               props={'bg': COLORS['accent_p5']})
@@ -1550,7 +1634,7 @@ class DashboardMixin:
         _emit('hdr', 'btn_export', 'button', parent='hdr::right',
               pack={'side': tk.RIGHT, 'padx': (6, 0)},
               props={'text': ' 导出 ▾', 'bg': COLORS['accent_p5_light'],
-                     'fg': WHITE, 'font': ('微软雅黑', 9, 'bold'),
+                     'fg': WHITE, 'font': (UI_FONT, 9, 'bold'),
                      'relief': 'flat', 'padx': 10, 'pady': 3,
                      'cursor': 'hand2',
                      'activebackground': COLORS['accent_p5_bright']},
@@ -1558,7 +1642,7 @@ class DashboardMixin:
         _emit('hdr', 'btn_detail', 'button', parent='hdr::right',
               pack={'side': tk.RIGHT, 'padx': (6, 0)},
               props={'text': ' 详细分析', 'bg': COLORS['accent_p5_light'],
-                     'fg': WHITE, 'font': ('微软雅黑', 9, 'bold'),
+                     'fg': WHITE, 'font': (UI_FONT, 9, 'bold'),
                      'relief': 'flat', 'padx': 10, 'pady': 3,
                      'cursor': 'hand2',
                      'activebackground': COLORS['accent_p5_bright']},
@@ -1590,7 +1674,7 @@ class DashboardMixin:
                   pack={'anchor': tk.W, 'padx': 12, 'pady': 6},
                   props={'text': ' ' + risk, 'bg': COLORS['bg_card'],
                          'fg': COLORS['accent_warning_light'],
-                         'font': ('微软雅黑', 9), 'wraplength': 620,
+                         'font': (UI_FONT, 9), 'wraplength': 620,
                          'justify': tk.LEFT})
 
         # 1) 数据概览行：期号 + 一致率 + 高置信度 + 来源数
@@ -1602,7 +1686,7 @@ class DashboardMixin:
               props={'text': f"{'第' if target_issue else ''}"
                              f"{target_issue or '—'}"
                              f"{'期' if target_issue else ''}",
-                     'font': ('Consolas', 13, 'bold'),
+                     'font': (MONO_FONT, 13, 'bold'),
                      'bg': COLORS['bg_secondary'],
                      'fg': COLORS['text_primary']})
         if conf is not None:
@@ -1611,14 +1695,14 @@ class DashboardMixin:
                   props={'text': f' 一致率 {conf}%',
                          'bg': COLORS['bg_card'],
                          'fg': COLORS['accent_p5'],
-                         'font': ('微软雅黑', 10, 'bold')})
+                         'font': (UI_FONT, 10, 'bold')})
         if high_conf:
             _emit('info', 'lbl_high', 'label', parent='info::row',
                   pack={'side': tk.LEFT, 'padx': (8, 0)},
                   props={'text': ' 高置信度 ✓',
                          'bg': COLORS['badge_active_bg'],
                          'fg': COLORS['badge_active_fg'],
-                         'font': ('微软雅黑', 9, 'bold')})
+                         'font': (UI_FONT, 9, 'bold')})
         src_names = ['四步流水线', '走势引擎', '快速预测']
         used = [n for i, n in enumerate(src_names)
                 if (i == 0 and pf) or (i == 1 and tr) or (i == 2 and qf)]
@@ -1627,7 +1711,7 @@ class DashboardMixin:
               props={'text': f' 来源 {len(used)}/3',
                      'bg': COLORS['bg_card'],
                      'fg': COLORS['text_secondary'],
-                     'font': ('微软雅黑', 9)})
+                     'font': (UI_FONT, 9)})
 
         # 2) 主推号大卡
         _emit('main', 'card', 'frame', parent='conclusion::frame',
@@ -1637,7 +1721,7 @@ class DashboardMixin:
                      'highlightthickness': 1})
         _emit('main', 'lbl_title', 'label', parent='main::card',
               pack={'anchor': tk.W, 'padx': 12, 'pady': (8, 4)},
-              props={'text': '推荐号码', 'font': ('微软雅黑', 11, 'bold'),
+              props={'text': '推荐号码', 'font': (UI_FONT, 11, 'bold'),
                      'bg': COLORS['bg_card'],
                      'fg': COLORS['text_primary']})
         _emit('main', 'row', 'frame', parent='main::card',
@@ -1648,7 +1732,7 @@ class DashboardMixin:
             _emit('main', 'digit_%d' % _i, 'label', parent='main::row',
                   pack={'side': tk.LEFT, 'padx': 4},
                   props={'text': str(_d) if _d is not None else '—',
-                         'font': ('Consolas', 18, 'bold'),
+                         'font': (MONO_FONT, 18, 'bold'),
                          'bg': (COLORS['accent_p5'] if _d is not None
                                 else COLORS['bg_card']),
                          'fg': (WHITE if _d is not None
@@ -1657,7 +1741,7 @@ class DashboardMixin:
         _emit('main', 'lbl_conf', 'label', parent='main::card',
               pack={'anchor': tk.W, 'padx': 12, 'pady': (0, 8)},
               props={'text': f"高置信度 · 一致率 {conf or 0}%",
-                     'font': ('微软雅黑', 9), 'bg': COLORS['bg_card'],
+                     'font': (UI_FONT, 9), 'bg': COLORS['bg_card'],
                      'fg': COLORS['text_secondary']})
 
         # 3) 备选号码折叠区（结论层的一部分，原 _build_alt_section 逻辑）
@@ -1672,7 +1756,7 @@ class DashboardMixin:
                               else ' 备选号码（各分析源结果）'),
                      'bg': COLORS['bg_card'],
                      'fg': COLORS['text_secondary'],
-                     'font': ('微软雅黑', 10, 'bold'),
+                     'font': (UI_FONT, 10, 'bold'),
                      'relief': 'flat', 'cursor': 'hand2',
                      'padx': 12, 'pady': 6},
               cmd='alt_toggle')
@@ -1691,8 +1775,8 @@ class DashboardMixin:
             _is_main = (_c_disp == _main_disp)
             _num_color = (COLORS['accent_p5_light'] if _is_main
                           else COLORS['text_secondary'])
-            _num_font = (('Consolas', 11, 'bold') if _is_main
-                         else ('Consolas', 11))
+            _num_font = ((MONO_FONT, 11, 'bold') if _is_main
+                         else (MONO_FONT, 11))
             _emit('alt', 'row_%s' % _key, 'frame', parent='alt::content',
                   pack={'fill': tk.X, 'pady': 3},
                   props={'bg': COLORS['bg_card']})
@@ -1701,7 +1785,7 @@ class DashboardMixin:
                   pack={'side': tk.LEFT},
                   props={'text': f' {_name}:', 'bg': COLORS['bg_card'],
                          'fg': COLORS['text_muted'],
-                         'font': ('微软雅黑', 9, 'bold')})
+                         'font': (UI_FONT, 9, 'bold')})
             _emit('alt', 'num_%s' % _key, 'label',
                   parent='alt::row_%s' % _key,
                   pack={'side': tk.LEFT, 'padx': (8, 0)},
@@ -1714,7 +1798,7 @@ class DashboardMixin:
                       props={'text': '← 选为最终预测',
                              'bg': COLORS['bg_card'],
                              'fg': COLORS['accent_p5'],
-                             'font': ('微软雅黑', 8, 'bold')})
+                             'font': (UI_FONT, 8, 'bold')})
 
         # === 分位信号层（原 _build_source_matrix 逻辑）────────────────
         _emit('signals', 'frame', 'frame', parent='layers::container',
@@ -1735,7 +1819,7 @@ class DashboardMixin:
               props={'text': ' 分源对比（逐位）',
                      'bg': COLORS['bg_card'],
                      'fg': COLORS['accent_info'],
-                     'font': ('微软雅黑', 10, 'bold')})
+                     'font': (UI_FONT, 10, 'bold')})
         _cols = [('位置', None)] + [(n, k) for k, n in active_srcs] \
             + [('综合', '__consensus__')]
         _emit('matrix', 'grid', 'frame', parent='matrix::wrap',
@@ -1748,7 +1832,7 @@ class DashboardMixin:
                         'sticky': 'nsew'},
                   props={'text': _name, 'fg': COLORS['text_secondary'],
                          'bg': COLORS['bg_secondary'],
-                         'font': ('微软雅黑', 9, 'bold'),
+                         'font': (UI_FONT, 9, 'bold'),
                          'padx': 10, 'pady': 6, 'width': 7,
                          'relief': 'solid',
                          'highlightbackground': COLORS['border'],
@@ -1761,7 +1845,7 @@ class DashboardMixin:
                         'sticky': 'nsew'},
                   props={'text': _pn, 'fg': COLORS['text_muted'],
                          'bg': COLORS['bg_secondary'],
-                         'font': ('微软雅黑', 9, 'bold'),
+                         'font': (UI_FONT, 9, 'bold'),
                          'padx': 10, 'pady': 6, 'width': 7,
                          'relief': 'solid',
                          'highlightbackground': COLORS['border'],
@@ -1792,7 +1876,7 @@ class DashboardMixin:
                       grid={'row': _r, 'column': _c, 'padx': 1, 'pady': 1,
                             'sticky': 'nsew'},
                       props={'text': _txt, 'fg': _fg, 'bg': _bg,
-                             'font': ('Consolas', 12, 'bold'),
+                             'font': (MONO_FONT, 12, 'bold'),
                              'padx': 10, 'pady': 6, 'width': 7,
                              'relief': 'flat'})
 
@@ -1808,7 +1892,7 @@ class DashboardMixin:
         _emit('basis', 'lbl_title', 'label', parent='basis::card',
               pack={'anchor': tk.W, 'padx': 12, 'pady': (8, 4)},
               props={'text': '算法依据',
-                     'font': ('微软雅黑', 10, 'bold'),
+                     'font': (UI_FONT, 10, 'bold'),
                      'bg': COLORS['bg_card'],
                      'fg': COLORS['text_primary']})
         _emit('basis', 'weights', 'frame', parent='basis::card',
@@ -1831,12 +1915,12 @@ class DashboardMixin:
                   props={'bg': COLORS['bg_card']})
             _emit('basis', 'name_%d' % _i, 'label',
                   parent='basis::row_%d' % _i, pack={'side': tk.LEFT},
-                  props={'text': _name, 'font': ('微软雅黑', 9),
+                  props={'text': _name, 'font': (UI_FONT, 9),
                          'bg': COLORS['bg_card'],
                          'fg': COLORS['text_secondary']})
             _emit('basis', 'val_%d' % _i, 'label',
                   parent='basis::row_%d' % _i, pack={'side': tk.RIGHT},
-                  props={'text': _w, 'font': ('Consolas', 9, 'bold'),
+                  props={'text': _w, 'font': (MONO_FONT, 9, 'bold'),
                          'bg': COLORS['bg_card'],
                          'fg': COLORS['accent_p5']})
 
@@ -1847,7 +1931,7 @@ class DashboardMixin:
         """详细分析：各来源 Top 候选 + 计算逻辑 + 位置差异点，表格化展示"""
         COLORS = _main_mod.COLORS
         tk.Label(parent, text="详细分析（来源 / 差异 / 计算逻辑）", bg=COLORS['bg_primary'],
-                 fg=COLORS['text_primary'], font=('微软雅黑', 10, 'bold')
+                 fg=COLORS['text_primary'], font=(UI_FONT, 10, 'bold')
                  ).pack(anchor=tk.W, padx=8, pady=(6, 4))
         
         # 创建表格容器
@@ -1858,7 +1942,7 @@ class DashboardMixin:
         headers = ['来源', '万位', '千位', '百位', '十位', '个位', '说明']
         for i, header in enumerate(headers):
             tk.Label(table_frame, text=header, bg=COLORS['bg_secondary'], fg=COLORS['accent_p5'],
-                     font=('微软雅黑', 9, 'bold')).grid(row=0, column=i, padx=4, pady=2, sticky='w')
+                     font=(UI_FONT, 9, 'bold')).grid(row=0, column=i, padx=4, pady=2, sticky='w')
         
         logic = {
             'pipeline': '四步流水线：八算法融合流水线，系统旗舰预测',
@@ -1882,18 +1966,18 @@ class DashboardMixin:
             
             # 来源名称列
             tk.Label(table_frame, text=name, bg=COLORS['bg_secondary'], fg=source_colors.get(key, COLORS['text_primary']),
-                     font=('微软雅黑', 9, 'bold')).grid(row=row, column=0, padx=4, pady=2, sticky='w')
+                     font=(UI_FONT, 9, 'bold')).grid(row=row, column=0, padx=4, pady=2, sticky='w')
             
             # 各位置候选
             for col, pk in enumerate(pos_keys, start=1):
                 candidates = top5.get(pk, {}).get(key, [])
                 text = ''.join(str(x) for x in candidates) if candidates else '—'
                 tk.Label(table_frame, text=text, bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
-                         font=('Consolas', 9)).grid(row=row, column=col, padx=4, pady=2, sticky='w')
+                         font=(MONO_FONT, 9)).grid(row=row, column=col, padx=4, pady=2, sticky='w')
             
             # 说明列
             tk.Label(table_frame, text=logic.get(key, ''), bg=COLORS['bg_secondary'], fg=COLORS['text_muted'],
-                     font=('微软雅黑', 8), wraplength=200, justify=tk.LEFT).grid(row=row, column=6, padx=4, pady=2, sticky='w')
+                     font=(UI_FONT, 8), wraplength=200, justify=tk.LEFT).grid(row=row, column=6, padx=4, pady=2, sticky='w')
             row += 1
 
         # 位置差异点表格
@@ -1907,13 +1991,13 @@ class DashboardMixin:
             diff_frame = tk.Frame(parent, bg=COLORS['bg_secondary'], relief='groove', bd=1)
             diff_frame.pack(fill=tk.X, padx=8, pady=3)
             tk.Label(diff_frame, text="位置差异点", bg=COLORS['bg_secondary'], fg=COLORS['warning'],
-                     font=('微软雅黑', 9, 'bold')).grid(row=0, column=0, columnspan=2, padx=8, pady=(4, 2), sticky='w')
+                     font=(UI_FONT, 9, 'bold')).grid(row=0, column=0, columnspan=2, padx=8, pady=(4, 2), sticky='w')
             for i, d in enumerate(diff_rows, 1):
                 tk.Label(diff_frame, text=d, bg=COLORS['bg_secondary'], fg=COLORS['text_secondary'],
-                         font=('Consolas', 8), wraplength=600, justify=tk.LEFT).grid(row=i, column=0, columnspan=2, padx=8, pady=(0, 2), sticky='w')
+                         font=(MONO_FONT, 8), wraplength=600, justify=tk.LEFT).grid(row=i, column=0, columnspan=2, padx=8, pady=(0, 2), sticky='w')
             tk.Label(diff_frame, text="注：主推荐按「多源多数投票、平票优先四步流水线」规则生成。",
                      bg=COLORS['bg_secondary'], fg=COLORS['text_muted'],
-                     font=('微软雅黑', 8), wraplength=600, justify=tk.LEFT).grid(row=len(diff_rows)+1, column=0, columnspan=2, padx=8, pady=(0, 4), sticky='w')
+                     font=(UI_FONT, 8), wraplength=600, justify=tk.LEFT).grid(row=len(diff_rows)+1, column=0, columnspan=2, padx=8, pady=(0, 4), sticky='w')
 
     @staticmethod
     def _dash_diff(old_state, new_data):

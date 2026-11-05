@@ -1,0 +1,376 @@
+﻿python : [DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+所在位置 行:15 字符: 3818
++ ... StartNew(); python -m PyInstaller --noconfirm --clean KPLuckyNumber.s ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([DLL固定] 检测到项目目录...\KP-AI-FENGSHUI:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+6897 INFO: PyInstaller: 6.21.0, contrib hooks: 2026.6
+6898 INFO: Python: 3.13.5 (conda)
+6971 INFO: Platform: Windows-11-10.0.26200-SP0
+6971 INFO: Python environment: D:\anaconda3
+7057 INFO: Removing temporary files and cleaning cache in F:\AppData\Local\pyinstaller
+7222 INFO: Module search paths (PYTHONPATH):
+['D:\\PythonProject\\KPLuckyNumber',
+ 'D:\\PythonProject\\KP-AI-FENGSHUI\\pyside6_packages\\PySide6',
+ 'D:\\anaconda3\\python313.zip',
+ 'D:\\anaconda3\\DLLs',
+ 'D:\\anaconda3\\Lib',
+ 'D:\\anaconda3',
+ 'F:\\AppData\\Roaming\\Python\\Python313\\site-packages',
+ 'D:\\anaconda3\\Lib\\site-packages',
+ 'D:\\anaconda3\\Lib\\site-packages\\win32',
+ 'D:\\anaconda3\\Lib\\site-packages\\win32\\lib',
+ 'D:\\anaconda3\\Lib\\site-packages\\Pythonwin',
+ 'D:\\PythonProject\\KPLuckyNumber']
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+17232 INFO: Appending 'datas' from .spec
+17235 INFO: checking Analysis
+17236 INFO: Building Analysis because Analysis-00.toc is non existent
+17236 INFO: Looking for Python shared library...
+17236 INFO: Using Python shared library: D:\anaconda3\python313.dll
+17236 INFO: Running Analysis Analysis-00.toc
+17236 INFO: Target bytecode optimization level: 0
+17236 INFO: Initializing module dependency graph...
+17252 INFO: Initializing module graph hook caches...
+17371 INFO: Analyzing modules for base_library.zip ...
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+41312 INFO: Processing standard module hook 'hook-encodings.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\h
+ooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+50109 INFO: Processing standard module hook 'hook-math.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks'
+53379 INFO: Processing standard module hook 'hook-pickle.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hook
+s'
+55527 INFO: Processing standard module hook 'hook-heapq.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks
+'
+57253 INFO: Caching module dependency graph...
+57713 INFO: Analyzing D:\PythonProject\KPLuckyNumber\main.py
+58054 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyI
+nstaller\\hooks'
+58571 INFO: Processing standard module hook 'hook-xml.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks'
+59224 INFO: Processing standard module hook 'hook-_ctypes.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hoo
+ks'
+59320 INFO: Processing pre-find-module-path hook 'hook-tkinter.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller
+\\hooks\\pre_find_module_path'
+59333 INFO: TclTkInfo: initializing cached Tcl/Tk info...
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+62320 INFO: Processing standard module hook 'hook-_tkinter.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\ho
+oks'
+63648 INFO: Processing standard module hook 'hook-platform.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\ho
+oks'
+65947 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'D:\\anaconda3\\Lib\\site-packages\
+\PyInstaller\\hooks\\pre_safe_import_module'
+65959 INFO: SetuptoolsInfo: initializing cached setuptools info...
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+88284 INFO: Processing standard module hook 'hook-cryptography.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstalle
+r_hooks_contrib\\stdhooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+108048 INFO: hook-cryptography: cryptography uses dynamically-linked OpenSSL: 'D:\\anaconda3\\Library\\bin\\libssl-3-x6
+4.dll'
+109843 INFO: Processing standard module hook 'hook-bcrypt.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hoo
+ks_contrib\\stdhooks'
+110059 INFO: Processing standard module hook 'hook-urllib3.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_ho
+oks_contrib\\stdhooks'
+110362 INFO: Processing pre-safe-import-module hook 'hook-backports.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInst
+aller\\hooks\\pre_safe_import_module'
+110368 INFO: Setuptools: 'backports' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._ven
+dor.backports'!
+110391 INFO: Processing standard module hook 'hook-setuptools.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\
+\hooks'
+110429 INFO: Processing pre-safe-import-module hook 'hook-distutils.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInst
+aller\\hooks\\pre_safe_import_module'
+110597 INFO: Processing standard module hook 'hook-sysconfig.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\
+hooks'
+111372 INFO: Processing pre-safe-import-module hook 'hook-packaging.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInst
+aller\\hooks\\pre_safe_import_module'
+111400 INFO: Processing pre-safe-import-module hook 'hook-jaraco.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstall
+er\\hooks\\pre_safe_import_module'
+111406 INFO: Setuptools: 'jaraco' appears to be a partial setuptools-vendored copy - extending search paths to ['D:\\an
+aconda3\\Lib\\site-packages\\jaraco', 'D:\\anaconda3\\Lib\\site-packages\\setuptools\\_vendor\\jaraco']!
+111417 INFO: Processing pre-safe-import-module hook 'hook-jaraco.text.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyIn
+staller\\hooks\\pre_safe_import_module'
+111423 INFO: Setuptools: 'jaraco.text' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor
+.jaraco.text'!
+111470 INFO: Processing standard module hook 'hook-setuptools._vendor.jaraco.text.py' from 'D:\\anaconda3\\Lib\\site-pa
+ckages\\PyInstaller\\hooks'
+111480 INFO: Processing pre-safe-import-module hook 'hook-importlib_resources.py' from 'D:\\anaconda3\\Lib\\site-packag
+es\\PyInstaller\\hooks\\pre_safe_import_module'
+111488 INFO: Setuptools: 'importlib_resources' appears to be a setuptools-vendored copy - creating alias to 'setuptools
+._vendor.importlib_resources'!
+111600 INFO: Processing pre-safe-import-module hook 'hook-zipp.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller
+\\hooks\\pre_safe_import_module'
+111705 INFO: Processing pre-safe-import-module hook 'hook-jaraco.functools.py' from 'D:\\anaconda3\\Lib\\site-packages\
+\PyInstaller\\hooks\\pre_safe_import_module'
+111741 INFO: Processing pre-safe-import-module hook 'hook-more_itertools.py' from 'D:\\anaconda3\\Lib\\site-packages\\P
+yInstaller\\hooks\\pre_safe_import_module'
+111963 INFO: Processing pre-safe-import-module hook 'hook-jaraco.context.py' from 'D:\\anaconda3\\Lib\\site-packages\\P
+yInstaller\\hooks\\pre_safe_import_module'
+113080 INFO: Processing pre-safe-import-module hook 'hook-importlib_metadata.py' from 'D:\\anaconda3\\Lib\\site-package
+s\\PyInstaller\\hooks\\pre_safe_import_module'
+113173 INFO: Processing standard module hook 'hook-importlib_metadata.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyIn
+staller\\hooks'
+113547 INFO: Processing pre-safe-import-module hook 'hook-ordered_set.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyIn
+staller\\hooks\\pre_safe_import_module'
+113555 INFO: Setuptools: 'ordered_set' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor
+.ordered_set'!
+113968 INFO: Processing pre-safe-import-module hook 'hook-tomli.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstalle
+r\\hooks\\pre_safe_import_module'
+115248 INFO: Processing standard module hook 'hook-pkg_resources.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstall
+er\\hooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+122667 INFO: Processing pre-safe-import-module hook 'hook-platformdirs.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyI
+nstaller\\hooks\\pre_safe_import_module'
+122702 INFO: Processing standard module hook 'hook-platformdirs.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstall
+er_hooks_contrib\\stdhooks'
+122910 INFO: Processing pre-safe-import-module hook 'hook-wheel.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstalle
+r\\hooks\\pre_safe_import_module'
+125187 INFO: Processing standard module hook 'hook-certifi.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_ho
+oks_contrib\\stdhooks'
+125482 INFO: Processing standard module hook 'hook-charset_normalizer.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyi
+nstaller_hooks_contrib\\stdhooks'
+125974 INFO: Processing standard module hook 'hook-chardet.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_ho
+oks_contrib\\stdhooks'
+130027 INFO: Processing standard module hook 'hook-nacl.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hooks
+_contrib\\stdhooks'
+131175 INFO: Processing standard module hook 'hook-numpy.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hook
+s'
+135238 INFO: Processing standard module hook 'hook-webbrowser.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\
+\hooks'
+138506 INFO: Processing standard module hook 'hook-difflib.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\ho
+oks'
+139625 INFO: Processing standard module hook 'hook-psutil.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hoo
+ks_contrib\\stdhooks'
+142314 INFO: Processing standard module hook 'hook-lz4.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hooks_
+contrib\\stdhooks'
+143117 INFO: Processing standard module hook 'hook-sklearn.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_ho
+oks_contrib\\stdhooks'
+158783 INFO: Processing standard module hook 'hook-sklearn.utils.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstal
+ler_hooks_contrib\\stdhooks'
+159008 INFO: Processing standard module hook 'hook-scipy.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hook
+s'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+168808 INFO: Processing standard module hook 'hook-pycparser.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_
+hooks_contrib\\stdhooks'
+172993 INFO: Processing standard module hook 'hook-scipy.linalg.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstalle
+r\\hooks'
+173414 INFO: Processing standard module hook 'hook-scipy.special._ufuncs.py' from 'D:\\anaconda3\\Lib\\site-packages\\P
+yInstaller\\hooks'
+173812 INFO: Processing standard module hook 'hook-scipy.special._ellip_harm_2.py' from 'D:\\anaconda3\\Lib\\site-packa
+ges\\PyInstaller\\hooks'
+174661 INFO: Processing standard module hook 'hook-scipy.spatial._ckdtree.py' from 'D:\\anaconda3\\Lib\\site-packages\\
+PyInstaller\\hooks'
+174832 INFO: Processing standard module hook 'hook-matplotlib.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\
+\hooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+177052 INFO: Processing pre-safe-import-module hook 'hook-gi.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\
+hooks\\pre_safe_import_module'
+177732 INFO: Processing standard module hook 'hook-matplotlib.backend_bases.py' from 'D:\\anaconda3\\Lib\\site-packages
+\\PyInstaller\\hooks'
+178041 INFO: Processing standard module hook 'hook-PIL.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks'
+178307 INFO: Processing standard module hook 'hook-PIL.Image.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\
+hooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+185851 INFO: Processing standard module hook 'hook-xml.etree.cElementTree.py' from 'D:\\anaconda3\\Lib\\site-packages\\
+PyInstaller\\hooks'
+186100 INFO: Processing standard module hook 'hook-xml.dom.domreg.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstal
+ler\\hooks'
+186709 INFO: Processing standard module hook 'hook-PIL.ImageFilter.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInsta
+ller\\hooks'
+189053 INFO: Processing standard module hook 'hook-jinja2.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hoo
+ks_contrib\\stdhooks'
+190343 INFO: Processing standard module hook 'hook-matplotlib.backends.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyI
+nstaller\\hooks'
+190569 INFO: Processing standard module hook 'hook-matplotlib.pyplot.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyIns
+taller\\hooks'
+192921 INFO: Processing standard module hook 'hook-dateutil.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_h
+ooks_contrib\\stdhooks'
+193546 INFO: Processing pre-safe-import-module hook 'hook-six.moves.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInst
+aller\\hooks\\pre_safe_import_module'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+200225 INFO: Processing standard module hook 'hook-scipy.sparse.csgraph.py' from 'D:\\anaconda3\\Lib\\site-packages\\Py
+Installer\\hooks'
+201118 INFO: Processing standard module hook 'hook-scipy.spatial.transform.rotation.py' from 'D:\\anaconda3\\Lib\\site-
+packages\\PyInstaller\\hooks'
+203398 INFO: Processing standard module hook 'hook-scipy.stats._stats.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyIn
+staller\\hooks'
+207536 INFO: Processing standard module hook 'hook-pandas.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hoo
+ks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+D:\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:23: UserWarning: Pandas requires version '2.10.2'
+ or newer of 'numexpr' (version '2.10.1' currently installed).
+  from pandas.core.computation.check import NUMEXPR_INSTALLED
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+8035 INFO: NumExpr defaulting to 16 threads.
+D:\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:23: UserWarning: Pandas requires version '2.10.2'
+ or newer of 'numexpr' (version '2.10.1' currently installed).
+  from pandas.core.computation.check import NUMEXPR_INSTALLED
+224102 INFO: Processing standard module hook 'hook-zoneinfo.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_h
+ooks_contrib\\stdhooks'
+228209 INFO: Processing standard module hook 'hook-pandas.io.formats.style.py' from 'D:\\anaconda3\\Lib\\site-packages\
+\PyInstaller\\hooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+D:\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:23: UserWarning: Pandas requires version '2.10.2'
+ or newer of 'numexpr' (version '2.10.1' currently installed).
+  from pandas.core.computation.check import NUMEXPR_INSTALLED
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+D:\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:23: UserWarning: Pandas requires version '2.10.2'
+ or newer of 'numexpr' (version '2.10.1' currently installed).
+  from pandas.core.computation.check import NUMEXPR_INSTALLED
+240545 INFO: Processing standard module hook 'hook-pandas.plotting.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInsta
+ller\\hooks'
+242100 INFO: Processing standard module hook 'hook-botocore.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_h
+ooks_contrib\\stdhooks'
+292812 INFO: Processing standard module hook 'hook-openpyxl.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_h
+ooks_contrib\\stdhooks'
+300712 INFO: Processing standard module hook 'hook-tables.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hoo
+ks_contrib\\stdhooks'
+303329 INFO: Processing standard module hook 'hook-sqlalchemy.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\
+\hooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+315086 INFO: Processing standard module hook 'hook-sqlite3.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\ho
+oks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+322605 INFO: Processing standard module hook 'hook-pandas.io.clipboard.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyI
+nstaller\\hooks'
+322644 INFO: Processing standard module hook 'hook-qtpy.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks
+'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+325135 WARNING: hook-qtpy: selected 'PyQt5' as Qt bindings, but multiple bindings are available: ['PyQt5', 'PyQt6']. Us
+e the QT_API environment variable to select different bindings and suppress this warning.
+325576 INFO: Processing standard module hook 'hook-fsspec.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hoo
+ks_contrib\\stdhooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+338728 INFO: Processing standard module hook 'hook-sklearn.metrics.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinst
+aller_hooks_contrib\\stdhooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+D:\anaconda3\Lib\site-packages\sklearn\utils\_param_validation.py:14: UserWarning: A NumPy version >=1.23.5 and <2.5.0 
+is required for this version of SciPy (detected version 2.5.2)
+  from scipy.sparse import csr_matrix, issparse
+D:\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:23: UserWarning: Pandas requires version '2.10.2'
+ or newer of 'numexpr' (version '2.10.1' currently installed).
+  from pandas.core.computation.check import NUMEXPR_INSTALLED
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+D:\anaconda3\Lib\site-packages\sklearn\utils\_param_validation.py:14: UserWarning: A NumPy version >=1.23.5 and <2.5.0 
+is required for this version of SciPy (detected version 2.5.2)
+  from scipy.sparse import csr_matrix, issparse
+12170 INFO: NumExpr defaulting to 16 threads.
+D:\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:23: UserWarning: Pandas requires version '2.10.2'
+ or newer of 'numexpr' (version '2.10.1' currently installed).
+  from pandas.core.computation.check import NUMEXPR_INSTALLED
+363757 INFO: Processing standard module hook 'hook-sklearn.metrics.cluster.py' from 'D:\\anaconda3\\Lib\\site-packages\
+\_pyinstaller_hooks_contrib\\stdhooks'
+364252 INFO: Processing standard module hook 'hook-sklearn.cluster.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinst
+aller_hooks_contrib\\stdhooks'
+364406 INFO: Processing standard module hook 'hook-sklearn.metrics.pairwise.py' from 'D:\\anaconda3\\Lib\\site-packages
+\\_pyinstaller_hooks_contrib\\stdhooks'
+365112 INFO: Processing standard module hook 'hook-sklearn.neighbors.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyin
+staller_hooks_contrib\\stdhooks'
+365414 INFO: Processing standard module hook 'hook-sklearn.linear_model.py' from 'D:\\anaconda3\\Lib\\site-packages\\_p
+yinstaller_hooks_contrib\\stdhooks'
+369040 INFO: Processing standard module hook 'hook-sklearn.tree.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstall
+er_hooks_contrib\\stdhooks'
+372241 INFO: Analyzing hidden import 'modules.ai_prompt'
+372256 INFO: Analyzing hidden import 'modules.data_fetcher'
+372574 INFO: Analyzing hidden import 'modules.evaluation'
+372594 INFO: Analyzing hidden import 'modules.metrics_dashboard'
+372625 INFO: Analyzing hidden import 'modules.monitor_visualizer'
+372689 INFO: Analyzing hidden import 'modules.mysql_storage_manager'
+372732 INFO: Analyzing hidden import 'modules.optimization_patches'
+372751 INFO: Analyzing hidden import 'modules.storage'
+372769 INFO: Analyzing hidden import 'modules.validator'
+372791 INFO: Processing module hooks (post-graph stage)...
+372812 WARNING: Hidden import "charset_normalizer.md__mypyc" not found!
+376616 INFO: Processing standard module hook 'hook-matplotlib.backends.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyI
+nstaller\\hooks'
+376622 INFO: Matplotlib backend selection method: user-provided name(s)
+376622 INFO: Selected matplotlib backends: ['TkAgg']
+378011 INFO: Processing standard module hook 'hook-PIL.SpiderImagePlugin.py' from 'D:\\anaconda3\\Lib\\site-packages\\P
+yInstaller\\hooks'
+378474 WARNING: Hidden import "scipy.special._cdflib" not found!
+378479 INFO: Processing standard module hook 'hook-sqlalchemy.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\
+\hooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+381954 WARNING: Hidden import "pysqlite2" not found!
+381961 WARNING: Hidden import "MySQLdb" not found!
+381966 WARNING: Hidden import "psycopg2" not found!
+385475 INFO: Processing standard module hook 'hook-_tkinter.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\h
+ooks'
+385482 INFO: Processing standard module hook 'hook-tzdata.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hoo
+ks_contrib\\stdhooks'
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+398507 INFO: Performing binary vs. data reclassification (3853 entries)
+409229 INFO: Looking for ctypes DLLs
+410034 INFO: Analyzing run-time hooks ...
+410051 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks\\
+rthooks'
+410067 INFO: Including run-time hook 'pyi_rth_cryptography_openssl.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinst
+aller_hooks_contrib\\rthooks'
+410076 INFO: Including run-time hook 'pyi_rth_setuptools.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hook
+s\\rthooks'
+410087 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks\\
+rthooks'
+410106 INFO: Including run-time hook 'pyi_rth_pkgres.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks\\r
+thooks'
+410122 INFO: Including run-time hook 'pyi_rth_mplconfig.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks
+\\rthooks'
+410130 INFO: Processing pre-find-module-path hook 'hook-_pyi_rth_utils.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyI
+nstaller\\hooks\\pre_find_module_path'
+410146 INFO: Processing standard module hook 'hook-_pyi_rth_utils.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstal
+ler\\hooks'
+410185 INFO: Including run-time hook 'pyi_rth_traitlets.py' from 'D:\\anaconda3\\Lib\\site-packages\\_pyinstaller_hooks
+_contrib\\rthooks'
+410194 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\
+\hooks\\rthooks'
+410205 INFO: Including run-time hook 'pyi_rth__tkinter.py' from 'D:\\anaconda3\\Lib\\site-packages\\PyInstaller\\hooks\
+\rthooks'
+410421 INFO: Creating base_library.zip...
+410454 INFO: Looking for dynamic libraries
+[DLL固定] 检测到项目目录: D:\PythonProject\KP-AI-FENGSHUI
+D:\anaconda3\Lib\site-packages\sklearn\utils\_param_validation.py:14: UserWarning: A NumPy version >=1.23.5 and <2.5.0 
+is required for this version of SciPy (detected version 2.5.2)
+  from scipy.sparse import csr_matrix, issparse
+D:\anaconda3\Lib\site-packages\pandas\core\computation\expressions.py:23: UserWarning: Pandas requires version '2.10.2'
+ or newer of 'numexpr' (version '2.10.1' currently installed).
+  from pandas.core.computation.check import NUMEXPR_INSTALLED
+442639 INFO: Extra DLL search directories (AddDllDirectory): ['D:\\anaconda3\\Lib\\site-packages\\numpy.libs', 'D:\\ana
+conda3\\Lib\\site-packages\\pandas.libs']
+442639 INFO: Extra DLL search directories (PATH): []
+471146 INFO: Warnings written to D:\PythonProject\KPLuckyNumber\build\KPLuckyNumber\warn-KPLuckyNumber.txt
+471565 INFO: Graph cross-reference written to D:\PythonProject\KPLuckyNumber\build\KPLuckyNumber\xref-KPLuckyNumber.htm
+l
+471841 INFO: checking PYZ
+471842 INFO: Building PYZ because PYZ-00.toc is non existent
+471843 INFO: Building PYZ (ZlibArchive) D:\PythonProject\KPLuckyNumber\build\KPLuckyNumber\PYZ-00.pyz
+474776 INFO: Building PYZ (ZlibArchive) D:\PythonProject\KPLuckyNumber\build\KPLuckyNumber\PYZ-00.pyz completed success
+fully.
+474858 INFO: checking PKG
+474859 INFO: Building PKG because PKG-00.toc is non existent
+474859 INFO: Building PKG (CArchive) KPLuckyNumber.pkg
+475083 INFO: Building PKG (CArchive) KPLuckyNumber.pkg completed successfully.
+475088 INFO: Bootloader D:\anaconda3\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+475088 INFO: checking EXE
+475088 INFO: Building EXE because EXE-00.toc is non existent
+475088 INFO: Building EXE from EXE-00.toc
+475091 INFO: Copying bootloader EXE to D:\PythonProject\KPLuckyNumber\build\KPLuckyNumber\KPLuckyNumber.exe
+475194 INFO: Copying icon to EXE
+475256 INFO: Copying 0 resources to EXE
+475256 INFO: Embedding manifest in EXE
+475319 INFO: Appending PKG archive to EXE
+475512 INFO: Fixing EXE headers
+476076 INFO: Building EXE from EXE-00.toc completed successfully.
+476145 INFO: checking COLLECT
+476146 INFO: Building COLLECT because COLLECT-00.toc is non existent
+476148 INFO: Removing dir D:\PythonProject\KPLuckyNumber\dist\KPLuckyNumber
+510812 INFO: Building COLLECT COLLECT-00.toc
+580474 INFO: Building COLLECT COLLECT-00.toc completed successfully.
+580612 INFO: Build complete! The results are available in: D:\PythonProject\KPLuckyNumber\dist

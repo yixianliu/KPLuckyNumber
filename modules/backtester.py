@@ -15,6 +15,7 @@ import logging
 import os
 import json
 import hashlib
+import concurrent.futures
 import numpy as np
 from collections import defaultdict
 from datetime import datetime
@@ -33,9 +34,12 @@ from paths import LOGS_DIR, REPORTS_BACKTEST_DIR
 os.makedirs(LOGS_DIR, exist_ok=True)
 os.makedirs(REPORTS_BACKTEST_DIR, exist_ok=True)
 
-# 回测断点续跑缓存版本号。预测语义发生变化时(如贝叶斯/融合逻辑调整)应递增，
-# 使旧缓存自动失效、避免用过期预测污染续跑结果。
-BACKTEST_RESUME_VERSION = "2026-07-31-v1"
+# ALG-04: 特征工程缓存配置
+from modules.features import P5FeatureCache, compute_history_fingerprint, _get_feature_cache
+from config import FEATURE_CACHE_CONFIG
+
+# ALG-05: 回测签名版本号。缓存失效阈值
+BACKTEST_RESUME_VERSION = "2026-10-22-v2"
 
 # 说明：回测结果与报告写入 reports/backtest 下；日志写入 logs/。
 # 本模块可能生成大量文件，请确保磁盘空间充足并使用配置好的日志路径进行集中管理。
@@ -54,12 +58,18 @@ class Backtester:
         """
         初始化回测引擎
 
-        Args:
-            predictor: 预测器实例（P5Predictor或优化后的预测器）
-            db_instance: 数据库实例，None时会自动创建
+        ALG-05: 初始化特征缓存（进程级共享，容量读取全局配置，默认 256）和缓存统计
         """
         self.predictor = predictor
         self.db = db_instance
+        
+        # ALG-05: 初始化特征缓存（进程级共享，容量读取全局配置，默认 256；
+        # 顺序回测首次运行每窗口指纹唯一、命中率 0，容量只服务重跑/断点重试）
+        self._feature_cache = P5FeatureCache(capacity=FEATURE_CACHE_CONFIG.get('capacity', 256))
+        self._cache_stats = {'hits': 0, 'misses': 0, 'evictions': 0}
+        
+        # ALG-05: 训练集特征指纹（用于增量更新检测）
+        self._train_fingerprint: Optional[str] = None
         self.position_names = ['万位', '千位', '百位', '十位', '个位']
 
     def _get_db(self):
@@ -494,11 +504,11 @@ class Backtester:
             3) 综合评分 overall_score（满分 100，见下方公式）。
             4) 概率校准度：用 Brier Score 衡量「预测概率」与「是否命中(0/1)」的差距。
 
-        综合评分公式（魔法数）：
-            overall_score = (top1_hits * 40 + top3_hits * 20) / 5
+        综合评分公式（魔法数，与 docs/hitrate_spec.md §4 已对齐）：
+            overall_score = (top1_hits * 40 + top3_hits * 20) / 3
             - top1_hits：5 个位置中 Top-1 命中的个数（每命中 1 位得 40 分权重）
             - top3_hits：Top-3 命中的个数（每命中 1 位得 20 分权重）
-            - 除以 5 归一化到约 0-? 区间（理论最大 = (5*40+5*20)/5 = 60，实际按业务理解为百分制转化）
+            - 除以 3 归一化到百分制（理论最大 = (5*40+5*20)/3 = 100）
             Top-1 权重(40) >> Top-3 权重(20)，强调「精准命中头号推荐」更重要。
 
         Brier Score（概率校准）：
@@ -514,13 +524,29 @@ class Backtester:
         Returns:
             含逐位置 accuracy、组合匹配、overall_score、calibration_score 等的字典。
         """
-        fused_probs = prediction_result.get('fused_probabilities', [])
+        # 概率键归一：JSON 落库/中断恢复后对象键为字符串（'0'..'9'），
+        # 与 int 型开奖号码比较会恒不相等 → Top-1/3/5 恒 False、Brier 取 0。
+        # 此处统一转 int，对内存态（int 键）输入结果完全等价。
+        fused_probs = []
+        for _pos_probs in prediction_result.get('fused_probabilities', []) or []:
+            if isinstance(_pos_probs, dict):
+                _norm = {}
+                for _num, _prob in _pos_probs.items():
+                    try:
+                        _n_i, _p_f = int(_num), float(_prob)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= _n_i <= 9:
+                        _norm[_n_i] = _p_f
+                fused_probs.append(_norm)
+            else:
+                fused_probs.append({})
         top_combinations = prediction_result.get('top_combinations', [])
 
-        # 计算各位置准确率
+        # 计算各位置准确率（开奖号码不足 5 位时按可用位置截断，不越界）
         position_accuracy = []
         for pos in range(5):
-            if pos >= len(fused_probs):
+            if pos >= len(fused_probs) or pos >= len(actual_numbers):
                 break
 
             pos_probs = fused_probs[pos]
@@ -549,7 +575,13 @@ class Backtester:
         # 组合匹配分析（仅评估推荐前 10 个组合，控制开销）
         combination_hits = []
         for combo in top_combinations[:10]:
+            if not isinstance(combo, dict):
+                continue
             pred_nums = combo.get('numbers', [])
+            try:
+                pred_nums = [int(n) for n in pred_nums]
+            except (TypeError, ValueError):
+                continue
             match_count = sum(1 for i in range(5) if i < len(pred_nums) and pred_nums[i] == actual_numbers[i])
             match_positions = [i + 1 for i in range(5) if i < len(pred_nums) and pred_nums[i] == actual_numbers[i]]
             combination_hits.append({
@@ -1141,3 +1173,26 @@ if __name__ == '__main__':
         print(f'可视化图表已保存: {viz_path}')
     else:
         print(f'回测失败: {result.get("message")}')
+
+# ALG-05: 并行回测 worker 函数（供 scripts/tests/test_backtest_walkforward.py 锁定无前视语义）
+def _parallel_backtest_worker(args: Tuple) -> List[Dict]:
+    idx, i, history_data, eval_start, test_count, predictor, db = args
+    target_issue = history_data[i]['issue']
+    train_data = history_data[:i]
+    actual_numbers = history_data[i]['numbers']
+    base_issue = history_data[i - 1]['issue'] if i > 0 else None
+    try:
+        prediction_result = predictor.predict(train_data, base_issue, target_issue=target_issue)
+        eval_result = {
+            'target_issue': target_issue,
+            'prediction_time': datetime.now().isoformat(),
+            'actual_numbers': actual_numbers,
+            'top1_hit': int(actual_numbers[0] == prediction_result.get('top1', None)),
+            'top3_hit': int(actual_numbers[0] in prediction_result.get('top3', [])),
+            'top5_hit': int(actual_numbers[0] in prediction_result.get('top5', [])),
+            'overall_score': prediction_result.get('overall_score', 0.0),
+        }
+        return [eval_result]
+    except Exception as e:
+        logger.warning(f'Parallel worker 期号{target_issue} 预测失败: {e}')
+        return []

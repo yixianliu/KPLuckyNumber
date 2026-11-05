@@ -92,6 +92,8 @@ class Task:
     started_at: Optional[float] = field(compare=False, default=None)
     finished_at: Optional[float] = field(compare=False, default=None)
     metadata: Dict = field(compare=False, default_factory=dict)
+    # 超时监控线程是否已触发：用于避免 TIMEOUT 与 CANCELLED 两条终态消息重复投递
+    timeout_fired: bool = field(compare=False, default=False)
 
 
 # ============ 任务管理器核心类 ============
@@ -159,6 +161,24 @@ class TaskManager:
         # 状态标志
         self._shutdown = False
         self._paused = False
+        
+        # 派发线程：_task_queue 的唯一消费者。
+        # 历史缺陷：队列只 put_nowait 从未 get，被当成"限流占位"，累计提交
+        # 达到 queue_size 后永久 queue.Full；同时 PriorityQueue 的优先级顺序
+        # 从未被消费，优先级语义被架空。见 _dispatch_loop。
+        self._dispatch_stop = threading.Event()
+        # 并发容量：worker 槽位保证同时派发的任务数不超过线程池大小，
+        # 使排队任务留在 PriorityQueue 里，优先级顺序才真正生效；
+        # submit 槽位限制"运行中+排队"总量，替代永不释放的队列计数。
+        self._worker_slots = threading.BoundedSemaphore(max(1, self.max_workers))
+        self._submit_slots = threading.BoundedSemaphore(
+            max(1, self.max_workers + self.queue_size))
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_loop,
+            name='KPLuckyDispatch',
+            daemon=True
+        )
+        self._dispatch_thread.start()
         
         # 日志文件
         from paths import LOG_GUI_RUN
@@ -417,6 +437,11 @@ class TaskManager:
         if self._shutdown:
             return False
         
+        # 并发容量闸门：非阻塞获取，满了立即拒绝（GUI 线程绝不阻塞）
+        if not self._submit_slots.acquire(blocking=False):
+            logger.warning(f"任务并发容量已满，拒绝任务: {task_name}")
+            return False
+        
         task_id = self._next_task_id()
         cancel_event = threading.Event()
         
@@ -439,17 +464,18 @@ class TaskManager:
             self._task_queue.put_nowait(task)
         except queue.Full:
             logger.warning(f"任务队列已满，拒绝任务: {task_name}")
+            self._submit_slots.release()
             return False
         
         # 记录运行中任务
         with self._running_lock:
             self._running_tasks[task_id] = task
         
-        # 提交到线程池
-        future = self._executor.submit(self._execute_task, task)
-        task.future = future
+        # 交给派发线程按优先级提交到线程池（此处不再直接 executor.submit）
+        # 提交仍是非阻塞 put_nowait，GUI 线程不会被阻塞。
         
-        # 通知 UI 任务开始
+        # 通知 UI 任务开始（保持原有提交方语义：submit 成功即视为已开始，
+        # 与历史"executor 内部排队也算已开始"的行为一致）
         self._ui_queue.put({
             'type': MsgType.TASK_STARTED.value,
             'task_id': task_id,
@@ -459,6 +485,71 @@ class TaskManager:
         logger.info(f"任务已提交: {task_name} (id={task_id}, priority={priority.name})")
         return True
     
+    def _dispatch_loop(self):
+        """_task_queue 的唯一消费者：按优先级把任务派发到线程池。
+
+        取舍理由：
+          1. 只做"出队 + 派发"，不新增业务线程池，不改动 submit 返回值语义；
+          2. 队列只在真正积压时才有内容，派发后立即释放槽位，长时间运行
+             不会因累计提交而永久 Full；
+          3. PriorityQueue 的出队顺序即优先级顺序（高优先级先派发），
+             使 priority 参数不再被架空。
+        未选择"删除队列、改用运行计数限流"：那会彻底丢掉优先级语义；
+        未选择"每个任务完成时 get_nowait 回收"：会误删其它优先级的排队任务。
+        """
+        while not self._dispatch_stop.is_set():
+            # 先占 worker 槽位再出队：队列里始终保留积压任务，
+            # 真正出队时才按 PriorityQueue 的优先级取最高者。
+            if not self._worker_slots.acquire(timeout=0.2):
+                continue
+            try:
+                task = self._task_queue.get(timeout=0.5)
+            except queue.Empty:
+                self._worker_slots.release()
+                continue
+            if self._dispatch_stop.is_set():
+                # 关闭时已出队但未派发的任务：不执行任务体，仅回收状态与容量
+                self._worker_slots.release()
+                task.cancel_event.set()
+                with self._running_lock:
+                    self._running_tasks.pop(task.task_id, None)
+                self._submit_slots.release()
+                break
+            try:
+                future = self._executor.submit(self._execute_task, task)
+                task.future = future
+            except Exception as e:  # noqa: BLE001
+                # 派发失败（通常是 executor 已关闭）：回收容量与运行记录
+                logger.error("任务派发失败: %s (id=%s): %s", task.name, task.task_id, e)
+                self._worker_slots.release()
+                self._submit_slots.release()
+                with self._running_lock:
+                    self._running_tasks.pop(task.task_id, None)
+                self.error(str(e), task.task_id)
+
+    def _drain_pending_tasks(self) -> int:
+        """关闭时排空未派发任务：只回收状态，不执行任务函数体。
+
+        每个入队任务都曾成功获取一个 submit 槽位，且未被派发就永远不会走到
+        _execute_task 的 finally，因此必须在这里显式归还，否则关闭后
+        `_running_tasks` 与容量信号量会残留。任务被标记为 cancel_event，
+        语义上等同「已取消 / 未执行」，不会产生 FINISHED 或错误消息。
+        """
+        drained = 0
+        while True:
+            try:
+                task = self._task_queue.get_nowait()
+            except queue.Empty:
+                break
+            task.cancel_event.set()
+            with self._running_lock:
+                self._running_tasks.pop(task.task_id, None)
+            self._submit_slots.release()
+            drained += 1
+        if drained:
+            logger.info("关闭时排空 %d 个未派发任务（未执行任务体）", drained)
+        return drained
+
     def _wrap_task(self, task: Task) -> Callable:
         """包装任务函数，注入取消检查和超时处理"""
         original_func = task.func
@@ -473,6 +564,7 @@ class TaskManager:
             if timeout:
                 def on_timeout():
                     if not cancel_event.is_set():
+                        task.timeout_fired = True
                         cancel_event.set()
                         tm._ui_queue.put({
                             'type': MsgType.TASK_TIMEOUT.value,
@@ -505,12 +597,8 @@ class TaskManager:
             task.func(self)
         except Exception as e:
             if task.cancel_event.is_set():
-                # 任务被取消，不视为错误
+                # 任务被取消，不视为错误（终态通知统一在 finally 投递，避免重复）
                 logger.info(f"任务已取消: {task.name} (id={task.task_id})")
-                self._ui_queue.put({
-                    'type': MsgType.TASK_CANCELLED.value,
-                    'task_id': task.task_id
-                })
             else:
                 # 真实错误
                 error_detail = traceback.format_exc()
@@ -518,8 +606,19 @@ class TaskManager:
                 self.log(f"  [错误详情]\n{error_detail}\n")
                 self.error(str(e), task.task_id)
         finally:
-            # 触发完成通知（如果未被取消/超时处理）
-            if not task.cancel_event.is_set():
+            # 终态通知：
+            # - 正常完成 → FINISHED
+            # - 超时 → TASK_TIMEOUT 已由超时线程投递，此处不重复
+            # - 其他取消（协作式 return / 程序主动 cancel）→ TASK_CANCELLED，
+            #   修复历史缺陷：任务在长循环里检测到 cancel_event 后正常 return 时
+            #   原先既不投 FINISHED 也不投 CANCELLED，UI 会一直停在「运行中」。
+            if task.cancel_event.is_set():
+                if not task.timeout_fired:
+                    self._ui_queue.put({
+                        'type': MsgType.TASK_CANCELLED.value,
+                        'task_id': task.task_id
+                    })
+            else:
                 self.finished(task.task_id)
             
             # 执行回调
@@ -529,9 +628,11 @@ class TaskManager:
                 except Exception as e:
                     logger.error(f"任务回调异常: {e}", exc_info=True)
             
-            # 清理运行中任务记录
+            # 清理运行中任务记录，并归还并发容量（worker + submit 两个槽位）
             with self._running_lock:
                 self._running_tasks.pop(task.task_id, None)
+            self._worker_slots.release()
+            self._submit_slots.release()
     
     def _on_task_finished(self, task_id: int = None):
         """任务完成清理"""
@@ -769,6 +870,15 @@ class TaskManager:
         """
         logger.info("TaskManager 正在关闭...")
         self._shutdown = True
+        
+        # 先停派发线程，避免它在 executor.shutdown 后继续提交任务
+        self._dispatch_stop.set()
+        if self._dispatch_thread and self._dispatch_thread.is_alive():
+            self._dispatch_thread.join(timeout=2.0)
+        
+        # 排空仍未派发的排队任务：不执行任务体，标记取消并释放运行记录/容量，
+        # 避免关闭后 _running_tasks 与信号量长期残留。
+        self._drain_pending_tasks()
         
         # 取消所有运行中任务
         self.cancel_all()

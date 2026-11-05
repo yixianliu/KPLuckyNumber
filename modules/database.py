@@ -36,6 +36,7 @@ import json
 import os
 import uuid
 import threading
+import weakref
 import numpy as np
 from datetime import datetime
 from decimal import Decimal
@@ -81,6 +82,25 @@ def _decimal_default(obj):
     if isinstance(obj, (np.ndarray,)):  # numpy array
         return obj.tolist()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def issue_numeric_key(issue) -> int:
+    """期号数值排序 key（唯一实现，供 Python 侧期号排序使用）。
+
+    背景：issue / target_issue 在库中为 VARCHAR(20)，直接 ``ORDER BY issue``
+    是字典序，仅当所有期号长度一致（YYYYDDD 7 位定长）时才恰好等价数值序；
+    一旦混入带分隔符/补零差异的脏数据就会错序。本 key 提取数字段转 int，
+    解析失败返回 -1（排在最前，避免异常值扰动主序）。
+    """
+    if isinstance(issue, int):
+        return issue
+    text = str(issue if issue is not None else '')
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    digits = ''.join(ch for ch in text if ch.isdigit())
+    return int(digits) if digits else -1
 
 
 def _clean_for_json(obj):
@@ -177,11 +197,43 @@ def _init_pool():
             return None
 
 
-def _get_pooled_connection(max_retries: int = 3):
-    """从连接池获取连接（每线程缓存一条）
+def _get_instance_conn_map():
+    """获取当前线程的『P5Database 实例 → 连接』映射。
+
+    使用 WeakKeyDictionary：实例被回收后映射项自动消失，不会让 thread-local
+    长期持有 P5Database 引用而阻止垃圾回收。
+    """
+    conns = getattr(_thread_connections, 'conns', None)
+    if conns is None:
+        conns = weakref.WeakKeyDictionary()
+        _thread_connections.conns = conns
+    return conns
+
+
+def _peek_pooled_connection(owner=None):
+    """读取当前线程缓存的连接；owner 为 None 时走旧的单槽位 .conn。"""
+    if owner is None:
+        return getattr(_thread_connections, 'conn', None)
+    return _get_instance_conn_map().get(owner)
+
+
+def _store_pooled_connection(conn, owner=None):
+    """写入当前线程缓存的连接；owner 为 None 时走旧的单槽位 .conn。"""
+    if owner is None:
+        _thread_connections.conn = conn
+    elif conn is None:
+        _get_instance_conn_map().pop(owner, None)
+    else:
+        _get_instance_conn_map()[owner] = conn
+
+
+def _get_pooled_connection(max_retries: int = 3, owner=None):
+    """从连接池获取连接（每线程每实例缓存一条）
 
     参数:
         max_retries: 最大重试次数，防止连接失败时无限递归导致栈溢出
+        owner: 连接归属的 P5Database 实例。传入时按实例隔离 thread-local 槽位，
+               避免同线程多实例互相覆盖/误释放；为 None 时沿用旧的单槽位缓存。
 
     返回:
         pymysql.Connection 实例或 None
@@ -190,44 +242,59 @@ def _get_pooled_connection(max_retries: int = 3):
     if pool is None:
         return None
 
-    # 使用 thread-local 存储，避免多线程共享同一连接
-    if not hasattr(_thread_connections, 'conn') or _thread_connections.conn is None:
+    # thread-local 存储：默认单槽位，传入 owner 时按实例隔离
+    conn = _peek_pooled_connection(owner)
+    if conn is None:
         try:
-            _thread_connections.conn = pool.connection()
-            logger.debug('从连接池获取新连接 (thread=%s)', threading.current_thread().ident)
+            conn = pool.connection()
+            _store_pooled_connection(conn, owner)
+            logger.debug('从连接池获取新连接 (thread=%s, owner=%s)',
+                         threading.current_thread().ident,
+                         id(owner) if owner is not None else '-')
         except Exception as e:
             logger.error(f'从连接池获取连接失败: {e}')
             return None
 
     # 验证连接是否有效
     try:
-        _thread_connections.conn.ping(reconnect=True)
+        conn.ping(reconnect=True)
     except Exception as e:
         logger.warning('连接池连接失效，尝试重新获取: %s', e)
         try:
-            if _thread_connections.conn:
-                _thread_connections.conn.close()
+            if conn:
+                conn.close()
         except Exception:  # noqa: BLE001
             pass
-        _thread_connections.conn = None
+        _store_pooled_connection(None, owner)
         # 限制递归深度，防止栈溢出
         if max_retries > 0:
-            return _get_pooled_connection(max_retries - 1)
+            return _get_pooled_connection(max_retries - 1, owner=owner)
         return None
 
-    return _thread_connections.conn
+    return conn
 
 
-def _release_pooled_connection():
-    """释放当前线程的连接回连接池"""
-    if hasattr(_thread_connections, 'conn') and _thread_connections.conn is not None:
+def _release_pooled_connection(owner=None):
+    """释放当前线程的连接回连接池
+
+    owner 为 None 时沿用旧的单槽位（_thread_connections.conn）；
+    传入 owner 时只释放该实例自己的连接，避免 A 实例的 disconnect()
+    误释放同线程 B 实例持有的连接。
+    """
+    conn = _peek_pooled_connection(owner)
+    if conn is not None:
         try:
-            _thread_connections.conn.close()  # PooledDB 的 close() 会归还连接而非真正关闭
-            logger.debug('连接已归还连接池 (thread=%s)', threading.current_thread().ident)
+            conn.close()  # PooledDB 的 close() 会归还连接而非真正关闭
+            logger.debug('连接已归还连接池 (thread=%s, owner=%s)',
+                         threading.current_thread().ident,
+                         id(owner) if owner is not None else '-')
         except Exception as e:
             logger.debug('归还连接池时异常: %s', e)
         finally:
-            _thread_connections.conn = None
+            _store_pooled_connection(None, owner)
+    # 兼容历史单槽位清理（owner=None 路径）
+    if owner is None:
+        _thread_connections.conn = None
 
 
 class P5Database:
@@ -304,13 +371,15 @@ class P5Database:
             # 如果检查连接状态时出错，视为连接失效，继续重新连接
             self.connection = None
         
-        # 释放旧的 thread-local 连接
-        if hasattr(_thread_connections, 'conn') and _thread_connections.conn is not None:
-            _thread_connections.conn = None
+        # 释放本实例残留的连接（连接失效走到这里时必须显式归还，避免池槽位泄漏）；
+        # 只释放 owner=self 的槽位，不影响同线程其它 P5Database 实例的连接。
+        if self._own_connection:
+            _release_pooled_connection(owner=self)
+            self._own_connection = False
         
         # 尝试连接池模式
         if self._use_pool:
-            pooled_conn = _get_pooled_connection()
+            pooled_conn = _get_pooled_connection(owner=self)
             if pooled_conn is not None:
                 self.connection = pooled_conn
                 self.cursor = self.connection.cursor()
@@ -426,8 +495,8 @@ class P5Database:
         
         try:
             if self._use_pool and self._own_connection:
-                # 连接池模式：归还连接
-                _release_pooled_connection()
+                # 连接池模式：只归还本实例自己的连接
+                _release_pooled_connection(owner=self)
                 self._own_connection = False
                 logger.debug('连接已归还连接池')
             else:
@@ -1603,9 +1672,20 @@ class P5Database:
             return None
     
     def get_all_ai_reports(self, limit=10):
-        """获取AI分析报告列表"""
+        """获取AI分析报告列表（摘要列，排除 report_content 大字段）
+
+        C5 优化：原实现 SELECT * 会连 LONGTEXT 全文列一起拉到内存，列表场景
+        （GUI 历史报告 / list_reports）只需摘要字段，排除 report_content 可显著
+        降低传输量与内存峰值。其余列保持全量，保证 list_reports 的
+        json.loads(trend_analysis) 等消费不受影响。
+        """
         try:
-            sql = 'SELECT * FROM p5_ai_report ORDER BY created_at DESC LIMIT %s'
+            sql = ('SELECT id, report_date, report_uuid, data_count, latest_issue, '
+                   'trend_analysis, probability_stats, recommended_numbers, '
+                   'recommended_combinations, confidence_scores, recommendation_reasons, '
+                   'key_conclusions, risk_warning, report_format, created_at, updated_at, '
+                   'next_issue, report_type, per_algo_predictions '
+                   'FROM p5_ai_report ORDER BY created_at DESC LIMIT %s')
             self.cursor.execute(sql, (limit,))
             return self.cursor.fetchall()
         except Exception as e:
@@ -1841,16 +1921,37 @@ class P5Database:
             logger.error(f'更新预测验证失败: {e}')
             return {'status': 'error', 'message': str(e)}
     
-    def get_pending_predictions(self) -> List[Dict[str, Any]]:
-        """获取待验证的预测记录"""
+    def get_pending_predictions(self, limit: Optional[int] = 500) -> List[Dict[str, Any]]:
+        """获取待验证的预测记录（按数值期号倒序）
+
+        Args:
+            limit: 单次返回条数上限，默认 500；显式传 None 表示不限。
+                批量验证流程（validator.verify_all_pending）必须传 None，
+                否则历史积压超过上限时会漏验（静默丢待验证数据）。
+
+        期号排序：target_issue 为 VARCHAR，旧实现 ``ORDER BY target_issue DESC``
+        是字典序；改 ``CAST(... AS UNSIGNED)`` 做数值序，并用
+        ``issue_numeric_key`` 在 Python 侧二次排序兜底脏期号（CAST 对非数字失效）。
+        返回条数达到 limit 时记录告警，避免调用方误以为已取全。
+        """
         try:
             sql = '''
             SELECT * FROM p5_prediction_record 
             WHERE verification_status = 'pending'
-            ORDER BY target_issue DESC
+            ORDER BY CAST(target_issue AS UNSIGNED) DESC, id DESC
             '''
-            self.cursor.execute(sql)
-            return self.cursor.fetchall()
+            if limit is None:
+                self.cursor.execute(sql)
+            else:
+                self.cursor.execute(sql + ' LIMIT %s', (int(limit),))
+            rows = self.cursor.fetchall() or []
+            # Python 侧按数值期号二次排序（CAST 对带分隔符/非数字期号会失效）
+            rows.sort(key=lambda r: issue_numeric_key(r.get('target_issue')), reverse=True)
+            if limit is not None and len(rows) >= int(limit):
+                logger.warning(
+                    f'待验证预测已达上限 {int(limit)} 条，结果可能被截断；'
+                    f'全量验证请显式传 limit=None')
+            return rows
         except Exception as e:
             logger.error(f'获取待验证预测失败: {e}')
             return []
