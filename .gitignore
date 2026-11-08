@@ -33,3 +33,5 @@ config/.env
 config/.env.*
 !config/.env.example
 tests
+dist
+docs
