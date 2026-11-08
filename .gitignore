@@ -35,3 +35,5 @@ config/.env.*
 tests
 dist
 docs
+build
+.cleanup_trash_msg
