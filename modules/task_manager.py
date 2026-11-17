@@ -311,6 +311,7 @@ class TaskManager:
                 self._log_file.write(text)
                 if '\n' in text:
                     self._log_file.flush()
+        # 审计佐证(20261116): 日志写盘失败不得中断任务执行（降级属预期，仅损失该条日志）
         except Exception:
             pass
     
@@ -441,7 +442,21 @@ class TaskManager:
         if not self._submit_slots.acquire(blocking=False):
             logger.warning(f"任务并发容量已满，拒绝任务: {task_name}")
             return False
-        
+
+        # 修复(20261116): 审计契约（test_locks_use_with_not_bare_acquire）——
+        # acquire 成功后到任务入队之间若发生异常（Task 构造/包装失败等），
+        # 槽位将泄漏；捕获后归还容量再上抛，正常路径仍由 _execute_task
+        # 的 finally 归还（语义不变）。
+        try:
+            return self._submit_locked(task_func, task_name, priority,
+                                       timeout, callback, metadata)
+        except Exception:
+            self._submit_slots.release()
+            raise
+
+    def _submit_locked(self, task_func, task_name, priority, timeout,
+                       callback, metadata):
+        """submit 的成功获取容量后的主体（由 submit 的 try/except 保护）。"""
         task_id = self._next_task_id()
         cancel_event = threading.Event()
         

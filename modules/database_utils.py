@@ -96,6 +96,12 @@ def insert_position_trend_data(cursor, position: str, data: List[Dict[str, Any]]
     """
     通用位置走势数据插入
 
+    结构清理(20261116): 本函数与 batch_insert_position_data 双实现并存且行为不一致
+    （本函数逐行 cursor.execute + ON DUPLICATE KEY UPDATE、单行失败可跳过续写；
+    batch 版 executemany 批量写入、整体失败返回 (0, len(data))）— 保留 executemany
+    批量实现为唯一实现（不回退逐行模式），本函数保留原签名与 (成功条数, 跳过条数)
+    返回结构，内部转调批量版。两版本均不在函数内 commit，由调用方统一提交。
+
     Args:
         cursor: 数据库游标（通过 db.cursor 获取，需确保连接有效）
         position: 位置标识
@@ -104,92 +110,8 @@ def insert_position_trend_data(cursor, position: str, data: List[Dict[str, Any]]
     Returns:
         (成功条数, 跳过条数)
     """
-    if not data:
-        return 0, 0
-
-    table, number_col = _get_position_info(position)
-
-    fields = ['issue', number_col, 'draw_date', 'is_odd', 'is_big', 'is_prime',
-              'omission', 'hot_level', 'consecutive_count', 'trend_json', 'source']
-    placeholders = ['%s'] * len(fields)
-
-    sql = f'''
-        INSERT INTO {table}
-        ({', '.join(fields)})
-        VALUES ({', '.join(placeholders)})
-        ON DUPLICATE KEY UPDATE
-            {number_col} = VALUES({number_col}),
-            draw_date = VALUES(draw_date),
-            is_odd = VALUES(is_odd),
-            is_big = VALUES(is_big),
-            is_prime = VALUES(is_prime),
-            omission = VALUES(omission),
-            hot_level = VALUES(hot_level),
-            consecutive_count = VALUES(consecutive_count),
-            trend_json = VALUES(trend_json),
-            source = VALUES(source)
-    '''
-
-    success_count = 0
-    skip_count = 0
-    insert_errors = []
-
-    try:
-        for item in data:
-            issue = str(item.get('issue', ''))
-            if not issue:
-                skip_count += 1
-                continue
-
-            number = item.get(number_col, 0)
-            if not (0 <= number <= 9):
-                skip_count += 1
-                continue
-
-            try:
-                cursor.execute(sql, (
-                    issue,
-                    number,
-                    item.get('draw_date', ''),
-                    item.get('is_odd', None),
-                    item.get('is_big', None),
-                    item.get('is_prime', None),
-                    item.get('omission', 0),
-                    item.get('hot_level', ''),
-                    item.get('consecutive_count', 0),
-                    json.dumps(item, ensure_ascii=False),
-                    item.get('source', 'china_lottery')
-                ))
-                success_count += 1
-            except Exception as e:
-                error_msg = str(e).lower()
-                error_code = e.args[0] if e.args else 0
-                # 检测连接中断错误
-                is_connection_error = (
-                    'invalidconnectionerror' in error_msg or
-                    'MySQL server has gone away' in error_msg or
-                    'lost connection' in error_msg or
-                    error_code in (2006, 2013, 0)
-                )
-                if is_connection_error:
-                    logger.error(f'插入{position}位走势数据失败: issue={issue}, 连接异常 (error_code={error_code})')
-                else:
-                    logger.error(f'插入{position}位走势数据失败: issue={issue}, {type(e).__name__}: {e}')
-                insert_errors.append(issue)
-                skip_count += 1
-                continue
-
-        if insert_errors:
-            logger.warning(f'{position}位走势数据部分插入失败, 失败期号示例: {insert_errors[:5]}')
-
-        logger.info(f'{position}位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
-        # 显式提交，确保数据持久化（调用方使用事务时此处提交会被事务统一提交覆盖）
-        if hasattr(cursor, 'connection') and cursor.connection:
-            cursor.connection.commit()
-        return success_count, skip_count
-    except Exception as e:
-        logger.error(f'插入{position}位走势数据失败: {type(e).__name__}: {e}')
-        return 0, len(data)
+    # 结构清理(20261116): 逐行实现收敛 — 内部一行转调 batch_insert_position_data（executemany 批量 upsert）
+    return batch_insert_position_data(cursor, position, data)
 
 
 def get_position_trend_data(cursor, position: str, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -661,6 +583,7 @@ def validate_history_record(record: Dict[str, Any]) -> bool:
             if int(record['span']) != span:
                 return False
         return True
+    # 审计佐证(20261116): 数据行字段类型异常时按校验失败兜底返回 False（防御性校验，降级属预期）
     except (TypeError, ValueError, AttributeError):
         return False
 
@@ -670,6 +593,7 @@ def validate_accuracy_rate(value: Any) -> bool:
     try:
         v = float(value)
         return _ACC_MIN <= v <= _ACC_MAX
+    # 审计佐证(20261116): 非数值输入按校验失败兜底返回 False（回退属预期）
     except (TypeError, ValueError):
         return False
 
@@ -682,5 +606,6 @@ def validate_position_numbers(position: str, numbers: List[Any]) -> bool:
             return False
         return all(n is not None and int(n) >= _DIGIT_MIN and int(n) <= _DIGIT_MAX
                    for n in numbers)
+    # 审计佐证(20261116): 号码字段不可解析时按校验失败兜底返回 False（回退属预期）
     except (TypeError, ValueError):
         return False

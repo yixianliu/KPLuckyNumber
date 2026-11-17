@@ -51,10 +51,14 @@ class CacheClient:
         self.db = db
         self.password = password
         self.client = None
+        # 修复(20261116): 连接失败后 __init__ 使 client 恒 None 永久旁路 — 记录最近一次连接尝试时间，供惰性重连按 60 秒间隔节流
+        self._last_connect_attempt = 0.0
         self._connect()
 
     def _connect(self):
         """连接Redis服务器"""
+        # 修复(20261116): 连接失败无重试入口，client 恒 None 永久旁路 — 记录尝试时间戳，配合 is_connected() 惰性重连
+        self._last_connect_attempt = time.time()
         try:
             self.client = redis.Redis(
                 host=self.host,
@@ -71,15 +75,19 @@ class CacheClient:
             logger.error(f'Redis连接失败: {e}')
             self.client = None
 
+    def _lazy_reconnect(self):
+        """client 为 None 时按 60 秒间隔惰性重试重连（避免每操作 PING/重连的开销）。"""
+        if time.time() - self._last_connect_attempt < 60:
+            return
+        logger.info('Redis惰性重连尝试...')
+        self._connect()
+
     def is_connected(self) -> bool:
-        """检查Redis连接状态"""
+        """检查Redis连接状态（轻量检查，不再逐操作 PING）"""
+        # 修复(20261116): L74-82 原实现每次读写前 PING 多一个 RTT，且连接失败后 client 恒 None 永久旁路 — 改为直接操作、异常即旁路；client 为 None 时按 60 秒间隔惰性重试重连
         if self.client is None:
-            return False
-        try:
-            self.client.ping()
-            return True
-        except Exception:
-            return False
+            self._lazy_reconnect()
+        return self.client is not None
 
     def get_key_prefix(self) -> str:
         """获取键名前缀"""
@@ -860,11 +868,10 @@ class CacheClient:
                 field,
                 json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
             )
-            
-            # 如果Key不存在则创建并设置TTL
-            if not self.client.exists(key):
-                self.client.set(key, '')
-            
+
+            # 结构清理(20261116): hset 后 key 必然存在（hset 会自动创建 Hash 键），
+            # 原 `if not exists(key): set(key,'')` 为恒假死分支（与注释语义不符）—
+            # 删除死分支，保留 hset + expire 语义不变
             if ttl_days:
                 self.client.expire(key, ttl_days * 86400)
             

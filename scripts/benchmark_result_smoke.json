@@ -1,0 +1,29 @@
+{
+  "tag": "smoke",
+  "timestamp": "2026-11-16T20:33:49.884740",
+  "n_eval": 3,
+  "window": 60,
+  "trials": 15,
+  "top1_hits": 2,
+  "top1_rate": 0.13333333333333333,
+  "top1_ci95": [
+    0.0373604698913593,
+    0.3788249920651624
+  ],
+  "top3_hits": 3,
+  "top3_rate": 0.2,
+  "top3_ci95": [
+    0.07047420643610414,
+    0.4518593533465045
+  ],
+  "random_baseline": {
+    "top1": 0.1,
+    "top3": 0.3
+  },
+  "significant_excess_top1": false,
+  "significant_excess_top3": false,
+  "time_mean_s": 48.1041919333317,
+  "time_median_s": 48.11582699999417,
+  "time_p95_s": 54.278998380003756,
+  "time_total_s": 144.3125757999951
+}

@@ -661,6 +661,208 @@ def _build_feature(p: str, i: int, issues: List[str], digits: Dict[str, List[int
 
 
 # ----------------------------------------------------------------------------
+# v5.3 优化(20261116): 特征矩阵向量化预计算（等价重构）
+# 原实现 _build_feature 对每个样本 i 重复做 O(w) 窗口扫描（n=1124 时 5 位约
+# 5295 次调用、耗时约 13 秒）。本函数一次向量化构建全部样本（i=60..n-1）的
+# 特征矩阵。等价性保证：所有计数为整数精确运算（cumsum 差分），比率分子/
+# 分母与原实现完全一致，浮点结果逐位相同；由
+# tests/test_ml_feature_matrix.py 用 _build_feature 参照实现断言逐位相等。
+# 预计算失败时调用方回退原逐样本路径，行为不变。
+# ----------------------------------------------------------------------------
+def _precompute_feature_matrix(p: str, issues: List[str], digits: Dict[str, List[int]],
+                               hezhi: List[int], pos_trend: Dict, spj: Dict,
+                               hz: Dict) -> Optional[np.ndarray]:
+    """一次性构建位置 p 全部样本（i=60..n-1）的特征矩阵，返回 (n-60, D) float64。
+
+    行 i 对应原 _build_feature(p, i, ...) 的返回值（逐位相等）。
+    数据形状不满足前提（hezhi 不足/各位序列不等长）时返回 None，调用方回退旧路径。
+    """
+    y = np.asarray(digits[p], dtype=np.int64)
+    n = len(y)
+    if n <= 60 or len(hezhi) < n:
+        return None
+    # 各位置序列必须等长（原实现按同长度索引，不等长会 IndexError）
+    for q in POS:
+        if len(digits.get(q, [])) < n:
+            return None
+
+    # ---- 预备序列（全部整数精确运算） ----
+    onehot = np.zeros((n, 10), dtype=np.int64)
+    onehot[np.arange(n), y] = 1
+    cum10 = onehot.cumsum(axis=0)                      # cum10[i, d] = 数字 d 到 i 的累计次数
+    hz_arr = np.asarray(hezhi[:n], dtype=np.int64)
+    hz_cum = np.concatenate(([0], hz_arr.cumsum()))    # hz_cum[i] = sum(hezhi[0..i-1])
+    # SPJ 方向差分符号（diff[k] = y[k+1]-y[k]，k=0..n-2）
+    diff = np.diff(y)
+    up_c = np.concatenate(([0], np.cumsum((diff > 0).astype(np.int64))))
+    eq_c = np.concatenate(([0], np.cumsum((diff == 0).astype(np.int64))))
+    dn_c = np.concatenate(([0], np.cumsum((diff < 0).astype(np.int64))))
+    # 和尾（hezhi%10）one-hot 累计
+    hwei_hot = np.zeros((n, 10), dtype=np.int64)
+    hwei_hot[np.arange(n), hz_arr % 10] = 1
+    hwei_cum = hwei_hot.cumsum(axis=0)
+
+    cols: List[np.ndarray] = []
+
+    # ---- 组1 多窗口频率 w=10/20/40/60（i>=60 保证窗口完整） ----
+    for w in (10, 20, 40, 60):
+        cnt = cum10.copy()
+        cnt[w:] = cum10[w:] - cum10[:-w]  # cnt[i, d] = 次数于 [i-w+1, i]
+        cols.append((cnt / float(w)).astype(np.float64))  # i>=w 行有效
+
+    # ---- 组2 多窗口遗漏 w=20/60：单遍扫描 last_seen ----
+    for w in (20, 60):
+        om_block = np.zeros((n, 10), dtype=np.float64)
+        last_seen = [-1] * 10
+        for i in range(n):
+            last_seen[int(y[i])] = i
+            lo = i - w + 1
+            for d in range(10):
+                j = last_seen[d]
+                # 原语义：窗口 [i-w+1, i] 内最后出现位置 idx → (L-1-idx) = i-j；不存在则 L=w
+                om_block[i, d] = (i - j) if j >= lo else float(w)
+        cols.append(om_block)
+
+    # ---- 组3 末位属性 + 组4 连号 ----
+    last = y.astype(np.float64)
+    attr = np.stack([
+        last,
+        (y % 3).astype(np.float64),
+        (y % 2).astype(np.float64),
+        (y >= 5).astype(np.float64),
+        np.isin(y, (2, 3, 5, 7)).astype(np.float64),
+    ], axis=1)
+    consec = np.zeros((n, 1), dtype=np.float64)
+    consec[1:, 0] = (y[1:] == y[:-1]).astype(np.float64)
+    cols += [attr, consec]
+
+    # ---- 组5 SPJ 方向计数（k=i-40..i-1 共 40 个差分） ----
+    # up_c[i] = diff[0..i-1] 中上升的个数 → 窗口 [i-40, i-1] 计数 = up_c[i] - up_c[i-40]
+    w = 40
+
+    def _win40(c_arr):
+        out = np.zeros(n, dtype=np.float64)
+        if n > w:
+            out[w:] = (c_arr[w:] - c_arr[:-w]) / 40.0
+        return out
+
+    up40 = _win40(up_c)
+    eq40 = _win40(eq_c)
+    dn40 = _win40(dn_c)
+    cols.append(np.stack([up40, eq40, dn40], axis=1))
+
+    # ---- 组6 和尾频率（近40期）+ 组7 均值和值 ----
+    cnt_hw = hwei_cum.copy()
+    cnt_hw[w:] = hwei_cum[w:] - hwei_cum[:-w]
+    cols.append((cnt_hw / 40.0).astype(np.float64))
+    # mean_hz[i] = sum(hezhi[i-39..i]) / 40 = (hz_cum[i+1] - hz_cum[i-39]) / 40
+    mean_hz = np.zeros(n, dtype=np.float64)
+    if n > w:
+        mean_hz[w:] = (hz_cum[w + 1:] - hz_cum[1:n + 1 - w]) / 40.0
+    cols.append(mean_hz.reshape(-1, 1))
+
+    # ---- 组8/9/10 位走势表 / SPJ 表 / 和值表（逐行字典查找，维度对齐原实现） ----
+    g8910 = np.zeros((n, 5 + 3 + 10), dtype=np.float64)
+    for i in range(n):
+        issue_i = issues[i] if i < len(issues) else None
+        off = 0
+        trend_row = pos_trend.get(p, {}).get(issue_i) if (pos_trend and issue_i) else None
+        if trend_row:
+            om = trend_row.get('omission')
+            g8910[i, off] = float(om) if isinstance(om, (int, float)) else 0.0
+            hl = trend_row.get('hot_level')
+            g8910[i, off + 1:off + 4] = [1.0 if hl == 'hot' else 0.0,
+                                         1.0 if hl == 'warm' else 0.0,
+                                         1.0 if hl == 'cold' else 0.0]
+            cc = trend_row.get('consecutive_count')
+            g8910[i, off + 4] = float(cc) if isinstance(cc, (int, float)) else 0.0
+        off += 5
+        spj_row = spj.get(issue_i) if spj and issue_i else None
+        if spj_row:
+            key = {'wan': 'miss_spj_ww', 'qian': 'miss_spj_qw', 'bai': 'miss_spj_bw',
+                   'shi': 'miss_spj_sw', 'ge': 'miss_spj_gw'}.get(p)
+            vec = spj_row.get(key)
+            if isinstance(vec, (list, tuple)) and len(vec) >= 3:
+                g8910[i, off:off + 3] = [float(vec[0]), float(vec[1]), float(vec[2])]
+        off += 3
+        hz_row = hz.get(issue_i) if hz and issue_i else None
+        if hz_row and isinstance(hz_row, (list, tuple)) and len(hz_row) >= 10:
+            g8910[i, off:off + 10] = [float(x) for x in hz_row[:10]]
+    cols.append(g8910)
+
+    # ---- 组11 位置链特征（4 对 × 2 维） ----
+    p_idx = POS.index(p)
+    if p_idx == 0:
+        adjacent_pairs = [('qian', 'bai'), ('shi', 'ge'), ('bai', 'shi'), ('qian', 'shi')]
+    elif p_idx == 1:
+        adjacent_pairs = [('wan', 'bai'), ('bai', 'shi'), ('shi', 'ge'), ('wan', 'shi')]
+    elif p_idx == 2:
+        adjacent_pairs = [('qian', 'shi'), ('wan', 'shi'), ('qian', 'ge'), ('shi', 'ge')]
+    elif p_idx == 3:
+        adjacent_pairs = [('bai', 'ge'), ('qian', 'ge'), ('bai', 'wan'), ('qian', 'wan')]
+    else:
+        adjacent_pairs = [('shi', 'bai'), ('shi', 'qian'), ('bai', 'wan'), ('qian', 'wan')]
+    chain = np.zeros((n, 8), dtype=np.float64)
+    for k, (a, b) in enumerate(adjacent_pairs):
+        seq_a = digits.get(a, [])
+        seq_b = digits.get(b, [])
+        min_len = min(len(seq_a), len(seq_b))
+        if min_len >= 3:
+            A = np.asarray(seq_a[:min_len], dtype=np.int64)
+            B = np.asarray(seq_b[:min_len], dtype=np.int64)
+            # t∈[2, min_len-1]：|A[t]-B[t-2]|<=2 与同向移动的累计命中
+            dflag = np.zeros(min_len, dtype=np.int64)
+            dflag[2:] = (np.abs(A[2:] - B[:min_len - 2]) <= 2).astype(np.int64)
+            da = np.diff(A)
+            db = np.diff(B)
+            same = np.zeros(min_len, dtype=np.int64)
+            same[2:] = (((da[1:] > 0) & (db[1:] > 0)) |
+                        ((da[1:] < 0) & (db[1:] < 0))).astype(np.int64)
+            cd = dflag.cumsum()  # cd[k] = t∈[0,k] 的命中数（注意 cumsum 为包含式前缀和）
+            cs = same.cumsum()
+            # 对每个 i：T = min(min_len-1, i)，hits=cd[T]，valid=T-1（t=2..T 共 T-1 个）
+            T = np.minimum(min_len - 1, np.arange(n))
+            valid = np.maximum(T - 1, 0)
+            ok = valid > 0
+            chain[ok, 2 * k] = cd[T[ok]] / valid[ok]
+            chain[ok, 2 * k + 1] = cs[T[ok]] / valid[ok]
+    cols.append(chain)
+
+    # ---- 组12 形态标记特征（近30期 对子/三连顺/四连顺 滞后 + 对子占比） ----
+    R = np.stack([np.asarray(digits[q][:n], dtype=np.int64) for q in POS], axis=1)
+    # 对子：任意两位数字相同（5 取 2 组合 10 个）
+    pair_flag = np.zeros(n, dtype=bool)
+    for a in range(5):
+        for b in range(a + 1, 5):
+            pair_flag |= (R[:, a] == R[:, b])
+    adj_d = np.abs(np.diff(R, axis=1))  # (n,4) 相邻位置差
+    seq3_flag = (((adj_d[:, 0] == 1) & (adj_d[:, 1] == 1)) |
+                 ((adj_d[:, 1] == 1) & (adj_d[:, 2] == 1)) |
+                 ((adj_d[:, 2] == 1) & (adj_d[:, 3] == 1)))
+    seq4_flag = (((adj_d[:, 0] == 1) & (adj_d[:, 1] == 1) & (adj_d[:, 2] == 1)) |
+                 ((adj_d[:, 1] == 1) & (adj_d[:, 2] == 1) & (adj_d[:, 3] == 1)))
+    idx_arr = np.arange(n)
+    lag2 = np.maximum.accumulate(np.where(pair_flag, idx_arr, -1))
+    lag3 = np.maximum.accumulate(np.where(seq3_flag, idx_arr, -1))
+    lag4 = np.maximum.accumulate(np.where(seq4_flag, idx_arr, -1))
+    cp = np.concatenate(([0], pair_flag.cumsum()))
+    form = np.zeros((n, 4), dtype=np.float64)
+    # 滞后需限定在近30期窗口内（j >= i-29），否则 99
+    form[:, 0] = np.where((lag2 >= 0) & (lag2 >= idx_arr - 29), (idx_arr - lag2).astype(float), 99.0)
+    form[:, 1] = np.where((lag3 >= 0) & (lag3 >= idx_arr - 29), (idx_arr - lag3).astype(float), 99.0)
+    form[:, 2] = np.where((lag4 >= 0) & (lag4 >= idx_arr - 29), (idx_arr - lag4).astype(float), 99.0)
+    # 对子占比：窗口 [i-29, i] 内对子期数 / 30（cp_full[i] = t∈[0,i] 的对子期数）
+    cp_full = cp[1:].astype(np.float64)
+    form[:, 3] = np.where(idx_arr >= 29,
+                          (cp_full - np.concatenate((np.zeros(30), cp_full[:-30]))) / 30.0,
+                          (cp_full / (idx_arr + 1).astype(float)))
+    cols.append(form)
+
+    M = np.hstack(cols)
+    return M[60:]  # 行 i=60..n-1
+
+
+# ----------------------------------------------------------------------------
 # 多源数据加载（只读，缺失则降级）
 # ----------------------------------------------------------------------------
 def _load_position_trend(conn) -> Dict[str, Dict[str, Dict]]:
@@ -791,25 +993,57 @@ def predict_next(sorted_data: List[Dict], target_issue: Optional[str] = None,
     DEFAULT_DIST = {d: 0.1 for d in NUM}
     trained_ok = 0  # ALG-01：仅当 5 位全部真实训练成功才落盘，防失败位污染缓存
 
-    # ---- 纯 numpy GBRT 路径（无 sklearn 依赖，串行训练避免 Windows daemon 限制）----
-    for p_idx, p in enumerate(POS):
+    # v5.3 优化(20261116): 特征矩阵预计算（等价重构，tests/test_ml_feature_matrix.py
+    # 断言与逐样本构建逐位相等）——一次向量化替代原 5 位 × 逐样本 Python 循环。
+    # 任一位预计算失败则该位回退旧路径，行为不变。
+    matrices = {}
+    for p in POS:
         try:
-            _get_logger().debug('[ml_predictor] 开始训练 %s 位，digits 长度=%d, n=%d', p, len(digits[p]), n)
-            # ALG-01 A18 埋点：每次发起训练即计数（缓存命中不走本循环）；
-            # 埋点在调用侧而非 _train_gbml_model 内部——测试可桩替换训练函数
-            _ML_CACHE_STATS['train_invocations'] += 1
-            dist = _train_gbml_model(p, issues, digits, hezhi, pos_trend, spj, hz, n)
+            matrices[p] = _precompute_feature_matrix(
+                p, issues, digits, hezhi, pos_trend, spj, hz)
+        except Exception as _pe:
+            matrices[p] = None
+            _get_logger().warning('[ml_predictor] %s 位特征矩阵预计算失败，回退逐样本路径: %s',
+                                  p, _pe)
+
+    # v5.3 优化(20261116): 5 位并行训练（各位置模型相互独立、random_state=42 固定，
+    # 结果与串行完全一致；sklearn 树拟合释放 GIL，线程池即可获得近线性加速。
+    # 原串行注释的「Windows daemon 限制」仅针对多进程，线程池不受影响）。
+    # progress_callback 经锁串行化，保持与原逐位回调相同的消息语义。
+    import threading as _threading
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    _cb_lock = _threading.Lock()
+
+    def _train_one(p):
+        """单位置训练（异常时返回默认均匀分布，语义与原串行 except 分支一致）。"""
+        try:
+            _get_logger().debug('[ml_predictor] 开始训练 %s 位，digits 长度=%d, n=%d',
+                                p, len(digits[p]), n)
+            # ALG-01 A18 埋点：每次发起训练即计数（缓存命中不走本路径）；
+            # 埋点在调用侧而非 _train_gbml_model 内部——测试可桩替换训练函数。
+            # v5.3: 并行线程下计数需持锁，避免并发 += 丢失更新。
+            with _cb_lock:
+                _ML_CACHE_STATS['train_invocations'] += 1
+            dist = _train_gbml_model(p, issues, digits, hezhi, pos_trend, spj, hz, n,
+                                     feature_matrix=matrices.get(p))
             if dist is not None:
-                result.append(dist)
-                trained_ok += 1
                 if progress_callback:
-                    progress_callback(1, f'监督模型[{p}]完成（GBRT-numpy）')
-            else:
-                result.append(DEFAULT_DIST)
-                _get_logger().warning('[ml_predictor] %s 位 GBRT 训练失败，回退均匀分布。', p)
+                    with _cb_lock:
+                        progress_callback(1, f'监督模型[{p}]完成（GBRT-numpy）')
+                return dist, True
+            _get_logger().warning('[ml_predictor] %s 位 GBRT 训练失败，回退均匀分布。', p)
+            return DEFAULT_DIST, False
         except Exception as e:
-            result.append(DEFAULT_DIST)
-            _get_logger().error('[ml_predictor] %s 位训练异常: %s\n%s', p, e, traceback.format_exc())
+            _get_logger().error('[ml_predictor] %s 位训练异常: %s\n%s',
+                                p, e, traceback.format_exc())
+            return DEFAULT_DIST, False
+
+    with _TPE(max_workers=len(POS)) as _pool:
+        _results = list(_pool.map(_train_one, POS))
+    for dist, ok in _results:
+        result.append(dist)
+        if ok:
+            trained_ok += 1
 
     # ALG-01：全位成功才落盘（失败位若入缓存，环境异常期会持续返回伪训练结果）
     if result and trained_ok == len(POS):
@@ -833,7 +1067,8 @@ def predict_next(sorted_data: List[Dict], target_issue: Optional[str] = None,
 
 def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
                       hezhi: List[int], pos_trend: Dict, spj: Dict, hz: Dict,
-                      n: int, progress_callback=None) -> Optional[Dict[int, float]]:
+                      n: int, progress_callback=None,
+                      feature_matrix: Optional[np.ndarray] = None) -> Optional[Dict[int, float]]:
     """
     对指定位置用纯 numpy 实现 GBRT（梯度提升回归树），输出预测概率向量。
 
@@ -843,6 +1078,13 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
       - 每棵树为简单深度3决策树（手工实现节点分裂）。
       - 最终概率 = softmax(各classifier的预测值)。
 
+    Args:
+        feature_matrix: v5.3 优化(20261116) 可选预计算特征矩阵
+            （_precompute_feature_matrix 输出，行 i 对应 _build_feature(p, i)，
+            与逐样本构建逐位相等，见 tests/test_ml_feature_matrix.py）。
+            传入时跳过逐样本 Python 循环（原为单次预测约 13 秒热点）；
+            为 None 或形状不符时自动回退旧路径，行为不变。
+
     Returns:
         {0: prob, 1: prob, ..., 9: prob} 归一化概率分布，或 None（训练失败）。
     """
@@ -850,33 +1092,45 @@ def _train_gbml_model(p: str, issues: List[str], digits: Dict[str, List[int]],
     _get_logger().info('[ml_predictor] %s 位: y_seq 类型=%s, 长度=%d, 前5项=%s',
                        p, type(y_seq).__name__, len(y_seq), y_seq[:5] if y_seq else '空')
     X, y_labels = [], []
+    feat_next = None
 
     # 修复 off-by-one（预测滞后一期）：_build_feature(p, i) 的语义是「预测 issue[i+1]」，
-    # 故训练标签必须用 y_seq[i+1]（而非 y_seq[i]），且只训练到 i=n-2（i+1<=n-1）。
+    # 故训练标签必须用 y_seq[i+1]（而非 y_seq[i])，且只训练到 i=n-2（i+1<=n-1）。
     # 推理端单独构造 feat_next=_build_feature(p, n-1) 预测 issue[n]（下一期），
     # 见下方 X_pred。旧实现用 y_seq[i] 作标签 → 模型学到「用<=i 预测 issue[i]」，
     # 推理返回 F[-1]（i=n-1）实际对应最新一期（已开奖），整条链路滞后一期。
-    for i in range(60, n - 1):  # 从第60期开始（特征需60期历史）；标签用 i+1
-        feat = _build_feature(p, i, issues, digits, hezhi, pos_trend, spj, hz)
-        if feat is not None:
-            X.append(feat)
-            try:
-                label = y_seq[i + 1]
-                # v3.57：循环逐样本 INFO → DEBUG，避免 ML 训练时刷屏几百行日志，
-                # 进而触发 RotatingFileHandler 频繁 rollover（多线程并发 rollover 在
-                # Windows 下会报 WinError 32）。仅在调试时开启。
-                _get_logger().debug('[ml_predictor] i=%d, label=%s (type=%s)', i, label, type(label).__name__)
-                y_labels.append(label)
-            except Exception as e2:
-                _get_logger().error('[ml_predictor] y_seq[%d] 索引失败: %s, y_seq 类型=%s, len=%d',
-                                   i + 1, e2, type(y_seq).__name__, len(y_seq))
-                raise
+    # v5.3 优化(20261116): 预计算矩阵路径（等价重构，行 i-60 对应样本 i）
+    use_matrix = False
+    if feature_matrix is not None and feature_matrix.shape[0] == n - 60:
+        use_matrix = True
+        X = feature_matrix[:n - 61]              # i = 60..n-2（共 n-61 行）
+        feat_next = feature_matrix[n - 61]       # i = n-1
+        y_labels = [y_seq[i + 1] for i in range(60, n - 1)]
+    else:
+        for i in range(60, n - 1):  # 从第60期开始（特征需60期历史）；标签用 i+1
+            feat = _build_feature(p, i, issues, digits, hezhi, pos_trend, spj, hz)
+            if feat is not None:
+                X.append(feat)
+                try:
+                    label = y_seq[i + 1]
+                    # v3.57：循环逐样本 INFO → DEBUG，避免 ML 训练时刷屏几百行日志，
+                    # 进而触发 RotatingFileHandler 频繁 rollover（多线程并发 rollover 在
+                    # Windows 下会报 WinError 32）。仅在调试时开启。
+                    _get_logger().debug('[ml_predictor] i=%d, label=%s (type=%s)', i, label, type(label).__name__)
+                    y_labels.append(label)
+                except Exception as e2:
+                    _get_logger().error('[ml_predictor] y_seq[%d] 索引失败: %s, y_seq 类型=%s, len=%d',
+                                        i + 1, e2, type(y_seq).__name__, len(y_seq))
+                    raise
 
     # 推理端：构造「下一期 issue[n]」特征向量（用 <=n-1 可观测数据），
     # 与训练标签对齐（_build_feature(p,n-1) 语义预测 issue[n]）。
-    feat_next = None
-    if n >= 61:  # 与 _build_feature 的 i<60 门槛一致
-        feat_next = _build_feature(p, n - 1, issues, digits, hezhi, pos_trend, spj, hz)
+    # v5.3 优化(20261116): 矩阵路径已在上方取 feat_next=矩阵第 n-61 行（i=n-1），
+    # 此处仅旧路径需要逐样本构建。
+    if not use_matrix:
+        feat_next = None
+        if n >= 61:  # 与 _build_feature 的 i<60 门槛一致
+            feat_next = _build_feature(p, n - 1, issues, digits, hezhi, pos_trend, spj, hz)
 
     if len(X) < 100:
         _get_logger().warning(

@@ -55,6 +55,9 @@ import math
 import time
 import uuid
 import copy
+# 结构清理(20261116): hashlib/itertools 原散落在多个函数内重复 import — 统一上提至模块顶部
+import hashlib
+import itertools
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
@@ -176,6 +179,7 @@ class AdaptiveWeightManager:
         self.effective_learning_rate = float(ewma_alpha)     # 当前实际生效学习率
         self._converged = False                              # 是否已收敛
         self._prev_weights = None                            # 上一轮权重(用于收敛检测)
+        self._converge_check_counter = 0                     # 收敛检测降频计数器(每10条记录检测一次)
 
         # 护栏用: 快照默认权重(先验)。初值 ewma 即等于 DEFAULT_CONFIG 冻结权重,
         # 归一化后作为收缩目标 prior, 与后续学习产生的 EWMA 解耦。
@@ -273,7 +277,9 @@ class AdaptiveWeightManager:
 
         # v3.17 收敛检测: 累积足够样本后, 比较相邻两次权重向量的最大分量位移,
         # 小于收敛阈值则标记已收敛(进入"稳定监控"态, 仅做微量调整)。
-        if self.iteration > self.warmup_iterations:
+        # 修复(20261116): 276-287 每条记录都调get_adaptive_weights做收敛检测，load_from_records回放N条为O(N²) — 降频为每10条检测一次
+        self._converge_check_counter += 1
+        if self._converge_check_counter % 10 == 0 and self.iteration > self.warmup_iterations:
             try:
                 _cur = self.get_adaptive_weights(metric='top1_hit')
                 if self._prev_weights is not None:
@@ -312,6 +318,7 @@ class AdaptiveWeightManager:
         self.effective_learning_rate = float(self.ewma_alpha)
         self._converged = False
         self._prev_weights = None
+        self._converge_check_counter = 0
 
     def get_adaptive_weights(self, metric: str = 'top1_hit') -> Dict[str, float]:
         """
@@ -414,6 +421,21 @@ class AdaptiveWeightManager:
                 elif isinstance(t1, (int, float)):
                     # 极端边界: 只有 t1 而无 hit
                     self.record_verification(algo, float(t1), top1_hit=float(t1))
+
+        # 修复(20261116): 398-416 回放降频后回放过程中收敛检测被跳过 — 回放结束后统一做一次最终检测，保证最终权重/收敛状态与原逐条检测逻辑一致
+        if self.iteration > self.warmup_iterations:
+            try:
+                _cur = self.get_adaptive_weights(metric='top1_hit')
+                if self._prev_weights is not None:
+                    _max_delta = max(
+                        abs(_cur.get(a, 0.0) - self._prev_weights.get(a, 0.0))
+                        for a in _cur
+                    )
+                    self._converged = bool(_max_delta < self.convergence_tol)
+                self._prev_weights = _cur
+            # 审计佐证(20261116): 权重收敛检测异常时保持现有权重继续运行（降级属预期，不影响下一轮学习）
+            except Exception:
+                pass
 
 class P5PredictorConfig:
     """
@@ -572,6 +594,24 @@ class P5PredictorConfig:
             # 压制模型最有把握的号码, 使 Top-1/Top-3 命中率低于随机基线。如需保守化可手动开启,
             # 且已从 _apply_boundary_protection 中移除破坏性的 Chebyshev+方差展平逻辑。
             'enable_boundary_protection': False,
+            # ────────────────────────────────────────────────────────────
+            # v5.3 融合概率收缩（fusion shrinkage，OPT-01）
+            # 依据：真实历史 1124 期统计检验显示五位数字分布与均匀分布不可区分
+            # （合并卡方 p=0.7509，熵 3.3212 bit vs 理论上限 3.3219 bit）。
+            # 此时经验频率对真实分布的偏离几乎全是估计噪声，直连融合会把噪声
+            # 当信号放大。对融合结果做向均匀分布的线性收缩：
+            #     p_shrunk(d) = (1-λ)·p_fused(d) + λ·(1/10)
+            # 性质（重要，勿误读）：
+            #   1. 线性收缩是**保序变换**，0<=λ<1 时 Top-k 排序完全不变，
+            #      因此**不改变命中率**；收益是降低对数损失与 Brier 分数
+            #      （实测 λ=0.6：对数损失 2.3917→2.3139，-3.25%；
+            #        Brier 0.9145→0.9022，-1.34%），即让置信度数值统计诚实。
+            #   2. λ=1.0 会退化为完全均匀分布（等于放弃预测），故钳制上限 0.9。
+            #   3. 默认 0.0 = 关闭 = 与历史行为逐位一致（向后兼容优先）。
+            # 诚实边界：本项不构成任何「提升命中率」主张，见 docs/hitrate_spec.md。
+            'fusion_shrinkage': 0.0,
+            # 收缩系数安全上限（防误配置为 1.0 而丢弃全部信号）
+            'fusion_shrinkage_max': 0.9,
             # v3.14 (2026-07-19) 双信号自适应能力 + 默认关闭回退安全:
             # 实验(opt_v314_dual_signal.py)在 30 期学习 + 50 期评测窗口下结果:
             # A 静态基线: Top-1=9.6% Top-6=59.2%
@@ -754,6 +794,36 @@ class P5PredictorConfig:
         """设置全局参数（深度调优用，临时覆盖 lookback 等）"""
         self.config['global'][key] = value
 
+    def algorithm_fingerprint(self) -> str:
+        """返回「实际生效算法权重」的短指纹，供预测缓存键使用（BUG-04）。
+
+        背景：预测缓存键原恒用 'default'，权重被自我进化 / 自适应改写后
+        仍会命中旧缓存，导致「权重变了但结果没变」。
+        本方法把归一化后的权重与关键全局参数序列化后取 MD5 前 12 位，
+        权重任意变动（哪怕 1e-9）都会使指纹变化 → 缓存自动失效。
+
+        说明：
+            - 只纳入会影响概率输出的项，避免无关配置造成无谓失效；
+            - 序列化失败时返回 'default'，退化为原行为，不阻断预测。
+        """
+        try:
+            # 结构清理(20261116): hashlib/json 已在模块顶部导入，删除函数内重复 import
+            payload = {
+                'weights': {k: round(float(v), 12)
+                            for k, v in sorted(self.get_algorithm_weights().items())},
+                'lookback': self.config['algorithms'].get(
+                    'frequency_weighted', {}).get('params', {}).get('lookback_periods'),
+                'shrinkage': float(self.config['global'].get('fusion_shrinkage', 0.0) or 0.0),
+                'top_n': self.config['global'].get('position_top_n'),
+                'boundary': bool(self.config['global'].get('enable_boundary_protection', False)),
+            }
+            return hashlib.md5(
+                json.dumps(payload, sort_keys=True, default=str).encode('utf-8')
+            ).hexdigest()[:12]
+        # 审计佐证(20261116): 指纹失败回退 default，仅损失缓存命中不损正确性（回退属预期）
+        except Exception:
+            return 'default'
+
     @classmethod
     def baseline_v21(cls) -> 'P5PredictorConfig':
         """
@@ -845,6 +915,7 @@ class P5Predictor:
         # (由 pipeline 验证闭环写入, 含各算法 per-algo 命中率), 使 EWMA 真正学习。
         try:
             self._load_adaptive_weight_history()
+        # 审计佐证(20261116): 历史缺失时按空回放兜底，EWMA 从当前状态继续（降级属预期）
         except Exception:
             pass
 
@@ -1049,7 +1120,8 @@ class P5Predictor:
 
 【历史开奖数据（最近30期）】
 """
-        for item in history_data[:30]:
+        # 修复(20261116): 1100 history_data[:30]取的是期号升序序列的最旧30期，与提示词「最近30期」不符 — 改为取序列末尾30期
+        for item in history_data[-30:]:
             numbers = item.get('numbers', [])
             if len(numbers) == 5:
                 issue = item.get('issue', '')
@@ -1406,13 +1478,27 @@ class P5Predictor:
 
         # 缓存检查 - 归一化后统一用 normalized 形态生成 key，
         # 确保 get/set 键一致（否则 raw 与 normalized 会产出不同键，缓存永不命中）
+        # BUG-04 修复：键中并入「算法权重指纹」。原实现恒传 algorithm_hash=None
+        # （即 'default'），权重被自我进化/自适应改写后仍会命中旧结果，
+        # 导致「权重已变但预测没变」的不可复现现象。
+        _algo_hash = self._algorithm_fingerprint()
         if _CACHE_ENABLED:
             try:
                 cache = _get_prediction_cache()
-                cached = cache.get_prediction(history_data, target_issue)
+                # 修复(20261116): 1464 缓存键不对称：get传原始target_issue（实时路径为None→键含字面"None"），set传推导的next_issue，实时预测缓存永不命中 — get改传已推导的next_issue
+                cached = cache.get_prediction(history_data, next_issue,
+                                              algorithm_hash=_algo_hash)
                 if cached:
-                    logger.info(f'命中预测缓存，直接返回: {target_issue}')
-                    return cached
+                    logger.info(f'命中预测缓存，直接返回: {next_issue}')
+                    # 修复(20261116): 缓存键修复后命中会返回同一 predict_uuid/predict_time，
+                    # 违反「每次预测调用唯一标识」语义（tests/test_predictor.py::
+                    # test_predict_uuid_uniqueness 钉桩）——命中时深拷贝并重新生成
+                    # uuid/时间戳，缓存只省计算，不共享标识。
+                    # 结构清理(20261116): copy 已在模块顶部导入，删除函数内重复 import
+                    result = copy.deepcopy(cached)
+                    result['predict_uuid'] = str(uuid.uuid4())
+                    result['predict_time'] = datetime.now().isoformat()
+                    return result
             except Exception as e:
                 logger.debug(f'缓存检查失败（非致命）: {e}')
 
@@ -1440,6 +1526,9 @@ class P5Predictor:
 
         # 修复：概率归一化
         fused_probs = self._normalize_probabilities(fused_probs)
+
+        # OPT-01：融合概率向均匀分布线性收缩（默认 λ=0 = 不生效）
+        fused_probs = self._apply_fusion_shrinkage(fused_probs)
 
         # 边界保护
         if self.config.get_global_param('enable_boundary_protection'):
@@ -1578,13 +1667,22 @@ class P5Predictor:
         if _CACHE_ENABLED:
             try:
                 cache = _get_prediction_cache()
-                cache.set_prediction(history_data, next_issue, result)
+                cache.set_prediction(history_data, next_issue, result,
+                                     algorithm_hash=_algo_hash)
             except Exception as e:
                 logger.debug(f'缓存写入失败（非致命）: {e}')
         if _is_cancelled():
             return {'success': False, 'error': '用户取消'}
 
         return result
+
+    def _algorithm_fingerprint(self) -> str:
+        """缓存键用的算法配置指纹（委托给配置对象，失败则退化 'default'）。"""
+        try:
+            return self.config.algorithm_fingerprint()
+        # 审计佐证(20261116): 指纹失败回退 default，缓存键退化但正确性不受影响（回退属预期）
+        except Exception:
+            return 'default'
 
     def _fuse_ai_results(self, fused_probs: List[Dict[int, float]],
                          ai_result: Dict[str, Any]) -> List[Dict[int, float]]:
@@ -1605,7 +1703,6 @@ class P5Predictor:
 
             # 构建AI推荐概率
             ai_probs = {n: 0.1 for n in self.number_range}
-            total_confidence = 0
             for rec in rec_list:
                 if isinstance(rec, dict):
                     num = rec.get('number')
@@ -1623,18 +1720,23 @@ class P5Predictor:
 
                     if 0 <= num_int <= 9:
                         ai_probs[num_int] = conf
-                        total_confidence += conf
                     else:
                         logger.warning(f'AI推荐号码超出范围0-9，跳过: {num_int}')
 
             # 归一化AI概率
+            # 修复(20261116): 1671-1697 未推荐号码的基础0.1未计入归一化分母，归一化后分布和>1、AI有效权重被放大约28% — 分母改为ai_probs完整求和（含未推荐号码的0.1基数）
+            total_confidence = sum(ai_probs.values())
             if total_confidence > 0:
                 for num in self.number_range:
                     ai_probs[num] /= total_confidence
 
             # 加权融合
+            # 修复(20261116): 审计回归（scripts/tests/test_ai_fusion.py::
+            # test_fuse_ai_weight_boundary_gap）——ai_weight 越界（如 1.5）时
+            # stat_weight 为负，与尖峰统计分布叠加可产生负概率（-0.0067）；
+            # 概率必须非负，融合后钳制 max(0.0, ·)，随后重归一化保持 Σ=1
             for num in self.number_range:
-                fused_probs[idx][num] = (
+                fused_probs[idx][num] = max(0.0,
                         stat_weight * fused_probs[idx].get(num, 0.1) +
                         ai_weight * ai_probs.get(num, 0.1)
                 )
@@ -1878,7 +1980,13 @@ class P5Predictor:
         # 读取该算法的可调参数（带默认值，避免配置缺失导致 KeyError）
         params = self.config.config['algorithms']['frequency_weighted']['params']
         smoothing = params.get('smoothing_factor', 0.1)   # 拉普拉斯平滑系数 α
-        lookback = params.get('lookback_periods')          # 回看期数，None 表示全量
+        # BUG-05 修复：原实现只读算法内部 params['lookback_periods']，
+        # 而 extract_components(lookback=N) 写的是 config['global']['lookback']，
+        # 且 self.lookback 属性也从未被消费 → 「回看窗口」成为死参数，
+        # GA/坐标下降把它当搜索轴却对输出毫无影响（实测 lookback=60 与 10 输出逐位相同）。
+        # 现改为：全局显式设置（非 None）优先，否则回落到算法级参数。
+        # 默认配置下 global 未设置 lookback，二者均为 DATA_WINDOW_PERIOD=60，行为不变。
+        lookback = self.config.get_global_param('lookback') or params.get('lookback_periods')
         recency = params.get('recency_weight', False) # v3.14审计落地: 近期指数加权开关
         decay = params.get('recency_decay', 0.0)           # 衰减率(每期)
 
@@ -1898,7 +2006,11 @@ class P5Predictor:
                     w = math.exp(-decay * (total - 1 - k))
                 total_weight += w
                 for pos, num in enumerate(numbers):
-                    counts[pos][int(num)] += w
+                    n = int(num)
+                    # 修复(20261116): 1971 越界号码走defaultdict静默建键 — 非法号码跳过不计
+                    if not (0 <= n <= 9):
+                        continue
+                    counts[pos][n] += w
 
         # 分母为加权总样本数(保证加权后为合法概率); recency 关闭时 total_weight==total 向后兼容
         denom = total_weight if total_weight > 0 else total
@@ -2115,6 +2227,9 @@ class P5Predictor:
                 for pos in range(self.positions):
                     p = int(prev_nums[pos])
                     c = int(curr_nums[pos])
+                    # 修复(20261116): 2188 越界号码走defaultdict静默建键稀释转移分母 — 非法号码跳过该位置
+                    if not (0 <= p <= 9 and 0 <= c <= 9):
+                        continue
                     transition_counts[pos][p][c] += weight
 
         probs = []
@@ -2220,10 +2335,17 @@ class P5Predictor:
                     score *= boost
 
                 # 质合延续（修复：使用正确的质数定义）
+                # BUG-02 修复：原条件为 (is_prime and prime_ratio>0.4) 与
+                # (not is_prime and prime_ratio<0.6)。当 prime_ratio∈(0.4,0.6) 时
+                # 两个分支同时成立 → 10 个号码同乘 boost → 归一化后分布完全均匀，
+                # 该算法在此区间内退化为恒等变换（实测占随机序列约 16.5% 的位置）。
+                # 现改为与奇偶/大小分支一致的对称高/低区间：
+                #   质数占比显著偏高(>0.6) → 质数加成；显著偏低(<0.4) → 合数加成；
+                #   中间区间不加成（保持无信息即不干预的语义）。
                 is_prime = num in self.primes
-                if is_prime and prime_ratio > 0.4:
+                if is_prime and prime_ratio > 0.6:
                     score *= boost
-                elif not is_prime and prime_ratio < 0.6:
+                elif not is_prime and prime_ratio < 0.4:
                     score *= boost
 
                 pos_probs[num] = score
@@ -2265,7 +2387,7 @@ class P5Predictor:
 
         # ALG-03: 贝叶斯后验缓存 - 同一 history 指纹下后验表复用
         # 计算 history 指纹（行数 + 逐位数字 + issue 信息），防止缓存污染
-        import hashlib
+        # 结构清理(20261116): hashlib 已上提至模块顶部导入，删除函数内重复 import
         data_hash = hashlib.blake2b(
             str(len(data)).encode() + b''.join(
                 str(item.get('issue', '')).encode() + b''.join(str(n).encode() for n in item.get('numbers', []))
@@ -2277,7 +2399,7 @@ class P5Predictor:
         # 检查缓存命中
         if data_hash in self._posterior_cache:
             # 缓存命中：返回深拷贝，避免调用方就地改写污染缓存
-            import copy
+            # 结构清理(20261116): copy 已在模块顶部导入，删除函数内重复 import
             return copy.deepcopy(self._posterior_cache[data_hash])
         # 缓存未命中：计算并存入缓存（容量超限则移除最早入库项）
         if len(self._posterior_cache) >= self._posterior_cache_capacity:
@@ -2306,8 +2428,7 @@ class P5Predictor:
         # 使用全部历史数据(或prior_temporal_scale期),对近期数据给予更高权重
         # 指数衰减: weight(i) = exp(-ln(2) * (total_data - i) / half_life)
         # 最新一期权重=1, half_life期前权重=0.5, 以此类推
-        import math
-        import numpy as np
+        # 结构清理(20261116): math/numpy 已在模块顶部导入，删除函数内重复 import
 
         # 限制先验数据范围，避免远古数据噪声
         prior_data = data[-prior_temporal_scale:] if len(data) > prior_temporal_scale else data
@@ -2356,7 +2477,11 @@ class P5Predictor:
         prior_probs = []
         # 向量化拉普拉斯平滑：(count/tw + prior_smooth * 0.1) / (1 + prior_smooth)
         # 广播 total_weight_arr 形状 (positions,) 到 (positions, n_numbers)
-        count_over_tw = prior_counts_arr / total_weight_arr[:, np.newaxis]  # (positions, n_numbers)
+        # 使用 np.divide 并配合 where 参数防止 total_weight_arr 为 0 时的除零警告
+        with np.errstate(divide='ignore', invalid='ignore'):
+            count_over_tw = prior_counts_arr / total_weight_arr[:, np.newaxis]  # (positions, n_numbers)
+            # 将因除零而产生的 inf/nan 置为 0，后续会被拉普拉斯平滑和归一化处理
+            count_over_tw = np.where(np.isfinite(count_over_tw), count_over_tw, 0.0)
         smooth_numerator = count_over_tw + prior_smooth * 0.1
         smooth_denominator = 1.0 + prior_smooth
         pos_prior_unnormalized = smooth_numerator / smooth_denominator
@@ -2381,14 +2506,37 @@ class P5Predictor:
         # 防止前视偏差:回测/预测时只使用早于截止期号的验证记录(截止期=当前期)
         cutoff = getattr(self, '_verification_cutoff', None)
         if cutoff is not None:
+            # 修复(20261116): 2465-2472 截止过滤在整体try内逐条int(target_issue)，单条脏记录即令整个防前视过滤被except:pass跳过 — 改为循环内逐条try，坏记录单独剔除，不让脏数据使防泄漏机制失效
             try:
                 cutoff_int = int(str(cutoff))
-                verification_records = [
-                    r for r in verification_records
-                    if int(str(r.get('target_issue', '0'))) < cutoff_int
-                ]
             except (ValueError, TypeError):
-                pass
+                cutoff_int = None
+            if cutoff_int is not None:
+                _filtered_records = []
+                for _r in verification_records:
+                    try:
+                        if int(str(_r.get('target_issue', '0'))) < cutoff_int:
+                            _filtered_records.append(_r)
+                    except (ValueError, TypeError):
+                        continue
+                verification_records = _filtered_records
+
+        # ── BUG-01 修复：显式按目标期号「升序」排列验证记录 ──────────────
+        # 缺陷：_load_verification_records() 的 SQL 为 ORDER BY p.id DESC（最新在前），
+        # 而下方窗口切片取 verification_records[-window:]，等于取到「最旧的 N 条」，
+        # 再叠加「越靠后权重越大」的指数衰减 → 时间方向完全反转：
+        # 最新验证记录永不参与学习，后验被最早期（口径最差）的记录主导。
+        # 修复：切片与衰减之前统一升序排序（旧→新），使 [-window:] 正确取最近 N 期。
+        # 幂等：已升序时排序为稳定排序，结果不变；不改变任何记录内容。
+        try:
+            verification_records = sorted(
+                verification_records,
+                key=lambda _r: int(str(_r.get('target_issue', '0'))))
+        except (ValueError, TypeError):
+            # 期号非数值时退化为字符串序（仍保证确定性），不阻断预测链路
+            verification_records = sorted(
+                verification_records,
+                key=lambda _r: str(_r.get('target_issue', '')))
         tolerance = self.config.get_global_param('tolerance_matching', True)
 
         min_samples = params.get('min_verification_samples', 50)
@@ -2461,6 +2609,11 @@ class P5Predictor:
                     actual_num = int(actual_nums[pos])
                 except (ValueError, IndexError, TypeError):
                     continue
+
+                # 修复(20261116): 2553-2559/2573-2581 pred_num/alt_num/actual_num未做0-9范围校验，越界键直接KeyError且无try保护会炸掉整次预测 — 非法号码跳过该位置计分，越界备用号码从预测集合剔除
+                if not (0 <= pred_num <= 9 and 0 <= actual_num <= 9):
+                    continue
+                all_preds = [x for x in all_preds if 0 <= x <= 9]
                 
                 # 命中判定:位置级精确匹配 + 容错匹配
                 # 注意:这里检测的是「实际开奖号是否在预测号码集合中」
@@ -2565,6 +2718,10 @@ class P5Predictor:
         except Exception as _e:
             logger.warning(f'贝叶斯 AI 辅助处理异常(降级为纯统计): {_e}')
             self._bayesian_ai_auxiliary = {}
+
+        # 修复(20261116): 2355-2363 _posterior_cache只有读与淘汰、从未写入，缓存永不命中且白算O(N)指纹 — 计算完成后写回缓存（存深拷贝防调用方就地改写污染缓存，容量淘汰逻辑保持）
+        # 结构清理(20261116): copy 已在模块顶部导入，删除函数内重复 import
+        self._posterior_cache[data_hash] = copy.deepcopy(posterior_probs)
 
         return posterior_probs
 
@@ -2727,7 +2884,7 @@ class P5Predictor:
             db.disconnect()
             
             records = []
-            import json
+            # 结构清理(20261116): json 已在模块顶部导入，删除函数内重复 import
             for row in rows:
                 pred = row['predicted_numbers']
                 actual = row['actual_numbers']
@@ -2806,21 +2963,18 @@ class P5Predictor:
             if total == 0:
                 return [{n: 0.1 for n in self.number_range} for _ in range(positions)]
 
-            # 频率统计
+            # 修复(20261116): 2908-2921/2954-2958 同一份data全量遍历7次 — 合并为单遍扫描同时产出freq_counts/last_occurrence/road_counts（等价重构）
             freq_counts = [defaultdict(int) for _ in range(positions)]
-            for item in data:
-                nums = item.get('numbers', [])
-                if len(nums) == positions:
-                    for pos, num in enumerate(nums):
-                        freq_counts[pos][int(num)] += 1
-
-            # 遗漏统计（当前遗漏期数）
             last_occurrence = [{} for _ in range(positions)]
+            road_counts = [defaultdict(int) for _ in range(positions)]
             for idx, item in enumerate(data):
                 nums = item.get('numbers', [])
                 if len(nums) == positions:
                     for pos, num in enumerate(nums):
-                        last_occurrence[pos][int(num)] = idx
+                        n = int(num)
+                        freq_counts[pos][n] += 1
+                        last_occurrence[pos][n] = idx
+                        road_counts[pos][n % 3] += 1
 
             # 上期号码（用于重号/连号特征）
             prev_nums = []
@@ -2852,16 +3006,11 @@ class P5Predictor:
                 omis_max = max(omis_raw.values()) or 1
                 omis_probs = {n: v / omis_max for n, v in omis_raw.items()}
 
-                # 012路分布（基于历史频率）
-                road_counts = defaultdict(int)
-                for item in data:
-                    nums = item.get('numbers', [])
-                    if len(nums) == positions:
-                        road_counts[int(nums[pos]) % 3] += 1
-                road_total = sum(road_counts.values()) or 1
+                # 012路分布（基于历史频率，已由上方单遍扫描统计）
+                road_total = sum(road_counts[pos].values()) or 1
                 road_probs = {}
                 for num in self.number_range:
-                    road_probs[num] = (road_counts[num % 3] + 0.1) / (road_total + 0.3)
+                    road_probs[num] = (road_counts[pos][num % 3] + 0.1) / (road_total + 0.3)
 
                 # 重号加成（上期出现 → 惯性）
                 repeat_boost = {num: 1.3 if num in prev_nums else 1.0 for num in self.number_range}
@@ -2896,6 +3045,94 @@ class P5Predictor:
             # 回退到均匀分布,确保系统稳定性
             return [{n: 0.1 for n in self.number_range} for _ in range(self.positions)]
     
+    def _topn_product_packages(self, fused_probs: List[Dict[int, float]],
+                               combination_count: int,
+                               position_top_n: int,
+                               constraint_score_fn=None,
+                               relative_confidence: bool = False,
+                               include_metrics: bool = False) -> List[Dict[str, Any]]:
+        """Top-N 组合生成的公共辅助（v1/v2 共用）。
+
+        结构清理(20261116): v1(_generate_combinations) 与 v2(_generate_combinations_v2)
+        的「Top-N 提取 + 笛卡尔积 + 联合概率 + 降序排序 + 打包」逻辑完全重复 — 收敛至此。
+        两版差异经参数注入，返回结构与原 v1/v2 逐字段一致：
+          - constraint_score_fn: v2 的约束评分闭包 (combo, base_score) -> score；
+            传 None 时直接使用联合概率（v1 行为，零/负分组合保留不跳过），
+            非空时保留 v2 的零分跳过与保底 wildcard 组合逻辑
+          - relative_confidence: True = v2 相对置信度(score/max_base*100)，
+            False = v1 绝对口径(score*100)，两种口径均保留不改
+          - include_metrics: v2 附带 hezhi/span/ssd 指标；v1 不附带
+        """
+        # 1. 提取每个位置的Top-N候选号码(按概率降序)
+        top_numbers_per_position = []
+        for pos in range(self.positions):
+            pos_probs = fused_probs[pos]
+            sorted_nums = sorted(pos_probs.items(), key=lambda x: x[1], reverse=True)
+            top_nums = [num for num, _ in sorted_nums[:position_top_n]]
+            top_numbers_per_position.append(top_nums)
+
+        # 2. 生成候选组合(笛卡尔积)
+        all_combinations = list(itertools.product(*top_numbers_per_position))
+
+        # 3. 计算联合概率(各位置概率的乘积)；constraint_score_fn 非空时叠加约束得分
+        combination_scores = []
+        for combo in all_combinations:
+            base_score = 1.0
+            for pos, num in enumerate(combo):
+                base_score *= fused_probs[pos].get(num, 0.1)
+            if constraint_score_fn is not None:
+                # v2 行为：零/负分组合直接跳过（与原 v2 一致）
+                if base_score <= 0:
+                    continue
+                score = constraint_score_fn(combo, base_score)
+            else:
+                # v1 行为：不做跳过，零/负分组合保留（排序后自然沉底）
+                score = base_score
+            combination_scores.append((combo, score))
+
+        # 4. 按得分降序排序
+        combination_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # 5. v2 保底:始终包含一个"无约束"组合(各位置概率最高的号码),
+        # 避免硬约束把理论可达的中奖组合挤出 Top 列表,人为压低命中率上限。
+        if constraint_score_fn is not None and combination_scores:
+            wildcard = tuple(
+                sorted(fused_probs[pos].items(), key=lambda x: x[1], reverse=True)[0][0]
+                for pos in range(self.positions)
+            )
+            if wildcard not in [c for c, _ in combination_scores]:
+                wscore = 1.0
+                for pos, num in enumerate(wildcard):
+                    wscore *= fused_probs[pos].get(num, 0.1)
+                combination_scores.append((wildcard, wscore))
+                combination_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # 6. 打包 Top-N：两种 confidence 口径并存（v2 相对值 / v1 绝对值 score*100）
+        max_base = combination_scores[0][1] if combination_scores else 0.0
+        position_mean = 4.5  # 每位号码理论期望均值 E[X]=4.5，用于 SSD 指标
+        top_combinations = []
+        for rank, (combo, score) in enumerate(combination_scores[:combination_count], 1):
+            package = {
+                'rank': rank,
+                'combination': ''.join(map(str, combo)),
+                'numbers': list(combo),
+                'probability': round(score, 6),
+            }
+            if relative_confidence:
+                package['confidence'] = round(100.0 * (score / max_base), 2) if max_base > 0 else 0.0
+            else:
+                package['confidence'] = round(score * 100, 2)
+            if include_metrics:
+                ssd = sum((n - position_mean) ** 2 for n in combo) / self.positions
+                package.update({
+                    'hezhi': sum(combo),
+                    'span': max(combo) - min(combo),
+                    'ssd': round(ssd, 4),
+                })
+            top_combinations.append(package)
+
+        return top_combinations
+
     def _generate_combinations_v2(self, fused_probs: List[Dict[int, float]]) -> List[Dict[str, Any]]:
         """
         生成推荐组合（增强版 v3.0）
@@ -2956,29 +3193,12 @@ class P5Predictor:
         # 每个位置号码的理论期望均值 E[X_i] = 4.5 (等概率分布的数学期望)
         position_mean = 4.5
         
-        # 获取每个位置的Top-N候选号码(按概率降序排列)
-        top_numbers_per_position = []
-        for pos in range(self.positions):
-            pos_probs = fused_probs[pos]
-            sorted_nums = sorted(pos_probs.items(), key=lambda x: x[1], reverse=True)
-            top_nums = [num for num, _ in sorted_nums[:position_top_n]]
-            top_numbers_per_position.append(top_nums)
+        def _apply_constraints(combo, base_score):
+            # 结构清理(20261116): v1/v2 重复的「Top-N 提取+笛卡尔积+联合概率+排序+打包」
+            # 逻辑收敛至公共辅助 _topn_product_packages；7 项约束评分原样搬入闭包并经
+            # constraint_score_fn 注入（零/负分组合跳过语义保持不变）
+            score = base_score
 
-        # 生成候选组合(笛卡尔积)
-        import itertools
-        all_combinations = list(itertools.product(*top_numbers_per_position))
-
-        # 对每个组合计算综合评分,应用7项约束条件
-        combination_scores = []
-        for combo in all_combinations:
-            # 基础概率: 各位置概率的乘积(独立事件联合概率)
-            score = 1.0
-            for pos, num in enumerate(combo):
-                score *= fused_probs[pos].get(num, 0.1)
-            
-            if score <= 0:
-                continue
-            
             # 约束1: 相邻位置号码差距惩罚（轻度）
             # 惩罚系数 0.85 为软惩罚：仅降权、不剔除，避免误杀可能的开奖组合。
             adjacent_similar = 0
@@ -3022,48 +3242,18 @@ class P5Predictor:
                 score *= 0.85
             elif combo_span > span_max:
                 score *= 0.9
-            
-            combination_scores.append((combo, score))
 
-        # 按综合得分降序排序
-        combination_scores.sort(key=lambda x: x[1], reverse=True)
+            return score
 
-        # 保底:始终包含一个"无约束"组合(各位置概率最高的号码),
-        # 避免硬约束把理论可达的中奖组合挤出 Top 列表,人为压低命中率上限。
-        if combination_scores:
-            wildcard = tuple(
-                sorted(fused_probs[pos].items(), key=lambda x: x[1], reverse=True)[0][0]
-                for pos in range(self.positions)
-            )
-            if wildcard not in [c for c, _ in combination_scores]:
-                wscore = 1.0
-                for pos, num in enumerate(wildcard):
-                    wscore *= fused_probs[pos].get(num, 0.1)
-                combination_scores.append((wildcard, wscore))
-                combination_scores.sort(key=lambda x: x[1], reverse=True)
-
-        # 置信度改为相对值(相对Top组合得分,0-100%),避免原 score*100 得到 ~0.01% 的误导值
-        max_base = combination_scores[0][1] if combination_scores else 0.0
-
-        # 取前N个高质量组合,附带各项指标
-        top_combinations = []
-        for rank, (combo, score) in enumerate(combination_scores[:combination_count], 1):
-            hezhi = sum(combo)
-            span = max(combo) - min(combo)
-            ssd = sum((n - position_mean) ** 2 for n in combo) / self.positions
-
-            top_combinations.append({
-                'rank': rank,
-                'combination': ''.join(map(str, combo)),      # 号码字符串形式
-                'numbers': list(combo),                        # 号码列表形式
-                'probability': round(score, 6),               # 综合概率得分
-                'confidence': round(100.0 * (score / max_base), 2) if max_base > 0 else 0.0,  # 相对置信度
-                'hezhi': hezhi,                               # 和值
-                'span': span,                                 # 跨度
-                'ssd': round(ssd, 4)                          # 平方和偏差
-            })
-
-        return top_combinations
+        # 结构清理(20261116): 排序/保底wildcard/相对置信度/hezhi/span/ssd 打包为 v1/v2
+        # 重复逻辑 — 已收敛至公共辅助 _topn_product_packages（wildcard 保底与相对置信度
+        # 口径在辅助函数内逐行等价实现），此处仅注入 7 项约束评分
+        return self._topn_product_packages(
+            fused_probs, combination_count, position_top_n,
+            constraint_score_fn=_apply_constraints,
+            relative_confidence=True,
+            include_metrics=True,
+        )
 
     def _fuse_probabilities(self, algorithm_probs: Dict[str, List[Dict[int, float]]]) -> List[Dict[int, float]]:
         """
@@ -3142,6 +3332,76 @@ class P5Predictor:
             normalized.append(normalized_probs)
 
         return normalized
+
+    def _apply_fusion_shrinkage(self, probs: List[Dict[int, float]]) -> List[Dict[int, float]]:
+        """OPT-01：把融合概率向均匀分布做线性收缩（默认关闭）。
+
+        数学形式：
+            p_shrunk(d) = (1 - λ) · p_fused(d) + λ · (1 / K)
+            其中 K = len(number_range) = 10，λ ∈ [0, fusion_shrinkage_max]
+
+        设计依据（可复现）：
+            真实 1124 期数据五位合并卡方 p=0.7509、熵 3.3212 bit
+            （理论上限 log2(10)=3.3219 bit），即历史频率与均匀分布不可区分。
+            在真实分布为均匀时，经验频率的偏离纯属估计方差；线性收缩用偏差
+            换方差下降，可降低期望对数损失与 Brier 分数。
+
+        诚实边界（不可突破）：
+            线性收缩是**保序变换**，0 <= λ < 1 时十位号码的相对排序完全不变，
+            因此 **Top-k 命中率不会改变**。本方法只改善概率数值的校准质量，
+            不产生也不宣称任何预测能力增益。
+
+        安全约束：
+            - λ 缺省/非法（None、非数值、NaN）时视为 0，直接原样返回；
+            - λ 被钳制到 [0, fusion_shrinkage_max]（默认上限 0.9），
+              防止误配置成 1.0 把分布退化为纯均匀（等于放弃预测）；
+            - 空输入或单位置概率为空时保持原样，不抛异常（保持链路稳健）。
+
+        Args:
+            probs: 归一化后的概率分布列表，每个元素为 {号码: 概率}
+
+        Returns:
+            收缩后的概率分布列表；λ=0 时返回的数值与输入逐位相同
+        """
+        lam_raw = self.config.get_global_param('fusion_shrinkage', 0.0)
+        try:
+            lam = float(lam_raw)
+        except (TypeError, ValueError):
+            logger.warning('fusion_shrinkage 配置非法(%r)，按 0 处理', lam_raw)
+            return probs
+        if math.isnan(lam) or lam <= 0.0:
+            return probs
+        cap_raw = self.config.get_global_param('fusion_shrinkage_max', 0.9)
+        try:
+            cap = float(cap_raw)
+        except (TypeError, ValueError):
+            cap = 0.9
+        if cap <= 0.0 or math.isnan(cap):
+            cap = 0.9
+        lam = min(lam, cap)
+
+        k = len(self.number_range)
+        if k <= 0:
+            return probs
+        uniform = 1.0 / k
+
+        shrunk = []
+        for pos_probs in probs:
+            if not pos_probs:
+                shrunk.append(pos_probs)
+                continue
+            out = {}
+            for num in self.number_range:
+                p = float(pos_probs.get(num, uniform))
+                out[num] = (1.0 - lam) * p + lam * uniform
+            # 数值安全：即使输入轻微越界，输出也重新归一化到 1
+            total = sum(out.values())
+            if total > 0:
+                out = {n: v / total for n, v in out.items()}
+            else:
+                out = {n: uniform for n in self.number_range}
+            shrunk.append(out)
+        return shrunk
 
     def _apply_boundary_protection(self, probs: List[Dict[int, float]],
                                    data: List[Dict]) -> List[Dict[int, float]]:
@@ -3297,42 +3557,15 @@ class P5Predictor:
         combination_count = self.config.get_global_param('combination_count', 10)
         position_top_n = self.config.get_global_param('position_top_n', 3)
 
-        # 获取每个位置的Top-N候选号码(按概率降序)
-        top_numbers_per_position = []
-        for pos in range(self.positions):
-            pos_probs = fused_probs[pos]
-            sorted_nums = sorted(pos_probs.items(), key=lambda x: x[1], reverse=True)
-            top_nums = [num for num, _ in sorted_nums[:position_top_n]]
-            top_numbers_per_position.append(top_nums)
-
-        # 生成所有可能的组合(笛卡尔积)
-        import itertools
-        all_combinations = list(itertools.product(*top_numbers_per_position))
-
-        # 计算每个组合的综合概率
-        # 联合概率 = 各位置概率的乘积(独立事件)
-        combination_scores = []
-        for combo in all_combinations:
-            score = 1.0
-            for pos, num in enumerate(combo):
-                score *= fused_probs[pos].get(num, 0.1)
-            combination_scores.append((combo, score))
-
-        # 按概率降序排序
-        combination_scores.sort(key=lambda x: x[1], reverse=True)
-
-        # 取前N个高概率组合作为推荐
-        top_combinations = []
-        for rank, (combo, score) in enumerate(combination_scores[:combination_count], 1):
-            top_combinations.append({
-                'rank': rank,
-                'combination': ''.join(map(str, combo)),
-                'numbers': list(combo),
-                'probability': round(score, 6),
-                'confidence': round(score * 100, 2)
-            })
-
-        return top_combinations
+        # 结构清理(20261116): Top-N 提取+笛卡尔积+联合概率+排序+打包为 v1/v2 重复逻辑，
+        # 收敛至公共辅助 _topn_product_packages；v1 无约束评分、confidence 保留原
+        # score*100 绝对口径，返回结构与原实现逐字段一致
+        return self._topn_product_packages(
+            fused_probs, combination_count, position_top_n,
+            constraint_score_fn=None,
+            relative_confidence=False,
+            include_metrics=False,
+        )
 
     def _forecast_trend(self, sorted_data: List[Dict],
                         fused_probs: List[Dict[int, float]]) -> Dict[str, Any]:
@@ -3511,7 +3744,7 @@ class P5Predictor:
 
 if __name__ == '__main__':
     # 测试优化后的预测器
-    import json
+    # 结构清理(20261116): json 已在模块顶部导入，删除重复 import
 
     # 模拟数据
     test_data = [

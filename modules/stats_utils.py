@@ -52,7 +52,11 @@ def wilson_ci(successes: int, total: int,
           偏差（见 docs/dev_schedule_v52_20261019.md §17）：保持二元组是为
           零漂移收敛，所有现存调用点均按二元组解包。
     """
-    if total == 0:
+    if total <= 0:
+        # total == 0 为已定义口径（返回 (0.0, 0.0)）；
+        # total < 0 属非法输入（docs/hitrate_spec.md 未定义），原实现会进入
+        # 下方 radicand 计算并因负总数触发 math domain error。此处统一按
+        # 「无有效样本」处理，保持函数永不抛异常，避免单个坏计数中断整份报告。
         return (0.0, 0.0)
     # 防御：比例钳制到 [0, 1]，避免 p*(1-p) 为负导致 math domain error
     p = min(1.0, max(0.0, successes / total))

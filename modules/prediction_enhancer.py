@@ -41,7 +41,9 @@ class PatternMiner:
         分析历史数据中的模式
 
         Args:
-            history_data: 历史数据列表，每项包含'numbers'键（5位号码列表）
+            history_data: 历史数据列表，每项包含'numbers'键（5位号码列表）。
+                注意：入参为「最新在前」的 DESC 序（index 0 = 最新一期），
+                与 pipeline._calc_statistical_prediction 的传参顺序一致。
 
         Returns:
             模式分析结果字典
@@ -49,7 +51,8 @@ class PatternMiner:
         if len(history_data) < 10:
             return {'error': '数据不足', 'summary': '历史数据少于10期，无法有效分析模式'}
 
-        recent = history_data[-self.lookback:]
+        # 修复(20261116): L52 原切片 [-N:] 在 DESC 序（index0=最新）下取的是窗口内最旧 N 期 — 改为 [:N]，取最新 N 期
+        recent = history_data[:self.lookback]
         numbers = [d.get('numbers', []) for d in recent if len(d.get('numbers', [])) == 5]
 
         if not numbers:
@@ -181,21 +184,25 @@ class PatternMiner:
         return result
 
     def _generate_summary(self, numbers: List[List[int]]) -> str:
-        """生成模式分析摘要"""
+        """生成模式分析摘要
+
+        Args:
+            numbers: 号码列表，保持调用方传入顺序（最新在前 DESC 序）。
+        """
         if not numbers:
             return "无数据"
 
-        # 和值统计
-        sums = [sum(nums) for nums in numbers[-30:]]
+        # 修复(20261116): L189 原切片 [-30:] 在 DESC 序下取的是窗口内最旧 30 期 — 改为 [:30]，统计最新 30 期（下同）
+        sums = [sum(nums) for nums in numbers[:30]]
         avg_sum = sum(sums) / len(sums) if sums else 0
         sum_std = (sum((s - avg_sum) ** 2 for s in sums) / len(sums)) ** 0.5 if sums else 0
 
         # 跨度统计
-        spans = [max(nums) - min(nums) for nums in numbers[-30:]]
+        spans = [max(nums) - min(nums) for nums in numbers[:30]]
         avg_span = sum(spans) / len(spans) if spans else 0
 
         # 奇偶比统计
-        odd_counts = [sum(1 for n in nums if n % 2 == 1) for nums in numbers[-30:]]
+        odd_counts = [sum(1 for n in nums if n % 2 == 1) for nums in numbers[:30]]
         most_common_odd_ratio = max(set(odd_counts), key=odd_counts.count) if odd_counts else 2
 
         return (
@@ -226,7 +233,7 @@ class AnomalyDetector:
         检测异常模式
 
         Args:
-            history_data: 历史数据列表
+            history_data: 历史数据列表，最新在前（DESC 序，index 0 = 最新一期）。
 
         Returns:
             异常检测结果
@@ -234,7 +241,8 @@ class AnomalyDetector:
         if len(history_data) < 10:
             return {'status': 'insufficient_data', 'anomalies': []}
 
-        recent = history_data[-30:]
+        # 修复(20261116): L237 原切片 [-30:] 在 DESC 序下取的是窗口内最旧 30 期 — 改为 [:30]，检测最新 30 期
+        recent = history_data[:30]
         numbers = [d.get('numbers', []) for d in recent if len(d.get('numbers', [])) == 5]
 
         anomalies = []

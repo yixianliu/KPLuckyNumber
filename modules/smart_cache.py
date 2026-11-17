@@ -18,6 +18,7 @@ import time
 import hashlib
 import json
 import logging
+import threading
 from collections import OrderedDict, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,6 +45,8 @@ class LFULogCache:
             freq_map 为 频率 -> OrderedDict(键) 的倒排索引，配合 min_freq 实现 O(1) 淘汰。
         """
         self.max_size = max_size
+        # 修复(20261116): L62-124 全局单例被多线程并发读写，get/set 复合更新（频率桶删除/淘汰）无锁会竞态 — 增加实例级线程锁，get/set/invalidate 全程持锁
+        self._lock = threading.Lock()
         self.freq_map = defaultdict(OrderedDict)  # freq -> OrderedDict(key)
         self.cache = {}  # key -> {value, freq, exp_at}
         self.min_freq = 0
@@ -73,27 +76,29 @@ class LFULogCache:
             过期条目会被顺带清理；频率提升时若旧频率桶变空且等于 min_freq，则 min_freq 自增。
         """
         hash_key = self._key_hash(key)
-        if hash_key not in self.cache:
-            return default
+        # 修复(20261116): get 的「检查-提频-删桶」复合更新全程持锁，防并发竞态
+        with self._lock:
+            if hash_key not in self.cache:
+                return default
 
-        entry = self.cache[hash_key]
-        if entry['exp_at'] and time.time() > entry['exp_at']:
-            self._remove(hash_key)
-            return default
+            entry = self.cache[hash_key]
+            if entry['exp_at'] and time.time() > entry['exp_at']:
+                self._remove(hash_key)
+                return default
 
-        # 提升频率
-        freq = entry['freq']
-        if hash_key in self.freq_map[freq]:
-            del self.freq_map[freq][hash_key]
-            if not self.freq_map[freq]:
-                del self.freq_map[freq]
-                if self.min_freq == freq:
-                    self.min_freq += 1
+            # 提升频率
+            freq = entry['freq']
+            if hash_key in self.freq_map[freq]:
+                del self.freq_map[freq][hash_key]
+                if not self.freq_map[freq]:
+                    del self.freq_map[freq]
+                    if self.min_freq == freq:
+                        self.min_freq += 1
 
-        entry['freq'] += 1
-        self.freq_map[entry['freq']][hash_key] = True
+            entry['freq'] += 1
+            self.freq_map[entry['freq']][hash_key] = True
 
-        return entry['value']
+            return entry['value']
 
     def set(self, key: str, value: Any, ttl: Optional[int] = None):
         """写入缓存值，容量不足时先淘汰最低频条目。
@@ -108,20 +113,22 @@ class LFULogCache:
         """
         hash_key = self._key_hash(key)
 
-        # 容量检查
-        if hash_key in self.cache:
-            self._remove(hash_key)
-        elif len(self.cache) >= self.max_size:
-            self._evict()
+        # 修复(20261116): set 的「淘汰-写入-建桶」复合更新全程持锁，防并发竞态
+        with self._lock:
+            # 容量检查
+            if hash_key in self.cache:
+                self._remove(hash_key)
+            elif len(self.cache) >= self.max_size:
+                self._evict()
 
-        exp_at = (time.time() + ttl) if ttl else None
-        self.cache[hash_key] = {
-            'value': value,
-            'freq': 1,
-            'exp_at': exp_at
-        }
-        self.freq_map[1][hash_key] = True
-        self.min_freq = 1
+            exp_at = (time.time() + ttl) if ttl else None
+            self.cache[hash_key] = {
+                'value': value,
+                'freq': 1,
+                'exp_at': exp_at
+            }
+            self.freq_map[1][hash_key] = True
+            self.min_freq = 1
 
     def _evict(self):
         """淘汰最低频率的条目"""
@@ -162,13 +169,17 @@ class LFULogCache:
             使长期缓存支持按期号精确清除，无需全量 clear。
         """
         hash_key = self._key_hash(raw_key)
-        self._remove(hash_key)
+        # 修复(20261116): invalidate_key 与 get/set 竞态会抛 KeyError — 按键失效同样全程持锁
+        with self._lock:
+            self._remove(hash_key)
 
     def clear(self):
         """清空全部缓存条目与频率索引，并重置最小频率计数。"""
-        self.cache.clear()
-        self.freq_map.clear()
-        self.min_freq = 0
+        # 修复(20261116): clear 与 get/set 并发时可能删除过程中条目再次变化 — 全程持锁
+        with self._lock:
+            self.cache.clear()
+            self.freq_map.clear()
+            self.min_freq = 0
 
     def stats(self) -> Dict:
         """返回 LFU 缓存的运行时统计。
@@ -216,6 +227,8 @@ class PredictionCache:
         self.short_ttl = 300  # 5分钟
         self.long_ttl = 3600  # 1小时
         self.max_short = 100
+        # 修复(20261116): L302-310 全局单例 _global_cache 被多线程并发读写，short_cache 的 in 检查+pop 非原子可抛 KeyError — 增加实例级线程锁，get/set/invalidate 全程持锁
+        self._lock = threading.Lock()
         # 命中统计（用于GUI展示与效果评估）
         self._hits = 0
         self._misses = 0
@@ -228,9 +241,12 @@ class PredictionCache:
         计算历史数据指纹（1.10 新增）。
 
         指纹由三部分构成，任一变化都会导致缓存失效：
-          - 最新期号（history_data[-1]['issue']）
+          - 最新期号（排序后最后一条的 issue）
           - 记录数（len(history_data)）
-          - 前 10 条记录的 MD5 校验和（防止前 10 条数据被修正后旧缓存仍命中）
+          - 首尾各 10 条记录的 MD5 校验和（v5.3 起同时覆盖早期与近期数据修正）
+
+        v5.3 修正（BUG-03）：原实现只校验最早 10 条，而「最近期数据被修正」
+        是最常见的变更场景，却不在校验范围内，会命中过期缓存。现同时校验尾部。
 
         Args:
             history_data: 参与本次预测的历史开奖数据列表
@@ -244,10 +260,16 @@ class PredictionCache:
         sorted_data = sorted(history_data, key=lambda x: str(x.get('issue', '')))
         latest_issue = str(sorted_data[-1].get('issue', ''))
         count = len(sorted_data)
-        # 前 10 条的 MD5 校验和（防止早期数据修正后旧缓存仍命中）
+        # BUG-03 修复：原取样 sorted_data[:10]（最早 10 条），而最新期号已由
+        # latest_issue 单独覆盖，导致「最近 10 期被修正」这一最需要失效的场景
+        # 恰恰不在校验和覆盖范围内（历史数据修正多发生在近期数据回补/纠错）。
+        # 现改为同时校验尾部 10 条（最近数据），并保留首部 10 条，
+        # 使「早期数据被修正」与「近期数据被修正」两类变更都能正确失效缓存。
         head = sorted_data[:10]
+        tail = sorted_data[-10:]
         checksum = hashlib.md5(
-            json.dumps(head, sort_keys=True, default=str).encode()
+            json.dumps({'head': head, 'tail': tail},
+                       sort_keys=True, default=str).encode()
         ).hexdigest()[:8]
 
         return f"{latest_issue}|{count}|{checksum}"
@@ -282,26 +304,28 @@ class PredictionCache:
         """
         key = self._make_key(history_data, issue, algorithm_hash)
 
-        # 先查长期缓存
-        result = self.long_cache.get(key)
-        if result:
-            logger.debug(f"命中长期缓存: {issue}")
-            self._hits += 1
-            return result
-
-        # 再查短期缓存
-        if key in self.short_cache:
-            entry = self.short_cache.pop(key)
-            if time.time() < entry['exp_at']:
-                self.short_cache[key] = entry
-                logger.debug(f"命中短期缓存: {issue}")
+        # 修复(20261116): get_prediction 的「in 检查+pop+回填」非原子，并发下可抛 KeyError — 全程持实例锁（内部 LFU 缓存有独立锁，锁序固定无死锁）
+        with self._lock:
+            # 先查长期缓存
+            result = self.long_cache.get(key)
+            if result:
+                logger.debug(f"命中长期缓存: {issue}")
                 self._hits += 1
-                return entry['value']
-            else:
-                del self.short_cache[key]
+                return result
 
-        self._misses += 1
-        return None
+            # 再查短期缓存
+            if key in self.short_cache:
+                entry = self.short_cache.pop(key)
+                if time.time() < entry['exp_at']:
+                    self.short_cache[key] = entry
+                    logger.debug(f"命中短期缓存: {issue}")
+                    self._hits += 1
+                    return entry['value']
+                else:
+                    del self.short_cache[key]
+
+            self._misses += 1
+            return None
 
     def set_prediction(self, history_data: List[Dict], issue: str,
                        result: Dict, algorithm_hash: str = None):
@@ -318,19 +342,21 @@ class PredictionCache:
         """
         key = self._make_key(history_data, issue, algorithm_hash)
 
-        # 写入长期缓存（LFU）
-        self.long_cache.set(key, result, ttl=self.long_ttl)
+        # 修复(20261116): set_prediction 的「容量淘汰+写入+索引更新」复合操作全程持实例锁，防并发竞态
+        with self._lock:
+            # 写入长期缓存（LFU）
+            self.long_cache.set(key, result, ttl=self.long_ttl)
 
-        # 同时写入短期缓存
-        if len(self.short_cache) >= self.max_short:
-            self.short_cache.popitem(last=False)
-        self.short_cache[key] = {
-            'value': result,
-            'exp_at': time.time() + self.short_ttl
-        }
+            # 同时写入短期缓存
+            if len(self.short_cache) >= self.max_short:
+                self.short_cache.popitem(last=False)
+            self.short_cache[key] = {
+                'value': result,
+                'exp_at': time.time() + self.short_ttl
+            }
 
-        # 1.10：维护 issue → keys 映射，供 invalidate 精确清除
-        self._issue_index[issue].add(key)
+            # 1.10：维护 issue → keys 映射，供 invalidate 精确清除
+            self._issue_index[issue].add(key)
 
     def get_ai_response(self, prompt: str) -> Optional[str]:
         """按 prompt 查询已缓存的 AI 响应。
@@ -360,22 +386,24 @@ class PredictionCache:
         1.10：对指定期号，通过 _issue_index 精确清除长期缓存与短期缓存，
         不再依赖字符串模糊匹配（旧实现无法清除长期缓存）。
         """
-        if issue is None:
-            self.short_cache.clear()
-            self.long_cache.clear()
-            self.ai_cache.clear()
-            self._issue_index.clear()
-            logger.info("缓存已清除")
-        else:
-            # 1.10：通过 issue_index 精确查找关联键
-            keys_to_remove = self._issue_index.pop(issue, set())
-            for k in keys_to_remove:
-                if k in self.short_cache:
-                    del self.short_cache[k]
-                # 长期缓存通过 LFULogCache.clear() 全清后重建，
-                # 此处对长期缓存使用 invalidate_by_key（新增方法）
-                self.long_cache.invalidate_key(k)
-            logger.info(f"已清除期号 {issue} 的缓存（共 {len(keys_to_remove)} 条）")
+        # 修复(20261116): invalidate 与 get/set 并发时对 short_cache/_issue_index 的复合删改无锁 — 全程持实例锁
+        with self._lock:
+            if issue is None:
+                self.short_cache.clear()
+                self.long_cache.clear()
+                self.ai_cache.clear()
+                self._issue_index.clear()
+                logger.info("缓存已清除")
+            else:
+                # 1.10：通过 issue_index 精确查找关联键
+                keys_to_remove = self._issue_index.pop(issue, set())
+                for k in keys_to_remove:
+                    if k in self.short_cache:
+                        del self.short_cache[k]
+                    # 长期缓存通过 LFULogCache.clear() 全清后重建，
+                    # 此处对长期缓存使用 invalidate_by_key（新增方法）
+                    self.long_cache.invalidate_key(k)
+                logger.info(f"已清除期号 {issue} 的缓存（共 {len(keys_to_remove)} 条）")
 
     def stats(self) -> Dict:
         """返回三级缓存各自的容量占用情况。

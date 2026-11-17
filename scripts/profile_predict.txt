@@ -1,0 +1,38 @@
+         24642247 function calls (24602493 primitive calls) in 68.100 seconds
+
+   Ordered by: cumulative time
+   List reduced from 5580 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000   68.128   68.128 D:\PythonProject\KPLuckyNumber\modules\predictor.py:1408(predict)
+        1    0.002    0.002   61.107   61.107 D:\PythonProject\KPLuckyNumber\modules\predictor.py:1831(_run_algorithms)
+        1    0.002    0.002   48.996   48.996 D:\PythonProject\KPLuckyNumber\modules\ml_predictor.py:731(predict_next)
+        5    0.041    0.008   44.030    8.806 D:\PythonProject\KPLuckyNumber\modules\ml_predictor.py:834(_train_gbml_model)
+ 3200/100    0.035    0.000   30.959    0.310 D:\anaconda3\Lib\site-packages\sklearn\base.py:1372(wrapper)
+      100    0.002    0.000   30.897    0.309 D:\anaconda3\Lib\site-packages\sklearn\ensemble\_gb.py:611(fit)
+      100    0.022    0.000   30.688    0.307 D:\anaconda3\Lib\site-packages\sklearn\ensemble\_gb.py:812(_fit_stages)
+     3000    0.076    0.000   30.417    0.010 D:\anaconda3\Lib\site-packages\sklearn\ensemble\_gb.py:427(_fit_stage)
+     3000    0.040    0.000   27.030    0.009 D:\anaconda3\Lib\site-packages\sklearn\tree\_classes.py:1374(fit)
+     3000   25.408    0.008   26.990    0.009 D:\anaconda3\Lib\site-packages\sklearn\tree\_classes.py:231(_fit)
+        5    0.000    0.000   17.550    3.510 D:\PythonProject\KPLuckyNumber\modules\ml_predictor.py:1157(_select_features_by_shap)
+        5    0.002    0.000   17.550    3.510 D:\PythonProject\KPLuckyNumber\modules\ml_predictor.py:1274(_sklearn_imports_top_k)
+       50    0.001    0.000   13.478    0.270 D:\PythonProject\KPLuckyNumber\modules\ml_predictor.py:105(_sklearn_gbrt_predict)
+     5295    8.728    0.002   12.936    0.002 D:\PythonProject\KPLuckyNumber\modules\ml_predictor.py:458(_build_feature)
+   1299/6    0.010    0.000    9.924    1.654 <frozen importlib._bootstrap>:1349(_find_and_load)
+   1268/6    0.008    0.000    9.924    1.654 <frozen importlib._bootstrap>:1304(_find_and_load_unlocked)
+   1237/6    0.006    0.000    9.911    1.652 <frozen importlib._bootstrap>:911(_load_unlocked)
+   1023/6    0.004    0.000    9.911    1.652 <frozen importlib._bootstrap_external>:1020(exec_module)
+  3009/12    0.008    0.000    9.886    0.824 <frozen importlib._bootstrap>:480(_call_with_frames_removed)
+   1256/6    0.057    0.000    9.886    1.648 {built-in method builtins.exec}
+        1    0.000    0.000    9.884    9.884 D:\PythonProject\KPLuckyNumber\modules\ml_predictor.py:1(<module>)
+   329/27    0.002    0.000    9.205    0.341 {built-in method builtins.__import__}
+        2    0.000    0.000    9.124    4.562 D:\PythonProject\KPLuckyNumber\modules\predictor.py:1149(_call_ai_model)
+        2    0.000    0.000    9.122    4.561 D:\anaconda3\Lib\site-packages\requests\sessions.py:557(request)
+        2    0.000    0.000    9.107    4.554 D:\anaconda3\Lib\site-packages\requests\sessions.py:752(send)
+        2    0.000    0.000    9.106    4.553 D:\anaconda3\Lib\site-packages\requests\adapters.py:634(send)
+        2    0.000    0.000    9.102    4.551 D:\anaconda3\Lib\site-packages\urllib3\connectionpool.py:592(urlopen)
+        2    0.000    0.000    9.101    4.551 D:\anaconda3\Lib\site-packages\urllib3\connectionpool.py:377(_make_request)
+        1    0.000    0.000    7.840    7.840 D:\anaconda3\Lib\site-packages\sklearn\__init__.py:1(<module>)
+        1    0.000    0.000    7.779    7.779 D:\anaconda3\Lib\site-packages\sklearn\base.py:1(<module>)
+
+

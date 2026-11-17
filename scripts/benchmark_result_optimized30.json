@@ -1,0 +1,29 @@
+{
+  "tag": "optimized30",
+  "timestamp": "2026-11-16T21:05:43.676994",
+  "n_eval": 30,
+  "window": 60,
+  "trials": 150,
+  "top1_hits": 16,
+  "top1_rate": 0.10666666666666667,
+  "top1_ci95": [
+    0.06672979536363804,
+    0.16624750076432737
+  ],
+  "top3_hits": 56,
+  "top3_rate": 0.37333333333333335,
+  "top3_ci95": [
+    0.2999970542949877,
+    0.45299563428859446
+  ],
+  "random_baseline": {
+    "top1": 0.1,
+    "top3": 0.3
+  },
+  "significant_excess_top1": false,
+  "significant_excess_top3": false,
+  "time_mean_s": 14.08659549000028,
+  "time_median_s": 12.398774149998644,
+  "time_p95_s": 19.257629989998527,
+  "time_total_s": 422.59786470000836
+}

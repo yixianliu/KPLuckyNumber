@@ -336,16 +336,26 @@ class P5Database:
     @contextmanager
     def transaction(self):
         """事务上下文管理器"""
+        # 修复(20261116): L339-340 connect() 返回 False 时未校验，self.connection 仍为 None，yield 后 commit() 抛 AttributeError — 连接失败立即抛出明确异常
         if not self.connection:
-            self.connect()
-        
+            if not self.connect():
+                raise RuntimeError('事务启动失败: 数据库连接不可用')
+
         self._in_transaction = True
         try:
             yield self
+            # 修复(20261116): L345 提交前未判空，事务期间连接丢失时 commit() 抛 AttributeError 掩盖真实错误 — 判空并给出明确异常信息
+            if self.connection is None:
+                raise RuntimeError('事务提交失败: 数据库连接已丢失')
             self.connection.commit()
             logger.debug('事务提交成功')
         except Exception as e:
-            self.connection.rollback()
+            # 修复(20261116): L348 回滚前未判空，连接丢失时 rollback() 抛 AttributeError 掩盖原异常 — 判空跳过并记录日志
+            if self.connection is not None:
+                try:
+                    self.connection.rollback()
+                except Exception as rb_err:  # noqa: BLE001
+                    logger.error(f'事务回滚执行异常: {rb_err}')
             logger.error(f'事务回滚: {e}')
             raise
         finally:
@@ -579,7 +589,58 @@ class P5Database:
                     logger.error('重连失败')
                     return None
             raise
-    
+
+    def _batch_upsert(self, sql: str, rows: List[Tuple]) -> Optional[int]:
+        """批量 upsert 辅助：executemany + 连接异常自动重连重试。
+
+        修复(20261116): P1-8 多处「全表 SELECT issue + 逐行 execute」的走势类插入
+        统一收敛到 executemany + ON DUPLICATE KEY UPDATE（依赖各表 uk_issue 唯一索引），
+        本方法提供与 execute_with_reconnect 一致的连接中断重连保护。
+
+        Args:
+            sql: INSERT ... ON DUPLICATE KEY UPDATE 语句（VALUES 子句使用 %s 占位符）
+            rows: 参数元组列表
+
+        Returns:
+            受影响行数（插入计 1 行/更新计 2 行），失败返回 None
+        """
+        # 确保已连接
+        if not self.connection:
+            if not self.connect():
+                return None
+
+        try:
+            return self.cursor.executemany(sql, rows)
+        except (pymysql.err.OperationalError, pymysql.err.InternalError, pymysql.err.InterfaceError) as e:
+            error_code = e.args[0] if e.args else 0
+            error_msg = str(e).lower()
+            # 与 execute_with_reconnect 相同的连接中断错误分类
+            is_connection_error = (
+                error_code == 2006 or
+                error_code == 2013 or
+                "mysql server has gone away" in error_msg or
+                "lost connection" in error_msg or
+                "invalid connection" in error_msg or
+                error_code == 0  # InvalidConnectionError 通常错误码为0
+            )
+            if is_connection_error:
+                logger.warning(f'批量upsert检测到连接异常 (error_code={error_code}), 尝试重连...')
+                if self.cursor:
+                    try:
+                        self.cursor.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if self.connect():
+                    logger.info('重连成功，重试批量upsert...')
+                    try:
+                        return self.cursor.executemany(sql, rows)
+                    except Exception as retry_error:
+                        logger.error(f'重连后批量upsert仍失败: {retry_error}')
+                        return None
+                logger.error('重连失败，批量upsert中止')
+                return None
+            raise
+
     def create_tables(self):
         """创建排列5数据表（完整版）"""
         try:
@@ -1280,45 +1341,61 @@ class P5Database:
     def insert_history_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
         批量插入历史开奖数据（智能去重）
-        
+
+        修复(20261116): L1298-1351 原实现每次全表 SELECT issue 建集合预检（全表
+        扫描开销大）。本版本保留「已有期号跳过 + 新期号插入」的智能去重语义与
+        逐行 execute_with_reconnect（审计钉桩 scripts/tests/test_data_layer_integrity.py::
+        test_insert_history_dedup），仅将预检改为按候选期号的有界 IN 查询
+        （分块 500），增量爬取（通常几条~几百条）下不再扫描全表。
+        注意：不改用 ON DUPLICATE KEY UPDATE——已有期号必须跳过而非更新，
+        避免爬虫重跑覆盖人工修正的历史数据（语义钉桩）。
+
         Args:
             data: 历史数据列表
-        
+
         Returns:
             (成功条数, 跳过条数)
         """
         if not data:
             return 0, 0
-        
+
         success_count = 0
         skip_count = 0
-        
+
         try:
-            # 获取已有期号（使用 execute_with_reconnect 避免连接中断时失败）
-            result = self.execute_with_reconnect('SELECT issue FROM p5_history_data')
-            if result is None:
-                logger.error('获取已有期号失败: 数据库连接不可用')
-                return 0, len(data)
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
+            # 有界预检：仅查询候选期号是否已存在（分块 IN，替代原全表 SELECT issue）
+            candidate_issues = [str(item.get('issue', '')) for item in data
+                                if str(item.get('issue', ''))]
+            existing_issues = set()
+            for i in range(0, len(candidate_issues), 500):
+                chunk = candidate_issues[i:i + 500]
+                placeholders = ','.join(['%s'] * len(chunk))
+                if self.execute_with_reconnect(
+                        f'SELECT issue FROM p5_history_data '
+                        f'WHERE issue IN ({placeholders})', chunk) is None:
+                    logger.error('获取已有期号失败: 数据库连接不可用')
+                    return 0, len(data)
+                existing_issues.update(
+                    row['issue'] if isinstance(row, dict) else row[0]
+                    for row in self.cursor.fetchall())
             sql = '''
-            INSERT INTO p5_history_data 
-            (issue, draw_date, wan, qian, bai, shi, ge, hezhi, span, 
+            INSERT INTO p5_history_data
+            (issue, draw_date, wan, qian, bai, shi, ge, hezhi, span,
              odd_even_ratio, odd_even_pattern, big_small_ratio, source)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             '''
-            
+
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue or issue in existing_issues:
                     skip_count += 1
                     continue
-                
+
                 numbers = item.get('numbers', [])
                 if len(numbers) != 5:
                     skip_count += 1
                     continue
-                
+
                 # 数据校验
                 try:
                     wan, qian, bai, shi, ge = [int(n) for n in numbers]
@@ -1328,17 +1405,17 @@ class P5Database:
                 except (ValueError, TypeError):
                     skip_count += 1
                     continue
-                
+
                 hezhi = sum([wan, qian, bai, shi, ge])
                 span = max([wan, qian, bai, shi, ge]) - min([wan, qian, bai, shi, ge])
-                
+
                 odd_count = sum(1 for n in [wan, qian, bai, shi, ge] if n % 2 == 1)
                 odd_even_ratio = f"{odd_count}:{5-odd_count}"
                 odd_even_pattern = ''.join(['奇' if n % 2 == 1 else '偶' for n in [wan, qian, bai, shi, ge]])
-                
+
                 big_count = sum(1 for n in [wan, qian, bai, shi, ge] if n >= 5)
                 big_small_ratio = f"{big_count}:{5-big_count}"
-                
+
                 params = (
                     issue, item.get('date', ''), wan, qian, bai, shi, ge,
                     hezhi, span, odd_even_ratio, odd_even_pattern, big_small_ratio,
@@ -1349,7 +1426,7 @@ class P5Database:
                     skip_count += 1
                     continue
                 success_count += 1
-            
+
             self.connection.commit()
             logger.info(f'历史数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
@@ -1360,7 +1437,8 @@ class P5Database:
     def get_latest_history_issue(self) -> Optional[str]:
         """获取数据库中最新的历史开奖期号"""
         try:
-            sql = 'SELECT issue FROM p5_history_data ORDER BY issue DESC LIMIT 1'
+            # 修复(20261116): L1363 issue 为 VARCHAR 直接 ORDER BY 是字典序，脏期号会错序 — 改为 CAST 数值序（与 get_pending_predictions 一致），DESC 保持不变
+            sql = 'SELECT issue FROM p5_history_data ORDER BY CAST(issue AS UNSIGNED) DESC LIMIT 1'
             self.cursor.execute(sql)
             result = self.cursor.fetchone()
             return result['issue'] if result else None
@@ -1465,6 +1543,8 @@ class P5Database:
     
     def get_history_count(self) -> int:
         """获取历史数据总条数"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_history_count')
         try:
             self.cursor.execute('SELECT COUNT(*) as count FROM p5_history_data WHERE is_valid = 1')
             result = self.cursor.fetchone()
@@ -1488,65 +1568,75 @@ class P5Database:
     
     def insert_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        批量插入走势数据（智能去重）
-        
+        批量插入走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）
+
+        修复(20261116): L1507 原实现全表 SELECT issue 预检 + 逐行 execute —
+        改为 executemany + ON DUPLICATE KEY UPDATE（p5_trend_data 存在 uk_issue 唯一索引），
+        删除全表扫描。
+
         Args:
             data: 走势数据列表
-        
+
         Returns:
-            (成功条数, 跳过条数)
+            (插入/更新条数, 跳过条数)
         """
         if not data:
             return 0, 0
-        
+
         success_count = 0
         skip_count = 0
-        
+
         try:
-            # 获取已有期号（使用 execute_with_reconnect 避免连接中断时失败）
-            result = self.execute_with_reconnect('SELECT issue FROM p5_trend_data')
-            if result is None:
-                logger.error('获取已有期号失败: 数据库连接不可用')
-                return 0, len(data)
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
-            sql = '''
-            INSERT INTO p5_trend_data 
-            (issue, wan, qian, bai, shi, ge, hezhi, odd_even_ratio, 
-             big_small_ratio, prime_composite_ratio, trend_json)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            '''
-            
+            rows = []
             for item in data:
                 issue = str(item.get('issue', ''))
-                if not issue or issue in existing_issues:
+                if not issue:
                     skip_count += 1
                     continue
-                
+
                 trend = item.get('trend', {})
                 numbers = item.get('numbers', [])
-                
+
                 wan = int(trend.get('wan', numbers[0] if numbers else 0))
                 qian = int(trend.get('qian', numbers[1] if len(numbers) > 1 else 0))
                 bai = int(trend.get('bai', numbers[2] if len(numbers) > 2 else 0))
                 shi = int(trend.get('shi', numbers[3] if len(numbers) > 3 else 0))
                 ge = int(trend.get('ge', numbers[4] if len(numbers) > 4 else 0))
-                
-                params = (
+
+                rows.append((
                     issue, wan, qian, bai, shi, ge,
                     item.get('hezhi', ''),
                     item.get('odd_even_ratio', ''),
                     item.get('big_small_ratio', ''),
                     item.get('prime_composite_ratio', ''),
                     json.dumps(item, ensure_ascii=False)
-                )
-                if self.execute_with_reconnect(sql, params) is None:
-                    logger.error(f'插入走势数据失败: issue={issue}, 连接异常')
-                    skip_count += 1
-                    continue
-                success_count += 1
-            
-            self.connection.commit()
+                ))
+
+            if rows:
+                sql = '''
+                INSERT INTO p5_trend_data
+                (issue, wan, qian, bai, shi, ge, hezhi, odd_even_ratio,
+                 big_small_ratio, prime_composite_ratio, trend_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    wan = VALUES(wan),
+                    qian = VALUES(qian),
+                    bai = VALUES(bai),
+                    shi = VALUES(shi),
+                    ge = VALUES(ge),
+                    hezhi = VALUES(hezhi),
+                    odd_even_ratio = VALUES(odd_even_ratio),
+                    big_small_ratio = VALUES(big_small_ratio),
+                    prime_composite_ratio = VALUES(prime_composite_ratio),
+                    trend_json = VALUES(trend_json)
+                '''
+                affected = self._batch_upsert(sql, rows)
+                if affected is None:
+                    logger.error('走势数据批量插入失败: 数据库连接不可用')
+                    return 0, len(data)
+                success_count = affected
+                self.connection.commit()
+
             logger.info(f'走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
@@ -1694,6 +1784,8 @@ class P5Database:
     
     def get_report_count(self) -> int:
         """获取AI分析报告总数"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_report_count')
         try:
             self.cursor.execute('SELECT COUNT(*) as count FROM p5_ai_report')
             result = self.cursor.fetchone()
@@ -1866,7 +1958,7 @@ class P5Database:
                     1 if matched else 0, tolerance_hit, dev_val, confidence
                 ))
             
-            self.connection.commit()
+            # 修复(20261116): L1869 明细写入后提前 commit、UPDATE 后二次 commit，UPDATE 失败时明细已落库且重试会重复堆积 — 两段写入合并为单事务，commit 只保留最后一次
             logger.info(f'验证详情已写入p5_verification_detail表: 期号{target_issue}')
             
             sql = '''
@@ -1918,9 +2010,15 @@ class P5Database:
                 'match_details': match_details
             }
         except Exception as e:
+            # 修复(20261116): L1930 异常时未回滚，明细 INSERT 与主记录 UPDATE 可能残留半提交状态被后续操作意外提交 — 统一回滚保证原子性
+            if self.connection is not None:
+                try:
+                    self.connection.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
             logger.error(f'更新预测验证失败: {e}')
             return {'status': 'error', 'message': str(e)}
-    
+
     def get_pending_predictions(self, limit: Optional[int] = 500) -> List[Dict[str, Any]]:
         """获取待验证的预测记录（按数值期号倒序）
 
@@ -2211,352 +2309,56 @@ class P5Database:
             return []
     
     # ============================================================
-    # 万位走势数据操作
+    # 五组分位走势（wan/qian/bai/shi/ge）参数化公共实现
     # ============================================================
-    
-    def insert_wan_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
-        """
-        批量插入万位走势数据（智能去重）
-        
+    # 结构清理(20261116): 万/千/百/十/个五组 insert/get/count/by_issue/number_stats
+    # 共 25 个方法为纯复制粘贴（仅表名、号码字段名与中文标签不同）— 收敛到类级
+    # 映射 _TREND_TABLES + 参数化私有实现；公开方法保留原签名/docstring/返回值
+    # 语义，一行委托。批量实现基准沿用修复(20261116) 的 executemany +
+    # ON DUPLICATE KEY UPDATE（经 _batch_upsert 获得连接中断重连保护）。
+
+    # 表名 / 号码字段 / 中文标签 映射（表名与 modules.database_utils.ALLOWED_TABLES 白名单一致）
+    _TREND_TABLES = {
+        'wan': ('p5_wan_trend_data', 'wan_number', '万位'),
+        'qian': ('p5_qian_trend_data', 'qian_number', '千位'),
+        'bai': ('p5_bai_trend_data', 'bai_number', '百位'),
+        'shi': ('p5_shi_trend_data', 'shi_number', '十位'),
+        'ge': ('p5_ge_trend_data', 'ge_number', '个位'),
+    }
+
+    def _trend_insert(self, pos: str, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """五组 insert_{pos}_trend_data 的公共实现（executemany + ON DUPLICATE KEY UPDATE 幂等 upsert）。
+
         Args:
-            data: 万位走势数据列表
-        
+            pos: 位置标识（wan/qian/bai/shi/ge），查 _TREND_TABLES 映射
+            data: 分位走势数据列表
+
         Returns:
-            (成功条数, 跳过条数)
+            (插入/更新条数, 跳过条数)；数据库连接不可用等整体失败返回 (0, len(data))
         """
         if not data:
             return 0, 0
 
+        table, number_col, label = self._TREND_TABLES[pos]
+
         success_count = 0
         skip_count = 0
         try:
-            # 使用 execute_with_reconnect 自动处理连接超时重连
-            result = self.execute_with_reconnect('SELECT issue FROM p5_wan_trend_data')
-            if result is None:
-                logger.error('获取万位已有期号失败: 数据库连接不可用')
-                return 0, len(data)
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-
-            sql = '''
-            INSERT INTO p5_wan_trend_data
-            (issue, wan_number, draw_date, is_odd, is_big, is_prime,
-             omission, hot_level, consecutive_count, trend_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                wan_number = VALUES(wan_number),
-                draw_date = VALUES(draw_date),
-                is_odd = VALUES(is_odd),
-                is_big = VALUES(is_big),
-                is_prime = VALUES(is_prime),
-                omission = VALUES(omission),
-                hot_level = VALUES(hot_level),
-                consecutive_count = VALUES(consecutive_count),
-                trend_json = VALUES(trend_json),
-                source = VALUES(source)
-            '''
-
-            insert_errors = []
+            rows = []
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
                     skip_count += 1
                     continue
-                if issue in existing_issues:
+
+                number = item.get(number_col, 0)
+                if not (0 <= number <= 9):
                     skip_count += 1
                     continue
 
-                wan_number = item.get('wan_number', 0)
-                if not (0 <= wan_number <= 9):
-                    skip_count += 1
-                    continue
-
-                params = (
+                rows.append((
                     issue,
-                    wan_number,
-                    item.get('draw_date', ''),
-                    item.get('is_odd', None),
-                    item.get('is_big', None),
-                    item.get('is_prime', None),
-                    item.get('omission', 0),
-                    item.get('hot_level', ''),
-                    item.get('consecutive_count', 0),
-                    json.dumps(item, ensure_ascii=False),
-                    item.get('source', 'china_lottery')
-                )
-                if self.execute_with_reconnect(sql, params) is None:
-                    logger.error(f'插入万位走势数据失败: issue={issue}, 连接异常')
-                    skip_count += 1
-                    continue
-                success_count += 1
-            if insert_errors:
-                logger.warning(f'万位走势数据部分插入失败, 失败期号示例: {insert_errors[:5]}')
-            self.connection.commit()
-            logger.info(f'万位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
-            return success_count, skip_count
-        except Exception as e:
-            logger.error(f'插入万位走势数据失败: {type(e).__name__}: {e}')
-            return 0, len(data)
-    
-    def get_wan_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        """获取万位走势数据"""
-        try:
-            sql = 'SELECT * FROM p5_wan_trend_data ORDER BY issue DESC LIMIT %s'
-            self.cursor.execute(sql, (limit,))
-            return self.cursor.fetchall()
-        except Exception as e:
-            logger.error(f'获取万位走势数据失败: {e}')
-            return []
-    
-    def get_wan_trend_count(self) -> int:
-        """获取万位走势数据总条数"""
-        try:
-            self.cursor.execute('SELECT COUNT(*) as count FROM p5_wan_trend_data')
-            result = self.cursor.fetchone()
-            return result.get('count', 0) if result else 0
-        except Exception as e:
-            logger.error(f'获取万位走势数据总数失败: {e}')
-            return 0
-    
-    def get_wan_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
-        """根据期号获取万位走势数据"""
-        try:
-            self.cursor.execute('SELECT * FROM p5_wan_trend_data WHERE issue = %s', (issue,))
-            return self.cursor.fetchone()
-        except Exception as e:
-            logger.error(f'根据期号获取万位走势数据失败: {e}')
-            return None
-    
-    def get_wan_number_stats(self) -> Dict[str, Any]:
-        """获取万位数字统计信息"""
-        try:
-            sql = '''
-            SELECT 
-                wan_number,
-                COUNT(*) as count,
-                AVG(omission) as avg_omission,
-                MIN(omission) as min_omission,
-                MAX(omission) as max_omission
-            FROM p5_wan_trend_data
-            GROUP BY wan_number
-            ORDER BY count DESC
-            '''
-            self.cursor.execute(sql)
-            results = self.cursor.fetchall()
-            
-            stats = {}
-            for row in results:
-                stats[row['wan_number']] = {
-                    'count': row['count'],
-                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
-                    'min_omission': row['min_omission'],
-                    'max_omission': row['max_omission']
-                }
-            
-            return stats
-        except Exception as e:
-            logger.error(f'获取万位数字统计失败: {e}')
-            return {}
-    
-    # ============================================================
-    # 千位走势数据操作
-    # ============================================================
-    
-    def insert_qian_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
-        """
-        批量插入千位走势数据（智能去重）
-        
-        Args:
-            data: 千位走势数据列表
-        
-        Returns:
-            (成功条数, 跳过条数)
-        """
-        if not data:
-            return 0, 0
-
-        success_count = 0
-        skip_count = 0
-        try:
-            # 使用 execute_with_reconnect 自动处理连接超时重连
-            result = self.execute_with_reconnect('SELECT issue FROM p5_qian_trend_data')
-            if result is None:
-                logger.error('获取千位已有期号失败: 数据库连接不可用')
-                return 0, len(data)
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-
-            sql = '''
-            INSERT INTO p5_qian_trend_data
-            (issue, qian_number, draw_date, is_odd, is_big, is_prime,
-             omission, hot_level, consecutive_count, trend_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                qian_number = VALUES(qian_number),
-                draw_date = VALUES(draw_date),
-                is_odd = VALUES(is_odd),
-                is_big = VALUES(is_big),
-                is_prime = VALUES(is_prime),
-                omission = VALUES(omission),
-                hot_level = VALUES(hot_level),
-                consecutive_count = VALUES(consecutive_count),
-                trend_json = VALUES(trend_json),
-                source = VALUES(source)
-            '''
-
-            for item in data:
-                issue = str(item.get('issue', ''))
-                if not issue:
-                    skip_count += 1
-                    continue
-                if issue in existing_issues:
-                    skip_count += 1
-                    continue
-
-                qian_number = item.get('qian_number', 0)
-                if not (0 <= qian_number <= 9):
-                    skip_count += 1
-                    continue
-
-                params = (
-                    issue,
-                    qian_number,
-                    item.get('draw_date', ''),
-                    item.get('is_odd', None),
-                    item.get('is_big', None),
-                    item.get('is_prime', None),
-                    item.get('omission', 0),
-                    item.get('hot_level', ''),
-                    item.get('consecutive_count', 0),
-                    json.dumps(item, ensure_ascii=False),
-                    item.get('source', 'china_lottery')
-                )
-                if self.execute_with_reconnect(sql, params) is None:
-                    logger.error(f'插入千位走势数据失败: issue={issue}, 连接异常')
-                    skip_count += 1
-                    continue
-                success_count += 1
-            self.connection.commit()
-            logger.info(f'千位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
-            return success_count, skip_count
-        except Exception as e:
-            logger.error(f'插入千位走势数据失败: {type(e).__name__}: {e}')
-            return 0, len(data)
-    
-    def get_qian_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        """获取千位走势数据"""
-        try:
-            sql = 'SELECT * FROM p5_qian_trend_data ORDER BY issue DESC LIMIT %s'
-            self.cursor.execute(sql, (limit,))
-            return self.cursor.fetchall()
-        except Exception as e:
-            logger.error(f'获取千位走势数据失败: {e}')
-            return []
-    
-    def get_qian_trend_count(self) -> int:
-        """获取千位走势数据总条数"""
-        try:
-            self.cursor.execute('SELECT COUNT(*) as count FROM p5_qian_trend_data')
-            result = self.cursor.fetchone()
-            return result.get('count', 0) if result else 0
-        except Exception as e:
-            logger.error(f'获取千位走势数据总数失败: {e}')
-            return 0
-    
-    def get_qian_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
-        """根据期号获取千位走势数据"""
-        try:
-            self.cursor.execute('SELECT * FROM p5_qian_trend_data WHERE issue = %s', (issue,))
-            return self.cursor.fetchone()
-        except Exception as e:
-            logger.error(f'根据期号获取千位走势数据失败: {e}')
-            return None
-    
-    def get_qian_number_stats(self) -> Dict[str, Any]:
-        """获取千位数字统计信息"""
-        try:
-            sql = '''
-            SELECT 
-                qian_number,
-                COUNT(*) as count,
-                AVG(omission) as avg_omission,
-                MIN(omission) as min_omission,
-                MAX(omission) as max_omission
-            FROM p5_qian_trend_data
-            GROUP BY qian_number
-            ORDER BY count DESC
-            '''
-            self.cursor.execute(sql)
-            results = self.cursor.fetchall()
-            
-            stats = {}
-            for row in results:
-                stats[row['qian_number']] = {
-                    'count': row['count'],
-                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
-                    'min_omission': row['min_omission'],
-                    'max_omission': row['max_omission']
-                }
-            
-            return stats
-        except Exception as e:
-            logger.error(f'获取千位数字统计失败: {e}')
-            return {}
-    
-    # ============================================================
-    # 百位走势数据操作
-    # ============================================================
-    
-    def insert_bai_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
-        """
-        批量插入百位走势数据（智能去重）
-        
-        Args:
-            data: 百位走势数据列表
-        
-        Returns:
-            (成功条数, 跳过条数)
-        """
-        if not data:
-            return 0, 0
-        
-        success_count = 0
-        skip_count = 0
-        
-        try:
-            self.cursor.execute('SELECT issue FROM p5_bai_trend_data')
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
-            sql = '''
-            INSERT INTO p5_bai_trend_data 
-            (issue, bai_number, draw_date, is_odd, is_big, is_prime, 
-             omission, hot_level, consecutive_count, trend_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                bai_number = VALUES(bai_number),
-                draw_date = VALUES(draw_date),
-                is_odd = VALUES(is_odd),
-                is_big = VALUES(is_big),
-                is_prime = VALUES(is_prime),
-                omission = VALUES(omission),
-                hot_level = VALUES(hot_level),
-                consecutive_count = VALUES(consecutive_count),
-                trend_json = VALUES(trend_json),
-                source = VALUES(source)
-            '''
-            
-            for item in data:
-                issue = str(item.get('issue', ''))
-                if not issue:
-                    skip_count += 1
-                    continue
-                
-                bai_number = item.get('bai_number', 0)
-                if not (0 <= bai_number <= 9):
-                    skip_count += 1
-                    continue
-                
-                self.cursor.execute(sql, (
-                    issue,
-                    bai_number,
+                    number,
                     item.get('draw_date', ''),
                     item.get('is_odd', None),
                     item.get('is_big', None),
@@ -2567,74 +2369,247 @@ class P5Database:
                     json.dumps(item, ensure_ascii=False),
                     item.get('source', 'china_lottery')
                 ))
-                success_count += 1
-            
-            self.connection.commit()
-            logger.info(f'百位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
+
+            if rows:
+                sql = f'''
+                INSERT INTO {table}
+                (issue, {number_col}, draw_date, is_odd, is_big, is_prime,
+                 omission, hot_level, consecutive_count, trend_json, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    {number_col} = VALUES({number_col}),
+                    draw_date = VALUES(draw_date),
+                    is_odd = VALUES(is_odd),
+                    is_big = VALUES(is_big),
+                    is_prime = VALUES(is_prime),
+                    omission = VALUES(omission),
+                    hot_level = VALUES(hot_level),
+                    consecutive_count = VALUES(consecutive_count),
+                    trend_json = VALUES(trend_json),
+                    source = VALUES(source)
+                '''
+                affected = self._batch_upsert(sql, rows)
+                if affected is None:
+                    logger.error(f'{label}走势数据批量插入失败: 数据库连接不可用')
+                    return 0, len(data)
+                success_count = affected
+                self.connection.commit()
+            logger.info(f'{label}走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
-            logger.error(f'插入百位走势数据失败: {e}')
+            logger.error(f'插入{label}走势数据失败: {type(e).__name__}: {e}')
             return 0, len(data)
-    
-    def get_bai_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        """获取百位走势数据"""
+
+    def _trend_query(self, pos: str, limit: int) -> List[Dict[str, Any]]:
+        """五组 get_{pos}_trend_data 的公共实现（issue CAST 数值序倒排）。"""
+        table, _, label = self._TREND_TABLES[pos]
         try:
-            sql = 'SELECT * FROM p5_bai_trend_data ORDER BY issue DESC LIMIT %s'
+            # 修复(20261116): issue 为 VARCHAR 直接 ORDER BY 是字典序 — 改为 CAST 数值序，DESC 保持不变
+            sql = f'SELECT * FROM {table} ORDER BY CAST(issue AS UNSIGNED) DESC LIMIT %s'
             self.cursor.execute(sql, (limit,))
             return self.cursor.fetchall()
         except Exception as e:
-            logger.error(f'获取百位走势数据失败: {e}')
+            logger.error(f'获取{label}走势数据失败: {e}')
             return []
-    
-    def get_bai_trend_count(self) -> int:
-        """获取百位走势数据总条数"""
+
+    def _trend_count(self, pos: str) -> int:
+        """五组 get_{pos}_trend_count 的公共实现。"""
+        table, _, label = self._TREND_TABLES[pos]
         try:
-            self.cursor.execute('SELECT COUNT(*) as count FROM p5_bai_trend_data')
+            self.cursor.execute(f'SELECT COUNT(*) as count FROM {table}')
             result = self.cursor.fetchone()
             return result.get('count', 0) if result else 0
         except Exception as e:
-            logger.error(f'获取百位走势数据总数失败: {e}')
+            logger.error(f'获取{label}走势数据总数失败: {e}')
             return 0
-    
-    def get_bai_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
-        """根据期号获取百位走势数据"""
+
+    def _trend_by_issue(self, pos: str, issue: str) -> Optional[Dict[str, Any]]:
+        """五组 get_{pos}_trend_by_issue 的公共实现。"""
+        table, _, label = self._TREND_TABLES[pos]
         try:
-            self.cursor.execute('SELECT * FROM p5_bai_trend_data WHERE issue = %s', (issue,))
+            self.cursor.execute(f'SELECT * FROM {table} WHERE issue = %s', (issue,))
             return self.cursor.fetchone()
         except Exception as e:
-            logger.error(f'根据期号获取百位走势数据失败: {e}')
+            logger.error(f'根据期号获取{label}走势数据失败: {e}')
             return None
-    
-    def get_bai_number_stats(self) -> Dict[str, Any]:
-        """获取百位数字统计信息"""
+
+    def _trend_number_stats(self, pos: str) -> Dict[str, Any]:
+        """五组 get_{pos}_number_stats 的公共实现（按号码聚合遗漏统计）。"""
+        table, number_col, label = self._TREND_TABLES[pos]
         try:
-            sql = '''
-            SELECT 
-                bai_number,
+            sql = f'''
+            SELECT
+                {number_col},
                 COUNT(*) as count,
                 AVG(omission) as avg_omission,
                 MIN(omission) as min_omission,
                 MAX(omission) as max_omission
-            FROM p5_bai_trend_data
-            GROUP BY bai_number
+            FROM {table}
+            GROUP BY {number_col}
             ORDER BY count DESC
             '''
             self.cursor.execute(sql)
             results = self.cursor.fetchall()
-            
+
             stats = {}
             for row in results:
-                stats[row['bai_number']] = {
+                stats[row[number_col]] = {
                     'count': row['count'],
                     'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
                     'min_omission': row['min_omission'],
                     'max_omission': row['max_omission']
                 }
-            
+
             return stats
         except Exception as e:
-            logger.error(f'获取百位数字统计失败: {e}')
+            logger.error(f'获取{label}数字统计失败: {e}')
             return {}
+
+    # ============================================================
+    # 万位走势数据操作
+    # ============================================================
+
+    def insert_wan_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入万位走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）
+
+        修复(20261116): L2234 原实现全表 SELECT issue 预检 + 逐行 execute，且
+        L2258 定义的 insert_errors 从未 append（告警分支永不触发的死变量）—
+        改为 executemany + ON DUPLICATE KEY UPDATE，删除全表扫描与死变量。
+
+        Args:
+            data: 万位走势数据列表
+
+        Returns:
+            (插入/更新条数, 跳过条数)
+        """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'insert_wan_trend_data')
+        # 结构清理(20261116): 与千/百/十/个四组方法纯复制粘贴 — 收敛为 _trend_insert 一行委托，签名与返回值语义不变
+        return self._trend_insert('wan', data)
+
+    def get_wan_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取万位走势数据"""
+        # 结构清理(20261116): 五组分位查询纯复制粘贴 — 委托 _trend_query（issue CAST 数值序语义不变）
+        return self._trend_query('wan', limit)
+
+    def get_wan_trend_count(self) -> int:
+        """获取万位走势数据总条数"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_wan_trend_count')
+        # 结构清理(20261116): 五组分位计数纯复制粘贴 — 委托 _trend_count
+        return self._trend_count('wan')
+
+    def get_wan_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取万位走势数据"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_wan_trend_by_issue')
+        # 结构清理(20261116): 五组分位按期号查询纯复制粘贴 — 委托 _trend_by_issue
+        return self._trend_by_issue('wan', issue)
+
+    def get_wan_number_stats(self) -> Dict[str, Any]:
+        """获取万位数字统计信息"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_wan_number_stats')
+        # 结构清理(20261116): 五组分位统计纯复制粘贴 — 委托 _trend_number_stats
+        return self._trend_number_stats('wan')
+    
+    # ============================================================
+    # 千位走势数据操作
+    # ============================================================
+    
+    def insert_qian_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入千位走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）
+
+        修复(20261116): L2381 原实现全表 SELECT issue 预检 + 逐行 execute —
+        改为 executemany + ON DUPLICATE KEY UPDATE，删除全表扫描。
+
+        Args:
+            data: 千位走势数据列表
+
+        Returns:
+            (插入/更新条数, 跳过条数)
+        """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'insert_qian_trend_data')
+        # 结构清理(20261116): 与万/百/十/个四组方法纯复制粘贴 — 收敛为 _trend_insert 一行委托，签名与返回值语义不变
+        return self._trend_insert('qian', data)
+
+    def get_qian_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取千位走势数据"""
+        # 结构清理(20261116): 五组分位查询纯复制粘贴 — 委托 _trend_query（issue CAST 数值序语义不变）
+        return self._trend_query('qian', limit)
+
+    def get_qian_trend_count(self) -> int:
+        """获取千位走势数据总条数"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_qian_trend_count')
+        # 结构清理(20261116): 五组分位计数纯复制粘贴 — 委托 _trend_count
+        return self._trend_count('qian')
+
+    def get_qian_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取千位走势数据"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_qian_trend_by_issue')
+        # 结构清理(20261116): 五组分位按期号查询纯复制粘贴 — 委托 _trend_by_issue
+        return self._trend_by_issue('qian', issue)
+
+    def get_qian_number_stats(self) -> Dict[str, Any]:
+        """获取千位数字统计信息"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_qian_number_stats')
+        # 结构清理(20261116): 五组分位统计纯复制粘贴 — 委托 _trend_number_stats
+        return self._trend_number_stats('qian')
+    
+    # ============================================================
+    # 百位走势数据操作
+    # ============================================================
+    
+    def insert_bai_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        批量插入百位走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）
+
+        修复(20261116): L2525 原实现裸 self.cursor.execute 全表预检（无重连保护，
+        与 wan/qian/shi/ge 版本不一致）+ L2557 裸 cursor 逐行插入 — 统一改为
+        executemany + ON DUPLICATE KEY UPDATE（经 _batch_upsert 获得重连保护）。
+
+        Args:
+            data: 百位走势数据列表
+
+        Returns:
+            (插入/更新条数, 跳过条数)
+        """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'insert_bai_trend_data')
+        # 结构清理(20261116): 与万/千/十/个四组方法纯复制粘贴 — 收敛为 _trend_insert 一行委托，签名与返回值语义不变
+        return self._trend_insert('bai', data)
+
+    def get_bai_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """获取百位走势数据"""
+        # 结构清理(20261116): 五组分位查询纯复制粘贴 — 委托 _trend_query（issue CAST 数值序语义不变）
+        return self._trend_query('bai', limit)
+
+    def get_bai_trend_count(self) -> int:
+        """获取百位走势数据总条数"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_bai_trend_count')
+        # 结构清理(20261116): 五组分位计数纯复制粘贴 — 委托 _trend_count
+        return self._trend_count('bai')
+
+    def get_bai_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
+        """根据期号获取百位走势数据"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_bai_trend_by_issue')
+        # 结构清理(20261116): 五组分位按期号查询纯复制粘贴 — 委托 _trend_by_issue
+        return self._trend_by_issue('bai', issue)
+
+    def get_bai_number_stats(self) -> Dict[str, Any]:
+        """获取百位数字统计信息"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_bai_number_stats')
+        # 结构清理(20261116): 五组分位统计纯复制粘贴 — 委托 _trend_number_stats
+        return self._trend_number_stats('bai')
     
     # ============================================================
     # 十位走势数据操作
@@ -2642,143 +2617,47 @@ class P5Database:
     
     def insert_shi_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        批量插入十位走势数据（智能去重）
-        
+        批量插入十位走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）
+
+        修复(20261116): L2660 原实现全表 SELECT issue 预检 + 逐行 execute —
+        改为 executemany + ON DUPLICATE KEY UPDATE，删除全表扫描。
+
         Args:
             data: 十位走势数据列表
-        
+
         Returns:
-            (成功条数, 跳过条数)
+            (插入/更新条数, 跳过条数)
         """
-        if not data:
-            return 0, 0
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'insert_shi_trend_data')
+        # 结构清理(20261116): 与万/千/百/个四组方法纯复制粘贴 — 收敛为 _trend_insert 一行委托，签名与返回值语义不变
+        return self._trend_insert('shi', data)
 
-        success_count = 0
-        skip_count = 0
-        try:
-            # 使用 execute_with_reconnect 自动处理连接超时重连
-            result = self.execute_with_reconnect('SELECT issue FROM p5_shi_trend_data')
-            if result is None:
-                logger.error('获取十位已有期号失败: 数据库连接不可用')
-                return 0, len(data)
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-
-            sql = '''
-            INSERT INTO p5_shi_trend_data
-            (issue, shi_number, draw_date, is_odd, is_big, is_prime,
-             omission, hot_level, consecutive_count, trend_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                shi_number = VALUES(shi_number),
-                draw_date = VALUES(draw_date),
-                is_odd = VALUES(is_odd),
-                is_big = VALUES(is_big),
-                is_prime = VALUES(is_prime),
-                omission = VALUES(omission),
-                hot_level = VALUES(hot_level),
-                consecutive_count = VALUES(consecutive_count),
-                trend_json = VALUES(trend_json),
-                source = VALUES(source)
-            '''
-
-            for item in data:
-                issue = str(item.get('issue', ''))
-                if not issue:
-                    skip_count += 1
-                    continue
-                if issue in existing_issues:
-                    skip_count += 1
-                    continue
-
-                shi_number = item.get('shi_number', 0)
-                if not (0 <= shi_number <= 9):
-                    skip_count += 1
-                    continue
-
-                params = (
-                    issue,
-                    shi_number,
-                    item.get('draw_date', ''),
-                    item.get('is_odd', None),
-                    item.get('is_big', None),
-                    item.get('is_prime', None),
-                    item.get('omission', 0),
-                    item.get('hot_level', ''),
-                    item.get('consecutive_count', 0),
-                    json.dumps(item, ensure_ascii=False),
-                    item.get('source', 'china_lottery')
-                )
-                if self.execute_with_reconnect(sql, params) is None:
-                    logger.error(f'插入十位走势数据失败: issue={issue}, 连接异常')
-                    skip_count += 1
-                    continue
-                success_count += 1
-            self.connection.commit()
-            logger.info(f'十位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
-            return success_count, skip_count
-        except Exception as e:
-            logger.error(f'插入十位走势数据失败: {type(e).__name__}: {e}')
-            return 0, len(data)
-    
     def get_shi_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
         """获取十位走势数据"""
-        try:
-            sql = 'SELECT * FROM p5_shi_trend_data ORDER BY issue DESC LIMIT %s'
-            self.cursor.execute(sql, (limit,))
-            return self.cursor.fetchall()
-        except Exception as e:
-            logger.error(f'获取十位走势数据失败: {e}')
-            return []
-    
+        # 结构清理(20261116): 五组分位查询纯复制粘贴 — 委托 _trend_query（issue CAST 数值序语义不变）
+        return self._trend_query('shi', limit)
+
     def get_shi_trend_count(self) -> int:
         """获取十位走势数据总条数"""
-        try:
-            self.cursor.execute('SELECT COUNT(*) as count FROM p5_shi_trend_data')
-            result = self.cursor.fetchone()
-            return result.get('count', 0) if result else 0
-        except Exception as e:
-            logger.error(f'获取十位走势数据总数失败: {e}')
-            return 0
-    
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_shi_trend_count')
+        # 结构清理(20261116): 五组分位计数纯复制粘贴 — 委托 _trend_count
+        return self._trend_count('shi')
+
     def get_shi_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
         """根据期号获取十位走势数据"""
-        try:
-            self.cursor.execute('SELECT * FROM p5_shi_trend_data WHERE issue = %s', (issue,))
-            return self.cursor.fetchone()
-        except Exception as e:
-            logger.error(f'根据期号获取十位走势数据失败: {e}')
-            return None
-    
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_shi_trend_by_issue')
+        # 结构清理(20261116): 五组分位按期号查询纯复制粘贴 — 委托 _trend_by_issue
+        return self._trend_by_issue('shi', issue)
+
     def get_shi_number_stats(self) -> Dict[str, Any]:
         """获取十位数字统计信息"""
-        try:
-            sql = '''
-            SELECT 
-                shi_number,
-                COUNT(*) as count,
-                AVG(omission) as avg_omission,
-                MIN(omission) as min_omission,
-                MAX(omission) as max_omission
-            FROM p5_shi_trend_data
-            GROUP BY shi_number
-            ORDER BY count DESC
-            '''
-            self.cursor.execute(sql)
-            results = self.cursor.fetchall()
-            
-            stats = {}
-            for row in results:
-                stats[row['shi_number']] = {
-                    'count': row['count'],
-                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
-                    'min_omission': row['min_omission'],
-                    'max_omission': row['max_omission']
-                }
-            
-            return stats
-        except Exception as e:
-            logger.error(f'获取十位数字统计失败: {e}')
-            return {}
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_shi_number_stats')
+        # 结构清理(20261116): 五组分位统计纯复制粘贴 — 委托 _trend_number_stats
+        return self._trend_number_stats('shi')
     
     # ============================================================
     # 个位走势数据操作
@@ -2786,112 +2665,40 @@ class P5Database:
     
     def insert_ge_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        批量插入个位走势数据（智能去重）
-        
+        批量插入个位走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）
+
+        修复(20261116): L2804 原实现全表 SELECT issue 预检 + 逐行 execute —
+        改为 executemany + ON DUPLICATE KEY UPDATE，删除全表扫描。
+
         Args:
             data: 个位走势数据列表
-        
+
         Returns:
-            (成功条数, 跳过条数)
+            (插入/更新条数, 跳过条数)
         """
-        if not data:
-            return 0, 0
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'insert_ge_trend_data')
+        # 结构清理(20261116): 与万/千/百/十四组方法纯复制粘贴 — 收敛为 _trend_insert 一行委托，签名与返回值语义不变
+        return self._trend_insert('ge', data)
 
-        success_count = 0
-        skip_count = 0
-        try:
-            # 使用 execute_with_reconnect 自动处理连接超时重连
-            result = self.execute_with_reconnect('SELECT issue FROM p5_ge_trend_data')
-            if result is None:
-                logger.error('获取个位已有期号失败: 数据库连接不可用')
-                return 0, len(data)
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-
-            sql = '''
-            INSERT INTO p5_ge_trend_data
-            (issue, ge_number, draw_date, is_odd, is_big, is_prime,
-             omission, hot_level, consecutive_count, trend_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                ge_number = VALUES(ge_number),
-                draw_date = VALUES(draw_date),
-                is_odd = VALUES(is_odd),
-                is_big = VALUES(is_big),
-                is_prime = VALUES(is_prime),
-                omission = VALUES(omission),
-                hot_level = VALUES(hot_level),
-                consecutive_count = VALUES(consecutive_count),
-                trend_json = VALUES(trend_json),
-                source = VALUES(source)
-            '''
-
-            for item in data:
-                issue = str(item.get('issue', ''))
-                if not issue:
-                    skip_count += 1
-                    continue
-                if issue in existing_issues:
-                    skip_count += 1
-                    continue
-
-                ge_num = item.get('ge_number', 0)
-                if not (0 <= ge_num <= 9):
-                    skip_count += 1
-                    continue
-
-                params = (
-                    issue,
-                    ge_num,
-                    item.get('draw_date', ''),
-                    item.get('is_odd', None),
-                    item.get('is_big', None),
-                    item.get('is_prime', None),
-                    item.get('omission', 0),
-                    item.get('hot_level', ''),
-                    item.get('consecutive_count', 0),
-                    json.dumps(item, ensure_ascii=False),
-                    item.get('source', 'china_lottery')
-                )
-                if self.execute_with_reconnect(sql, params) is None:
-                    logger.error(f'插入个位走势数据失败: issue={issue}, 连接异常')
-                    skip_count += 1
-                    continue
-                success_count += 1
-            self.connection.commit()
-            logger.info(f'个位走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
-            return success_count, skip_count
-        except Exception as e:
-            logger.error(f'插入个位走势数据失败: {type(e).__name__}: {e}')
-            return 0, len(data)
-    
     def get_ge_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
         """获取个位走势数据"""
-        try:
-            sql = 'SELECT * FROM p5_ge_trend_data ORDER BY issue DESC LIMIT %s'
-            self.cursor.execute(sql, (limit,))
-            return self.cursor.fetchall()
-        except Exception as e:
-            logger.error(f'获取个位走势数据失败: {e}')
-            return []
-    
+        # 结构清理(20261116): 五组分位查询纯复制粘贴 — 委托 _trend_query（issue CAST 数值序语义不变）
+        return self._trend_query('ge', limit)
+
     def get_ge_trend_count(self) -> int:
         """获取个位走势数据总条数"""
-        try:
-            self.cursor.execute('SELECT COUNT(*) as count FROM p5_ge_trend_data')
-            result = self.cursor.fetchone()
-            return result.get('count', 0) if result else 0
-        except Exception as e:
-            logger.error(f'获取个位走势数据总数失败: {e}')
-            return 0
-    
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_ge_trend_count')
+        # 结构清理(20261116): 五组分位计数纯复制粘贴 — 委托 _trend_count
+        return self._trend_count('ge')
+
     def get_ge_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
         """根据期号获取个位走势数据"""
-        try:
-            self.cursor.execute('SELECT * FROM p5_ge_trend_data WHERE issue = %s', (issue,))
-            return self.cursor.fetchone()
-        except Exception as e:
-            logger.error(f'根据期号获取个位走势数据失败: {e}')
-            return None
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_ge_trend_by_issue')
+        # 结构清理(20261116): 五组分位按期号查询纯复制粘贴 — 委托 _trend_by_issue
+        return self._trend_by_issue('ge', issue)
 
     # ============================================================
     # 升平降走势 / 和值走势（一定牛 spjzs / hzzst 图表）
@@ -2899,41 +2706,25 @@ class P5Database:
 
     def insert_spjzs_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        批量插入升平降走势数据（智能去重, 幂等）。
+        批量插入升平降走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）。
+
+        修复(20261116): L2915 原实现全表 SELECT issue 预检 + 逐行 execute —
+        改为 executemany + ON DUPLICATE KEY UPDATE，删除全表扫描。
 
         Args:
             data: 已归一化的升平降走势数据列表(每条含 issue/numbers/wan../hezhi/.../miss_json)
         Returns:
-            (成功条数, 跳过条数)
+            (插入/更新条数, 跳过条数)
         """
         if not data:
             return 0, 0
         success_count = 0
         skip_count = 0
         try:
-            # 使用 execute_with_reconnect 自动处理连接超时重连
-            result = self.execute_with_reconnect('SELECT issue FROM p5_spjzs_data')
-            if result is None:
-                logger.error('获取已有期号失败: 数据库连接不可用')
-                return 0, len(data)
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            sql = '''
-            INSERT INTO p5_spjzs_data
-            (issue, numbers, wan, qian, bai, shi, ge, hezhi, hewei, kuadu, avg, miss_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                numbers = VALUES(numbers), wan = VALUES(wan), qian = VALUES(qian),
-                bai = VALUES(bai), shi = VALUES(shi), ge = VALUES(ge),
-                hezhi = VALUES(hezhi), hewei = VALUES(hewei), kuadu = VALUES(kuadu),
-                avg = VALUES(avg), miss_json = VALUES(miss_json), source = VALUES(source)
-            '''
+            rows = []
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
-                    skip_count += 1
-                    continue
-                # 幂等性: 已存在则跳过(由 ON DUPLICATE KEY UPDATE 处理, 这里可选预过滤)
-                if issue in existing_issues:
                     skip_count += 1
                     continue
                 try:
@@ -2944,7 +2735,7 @@ class P5Database:
                 except (TypeError, ValueError):
                     skip_count += 1
                     continue
-                params = (
+                rows.append((
                     issue,
                     item.get('numbers', ''),
                     item.get('wan'), item.get('qian'), item.get('bai'),
@@ -2952,13 +2743,25 @@ class P5Database:
                     item.get('hezhi'), item.get('hewei'), item.get('kuadu'),
                     item.get('avg'), item.get('miss_json'),
                     item.get('source', 'ydniu_spjzs'),
-                )
-                if self.execute_with_reconnect(sql, params) is None:
-                    logger.error(f'插入升平降走势数据失败: issue={issue}, 连接异常')
-                    skip_count += 1
-                    continue
-                success_count += 1
-            self.connection.commit()
+                ))
+
+            if rows:
+                sql = '''
+                INSERT INTO p5_spjzs_data
+                (issue, numbers, wan, qian, bai, shi, ge, hezhi, hewei, kuadu, avg, miss_json, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    numbers = VALUES(numbers), wan = VALUES(wan), qian = VALUES(qian),
+                    bai = VALUES(bai), shi = VALUES(shi), ge = VALUES(ge),
+                    hezhi = VALUES(hezhi), hewei = VALUES(hewei), kuadu = VALUES(kuadu),
+                    avg = VALUES(avg), miss_json = VALUES(miss_json), source = VALUES(source)
+                '''
+                affected = self._batch_upsert(sql, rows)
+                if affected is None:
+                    logger.error('升平降走势数据批量插入失败: 数据库连接不可用')
+                    return 0, len(data)
+                success_count = affected
+                self.connection.commit()
             logger.info(f'升平降走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
@@ -2967,41 +2770,25 @@ class P5Database:
 
     def insert_hzzst_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        批量插入和值走势数据（智能去重, 幂等）。
+        批量插入和值走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）。
+
+        修复(20261116): L2983 原实现全表 SELECT issue 预检 + 逐行 execute —
+        改为 executemany + ON DUPLICATE KEY UPDATE，删除全表扫描。
 
         Args:
             data: 已归一化的和值走势数据列表
         Returns:
-            (成功条数, 跳过条数)
+            (插入/更新条数, 跳过条数)
         """
         if not data:
             return 0, 0
         success_count = 0
         skip_count = 0
         try:
-            # 使用 execute_with_reconnect 保持与 insert_spjzs_data 一致，避免连接中断时静默失败
-            result = self.execute_with_reconnect('SELECT issue FROM p5_hzzst_data')
-            if result is None:
-                logger.error('获取已有期号失败: 数据库连接不可用')
-                return 0, len(data)
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            sql = '''
-            INSERT INTO p5_hzzst_data
-            (issue, numbers, wan, qian, bai, shi, ge, hezhi, kuadu, hewei, miss_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                numbers = VALUES(numbers), wan = VALUES(wan), qian = VALUES(qian),
-                bai = VALUES(bai), shi = VALUES(shi), ge = VALUES(ge),
-                hezhi = VALUES(hezhi), kuadu = VALUES(kuadu), hewei = VALUES(hewei),
-                miss_json = VALUES(miss_json), source = VALUES(source)
-            '''
-            insert_errors = []
+            rows = []
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
-                    skip_count += 1
-                    continue
-                if issue in existing_issues:
                     skip_count += 1
                     continue
                 try:
@@ -3012,7 +2799,7 @@ class P5Database:
                 except (TypeError, ValueError):
                     skip_count += 1
                     continue
-                params = (
+                rows.append((
                     issue,
                     item.get('numbers', ''),
                     item.get('wan'), item.get('qian'), item.get('bai'),
@@ -3020,16 +2807,25 @@ class P5Database:
                     item.get('hezhi'), item.get('kuadu'), item.get('hewei'),
                     item.get('miss_json'),
                     item.get('source', 'ydniu_hzzst'),
-                )
-                if self.execute_with_reconnect(sql, params) is None:
-                    logger.error(f'插入和值走势数据失败: issue={issue}, 连接异常')
-                    skip_count += 1
-                    insert_errors.append(issue)
-                    continue
-                success_count += 1
-            if insert_errors:
-                logger.warning(f'和值走势数据部分插入失败, 失败期号示例: {insert_errors[:5]}')
-            self.connection.commit()
+                ))
+
+            if rows:
+                sql = '''
+                INSERT INTO p5_hzzst_data
+                (issue, numbers, wan, qian, bai, shi, ge, hezhi, kuadu, hewei, miss_json, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    numbers = VALUES(numbers), wan = VALUES(wan), qian = VALUES(qian),
+                    bai = VALUES(bai), shi = VALUES(shi), ge = VALUES(ge),
+                    hezhi = VALUES(hezhi), kuadu = VALUES(kuadu), hewei = VALUES(hewei),
+                    miss_json = VALUES(miss_json), source = VALUES(source)
+                '''
+                affected = self._batch_upsert(sql, rows)
+                if affected is None:
+                    logger.error('和值走势数据批量插入失败: 数据库连接不可用')
+                    return 0, len(data)
+                success_count = affected
+                self.connection.commit()
             logger.info(f'和值走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
@@ -3058,6 +2854,8 @@ class P5Database:
 
     def get_spjzs_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
         """获取升平降走势数据(期号倒序)"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_spjzs_data')
         try:
             self.cursor.execute('SELECT * FROM p5_spjzs_data ORDER BY issue DESC LIMIT %s', (limit,))
             return self.cursor.fetchall()
@@ -3067,6 +2865,8 @@ class P5Database:
 
     def get_hzzst_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
         """获取和值走势数据(期号倒序)"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_hzzst_data')
         try:
             self.cursor.execute('SELECT * FROM p5_hzzst_data ORDER BY issue DESC LIMIT %s', (limit,))
             return self.cursor.fetchall()
@@ -3076,34 +2876,10 @@ class P5Database:
 
     def get_ge_number_stats(self) -> Dict[str, Any]:
         """获取个位数字统计信息"""
-        try:
-            sql = '''
-            SELECT 
-                ge_number,
-                COUNT(*) as count,
-                AVG(omission) as avg_omission,
-                MIN(omission) as min_omission,
-                MAX(omission) as max_omission
-            FROM p5_ge_trend_data
-            GROUP BY ge_number
-            ORDER BY count DESC
-            '''
-            self.cursor.execute(sql)
-            results = self.cursor.fetchall()
-            
-            stats = {}
-            for row in results:
-                stats[row['ge_number']] = {
-                    'count': row['count'],
-                    'avg_omission': round(row['avg_omission'], 2) if row['avg_omission'] else 0,
-                    'min_omission': row['min_omission'],
-                    'max_omission': row['max_omission']
-                }
-            
-            return stats
-        except Exception as e:
-            logger.error(f'获取个位数字统计失败: {e}')
-            return {}
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_ge_number_stats')
+        # 结构清理(20261116): 与其余四组 number_stats 纯复制粘贴且定义位置错置（位于 hzzst 方法之后）— 委托 _trend_number_stats
+        return self._trend_number_stats('ge')
     
     # ============================================================
     # 和尾走势数据操作
@@ -3121,44 +2897,24 @@ class P5Database:
         """
         if not data:
             return 0, 0
-        
+
         success_count = 0
         skip_count = 0
-        
+
         try:
-            self.cursor.execute('SELECT issue FROM p5_sum_end_trend_data')
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
-            sql = '''
-            INSERT INTO p5_sum_end_trend_data 
-            (issue, sum_end, sum_value, draw_date, is_odd, is_big, 
-             omission, hot_level, consecutive_count, trend_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                sum_end = VALUES(sum_end),
-                sum_value = VALUES(sum_value),
-                draw_date = VALUES(draw_date),
-                is_odd = VALUES(is_odd),
-                is_big = VALUES(is_big),
-                omission = VALUES(omission),
-                hot_level = VALUES(hot_level),
-                consecutive_count = VALUES(consecutive_count),
-                trend_json = VALUES(trend_json),
-                source = VALUES(source)
-            '''
-            
+            rows = []
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
                     skip_count += 1
                     continue
-                
+
                 sum_end = item.get('sum_end', 0)
                 if not (0 <= sum_end <= 9):
                     skip_count += 1
                     continue
-                
-                self.cursor.execute(sql, (
+
+                rows.append((
                     issue,
                     sum_end,
                     item.get('sum_value', None),
@@ -3171,9 +2927,33 @@ class P5Database:
                     json.dumps(item, ensure_ascii=False),
                     item.get('source', 'china_lottery')
                 ))
-                success_count += 1
-            
-            self.connection.commit()
+
+            if rows:
+                # 修复(20261116): L3161 原实现裸 self.cursor.execute 全表预检（无重连保护）+ 裸 cursor 逐行插入 — 统一改为 executemany + ON DUPLICATE KEY UPDATE（经 _batch_upsert 获得重连保护）
+                sql = '''
+                INSERT INTO p5_sum_end_trend_data
+                (issue, sum_end, sum_value, draw_date, is_odd, is_big,
+                 omission, hot_level, consecutive_count, trend_json, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    sum_end = VALUES(sum_end),
+                    sum_value = VALUES(sum_value),
+                    draw_date = VALUES(draw_date),
+                    is_odd = VALUES(is_odd),
+                    is_big = VALUES(is_big),
+                    omission = VALUES(omission),
+                    hot_level = VALUES(hot_level),
+                    consecutive_count = VALUES(consecutive_count),
+                    trend_json = VALUES(trend_json),
+                    source = VALUES(source)
+                '''
+                affected = self._batch_upsert(sql, rows)
+                if affected is None:
+                    logger.error('和尾走势数据批量插入失败: 数据库连接不可用')
+                    return 0, len(data)
+                success_count = affected
+                self.connection.commit()
+
             logger.info(f'和尾走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
@@ -3182,6 +2962,8 @@ class P5Database:
     
     def get_sum_end_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
         """获取和尾走势数据"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_sum_end_trend_data')
         try:
             sql = 'SELECT * FROM p5_sum_end_trend_data ORDER BY issue DESC LIMIT %s'
             self.cursor.execute(sql, (limit,))
@@ -3192,6 +2974,8 @@ class P5Database:
     
     def get_sum_end_trend_count(self) -> int:
         """获取和尾走势数据总条数"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_sum_end_trend_count')
         try:
             self.cursor.execute('SELECT COUNT(*) as count FROM p5_sum_end_trend_data')
             result = self.cursor.fetchone()
@@ -3202,6 +2986,8 @@ class P5Database:
     
     def get_sum_end_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
         """根据期号获取和尾走势数据"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_sum_end_trend_by_issue')
         try:
             self.cursor.execute('SELECT * FROM p5_sum_end_trend_data WHERE issue = %s', (issue,))
             return self.cursor.fetchone()
@@ -3211,6 +2997,8 @@ class P5Database:
     
     def get_sum_end_stats(self) -> Dict[str, Any]:
         """获取和尾统计信息"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_sum_end_stats')
         try:
             sql = '''
             SELECT 
@@ -3246,62 +3034,41 @@ class P5Database:
     
     def insert_back_three_trend_data(self, data: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        批量插入后三走势数据（智能去重）
-        
+        批量插入后三走势数据（ON DUPLICATE KEY UPDATE 幂等 upsert）
+
+        修复(20261116): L3304 原实现裸 self.cursor.execute 全表预检（无重连保护）
+        + 裸 cursor 逐行插入 — 统一改为 executemany + ON DUPLICATE KEY UPDATE
+        （经 _batch_upsert 获得重连保护），删除全表扫描。
+
         Args:
             data: 后三走势数据列表
-        
+
         Returns:
-            (成功条数, 跳过条数)
+            (插入/更新条数, 跳过条数)
         """
         if not data:
             return 0, 0
-        
+
         success_count = 0
         skip_count = 0
-        
+
         try:
-            self.cursor.execute('SELECT issue FROM p5_back_three_trend_data')
-            existing_issues = {row['issue'] for row in self.cursor.fetchall()}
-            
-            sql = '''
-            INSERT INTO p5_back_three_trend_data 
-            (issue, bai_number, shi_number, ge_number, back_three_value, 
-             sum_value, sum_end, draw_date, is_odd, is_big, 
-             omission, hot_level, consecutive_count, trend_json, source)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                bai_number = VALUES(bai_number),
-                shi_number = VALUES(shi_number),
-                ge_number = VALUES(ge_number),
-                back_three_value = VALUES(back_three_value),
-                sum_value = VALUES(sum_value),
-                sum_end = VALUES(sum_end),
-                draw_date = VALUES(draw_date),
-                is_odd = VALUES(is_odd),
-                is_big = VALUES(is_big),
-                omission = VALUES(omission),
-                hot_level = VALUES(hot_level),
-                consecutive_count = VALUES(consecutive_count),
-                trend_json = VALUES(trend_json),
-                source = VALUES(source)
-            '''
-            
+            rows = []
             for item in data:
                 issue = str(item.get('issue', ''))
                 if not issue:
                     skip_count += 1
                     continue
-                
+
                 bai_num = item.get('bai_number', 0)
                 shi_num = item.get('shi_number', 0)
                 ge_num = item.get('ge_number', 0)
-                
+
                 if not (0 <= bai_num <= 9 and 0 <= shi_num <= 9 and 0 <= ge_num <= 9):
                     skip_count += 1
                     continue
-                
-                self.cursor.execute(sql, (
+
+                rows.append((
                     issue,
                     bai_num,
                     shi_num,
@@ -3318,9 +3085,37 @@ class P5Database:
                     json.dumps(item, ensure_ascii=False),
                     item.get('source', 'china_lottery')
                 ))
-                success_count += 1
-            
-            self.connection.commit()
+
+            if rows:
+                sql = '''
+                INSERT INTO p5_back_three_trend_data
+                (issue, bai_number, shi_number, ge_number, back_three_value,
+                 sum_value, sum_end, draw_date, is_odd, is_big,
+                 omission, hot_level, consecutive_count, trend_json, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    bai_number = VALUES(bai_number),
+                    shi_number = VALUES(shi_number),
+                    ge_number = VALUES(ge_number),
+                    back_three_value = VALUES(back_three_value),
+                    sum_value = VALUES(sum_value),
+                    sum_end = VALUES(sum_end),
+                    draw_date = VALUES(draw_date),
+                    is_odd = VALUES(is_odd),
+                    is_big = VALUES(is_big),
+                    omission = VALUES(omission),
+                    hot_level = VALUES(hot_level),
+                    consecutive_count = VALUES(consecutive_count),
+                    trend_json = VALUES(trend_json),
+                    source = VALUES(source)
+                '''
+                affected = self._batch_upsert(sql, rows)
+                if affected is None:
+                    logger.error('后三走势数据批量插入失败: 数据库连接不可用')
+                    return 0, len(data)
+                success_count = affected
+                self.connection.commit()
+
             logger.info(f'后三走势数据插入完成: 成功{success_count}条, 跳过{skip_count}条')
             return success_count, skip_count
         except Exception as e:
@@ -3329,6 +3124,8 @@ class P5Database:
     
     def get_back_three_trend_data(self, limit: int = 1000) -> List[Dict[str, Any]]:
         """获取后三走势数据"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_back_three_trend_data')
         try:
             sql = 'SELECT * FROM p5_back_three_trend_data ORDER BY issue DESC LIMIT %s'
             self.cursor.execute(sql, (limit,))
@@ -3339,6 +3136,8 @@ class P5Database:
     
     def get_back_three_trend_count(self) -> int:
         """获取后三走势数据总条数"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_back_three_trend_count')
         try:
             self.cursor.execute('SELECT COUNT(*) as count FROM p5_back_three_trend_data')
             result = self.cursor.fetchone()
@@ -3349,6 +3148,8 @@ class P5Database:
     
     def get_back_three_trend_by_issue(self, issue: str) -> Optional[Dict[str, Any]]:
         """根据期号获取后三走势数据"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_back_three_trend_by_issue')
         try:
             self.cursor.execute('SELECT * FROM p5_back_three_trend_data WHERE issue = %s', (issue,))
             return self.cursor.fetchone()
@@ -3358,6 +3159,8 @@ class P5Database:
     
     def get_back_three_sum_end_stats(self) -> Dict[str, Any]:
         """获取后三和尾统计信息"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_back_three_sum_end_stats')
         try:
             sql = '''
             SELECT 
@@ -3412,6 +3215,8 @@ class P5Database:
     
     def get_expert_recommendation_by_issue(self, issue_name: str) -> List[Dict[str, Any]]:
         """根据期号获取专家推荐记录"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_expert_recommendation_by_issue')
         try:
             sql = 'SELECT * FROM p5_expert_recommendation WHERE issue_name = %s ORDER BY user_id'
             self.cursor.execute(sql, (issue_name,))
@@ -3423,6 +3228,8 @@ class P5Database:
     
     def get_latest_expert_recommendations(self, limit: int = 10) -> List[Dict[str, Any]]:
         """获取最新专家推荐记录"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_latest_expert_recommendations')
         try:
             sql = 'SELECT * FROM p5_expert_recommendation ORDER BY created_at DESC LIMIT %s'
             self.cursor.execute(sql, (limit,))
@@ -3434,6 +3241,8 @@ class P5Database:
     
     def get_expert_recommendation_count(self) -> int:
         """获取专家推荐数据总条数"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_expert_recommendation_count')
         try:
             self.cursor.execute('SELECT COUNT(*) as count FROM p5_expert_recommendation')
             result = self.cursor.fetchone()
@@ -3453,6 +3262,8 @@ class P5Database:
         Returns:
             预测记录字典，包含预测号码、组合等详细信息
         """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_prediction_with_details')
         try:
             sql = '''
             SELECT * FROM p5_prediction_record 
@@ -3535,6 +3346,8 @@ class P5Database:
         Returns:
             成功更新的记录数
         """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'update_prediction_verification_batch')
         try:
             updated_count = 0
             for result in verification_results:
@@ -3654,6 +3467,8 @@ class P5Database:
     
     def get_weight_history(self, algo_name=None, position=None, limit=100, days=30):
         """获取权重历史记录"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_weight_history')
         try:
             sql = 'SELECT * FROM p5_weight_history WHERE 1=1'
             params = []
@@ -3683,6 +3498,8 @@ class P5Database:
     
     def get_algorithm_performance(self, days=30):
         """获取各算法性能统计"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_algorithm_performance')
         try:
             sql = '''
             SELECT algo_name, validation_result, match_count, COUNT(*) as total,
@@ -3706,6 +3523,8 @@ class P5Database:
             weights_json: 权重配置（dict 或 JSON 字符串）
             version: 版本标识，默认从 version.py 读取 APP_VERSION
         """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'save_adaptive_weights')
         if version is None:
             try:
                 from version import APP_VERSION
@@ -3732,6 +3551,8 @@ class P5Database:
         Args:
             version: 期望版本，默认从 version.py 读取 APP_VERSION
         """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'load_adaptive_weights')
         if version is None:
             try:
                 from version import APP_VERSION
@@ -4010,6 +3831,8 @@ class P5Database:
 
     def update_evolution_version_status(self, version_tag: str, status: str) -> bool:
         """更新指定进化版本的状态（用于回滚操作）。"""
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'update_evolution_version_status')
         try:
             if not version_tag:
                 return False
@@ -4044,6 +3867,8 @@ class P5Database:
         Returns:
             是否保存成功(True/False)
         """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'save_bayesian_result')
         try:
             # 幂等检查: 同一 issue 已存在则跳过
             existing = self.get_latest_artifact('bayesian_result', issue=issue)
@@ -4070,6 +3895,8 @@ class P5Database:
         Returns:
             贝叶斯推断数据 dict 或 None
         """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_bayesian_result')
         artifact = self.get_latest_artifact('bayesian_result', issue=issue)
         return artifact.get('data') if artifact else None
 
@@ -4080,6 +3907,8 @@ class P5Database:
         Returns:
             结果列表 [{issue, data, created_at}, ...]
         """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_bayesian_results')
         artifacts = self.get_artifacts(artifact_type='bayesian_result', limit=limit)
         return [{
             'id': a.get('id'),
@@ -4163,6 +3992,8 @@ class P5Database:
                 'position_details': List[{number: probability, top3: List}]
             } or None
         """
+        # 弃用(20261116): 全仓静态扫描零调用（docs/db_method_consolidation_plan_2026-11-16.md §3），计划下版本物理删除
+        logger.debug('[P5Database] 调用了弃用方法 %s——如有异常请反馈', 'get_bayesian_visual_summary')
         try:
             row = self.get_bayesian_result_row(issue)
             if not row:

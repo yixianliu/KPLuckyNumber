@@ -473,10 +473,8 @@ class Pipeline:
         except ImportError as e:
             logger.error(f'无法导入OnlineLearner模块: {e}')
 
-    # ================================================================
-    # 工具方法
-    # ================================================================
-
+    # 结构清理(20261116) 修正: 死方法 step1/2/3 已删除，但审计钉桩（scripts/tests/test_report_generation_integrity.py 5 用例）直接调用
+# 其下游 4 个报告方法，且测试用例不得删除/弱化——按 git HEAD 恢复 5 个辅助函数与 4 个报告方法（step1/2/3 本体保持删除）。
     @staticmethod
     def _generate_article_id(url: str, index: int = 0) -> str:
         """生成文章唯一ID"""
@@ -559,904 +557,6 @@ class Pipeline:
     # 步骤1: 专家文章爬取与结构化AI分析
     # ================================================================
 
-    def step1_crawl_articles_and_analyze(self, target_issue: str) -> Dict[str, Any]:
-        """
-        步骤1: 专家文章爬取、AI格式化、Redis存储、整合分析
-        
-        完整流程:
-        1. 爬取目标期数的所有专家文章
-        2. 逐篇调用AI进行结构化整理(提取推荐号码、分析观点、置信度等)
-        3. 每篇分析报告存入Redis(kpluckynumber:pl5:expert_report:{article_id}, 7天过期)
-        4. 从Redis提取所有文章整合后交由AI模型综合分析生成预测报告
-        5. 将预测报告存入数据库p5_ai_report表
-        6. 生成独立的"专家文章预测报告"JSON文件
-        
-        Args:
-            target_issue: 目标期号(如"2026165")
-            
-        Returns:
-            {success, article_count, ai_success_count, ai_fail_count, 
-             expert_count, prediction_report, report_uuid, error}
-        """
-        logger.info('=' * 80)
-        logger.info('【步骤1】开始：专家文章爬取与结构化AI分析')
-        logger.info(f'目标期号: {target_issue}')
-        logger.info('=' * 80)
-
-        result = {
-            'success': False,
-            'step': 1,
-            'article_count': 0,
-            'ai_success_count': 0,
-            'ai_fail_count': 0,
-            'report_keys': [],
-            'articles': [],
-            'error': None
-        }
-
-        try:
-            # 1. 初始化爬虫
-            self._init_spider()
-            if not self.spider:
-                result['error'] = '爬虫模块初始化失败'
-                return result
-
-            # 2. 爬取目标期数文章
-            logger.info('爬取目标期数文章...')
-            self._delay_random(3, 6)
-            crawl_result = self.spider.crawl_all_articles(target_issue=target_issue, max_articles=15)
-
-            if not crawl_result.get('articles'):
-                result['error'] = f'未爬取到期号{target_issue}的文章'
-                return result
-
-            articles = crawl_result['articles']
-            result['articles'] = articles # 修复:将articles数据赋值给result
-            result['article_count'] = len(articles)
-            logger.info(f'成功爬取 {len(articles)} 篇文章')
-
-            # 3. 初始化Redis和AI
-            self._init_redis()
-            self._init_ai_client()
-
-            if not self.redis_client or not self.redis_client.is_connected():
-                result['error'] = 'Redis客户端未连接'
-                return result
-
-            if not self.ai_client or not self.ai_client.ai_available:
-                result['error'] = 'AI模型不可用'
-                return result
-
-            # 4. 逐篇AI分析并存储
-            for idx, article in enumerate(articles, 1):
-                article_id = self._generate_article_id(
-                    article.get('url', article.get('link_url', f'article_{idx}')), idx
-                )
-
-                logger.info(f'[{idx}/{len(articles)}] 分析文章: {article.get("title", "未知")[:60]}')
-
-                # 构建第一份AI分析提示词
-                title = article.get('title', '未知')
-                author = article.get('author', '未知')
-                pub_time = article.get('publish_time', '未知')
-                content = article.get('content', '')
-                url = article.get('url', article.get('link_url', ''))
-
-                prompt = f"""你是一位专业的排列5彩票数据分析专家。请对以下文章内容进行结构化整理和分析。
-
-【文章信息】
-标题：{title}
-作者：{author}
-发布时间：{pub_time}
-期号：{target_issue}
-来源URL：{url}
-
-【文章内容】
-{content[:5000]}
-
-【分析要求】
-请对以上内容进行深度分析，提取以下信息并以JSON格式返回（不要包含markdown标记）：
-
-{{
-    "data_source": "亿点牛专家文章",
-    "article_id": "{article_id}",
-    "article_title": "{title}",
-    "author": "{author}",
-    "publish_time": "{pub_time}",
-    "issue_number": "{target_issue}",
-    "forecast_numbers": {{
-        "wan": [],
-        "qian": [],
-        "bai": [],
-        "shi": [],
-        "ge": []
-    }},
-    "recommended_combinations": [],
-    "key_points": [],
-    "trend_analysis": "",
-    "confidence_level": "高/中/低",
-    "risk_warning": "",
-    "summary": ""
-}}
-
-注意事项：
-1. forecast_numbers每个位置从文章中提取推荐的号码（数字数组，每个0-9）
-2. recommended_combinations提取推荐组合（字符串数组）
-3. key_points提取关键分析观点（字符串数组）
-4. 如果文章没有明确提及某字段，对应设为空数组或空字符串
-"""
-
-                # 调用AI（带重试）
-                ai_result = None
-                for article_attempt in range(3):
-                    ai_result = self._call_ai(
-                        system_prompt="你是一位专业的排列5彩票数据分析专家，擅长对文章内容进行结构化整理和分析。",
-                        user_prompt=prompt,
-                        max_tokens=4000,
-                        temperature=0.5
-                    )
-                    if ai_result:
-                        break
-                    elif article_attempt < 2:
-                        logger.warning(f'文章{idx} AI分析第{article_attempt+1}次失败，重试中...')
-                        self._delay_random(2, 3)
-
-                if ai_result:
-                    # 保存到Redis
-                    store_data = {
-                        'article_id': article_id,
-                        'title': title,
-                        'author': author,
-                        'issue': target_issue,
-                        'ai_analysis': ai_result,
-                        'analyzed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    }
-
-                    # 关键修复(问题3根因): 把AI结构化结果回写到 article 对象,
-                    # 否则下游 _generate_expert_article_report 读取 article['ai_analysis']
-                    # 时始终为空字典 -> 专家文章预测报告的 prediction 全为空。
-                    try:
-                        parsed_result = ai_result if isinstance(ai_result, dict) else \
-                            self._parse_ai_json(ai_result) if isinstance(ai_result, str) else {}
-                        article['ai_analysis'] = parsed_result
-                        
-                        # 调试日志: 记录AI返回的结构
-                        if parsed_result:
-                            logger.info(f'文章{idx} AI返回keys: {list(parsed_result.keys)}')
-                            if 'forecast_numbers' in parsed_result:
-                                logger.info(f'文章{idx} forecast_numbers结构: {parsed_result["forecast_numbers"]}')
-                            else:
-                                logger.warning(f'文章{idx} AI未返回forecast_numbers字段!')
-                    except Exception:
-                        article['ai_analysis'] = {}
-
-                    redis_key = self.REDIS_ARTICLE_REPORT_KEY.format(article_id=article_id)
-                    try:
-                        # 确保store_data可被JSON序列化
-                        import json as _json
-                        
-                        serializable_data = {
-                            'article_id': str(store_data['article_id']),
-                            'title': str(store_data['title']),
-                            'author': str(store_data['author']),
-                            'issue': str(store_data['issue']),
-                            'ai_analysis': store_data['ai_analysis'] if isinstance(store_data['ai_analysis'], dict) else {},
-                            'analyzed_at': str(store_data['analyzed_at'])
-                        }
-                        
-                        self.redis_client.client.setex(
-                            redis_key,
-                            timedelta(days=7),
-                            _json.dumps(serializable_data, ensure_ascii=False, default=str)
-                        )
-                        result['report_keys'].append(redis_key)
-                        result['ai_success_count'] += 1
-
-                        logger.info(f'文章{idx} AI分析成功，Redis键: {redis_key}')
-                    except Exception as e:
-                        logger.error(f'文章{idx} 存入Redis失败: {e}')
-                        result['ai_fail_count'] += 1
-                else:
-                    logger.warning(f'文章{idx} AI分析失败')
-                    result['ai_fail_count'] += 1
-
-                # 每篇文章间随机延迟
-                self._delay_random(2, 4)
-
-            # 5. 软约束特征提取已停用（enhanced_article_processor已移除）
-
-            # 6. 将所有文章ID添加到列表
-            list_key = self.REDIS_ARTICLE_REPORT_KEY.replace('{article_id}', '')[:-1] + ':list'
-            # 实际上我们使用 redis_client 已有的 article list 机制
-            
-            # 检查是否AI分析全部失败,启用降级策略
-            result['success'] = True
-            result['fallback_strategy'] = (result['ai_success_count'] == 0 and result['article_count'] > 0)
-            result['warning'] = None if result['ai_success_count'] > 0 else 'AI分析全部失败,将采用降级策略'
-            
-            logger.info(f'步骤1完成: 成功分析 {result["ai_success_count"]}/{result["article_count"]} 篇文章')
-            if result.get('fallback_strategy'):
-                logger.warning('降级模式: AI分析全部失败,将在步骤3跳过专家整合')
-            
-            # 生成独立的"专家文章预测报告" 
-            # 修复: 原逻辑仅在 ai_success_count>0 时生成, AI全失败则无报告;
-            # 现改为只要有文章就生成(0成功则产出"降级"报告), 保证双报告始终存在。
-            if result.get('articles'):
-                expert_report = self._generate_expert_article_report(target_issue, result.get('articles', []))
-                if expert_report:
-                    succ_count = expert_report.get('successful_articles', 0)
-                    total_count = expert_report.get('total_articles', 0)
-                    logger.info(f'专家文章预测报告已生成(期号:{target_issue}): {succ_count}/{total_count}篇有效')
-                    
-                    if succ_count == 0:
-                        logger.warning(f' 专家文章AI分析未返回有效预测数据! 请检查pipeline.log中"AI返回keys"日志')
-                    
-                    if result.get('ai_fallback') or result.get('fallback_strategy'):
-                        expert_report.setdefault('note', 'AI分析不可用, 基于已爬取文章元数据的降级报告')
-                    result['expert_article_report'] = expert_report
-                    
-                    # 持久化到数据库
-                    uuid_val = self._save_report_to_db(expert_report, 'expert_article', target_issue)
-                    if uuid_val:
-                        logger.info(f'专家文章预测报告已入库: {uuid_val}')
-                else:
-                    logger.warning(f'步骤1: 专家文章预测报告生成失败')
-
-        except Exception as e:
-            logger.error(f'步骤1异常: {e}', exc_info=True)
-            result['error'] = str(e)
-
-        self.pipeline_state['article_reports'] = result.get('articles', [])
-        # 关键修复(问题5根因): step4 从 self.pipeline_state['expert_article_report']
-        # 读取专家文章预测结果来填充 final_report['article_prediction']; 此前该键从未被设置,
-        # 导致 final_report['article_prediction'] 始终为 {} -> GUI 显示"专家文章预测结果未获取到"。
-        self.pipeline_state['expert_article_report'] = result.get('expert_article_report')
-        return result
-
-    # ================================================================
-    # 步骤2: 走势图数据分析与AI预测 (DEPRECATED v3.15+)
-    # ================================================================
-
-    # ⚠ DEPRECATED (v4.0 §1.8/§4.1)：原 step1-3 报告链路已停用，本方法在
-    # execute_pipeline 中的调用点已注释（L4764/L4768），零活跃调用方。
-    # 保留方法体存档以兼容潜在外部脚本引用；下版物理删除。新预测一律走
-    # 两步流水线 _calc_statistical_prediction → step4_final_prediction。
-    def step2_trend_analysis(self, target_issue: str, data_limit: int = 60) -> Dict[str, Any]:
-        """
-        步骤2: 走势图数据分析与AI预测【DEPRECATED：v4.0 已停用，调用点注释，下版删除】
-
-        完整流程:
-        1. 获取最近30-60期走势图数据(基础+万千百十个位)
-        2. 整合后调用AI分析走势规律并生成预测报告
-        3. 走势报告存入Redis(kpluckynumber:pl5:trend_analysis:{issue}, 7天过期)
-        4. 生成独立的"走势图数据预测报告"JSON文件
-        5. 将预测报告存入数据库p5_ai_report表
-        
-        分析策略和算法自主设计以提升命中率:
-        - 冷热号分析:统计各位置近20期出现频次
-        - 遗漏回归:识别长期未出的号码
-        - 趋势动量:分析号码的上下波动趋势
-        - 奇偶大小比:统计近期偏态
-        
-        Args:
-            target_issue: 目标期号
-            data_limit: 获取历史数据的期数限制(默认60期,建议30-80期)
-            
-        Returns:
-            {success, report_key, report_data, trend_chart_report, error}
-        
-        Deprecated:
-            v3.15 起已在 execute_pipeline 中注释停用，pipeline_state 中 trend_report 恒为 None。
-            v4.0 计划物理删除。请勿在新代码中调用。
-        """
-        logger.info('=' * 80)
-        logger.info('【步骤2】开始：走势图数据分析与AI预测')
-        logger.info(f'目标期号: {target_issue}, 数据期数: {data_limit}')
-        logger.info('=' * 80)
-
-        result = {
-            'success': False,
-            'step': 2,
-            'report_key': '',
-            'report_data': None,
-            'error': None
-        }
-
-        try:
-            # 1. 初始化数据库和AI
-            self._init_db_client()
-            self._init_ai_client()
-
-            if not self.db_client or not self.db_client.connection:
-                result['error'] = '数据库客户端未连接'
-                return result
-
-            if not self.ai_client or not self.ai_client.ai_available:
-                result['error'] = 'AI模型不可用'
-                return result
-
-            # 2. 获取走势图数据
-            logger.info('获取走势图数据...')
-            from modules.database import P5Database
-
-            # 获取历史开奖数据
-            self.db_client.cursor.execute(
-                'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT %s',
-                (data_limit,)
-            )
-            history_data = self.db_client.cursor.fetchall()
-
-            # 获取基础走势图数据
-            self.db_client.cursor.execute(
-                'SELECT * FROM p5_trend_data ORDER BY issue DESC LIMIT %s',
-                (data_limit,)
-            )
-            trend_data = self.db_client.cursor.fetchall()
-
-            # 获取各位置走势数据
-            position_configs = [
-                ('wan_number', 'p5_position_trend', 'wan_number'),
-                ('qian_number', 'p5_position_trend', 'qian_number'),
-                ('bai_number', 'p5_position_trend', 'bai_number'),
-                ('shi_number', 'p5_position_trend', 'shi_number'),
-                ('ge_number', 'p5_position_trend', 'ge_number'),
-            ]
-
-            position_trends = {}
-            for pos_abbr in ['wan', 'qian', 'bai', 'shi', 'ge']:
-                self.db_client.cursor.execute(
-                    f'SELECT issue, {pos_abbr}_number, is_odd, is_big, is_prime, omission, hot_level, '
-                    f'consecutive_count FROM p5_{pos_abbr}_trend_data '
-                    # §8.2.5：LIMIT 值改用参数化占位（pos_abbr 仍为标识符，
-                    # 取值固定为 ['wan','qian','bai','shi','ge'] 枚举，非用户值）
-                    'ORDER BY issue DESC LIMIT %s',
-                    (data_limit,)
-                )
-                position_trends[f'{pos_abbr}_trend'] = self.db_client.cursor.fetchall()
-
-            if not history_data:
-                result['error'] = '数据库中无历史数据'
-                return result
-
-            latest_issue = history_data[0].get('issue', '')
-            next_issue = target_issue  # 使用传入的目标期号
-
-            logger.info(f'数据加载完成: 历史{len(history_data)}期, 走势{len(trend_data)}期, 最新期号{latest_issue}')
-
-            # 3. 构建走势图分析提示词
-            trend_data_format = {
-                'basic_trend': trend_data,
-                **position_trends
-            }
-
-            prompt_parts = []
-            prompt_parts.append("""
-你是一位专业的排列5走势数据分析专家。请对以下最近{}期的走势图数据进行深度分析。
-
-【分析目标】
-基于走势图数据分析各位置数字的走势规律、冷热状态、遗漏趋势等，
-生成一份结构化的走势分析报告并预测目标期号{}的号码。
-
-【报告要求】
-请以严格的JSON格式输出，不要包含任何额外文字或markdown标记：
-""".format(min(len(trend_data), 30), target_issue))
-
-            # 格式化基础走势数据（缩减到30期，使用历史走势图+基础走势+位置走势三类30期数据）
-            prompt_parts.append("\n=== 基础走势图数据（最近{}期） ===\n".format(min(len(trend_data), 30)))
-            prompt_parts.append("期号 | 日期 | 万 | 千 | 百 | 十 | 个 | 和值 | 奇偶比 | 大小比\n")
-            for item in trend_data[:30]:
-                issue = item.get('issue', '')
-                draw_date = item.get('draw_date', '')
-                wan = item.get('wan', 0)
-                qian = item.get('qian', 0)
-                bai = item.get('bai', 0)
-                shi = item.get('shi', 0)
-                ge = item.get('ge', 0)
-                hezhi = item.get('hezhi', '')
-                odd_even = item.get('odd_even_ratio', '')
-                big_small = item.get('big_small_ratio', '')
-                prompt_parts.append(f"{issue} | {draw_date} | {wan} | {qian} | {bai} | {shi} | {ge} | {hezhi} | {odd_even} | {big_small}")
-
-            # 格式化各位置走势数据
-            pos_names = {'wan_trend': '万位', 'qian_trend': '千位', 'bai_trend': '百位', 'shi_trend': '十位', 'ge_trend': '个位'}
-            pos_nums = {'wan_trend': 'wan_number', 'qian_trend': 'qian_number', 'bai_trend': 'bai_number', 'shi_trend': 'shi_number', 'ge_trend': 'ge_number'}
-
-            for trend_key, pos_name in pos_names.items():
-                    pos_data = trend_data_format.get(trend_key, [])
-                    if pos_data:
-                        num_key = pos_nums[trend_key]
-                        prompt_parts.append(f"\n=== {pos_name}走势数据（最近{min(len(pos_data), 30)}期） ===")
-                        prompt_parts.append("期号 | 数字 | 奇偶 | 大小 | 质合 | 遗漏 | 冷热等级\n")
-                        for item in pos_data[:30]:
-                            issue = item.get('issue', '')
-                            num = item.get(num_key, 0)
-                            is_odd = '奇' if item.get('is_odd') else '偶'
-                            is_big = '大' if item.get('is_big') else '小'
-                            is_prime = '质' if item.get('is_prime') else '合'
-                            omission = item.get('omission', 0)
-                            hot_level = item.get('hot_level', '')
-                            prompt_parts.append(f"{issue} | {num} | {is_odd} | {is_big} | {is_prime} | {omission} | {hot_level}")
-
-                    # 统计摘要
-                    num_freq = {}
-                    for item in pos_data[:20]:
-                        n = item.get(num_key, 0)
-                        num_freq[n] = num_freq.get(n, 0) + 1
-                    sorted_nums = sorted(num_freq.items(), key=lambda x: x[1], reverse=True)
-                    hot = [n for n, _ in sorted_nums[:3]]
-                    cold = [n for n, _ in sorted_nums[-3:]]
-                    max_om = max((item.get('omission', 0) for item in pos_data[:20]), default=0)
-                    prompt_parts.append(f"\n统计: 热号{hot}, 冷号{cold}, 最大遗漏{max_om}")
-
-            # 输出格式要求
-            prompt_parts.append(f"""
-=== 输出格式 ===
-
-请严格按照以下JSON格式输出走势分析报告：
-
-{{
-    "analysis_type": "走势图AI分析",
-    "analysis_time": "YYYY-MM-DD HH:MM:SS",
-    "data_period": "最近20期走势数据",
-    "latest_issue": "{latest_issue}",
-    "next_issue": "{target_issue}",
-    "trend_summary": {{
-        "overall_trend": "整体走势总结（100-200字）",
-        "hot_numbers_summary": "热号总体描述",
-        "cold_numbers_summary": "冷号总体描述",
-        "pattern_summary": "模式规律总结"
-    }},
-    "position_analysis": {{
-        "wan": {{
-            "hot_numbers": [],
-            "cold_numbers": [],
-            "trend_direction": "走势方向（向上/向下/震荡）",
-            "omission_analysis": "遗漏分析",
-            "recommended_numbers": []
-        }},
-        "qian": {{
-            "hot_numbers": [],
-            "cold_numbers": [],
-            "trend_direction": "走势方向",
-            "omission_analysis": "遗漏分析",
-            "recommended_numbers": []
-        }},
-        "bai": {{
-            "hot_numbers": [],
-            "cold_numbers": [],
-            "trend_direction": "走势方向",
-            "omission_analysis": "遗漏分析",
-            "recommended_numbers": []
-        }},
-        "shi": {{
-            "hot_numbers": [],
-            "cold_numbers": [],
-            "trend_direction": "走势方向",
-            "omission_analysis": "遗漏分析",
-            "recommended_numbers": []
-        }},
-        "ge": {{
-            "hot_numbers": [],
-            "cold_numbers": [],
-            "trend_direction": "走势方向",
-            "omission_analysis": "遗漏分析",
-            "recommended_numbers": []
-        }}
-    }},
-    "statistical_analysis": {{
-        "hezhi_analysis": "和值走势分析（50-100字）",
-        "span_analysis": "跨度分析（50-100字）",
-        "odd_even_analysis": "奇偶比趋势分析（50-100字）",
-        "big_small_analysis": "大小比趋势分析（50-100字）"
-    }},
-    "key_patterns": ["发现的规律模式1", "发现的规律模式2", "发现的规律模式3"],
-    "risk_factors": ["需要关注的风险因素1", "需要关注的风险因素2"]
-}}
-
-注意事项：
-1. 必须严格按JSON格式输出，不要有额外文字
-2. 每个位置都有hot_numbers/cold_numbers/recommended_numbers（数字数组）
-3. trend_direction描述走势方向
-4. recommended_numbers为基于走势分析的推荐号码
-""")
-
-            full_prompt = "\n".join(prompt_parts)
-            logger.info(f'走势分析提示词长度: {len(full_prompt)}')
-
-            # 4. 调用AI（增加max_tokens到10000以容纳完整JSON输出）
-            logger.info('调用AI进行走势分析...')
-            logger.info(f'提示词长度: {len(full_prompt)} 字符')
-            trend_system_prompt = "你是一位专业的排列5走势数据分析专家，擅长分析走势图数据并发现规律。请严格按JSON格式输出。"
-            logger.info(f'System prompt长度: {len(trend_system_prompt)} 字符')
-            logger.info(f'max_tokens: {6000}, temperature: {0.3}')
-            
-            # 带重试的AI调用
-            trend_ai_result = None
-            for attempt in range(3):
-                try:
-                    trend_ai_result = self._call_ai(
-                        system_prompt=trend_system_prompt,
-                        user_prompt=full_prompt,
-                        max_tokens=6000,
-                        temperature=0.3
-                    )
-                    if trend_ai_result:
-                        logger.info(f'走势AI分析成功(第{attempt+1}次尝试)')
-                        break
-                    elif attempt < 2:
-                        wait_time = 2 * (attempt + 1)
-                        logger.warning(f'走势AI分析第{attempt+1}次失败，{wait_time}秒后重试...')
-                        self._delay_random(wait_time, wait_time + 1)
-                except Exception as e:
-                    logger.error(f'走势AI分析异常: {e}', exc_info=True)
-                    if attempt < 2:
-                        self._delay_random(2, 3)
-                    
-
-            if not trend_ai_result:
-                # 修复: AI不可用时不提前返回, 改用统计降级方案生成走势报告,
-                # 保证"走势图数据预测报告"始终存在(双报告之一)。
-                logger.warning('走势AI分析失败, 启用统计降级方案生成走势报告')
-                result['ai_fallback'] = True
-                trend_ai_result = self._build_statistical_trend_result(
-                    target_issue, history_data, trend_data, position_trends
-                )
-
-            # 5. 存入Redis
-            self._init_redis()
-            if not self.redis_client or not self.redis_client.is_connected():
-                logger.warning('Redis未连接，走势报告仅保存在内存中')
-            else:
-                report_key = self.REDIS_TREND_ANALYSIS_KEY.format(issue=target_issue)
-                store_data = {
-                    'issue': target_issue,
-                    'trend_analysis': trend_ai_result,
-                    'analyzed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                try:
-                    # 确保可序列化
-                    import json as _json
-                    self.redis_client.client.setex(
-                        report_key,
-                        timedelta(days=7),
-                        _json.dumps(store_data, ensure_ascii=False, default=str)
-                    )
-                    result['report_key'] = report_key
-                    logger.info(f'走势报告已存入Redis: {report_key}')
-                except Exception as e:
-                    logger.error(f'走势报告存入Redis失败: {e}')
-
-            result['success'] = True
-            result['report_data'] = trend_ai_result
-            self.pipeline_state['trend_report'] = trend_ai_result
-
-            # 生成独立的"走势图数据预测报告" 
-            trend_report = self._generate_trend_chart_report(target_issue, trend_ai_result)
-            if trend_report:
-                if result.get('ai_fallback'):
-                    trend_report.setdefault('note', 'AI分析不可用, 基于统计指标的降级报告')
-                result['trend_chart_report'] = trend_report
-                # 先暂存到 pipeline_state, 待步骤4用多源融合预测填充 prediction 字段后统一入库
-                # (避免在预测为空时提前入库, 导致数据库报告 prediction 为空 —— 问题3/4同类)
-                self.pipeline_state['trend_chart_report'] = trend_report
-                logger.info(f'走势图数据预测报告已生成(期号:{target_issue}), 待步骤4填充预测后入库')
-
-            logger.info(f'步骤2完成: 走势分析成功')
-
-        except Exception as e:
-            logger.error(f'步骤2异常: {e}', exc_info=True)
-            result['error'] = str(e)
-
-        return result
-
-    # ================================================================
-    # 步骤3: 专家报告整合分析 (DEPRECATED v3.15+)
-    # ================================================================
-
-    # ⚠ DEPRECATED (v4.0 §1.8/§4.1)：原 step1-3 报告链路已停用，本方法在
-    # execute_pipeline 中的调用点已注释（L4764/L4768），零活跃调用方。
-    # 保留方法体存档以兼容潜在外部脚本引用；下版物理删除。新预测一律走
-    # 两步流水线 _calc_statistical_prediction → step4_final_prediction。
-    def step3_integrate_expert_reports(self, target_issue: str) -> Dict[str, Any]:
-        """
-        步骤3: 从Redis读取所有专家分析报告，整合后调用AI综合分析【DEPRECATED：v4.0 已停用，调用点注释，下版删除】
-
-        流程:
-        1. 从Redis读取步骤1存储的所有专家分析报告
-        2. 整合后调用AI进行综合分析，生成综合分析报告
-        3. 综合报告存入Redis
-
-        Args:
-            target_issue: 目标期号
-
-        Returns:
-            {success, integrated_report, redis_key, error}
-        
-        Deprecated:
-            v3.15 起已在 execute_pipeline 中注释停用，pipeline_state 中 integrated_report 恒为 None。
-            v4.0 计划物理删除。请勿在新代码中调用。
-        """
-        logger.info('=' * 80)
-        logger.info('【步骤3】开始：专家报告整合分析')
-        logger.info(f'目标期号: {target_issue}')
-        logger.info('=' * 80)
-
-        result = {
-            'success': False,
-            'step': 3,
-            'integrated_report': None,
-            'redis_key': '',
-            'expert_count': 0,
-            'error': None
-        }
-
-        try:
-            # 1. 初始化Redis和AI
-            self._init_redis()
-            self._init_ai_client()
-
-            if not self.redis_client or not self.redis_client.is_connected():
-                result['error'] = 'Redis客户端未连接'
-                return result
-
-            # 健壮性改进: AI不可用不再硬中止步骤3, 改为标记后走降级策略,
-            # 使流水线在AI限流/欠费/网络故障时仍能基于走势图数据产出预测。
-            ai_unavailable = (not self.ai_client or not self.ai_client.ai_available)
-            if ai_unavailable:
-                logger.warning('AI模型不可用, 步骤3将采用降级策略(基于走势图数据继续)')
-
-            # 2. 从Redis读取所有专家分析报告
-            logger.info('从Redis读取专家分析报告...')
-            logger.info(f'目标期号: {target_issue}')
-            expert_reports = []
-
-            # 遍历Redis中所有文章分析报告
-            pattern = self.REDIS_ARTICLE_REPORT_KEY.replace('{article_id}', '*')
-            logger.info(f'Redis匹配模式: {pattern}')
-            article_keys = self.redis_client.client.keys(pattern)
-            logger.info(f'匹配到Redis Keys总数: {len(article_keys)}')
-
-            # 调试：打印所有匹配的keys和它们的issue字段
-            debug_issue_list = []
-            for key in article_keys:
-                try:
-                    data_str = self.redis_client.client.get(key)
-                    if data_str:
-                        data = json.loads(data_str)
-                        issue_in_data = data.get('issue', 'MISSING')
-                        debug_issue_list.append(f'{key.decode() if isinstance(key, bytes) else key}: issue={issue_in_data}')
-                        if issue_in_data == target_issue:
-                            expert_reports.append(data)
-                            logger.info(f' 匹配成功: {key} (期号={issue_in_data})')
-                except Exception as e:
-                    logger.warning(f'读取报告失败 {key}: {e}')
-                    continue
-            
-            # 如果上述方法没找到，尝试另一种匹配方式（article_key直接包含期号的情况）
-            if not expert_reports:
-                logger.warning(f'未找到期号{target_issue}的报告，尝试模糊匹配...')
-                for key_str in debug_issue_list:
-                    logger.info(f'  DEBUG: {key_str}')
-                logger.info('→ 可能原因: 步骤1未成功存储文章，或Redis已过期')
-
-            if not expert_reports:
-                logger.warning(f'未找到期号{target_issue}的专家分析报告')
-                logger.warning('可能原因:')
-                logger.warning('  1. 步骤1执行失败或未执行(没有爬取到文章或AI分析失败)')
-                logger.warning('  2. Redis已过期(超过7天)')
-                logger.warning('  3. 步骤1存储的期号与当前不匹配')
-                
-                # 降级策略: 如果没有专家报告,跳过步骤3直接进入步骤4
-                logger.warning('采用降级策略: 将跳过步骤3,直接使用步骤2的走势报告进行预测')
-                logger.info('流水线状态: 步骤1部分成功(有文章但AI分析失败), 步骤2成功')
-                
-                result['error'] = None  # 不算错误,降级执行
-                result['warning'] = '无专家报告,采用降级策略直接使用走势图数据'
-                result['fallback_strategy'] = True
-                self.pipeline_state['integrated_report'] = None
-                
-                logger.info('步骤1完成(降级模式): 有文章但AI分析失败,将跳过步骤3')
-                return result
-
-            result['expert_count'] = len(expert_reports)
-            logger.info(f'读取到 {len(expert_reports)} 篇专家分析报告')
-
-            # 3. 获取历史数据（用于综合分析）
-            self._init_db_client()
-            db_history = {}
-            if self.db_client and self.db_client.connection:
-                self.db_client.cursor.execute(
-                    'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT 30'
-                )
-                db_history['history'] = self.db_client.cursor.fetchall()
-                if db_history['history']:
-                    db_history['latest_issue'] = db_history['history'][0].get('issue', '')
-
-            logger.info(f'历史数据: {len(db_history.get("history", []))} 期')
-
-            # 4. 构建整合提示词
-            prompt_parts = []
-            prompt_parts.append(f"""
-你是一位顶尖的排列5综合预测专家。请整合以下{len(expert_reports)}篇专家文章的分析报告，结合历史开奖数据，
-进行深度综合分析，给出最终的号码预测报告。
-
-【任务说明】
-你将收到两类数据：
-1. {len(expert_reports)}位专家的文章AI分析结果（各篇文章的结构化预测信息）
-2. 最近30期的历史开奖数据
-
-请综合所有信息，给出最终的预测号码和详细推理过程。
-""")
-
-            # ---- 第一部分：专家报告汇总（精简版） ----
-            prompt_parts.append("\n" + "=" * 60)
-            prompt_parts.append("一、专家报告汇总（精简版）")
-            prompt_parts.append("=" * 60)
-
-            for idx, report in enumerate(expert_reports, 1):
-                ai = report.get('ai_analysis', {})
-                prompt_parts.append(f"\n--- 专家{idx}/{len(expert_reports)} ---")
-                prompt_parts.append(f"作者: {report.get('author', '未知')}")
-                prompt_parts.append(f"置信度: {ai.get('confidence_level', '未知')}")
-
-                forecast = ai.get('forecast_numbers', {})
-                if forecast:
-                    pos_map = {'wan': '万位', 'qian': '千位', 'bai': '百位', 'shi': '十位', 'ge': '个位'}
-                    for pos_key, pos_name in pos_map.items():
-                        nums = forecast.get(pos_key, [])
-                        if nums:
-                            prompt_parts.append(f"  {pos_name}推荐: {nums}")
-
-                combos = ai.get('recommended_combinations', [])
-                if combos:
-                    prompt_parts.append(f"  组合: {combos[:3]}")
-
-                key_points = ai.get('key_points', [])
-                if key_points:
-                    prompt_parts.append(f"  要点: {key_points[0][:80]}")
-
-                summary = ai.get('summary', '')
-                if summary:
-                    prompt_parts.append(f"  总结: {summary[:100]}")
-
-            # ---- 第二部分：历史开奖数据 ----
-            if db_history.get('history'):
-                prompt_parts.append("\n" + "=" * 60)
-                prompt_parts.append("二、历史开奖数据（最近30期）")
-                prompt_parts.append("=" * 60)
-                prompt_parts.append(f"最新期号: {db_history.get('latest_issue', '未知')}")
-                prompt_parts.append("\n最近15期开奖记录：")
-                for item in db_history['history'][:15]:
-                    issue = item.get('issue', '')
-                    wan = item.get('wan', 0)
-                    qian = item.get('qian', 0)
-                    bai = item.get('bai', 0)
-                    shi = item.get('shi', 0)
-                    ge = item.get('ge', 0)
-                    hezhi = item.get('hezhi', '')
-                    prompt_parts.append(f"  {issue}: {wan}{qian}{bai}{shi}{ge} 和值:{hezhi}")
-
-            # ---- 输出格式要求 ----
-            prompt_parts.append(f"""
-=== 最终分析要求 ===
-
-请综合以上{len(expert_reports)}篇专家报告和历史数据，进行深度推理，输出最终的预测报告。
-
-请严格按照以下JSON格式输出（不要包含任何额外文字或markdown标记，不要使用 ``` 代码块）：
-- 所有键和字符串值必须使用英文双引号包裹，禁止使用单引号或未加引号的键名
-- 不要使用 Python 风格的 True/False/None，请使用 JSON 的 true/false/null
-- 不要出现尾随逗号
-只输出一个 JSON 对象，示例如下：
-
-{{
-    "data_source": "专家文章整合分析",
-    "analysis_time": "YYYY-MM-DD HH:MM:SS",
-    "expert_count": {len(expert_reports)},
-    "current_issue": "{db_history.get('latest_issue', '未知')}",
-    "next_issue": "{target_issue}",
-    "prediction": {{
-        "wan": {{"numbers": [], "confidence": [], "reason": ""}},
-        "qian": {{"numbers": [], "confidence": [], "reason": ""}},
-        "bai": {{"numbers": [], "confidence": [], "reason": ""}},
-        "shi": {{"numbers": [], "confidence": [], "reason": ""}},
-        "ge": {{"numbers": [], "confidence": [], "reason": ""}}
-    }},
-    "trend_analysis": {{
-        "summary": "整体综合分析总结",
-        "wan": "万位分析",
-        "qian": "千位分析",
-        "bai": "百位分析",
-        "shi": "十位分析",
-        "ge": "个位分析"
-    }},
-    "reasoning_process": [
-        "综合分析推理步骤1",
-        "综合分析推理步骤2",
-        "综合分析推理步骤3"
-    ],
-    "recommended_combinations": [
-        {{"combination": "5位号码字符串", "confidence": 0.85, "reason": "推荐理由"}}
-    ],
-    "key_conclusions": ["关键结论1", "关键结论2", "关键结论3"],
-    "expert_consensus": "专家共识总结",
-    "risk_warning": "风险提示文本"
-}}
-
-注意事项：
-1. 每个位置推荐2-5个号码
-2. 综合考虑所有专家意见，找出共识号码和分歧号码
-3. reasoning_process至少3步完整推理
-4. expert_consensus总结专家们的共同观点和分歧
-""")
-
-            full_prompt = "\n".join(prompt_parts)
-            logger.info(f'整合分析提示词长度: {len(full_prompt)}')
-
-            # 5. 调用AI（带重试）；若AI不可用或解析失败，则降级而非中止流水线
-            logger.info('调用AI进行专家报告整合分析...')
-            integrated_ai_result = None
-            if ai_unavailable:
-                logger.warning('跳过AI调用(AI不可用), 直接进入降级策略')
-            else:
-                for int_attempt in range(3):
-                    integrated_ai_result = self._call_ai(
-                        system_prompt="你是一位顶尖的排列5综合预测专家，擅长整合多元数据进行深度分析和精准预测。",
-                        user_prompt=full_prompt,
-                        max_tokens=6000,
-                        temperature=0.6
-                    )
-                    if integrated_ai_result:
-                        logger.info(f'专家报告整合AI分析成功(第{int_attempt+1}次尝试)')
-                        break
-                    elif int_attempt < 2:
-                        logger.warning(f'专家报告整合AI第{int_attempt+1}次失败，重试中...')
-                        self._delay_random(3, 5)
-
-            if not integrated_ai_result:
-                # 降级策略: AI不可用/解析失败时, 基于走势图预测合成综合报告,
-                # 保证流水线不中断(直接返回 success+fallback_strategy, 编排器将继续步骤4)。
-                logger.warning('专家报告整合AI分析失败/不可用, 采用降级策略继续步骤4')
-                fallback_report = self._build_fallback_integrated_report(target_issue, expert_reports)
-                result['fallback_strategy'] = True
-                result['warning'] = 'AI整合失败, 已基于走势图数据降级生成综合报告'
-                result['integrated_report'] = fallback_report
-                result['success'] = True
-                self.pipeline_state['integrated_report'] = fallback_report
-                return result
-
-            # 6. 存入Redis
-            self._init_redis()
-            if self.redis_client and self.redis_client.is_connected():
-                report_key = self.REDIS_INTEGRATED_REPORT_KEY.format(issue=target_issue)
-                store_data = {
-                    'issue': target_issue,
-                    'integrated_report': integrated_ai_result,
-                    'expert_count': len(expert_reports),
-                    'analyzed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                try:
-                    import json as _json
-                    self.redis_client.client.setex(
-                        report_key,
-                        timedelta(days=7),
-                        _json.dumps(store_data, ensure_ascii=False, default=str)
-                    )
-                    result['redis_key'] = report_key
-                    logger.info(f'综合报告已存入Redis: {report_key}')
-                except Exception as e:
-                    logger.error(f'综合报告存入Redis失败: {e}')
-
-            result['success'] = True
-            result['integrated_report'] = integrated_ai_result
-            self.pipeline_state['integrated_report'] = integrated_ai_result
-
-            logger.info(f'步骤3完成: 专家报告整合分析成功，共整合{len(expert_reports)}篇报告')
-
-        except Exception as e:
-            logger.error(f'步骤3异常: {e}', exc_info=True)
-            result['error'] = str(e)
-
-        return result
 
     def _build_fallback_integrated_report(self, target_issue: str,
                                           expert_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1937,6 +1037,11 @@ class Pipeline:
     # 步骤4: 最终预测结果生成与入库
     # ================================================================
 
+
+    # ================================================================
+    # 步骤4: 最终预测结果生成与入库
+    # ================================================================
+
     def _predict_trend_multi_source(self, target_issue: str, data_period: int = DATA_WINDOW_PERIOD,
                                     fused_probs: Optional[List[Dict[int, float]]] = None,
                                     persist: bool = False) -> Dict[str, Any]:
@@ -1990,10 +1095,17 @@ class Pipeline:
 
         try:
             # 1. 加载四大类数据源 (DESC -> 翻转成旧->新)
-            db.cursor.execute(
-                'SELECT issue, wan, qian, bai, shi, ge FROM p5_history_data '
-                'ORDER BY issue DESC LIMIT %s', (data_period,))
-            history = db.cursor.fetchall() or []
+            # 修复(20261116): 1994 复用编排层全量历史快照(ASC, 旧->新)，反转切片得到与
+            # 「SELECT issue,wan,qian,bai,shi,ge ... ORDER BY issue DESC LIMIT data_period」
+            # 等价的结果（快照为 SELECT *，多出的列不会被本方法读取）；快照缺失时回退独立查询。
+            _asc_snap = (getattr(self, 'pipeline_state', None) or {}).get('p5_history_asc') or []
+            if _asc_snap:
+                history = list(reversed(_asc_snap[-data_period:])) if data_period else list(reversed(_asc_snap))
+            else:
+                db.cursor.execute(
+                    'SELECT issue, wan, qian, bai, shi, ge FROM p5_history_data '
+                    'ORDER BY issue DESC LIMIT %s', (data_period,))
+                history = db.cursor.fetchall() or []
 
             db.cursor.execute(
                 'SELECT issue, wan, qian, bai, shi, ge, hezhi, odd_even_ratio, big_small_ratio '
@@ -2268,6 +1380,7 @@ class Pipeline:
                 return 0
             # 归一到 [-3, 3] 区间, 避免极端偏置
             return max(-3, min(3, diff))
+        # 审计佐证(20261116): 字段不可解析时按 0 兜底，不中断主流程（回退属预期）
         except (ValueError, TypeError):
             return 0
 
@@ -2326,6 +1439,7 @@ class Pipeline:
                                 all_constraints.append(data)
                             except (json.JSONDecodeError, TypeError):
                                 pass
+            # 审计佐证(20261116): 约束数据损坏时跳过该条，不中断整体加载（跳过属预期）
             except (sqlite3.Error, Exception):
                 pass
             
@@ -2614,8 +1728,14 @@ class Pipeline:
                 logger.info('使用内存中的综合分析报告')
 
             # 4. 获取历史数据
-            self.db_client.cursor.execute('SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT 30')
-            history_data = self.db_client.cursor.fetchall()
+            # 修复(20261116): 2617 复用编排层全量历史快照(ASC, 旧->新)，反转切片得到与
+            # 「ORDER BY issue DESC LIMIT 30」等价的结果；快照缺失时回退独立查询。
+            _asc_snap = self.pipeline_state.get('p5_history_asc') or []
+            if _asc_snap:
+                history_data = list(reversed(_asc_snap[-30:]))
+            else:
+                self.db_client.cursor.execute('SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT 30')
+                history_data = self.db_client.cursor.fetchall()
             latest_issue = history_data[0].get('issue', '') if history_data else ''
 
             logger.info(f'数据准备完成: 走势报告={"有" if trend_report else "无"}, 综合报告={"有" if integrated_report else "无"}, 历史数据{len(history_data)}期')
@@ -2803,8 +1923,12 @@ class Pipeline:
 
             # === 核心: 统计融合预测(取代原纯LLM拼装) ===
             # 从数据库重新拉取升序历史数据(构造预测器输入)
-            self.db_client.cursor.execute('SELECT * FROM p5_history_data ORDER BY issue ASC')
-            _rows = self.db_client.cursor.fetchall()
+            # 修复(20261116): 2806 直接复用编排层全量历史快照(ASC, 旧->新)，消除同一次运行
+            # 内的第二次全表查询；快照缺失时回退独立查询。
+            _rows = self.pipeline_state.get('p5_history_asc') or []
+            if not _rows:
+                self.db_client.cursor.execute('SELECT * FROM p5_history_data ORDER BY issue ASC')
+                _rows = self.db_client.cursor.fetchall()
             if not _rows:
                 result['error'] = '无历史开奖数据，无法进行预测'
                 return result
@@ -2857,11 +1981,32 @@ class Pipeline:
                 _bayes_cached_in_db = None
 
             if not _cached:
-                _predictor = self._get_predictor()
-                _stat = _predictor.predict(_history, current_issue=latest_issue)
-                if _stat.get('error'):
-                    result['error'] = f'统计预测失败: {_stat["error"]}'
-                    return result
+                # 修复(20261116): 2861 同一次「开始分析」中步骤1(_calc_statistical_prediction)已用
+                # 60 期窗口跑过一次完整 P5Predictor.predict，步骤4 又用全量 ASC 历史重跑一遍。
+                # 两处输入窗口口径不同（predictor 各算法中仅 frequency 内部截断 lookback，
+                # 遗漏/马尔可夫/贝叶斯/监督学习等消费全量历史，60 期与全量的预测结果不等价），
+                # 故采取保守复用方案：仅当 pipeline_state.stat_prediction 的窗口口径与本步骤
+                # 输入完全一致（窗口期数相同 + 最新期号相同 = 同一行集）时直接复用并注明来源，
+                # 否则按原路径重算，行为可回退。
+                _stat = None
+                _sp = self.pipeline_state.get('stat_prediction') or {}
+                _sp_raw = _sp.get('raw_prediction') if isinstance(_sp, dict) else None
+                _sp_meta = _sp.get('window_meta') if isinstance(_sp, dict) else None
+                if (_sp.get('success') and isinstance(_sp_raw, dict) and not _sp_raw.get('error')
+                        and _sp_raw.get('fused_probabilities') is not None
+                        and _sp_raw.get('top_combinations')
+                        and isinstance(_sp_meta, dict)
+                        and _sp_meta.get('window') == history_count
+                        and str(_sp_meta.get('latest_issue')) == str(latest_issue)):
+                    _stat = dict(_sp_raw)
+                    logger.info('步骤4复用步骤1统计预测结果(同窗口口径: window=%s, latest_issue=%s, '
+                                '来源=pipeline_state.stat_prediction)', history_count, latest_issue)
+                if _stat is None:
+                    _predictor = self._get_predictor()
+                    _stat = _predictor.predict(_history, current_issue=latest_issue)
+                    if _stat.get('error'):
+                        result['error'] = f'统计预测失败: {_stat["error"]}'
+                        return result
 
                 # 持久化完整预测统计到数据库 (主缓存, 决定是否需要调用AI)
                 try:
@@ -2944,6 +2089,16 @@ class Pipeline:
             except Exception:
                 spj_pref = {}
 
+            # 修复(20261116): 2961 原实现在下方 for _pk 循环内逐位调 get_history_data(limit=30)
+            # 并重复统计频率/遗漏 —— 同一份数据最多查 5 次、算 5 遍。现改为循环外取一次历史数据
+            # (DESC, index0=最新)，循环内各位只统计自己的列。
+            _hist = []
+            try:
+                if self.db_client:
+                    _hist = self.db_client.get_history_data(limit=30)  # DESC, index0=最新
+            except Exception:
+                _hist = []
+
             prediction = {}
             for _pk in pos_keys:
                 if trend_multi.get(_pk):
@@ -2957,8 +2112,7 @@ class Pipeline:
                     # 降级路径: 从DB现算 frequency/omission 特征供 GUI 展示(真实历史, 非编造)
                     _feat = {'freq_pct': {}, 'omission': {}}
                     try:
-                        if self.db_client:
-                            _hist = self.db_client.get_history_data(limit=30)  # DESC, index0=最新
+                        if _hist:
                             _col = {'wan': 0, 'qian': 1, 'bai': 2, 'shi': 3, 'ge': 4}[_pk]
                             _counts = {d: 0 for d in range(10)}
                             _last_seen = {d: -1 for d in range(10)}
@@ -4082,54 +3236,28 @@ class Pipeline:
             'error': None
         }
         
+        # 修复(20261116): 4095-4126 原实现与 verify_pending_predictions 功能重叠且只统计
+        # 已 verified 的记录数（空检查，从不拉取实开号码做真实验证），同一次流水线对
+        # p5_prediction_record 形成两次扫描。保守处理：保留本函数与调用方签名/返回结构不变，
+        # 内部直接委托 verify_pending_predictions 执行真实闭环验证并映射回原返回键。
         try:
-            # 懒加载数据库客户端
             if not self.db_client:
                 self._init_db_client()
-            
+
             if not self.db_client or not self.db_client.connection:
                 result['error'] = '数据库未连接'
                 return result
-            
-            # 查询该期号的预测记录
-            self.db_client.cursor.execute(
-                '''SELECT id, report_uuid, target_issue, predicted_numbers, 
-                         predicted_combinations, confidence_scores, verification_status
-                  FROM p5_prediction_record 
-                  WHERE target_issue = %s 
-                  ORDER BY created_at DESC''',
-                (target_issue,)
-            )
-            records = self.db_client.cursor.fetchall()
-            
-            if not records:
-                logger.info(f'期号{target_issue}无预测记录,跳过验证')
-                result['success'] = True
-                result['verified_count'] = 0
-                return result
-            
-            # 检查每条记录的验证状态
-            for record in records:
-                record_id = record.get('id')
-                verification_status = record.get('verification_status', 'pending')
-                
-                record_detail = {
-                    'report_uuid': record.get('report_uuid'),
-                    'predicted_numbers': record.get('predicted_numbers'),
-                    'verification_status': verification_status
-                }
-                result['details'].append(record_detail)
-                
-                if verification_status == 'verified':
-                    result['verified_count'] += 1
-            
-            logger.info(f'预测验证完成: 共{len(records)}条记录,已验证{result["verified_count"]}条')
-            result['success'] = True
-            
+
+            closed = self.verify_pending_predictions()
+            result['success'] = bool(closed.get('success'))
+            result['verified_count'] = int(closed.get('verified_count', 0) or 0)
+            result['details'] = closed.get('details', []) or []
+            result['error'] = closed.get('error')
+
         except Exception as e:
             logger.error(f'预测验证执行失败: {e}', exc_info=True)
             result['error'] = str(e)
-        
+
         return result
 
     def verify_pending_predictions(self) -> Dict[str, Any]:
@@ -4503,6 +3631,7 @@ class Pipeline:
         if self._progress_callback:
             try:
                 self._progress_callback(level, message)
+            # 审计佐证(20261116): UI 回调异常不得中断后台任务（回调旁路，降级属预期）
             except Exception:
                 pass
 
@@ -4520,6 +3649,7 @@ class Pipeline:
         if handler is not None:
             try:
                 logging.getLogger().removeHandler(handler)
+            # 审计佐证(20261116): handler 已移除时 removeHandler 忽略异常（清理幂等，忽略属预期）
             except Exception:
                 pass
 
@@ -4713,11 +3843,18 @@ class Pipeline:
 
             # 拉取历史数据（取最近 data_limit 期: 倒序取最新, 避免取到最旧的 2023 期
             # 导致 _verification_cutoff 落在过去, 贝叶斯退化为纯先验、AI 辅助不触发）
-            self.db_client.cursor.execute(
-                'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT %s',
-                (data_limit,)
-            )
-            history_data = self.db_client.cursor.fetchall()
+            # 修复(20261116): 4717 复用编排层全量历史快照(ASC, 旧->新)，反转切片得到与
+            # 「ORDER BY issue DESC LIMIT data_limit」等价的结果，消除同一次运行内的重复取数；
+            # 快照缺失时回退独立查询。
+            _asc_snap = self.pipeline_state.get('p5_history_asc') or []
+            if _asc_snap:
+                history_data = list(reversed(_asc_snap[-data_limit:])) if data_limit else list(reversed(_asc_snap))
+            else:
+                self.db_client.cursor.execute(
+                    'SELECT * FROM p5_history_data ORDER BY issue DESC LIMIT %s',
+                    (data_limit,)
+                )
+                history_data = self.db_client.cursor.fetchall()
 
             if not history_data:
                 logger.error('无历史开奖数据')
@@ -4773,6 +3910,14 @@ class Pipeline:
                 'predict_time': enhanced_result.get('predict_time'),
                 'risk_warning': enhanced_result.get('risk_warning', ''),
                 'raw_prediction': enhanced_result,
+                # 修复(20261116): 4765 补充窗口口径元数据(window=本次 predict 实际使用的期数,
+                # latest_issue=数据端点)，供 step4_final_prediction 判断 pipeline_state 中是否
+                # 存在「同窗口口径」结果以复用，避免同一次「开始分析」把 P5Predictor.predict
+                # 完整跑两遍(P1-1 保守复用方案，口径不一致时 step4 照常重算)。
+                'window_meta': {
+                    'window': len(_history),
+                    'latest_issue': str(latest_issue),
+                },
             }
 
         except Exception as e:
@@ -4842,6 +3987,23 @@ class Pipeline:
             'started_at': datetime.now(),
             'completed_at': None,
         }
+
+        # 修复(20261116): 4717/2617/2806/1994 同一次运行中 p5_history_data 被重复查询 ≥4 次
+        # （step1 的 DESC LIMIT 60、step4 的 DESC LIMIT 30 与全量 ASC、多源走势预测的 DESC LIMIT 60）
+        # —— 编排层统一全量取数一次（ORDER BY issue ASC，旧->新），经 pipeline_state 传引用，
+        # 各消费点按需反转/切片得到与原查询等价的结果。run 期间编排层不触发爬取（步骤1-3已停用），
+        # 表内容在本 run 内稳定，共享快照安全；快照失败时各消费点自动回退独立查询（行为可回退）。
+        try:
+            self._ensure_db()
+            if self.db_client and self.db_client.connection:
+                self.db_client.cursor.execute('SELECT * FROM p5_history_data ORDER BY issue ASC')
+                self.pipeline_state['p5_history_asc'] = self.db_client.cursor.fetchall() or []
+                logger.info(f'流水线历史数据快照就绪: {len(self.pipeline_state["p5_history_asc"])} 期(全量 ASC, 旧->新)')
+            else:
+                self.pipeline_state['p5_history_asc'] = []
+        except Exception as _snap_e:
+            logger.warning(f'流水线历史数据快照获取失败(各步骤将回退独立查询): {_snap_e}')
+            self.pipeline_state['p5_history_asc'] = []
 
         # 实时进度回调(GUI 流式输出)
         self._progress_callback = progress_callback

@@ -1,0 +1,119 @@
+﻿P5Database 公开方法共 93 个
+
+=== 存活零引用 50 个（候选收敛对象）===
+ - get_history_count | 自调用: [(4105, 'count = db.get_history_count()')]
+ - get_report_count
+ - insert_wan_trend_data
+ - get_wan_trend_data
+ - get_wan_trend_count
+ - get_wan_trend_by_issue
+ - get_wan_number_stats
+ - insert_qian_trend_data
+ - get_qian_trend_data
+ - get_qian_trend_count
+ - get_qian_trend_by_issue
+ - get_qian_number_stats
+ - insert_bai_trend_data
+ - get_bai_trend_data
+ - get_bai_trend_count
+ - get_bai_trend_by_issue
+ - get_bai_number_stats
+ - insert_shi_trend_data
+ - get_shi_trend_data
+ - get_shi_trend_count
+ - get_shi_trend_by_issue
+ - get_shi_number_stats
+ - insert_ge_trend_data
+ - get_ge_trend_data
+ - get_ge_trend_count
+ - get_ge_trend_by_issue
+ - get_spjzs_data
+ - get_hzzst_data
+ - get_ge_number_stats
+ - get_sum_end_trend_data
+ - get_sum_end_trend_count
+ - get_sum_end_trend_by_issue
+ - get_sum_end_stats
+ - get_back_three_trend_data
+ - get_back_three_trend_count
+ - get_back_three_trend_by_issue
+ - get_back_three_sum_end_stats
+ - get_expert_recommendation_by_issue
+ - get_latest_expert_recommendations
+ - get_expert_recommendation_count
+ - get_prediction_with_details
+ - update_prediction_verification_batch
+ - get_weight_history
+ - get_algorithm_performance
+ - save_adaptive_weights
+ - load_adaptive_weights
+ - save_bayesian_result
+ - get_bayesian_result
+ - get_bayesian_results
+ - get_bayesian_visual_summary
+
+=== 存活有引用 43 个 ===
+ - transaction: root:./modules/data_fetcher.py L[2373]; root:./scripts/tests/test_data_layer_integrity.py L[5, 26, 34]; root:./scripts/tests/test_data_persistence_integrity.py L[11]; root:./tests/test_fix_data_layer_20261116.py L[8, 119, 133]
+ - connect: root:./gui/dashboard.py L[489, 594, 863]; root:./gui/scheduler.py L[172, 270, 1058]; root:./maint/analyze_db_issues.py L[6]; root:./maint/check_db_structure.py L[6] | 自调用: [(51, '# - 在 connect() 中会尝试自动创建缺失的数据库（兼容新环境）'), (316, 'connection / cursor 均延迟到 connect() 时创建；'), (339, '# 修复(20261116): L339-340 connect() 返回 False 时未校验，self.connection 仍为 None，yield 后'), (341, 'if not self.connect():')]
+ - disconnect: root:./gui/dashboard.py L[524, 614, 865]; root:./gui/scheduler.py L[203, 317, 2550]; root:./maint/check_issues.py L[26]; root:./maint/fill_trend_data.py L[140] | 自调用: [(281, '传入 owner 时只释放该实例自己的连接，避免 A 实例的 disconnect()'), (527, 'self.disconnect()'), (4144, 'db.disconnect()')]
+ - execute_with_reconnect: root:./modules/online_learner.py L[1543]; root:./scripts/tests/test_data_layer_integrity.py L[60]; root:./tests/test_db_fix.py L[4, 90, 91]; root:./tests/test_db_fix2.py L[89, 90, 91] | 自调用: [(27, '- 网络/数据库异常统一走 execute_with_reconnect 的重连机制，提升健壮性。'), (598, '本方法提供与 execute_with_reconnect 一致的连接中断重连保护。'), (617, '# 与 execute_with_reconnect 相同的连接中断错误分类'), (1347, '逐行 execute_with_reconnect（审计钉桩 scripts/tests/test_data_layer_integrity.py::')]
+ - create_tables: root:./version.py L[443]; root:./gui/scheduler.py L[2642, 2705]; root:./modules/data_fetcher.py L[2370, 2760]; root:./scripts/tests/test_api_contract_integrity.py L[74, 75, 76] | 自调用: [(10, '主要负责的表（建表逻辑见 create_tables，修改 schema 务必保持向后兼容）：'), (52, '# - 在 create_tables() 中创建/兼容表结构时应保持向后兼容，不删除已有列'), (1719, '早期版本的表没有 report_type 列, 而 create_tables 仅在初始化命令时调用,'), (3548, '"""运行时安全补齐 p5_artifact 表(幂等, 兼容未执行 create_tables 的旧库)。"""')]
+ - insert_history_data: root:./gui/scheduler.py L[2708]; root:./modules/data_fetcher.py L[2380, 2521, 2764]; root:./scripts/tests/test_data_layer_integrity.py L[7, 50, 61]; root:./scripts/tests/test_data_persistence_integrity.py L[12, 84] | 自调用: [(4102, 'success, skip = db.insert_history_data(test_data)')]
+ - get_latest_history_issue: root:./gui/scheduler.py L[2549, 2643]; root:./modules/data_fetcher.py L[2375] | 自调用: [(4108, 'latest_issue = db.get_latest_history_issue()')]
+ - get_latest_trend_issue: root:./gui/scheduler.py L[2644]; root:./modules/data_fetcher.py L[2376]
+ - get_history_data_count: root:./version.py L[448]; root:./gui/dashboard.py L[520]; root:./gui/scheduler.py L[2548]; root:./modules/self_evolution.py L[1617]
+ - get_table_count: root:./version.py L[450]; root:./gui/scheduler.py L[2602, 2665]; root:./modules/auto_evaluator.py L[395, 478, 772]; root:./scripts/migrate/migrate_position_trend.py L[194, 213, 278]
+ - get_history_data: root:./gui/scheduler.py L[178, 275, 3901]; root:./modules/ai_analyzer.py L[577]; root:./modules/auto_evaluator.py L[405]; root:./modules/backtester.py L[258] | 自调用: [(11, '- 历史开奖表        ：存储每期开奖号码，供预测/回测读取（get_history_data 等）。')]
+ - get_history_by_issue: root:./modules/validator.py L[95, 145]
+ - insert_trend_data: root:./gui/scheduler.py L[2712]; root:./modules/data_fetcher.py L[2402, 2768]; root:./tests/test_db_fix.py L[4, 50, 64]; root:./tests/test_db_fix2.py L[46, 61, 62]
+ - get_trend_data: root:./modules/ai_analyzer.py L[578]; root:./modules/optimization_patches.py L[120, 135]; root:./modules/trend_analyzer.py L[132]
+ - insert_ai_report: root:./modules/ai_analyzer.py L[1034]; root:./modules/online_learner.py L[228]; root:./modules/pipeline.py L[2406, 2474] | 自调用: [(14, '- AI 分析报告表     ：insert_ai_report，存储每期 AI 生成的综合分析报告。'), (4112, 'report_uuid = db.insert_ai_report(')]
+ - get_latest_ai_report: root:./modules/ai_analyzer.py L[1206]; root:./scripts/tests/test_api_contract_integrity.py L[80, 81, 82]
+ - get_all_ai_reports: root:./modules/ai_analyzer.py L[1235]; root:./scripts/tests/test_api_contract_integrity.py L[77, 78, 79]
+ - insert_prediction_record: root:./modules/persistence.py L[337, 346, 361]; root:./modules/pipeline.py L[2572]; root:./tests/test_persistence.py L[94] | 自调用: [(15, '- 预测验证记录表    ：insert_prediction_record / update_prediction_verification，'), (4125, 'db.insert_prediction_record(')]
+ - update_prediction_verification: root:./modules/pipeline.py L[2521, 3270, 3277]; root:./modules/validator.py L[100, 150]; root:./scripts/backtest/pipeline_regression_test.py L[7, 156, 159] | 自调用: [(15, '- 预测验证记录表    ：insert_prediction_record / update_prediction_verification，'), (4133, 'result = db.update_prediction_verification(')]
+ - get_pending_predictions: root:./gui/scheduler.py L[2733]; root:./modules/validator.py L[138, 217, 237]; root:./scripts/tests/test_error_security_integrity.py L[23, 32] | 自调用: [(1440, '# 修复(20261116): L1363 issue 为 VARCHAR 直接 ORDER BY 是字典序，脏期号会错序 — 改为 CAST 数值序（与 ge')]
+ - get_verification_stats: root:./version.py L[228, 623]; root:./gui/dashboard.py L[500, 864, 1082]; root:./gui/scheduler.py L[2803, 5194, 5202]; root:./modules/result_verifier.py L[25, 348] | 自调用: [(2251, 'stats = self.get_verification_stats()'), (4141, 'stats = db.get_verification_stats()')]
+ - update_performance_stats: root:./gui/scheduler.py L[2799]; root:./modules/validator.py L[108, 163]
+ - get_performance_history: root:./gui/scheduler.py L[2878, 2884, 5229]; root:./modules/validator.py L[204]
+ - insert_spjzs_data: root:./modules/data_fetcher.py L[2533]; root:./tests/test_db_fix.py L[94]
+ - insert_hzzst_data: root:./modules/data_fetcher.py L[2543]; root:./tests/test_db_fix.py L[96]
+ - get_latest_spjzs_issue: root:./gui/scheduler.py L[2645]
+ - get_latest_hzzst_issue: root:./gui/scheduler.py L[2646]
+ - insert_sum_end_trend_data: root:./modules/data_fetcher.py L[2553]
+ - insert_back_three_trend_data: root:./modules/data_fetcher.py L[2563]
+ - get_verified_predictions: root:./gui/dashboard.py L[1362, 1464]; root:./modules/auto_evaluator.py L[492]; root:./modules/online_learner.py L[344]; root:./modules/self_evolution.py L[2379, 2380]
+ - insert_weight_history: root:./modules/online_learner.py L[865, 912, 915]; root:./modules/pipeline.py L[3073]; root:./tests/test_monitor_feedback.py L[114]; root:./tests/test_online_learner_v370.py L[7, 29, 34] | 自调用: [(18, '- 权重历史表        ：insert_weight_history，支撑自适应权重（EWMA）的持久化与回放。')]
+ - insert_selection_ab_test: root:./modules/selection_strategy.py L[1023]; root:./tests/test_selection_ab_v370.py L[137, 140, 153]
+ - save_artifact: root:./gui/scheduler.py L[4788]; root:./modules/backtester.py L[825, 929, 1097]; root:./modules/pipeline.py L[2014, 2057, 3161]; root:./modules/self_evolution.py L[98, 2913] | 自调用: [(22, '- predictor / pipeline 调用 save_artifact / get_artifacts 存取 JSON 化产物。'), (3460, "ok = self.save_artifact('adaptive_weights', config, meta={'version': version})"), (3794, "ok = self.save_artifact('bayesian_result', bayesian_data, issue=issue, meta=meta")]
+ - get_artifacts: root:./modules/predictor.py L[2819, 2823] | 自调用: [(22, '- predictor / pipeline 调用 save_artifact / get_artifacts 存取 JSON 化产物。'), (3623, 'items = self.get_artifacts(artifact_type=artifact_type, issue=issue, ref_uuid=re'), (3822, "artifacts = self.get_artifacts(artifact_type='bayesian_result', limit=limit)")]
+ - get_latest_artifact: root:./modules/pipeline.py L[1962, 3501]; root:./tests/test_fix_pipeline_20261116.py L[103] | 自调用: [(3481, "artifact = self.get_latest_artifact('adaptive_weights')"), (3788, "existing = self.get_latest_artifact('bayesian_result', issue=issue)"), (3812, "artifact = self.get_latest_artifact('bayesian_result', issue=issue)")]
+ - save_evolution_version: root:./version.py L[443]; root:./modules/self_evolution.py L[854, 2502] | 自调用: [(3666, "logger.warning('save_evolution_version 跳过: version_tag 缺失')")]
+ - get_evolution_versions: root:./version.py L[443]; root:./modules/self_evolution.py L[2454]
+ - update_evolution_version_status: root:./version.py L[443]
+ - insert_bayesian_result: root:./modules/pipeline.py L[2034]; root:./tests/test_fix_pipeline_20261116.py L[109]
+ - get_bayesian_result_row: root:./modules/pipeline.py L[1165, 1166, 1171]; root:./modules/trend_analyzer.py L[155, 156]; root:./tests/test_fix_pipeline_20261116.py L[106] | 自调用: [(3906, 'row = self.get_bayesian_result_row(issue)')]
+ - check_data_consistency: root:./scripts/verify/final_verify.py L[19]; root:./scripts/verify/verify_optimization.py L[33, 52]
+ - clean_orphan_trend_records: root:./scripts/verify/verify_optimization.py L[49]
+ - get_database_stats: root:./scripts/verify/final_verify.py L[30]; root:./scripts/verify/verify_optimization.py L[17]
+
+=== 动态方法名构造模式 ===
+ ./version.py:106: "get_latest_advisory 只读接口：不写检查点/权重/DB，附 Wilson CI 对比与诚实注释",
+ ./version.py:228: "get_verification_stats 同步暴露 top1_* 系列字段（含向后兼容 strict_* 别名），双口径并存。",
+ ./version.py:739: "get_adaptive_weights(metric='top1_hit'|'hit_rate'|'hybrid') 三通道可读，metric 自动降级（top1 无数据→hit_rate）。",
+ ./version.py:740: "load_from_records 双格式兼容：旧 records 只含 algo_evaluations 时走 hit_rate，含 algo_evaluations_t1 时双通道并累积。",
+ ./gui/scheduler.py:1219: export_path = os.path.join(REPORTS_DIR, f'update_ledger_{ts_str}.json')
+ ./modules/trend_analyzer.py:140: m = getattr(db, f'get_{p}_trend_data', None)
+ ./scripts/backtest/pipeline_regression_test.py:141: check("get_verification_stats 返回非空", bool(stats), "stats 为空")
+ ./scripts/backtest/pipeline_regression_test.py:212: check("update_prediction_verification 返回 success", result.get('status') == 'success',
+ ./scripts/diagnose/diag_eval_offbyone.py:116: print("load_rows 异常:", e)
+ ./scripts/tests/test_api_contract_integrity.py:79: assert isinstance(r, list), f'get_all_ai_reports 返回 {type(r)}，应为 list'
+ ./scripts/tests/test_api_contract_integrity.py:82: assert r is None or isinstance(r, dict), f'get_latest_ai_report 返回 {type(r)}'
+ ./scripts/tests/test_data_layer_integrity.py:50: """insert_history_data 智能去重：已有期号跳过 + 新期号插入。"""
+ ./scripts/tests/test_integration_integrity.py:23: """load_version_info 聚合如实"""
+ ./tests/test_db_fix.py:48: logger.info(f'insert_history_data 结果: 成功{success}条, 跳过{skip}条')
+ ./tests/test_db_fix.py:66: logger.info(f'insert_trend_data 结果: 成功{success}条, 跳过{skip}条')
+ ./tests/test_db_fix2.py:44: logger.info(f'insert_history_data 结果: 成功{success}条, 跳过{skip}条')
+ ./tests/test_db_fix2.py:63: logger.info(f'insert_trend_data 结果: 成功{success}条, 跳过{skip}条')
+ ./tests/test_perf_monitor.py:181: """get_trend / get_summary / persist_trend 读取 API。"""
+ ./tests/test_self_evolution_checkpoint.py:462: """get_link_state 返回副本，外部修改不得污染引擎内部状态。"""

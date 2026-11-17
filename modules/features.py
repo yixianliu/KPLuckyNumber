@@ -452,21 +452,27 @@ class P5Features:
             }
 
             # 计算当前012路状态
+            # 修复(20261116): 456 直接索引data[-1]的numbers，缺失或长度不足5即IndexError — 先做len==positions校验，非法行视为未知路
+            current_road = -1
             if data:
-                last_num = int(data[-1].get('numbers', [])[pos])
-                if last_num in self.road_0:
-                    current_road = 0
-                elif last_num in self.road_1:
-                    current_road = 1
-                else:
-                    current_road = 2
-            else:
-                current_road = -1
+                last_numbers = data[-1].get('numbers', [])
+                if len(last_numbers) == self.positions:
+                    last_num = int(last_numbers[pos])
+                    if last_num in self.road_0:
+                        current_road = 0
+                    elif last_num in self.road_1:
+                        current_road = 1
+                    else:
+                        current_road = 2
 
             # 计算各路遗漏
             road_omissions = {0: 0, 1: 0, 2: 0}
-            for item in reversed(data):
-                num = int(item.get('numbers', [])[pos])
+            # 修复(20261116): 468-469 误用reversed(data)忽略window参数且直接索引numbers会IndexError — 改用reversed(use_data)并跳过非法行
+            for item in reversed(use_data):
+                nums = item.get('numbers', [])
+                if len(nums) != self.positions:
+                    continue
+                num = int(nums[pos])
                 if num in self.road_0:
                     road = 0
                 elif num in self.road_1:
@@ -652,16 +658,18 @@ class P5Features:
             }
 
             # 计算当前区间
+            # 修复(20261116): 656 直接索引data[-1]的numbers，缺失或长度不足5即IndexError — 先做len==positions校验，非法行视为unknown
+            current_interval = 'unknown'
             if data:
-                last_num = int(data[-1].get('numbers', [])[pos])
-                if last_num in self.intervals['low']:
-                    current_interval = 'low'
-                elif last_num in self.intervals['mid']:
-                    current_interval = 'mid'
-                else:
-                    current_interval = 'high'
-            else:
-                current_interval = 'unknown'
+                last_numbers = data[-1].get('numbers', [])
+                if len(last_numbers) == self.positions:
+                    last_num = int(last_numbers[pos])
+                    if last_num in self.intervals['low']:
+                        current_interval = 'low'
+                    elif last_num in self.intervals['mid']:
+                        current_interval = 'mid'
+                    else:
+                        current_interval = 'high'
 
             interval_features[pos_name] = {
                 'interval_ratios': interval_ratios,
@@ -942,6 +950,10 @@ class P5Features:
                 sums.append(sum(nums))
                 spans.append(max(nums) - min(nums))
 
+        # 修复(20261116): 946-951 只查行数不查行内容，use_data全行numbers非法时sums/spans为空，min()抛ValueError、np.mean([])产生nan — 空列表提前返回error
+        if not sums or not spans:
+            return {'error': '数据为空'}
+
         # 计算和值特征
         sum_stats = {
             'mean': float(np.mean(sums)),
@@ -1100,7 +1112,8 @@ class P5Features:
                 # 统计 十位=src 且 下一期个位=dst 的相邻期对数
                 cnt = 0
                 denom = 0
-                for k in range(len(seq) - recent_window - 1, len(seq) - 1):
+                # 修复(20261116): 1103 len(seq)<=50时起始下标为-1，Python负索引回绕把「末尾→开头」的错误转移对计入矩阵 — 起始下标钳制为max(0, len(seq)-recent_window)
+                for k in range(max(0, len(seq) - recent_window), len(seq) - 1):
                     if seq[k][3] == src:
                         denom += 1
                         if seq[k + 1][4] == dst:
@@ -1673,7 +1686,7 @@ class P5Features:
                     pair_count += 1
                 
                 # 检测豹子（三个相同数字）
-                from collections import Counter
+                # 结构清理(20261116): Counter 已在模块顶部导入，删除循环体内重复 import
                 num_counts = Counter(nums)
                 if any(count >= 3 for count in num_counts.values()):
                     triple_count += 1
@@ -1976,7 +1989,7 @@ class P5Features:
                 
                 # 重号数量（与上期相比，但这里简化为当期重复数字数量）
                 # 实际的重号需要和上期比较，这里我们计算当期内的重复程度
-                from collections import Counter
+                # 结构清理(20261116): Counter 已在模块顶部导入，删除循环体内重复 import
                 num_counts = Counter(nums)
                 repeat_count = sum(count - 1 for count in num_counts.values() if count > 1)
                 constraint_series['repeat_counts'].append(repeat_count)
@@ -2903,8 +2916,6 @@ class P5Features:
             likelihood = likelihoods[pos]
 
             posterior = {}
-            evidence = 0.0
-            surprise = {}
 
             for key in self.number_range:
                 p_key = str(key)
@@ -2915,9 +2926,9 @@ class P5Features:
                 # 原实现 posterior += l_val * p_val 随样本增多方差膨胀; log-space 等价但数值稳定.
                 log_post = math.log(max(l_val, 1e-12)) + math.log(max(p_val, 1e-12))
                 posterior[p_key] = log_post
-                evidence += log_post
-                # 意外度
-                surprise[p_key] = log_post - math.log(max(p_val, 1e-12))
+                # 结构清理(20261116): evidence 初值/累加与初版 surprise 赋值均为死计算
+                # （evidence/surprise 在下方分别被 `evidence = sum(posterior.values())` 与
+                # 概率空间重算无条件覆盖），删除后输出逐位不变
 
             # 归一化后验: exp(log_post - max) 防下溢, 等价于 softmax
             max_log = max(posterior.values()) if posterior else 0.0
@@ -3028,6 +3039,7 @@ class P5Features:
         try:
             entropy = -sum(p * np.log2(p) for p in probs)
             return float(entropy)
+        # 审计佐证(20261116): p=0 时 log2 无定义，熵按 0.0 兜底（回退属预期）
         except (ValueError, OverflowError):
             return 0.0
 
@@ -3226,6 +3238,7 @@ def get_drop_collinear() -> bool:
             return True
         from config import FEATURE_DROP_COLLINEAR
         return bool(FEATURE_DROP_COLLINEAR)
+    # 审计佐证(20261116): 配置缺失时按未启用降级返回 False（兜底属预期）
     except Exception:
         return False
 
@@ -3340,9 +3353,8 @@ def _standardize_group(group: Any, mean: float, std: float) -> Any:
     return group
 
 
-def feature_group_categories() -> Dict[str, str]:
-    """返回分组名 → 类别映射（供可视化/报告用）。"""
-    return {k: v.get('category', 'other') for k, v in FEATURE_GROUP_REGISTRY.items()}
+# 结构清理(20261116): feature_group_categories 全仓零调用（.py/docs 均无引用）死代码 — 整体删除
+# （原实现返回 {分组名: category} 映射，仅包装 FEATURE_GROUP_REGISTRY，无任何调用方）
 
 
 def measure_feature_extraction_perf(

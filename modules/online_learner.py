@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 # 不可回溯补齐，会污染「归因覆盖率」指标。故覆盖率默认仅统计该部署日之后创建的记录。
 ATTRIBUTION_FIX_DEPLOY_DATE = '2026-08-05'
 
+# 五个开奖位置的规范键名（万/千/百/十/个）。
+# 修复(20261116): P2-8 引入 —— 原实现多处内联 ['wan', 'qian', ...] 硬列表并用 .index() 取下标，
+# 遇 AI 返回的非预期键（中文位名/别名）会抛 ValueError；统一常量供成员判断与跳过。
+POS_LIST = ['wan', 'qian', 'bai', 'shi', 'ge']
+
 
 def _created_at_ge(created_at: Any, since_str: str) -> bool:
     """判断预测记录的 created_at 是否 >= since_str (格式 'YYYY-MM-DD')。
@@ -187,6 +192,36 @@ class OnlineLearner:
             return {'status': 'error', 'error': str(e)}
 
     @staticmethod
+    def _parse_attribution_row(raw, content_raw):
+        """解析单行归因数据（P2-7 配套）：per_algo_predictions 独立列优先，
+        report_content JSON 回退（历史格式兼容）。
+
+        Returns:
+            (per_algo: dict|None, content: dict) —— content 仅在回退命中时非空
+        """
+        import json as _json
+        per_algo, content = None, {}
+
+        # A. 独立列（当前写入路径）
+        if raw:
+            try:
+                per_algo = _json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                per_algo = None  # 解析失败视为无归因，走回退
+
+        # B. 回退 report_content（历史 JSON 格式报告）
+        if not per_algo and content_raw:
+            try:
+                c = _json.loads(content_raw) if isinstance(content_raw, str) else content_raw
+                if isinstance(c, dict):
+                    content = c
+                    per_algo = c.get('per_algo_top_predictions')
+            except Exception:
+                pass  # 纯文本 report_content 解析失败属预期
+
+        return per_algo, content
+
+    @staticmethod
     def _load_report_attribution(db, report_uuid: str):
         """读取一份报告的 per-algo 归因数据（v3.44）。
 
@@ -197,39 +232,33 @@ class OnlineLearner:
 
         这里优先读独立列，再回退 report_content 以兼容历史 JSON 格式报告。
 
+        修复(20261116): 207-232 原实现对同一行先后发两条 SELECT（先查
+        per_algo_predictions，miss 后再查 report_content）—— 现合并为一条
+        SELECT 同时取两列，一次往返完成取数与回退判断；极老库缺失独立列
+        导致合并查询失败时，退化为仅查 report_content（保持原兼容行为）。
+
         Returns:
             (per_algo: dict|None, content: dict) —— content 仅在回退命中时非空
         """
-        import json as _json
-        per_algo, content = None, {}
-
-        # A. 独立列（当前写入路径）
+        # 合并取数：一条 SELECT 同时拿两列
+        row = {}
         try:
             db.cursor.execute(
-                "SELECT per_algo_predictions FROM p5_ai_report "
+                "SELECT per_algo_predictions, report_content FROM p5_ai_report "
                 "WHERE report_uuid=%s LIMIT 1", (report_uuid,))
-            raw = (db.cursor.fetchone() or {}).get('per_algo_predictions')
-            if raw:
-                per_algo = _json.loads(raw) if isinstance(raw, str) else raw
+            row = db.cursor.fetchone() or {}
         except Exception:
-            pass  # 老库可能无此列，静默回退
-
-        # B. 回退 report_content（历史 JSON 格式报告）
-        if not per_algo:
+            # 老库可能无 per_algo_predictions 列 —— 退化为仅查 report_content
             try:
                 db.cursor.execute(
                     "SELECT report_content FROM p5_ai_report "
                     "WHERE report_uuid=%s LIMIT 1", (report_uuid,))
-                c = (db.cursor.fetchone() or {}).get('report_content')
-                if isinstance(c, str):
-                    c = _json.loads(c)
-                if isinstance(c, dict):
-                    content = c
-                    per_algo = c.get('per_algo_top_predictions')
+                row = {'report_content': (db.cursor.fetchone() or {}).get('report_content')}
             except Exception:
-                pass  # 纯文本 report_content 解析失败属预期
+                row = {}
 
-        return per_algo, content
+        return OnlineLearner._parse_attribution_row(
+            row.get('per_algo_predictions'), row.get('report_content'))
 
     def learn_from_verification(self, db, target_issue: str,
                                 actual_numbers: List[int]) -> Dict[str, Any]:
@@ -319,16 +348,35 @@ class OnlineLearner:
             with_attr = 0        # 主口径(仅 v3.44 后)含归因数
             raw_with = 0         # 全量含归因数
             post_n = 0           # 主口径采样期数
+
+            # 修复(20261116): 322-331 原实现对最多 200 条验证记录逐条调 _load_report_attribution
+            # （N+1 取数：每条记录各发一条 SELECT）。现改为一条 IN 批量查询取回全部归因列，
+            # 解析复用 _parse_attribution_row，循环内查内存字典；极老库缺失独立列导致批量
+            # 查询失败时，退化为原逐条查询（保持兼容）。
+            uuids = [v.get('report_uuid') for v in all_verified if v.get('report_uuid')]
+            attr_map = {}
+            if uuids:
+                try:
+                    _ph = ','.join(['%s'] * len(uuids))
+                    db.cursor.execute(
+                        "SELECT report_uuid, per_algo_predictions, report_content "
+                        f"FROM p5_ai_report WHERE report_uuid IN ({_ph})",
+                        tuple(uuids))
+                    for _r in (db.cursor.fetchall() or []):
+                        _pa, _c = OnlineLearner._parse_attribution_row(
+                            _r.get('per_algo_predictions'), _r.get('report_content'))
+                        attr_map[_r.get('report_uuid')] = bool(_pa)
+                except Exception:
+                    for _ru in uuids:
+                        try:
+                            _pa, _c = self._load_report_attribution(db, _ru)
+                            attr_map[_ru] = bool(_pa)
+                        except Exception:
+                            attr_map[_ru] = False
+
             for v in all_verified:
                 ru = v.get('report_uuid')
-                has = False
-                if ru:
-                    try:
-                        # 与 learn_from_verification 同源取数，确保覆盖率反映真实学习能力
-                        per_algo, _ = self._load_report_attribution(db, ru)
-                        has = bool(per_algo)
-                    except Exception:
-                        has = False
+                has = bool(attr_map.get(ru)) if ru else False
                 if has:
                     raw_with += 1
                 if _created_at_ge(v.get('created_at'), since_created_at):
@@ -487,7 +535,12 @@ class OnlineLearner:
             # 检查专家推荐命中率
             hit_positions = []
             for pos_name, nums in expert_numbers.items():
-                pos_idx = ['wan', 'qian', 'bai', 'shi', 'ge'].index(pos_name)
+                # 修复(20261116): 490 原实现用 ['wan',...].index(pos_name) 硬索引，AI 返回
+                # 非预期键（中文位名/别名）时抛 ValueError，中断本专家及后续 7 步追踪 ——
+                # 改为键不在 POS_LIST 时跳过该位，其余位置与后续步骤照常执行。
+                if pos_name not in POS_LIST:
+                    continue
+                pos_idx = POS_LIST.index(pos_name)
                 if pos_idx < 5:
                     actual_num = actual_numbers[pos_idx]
                     if actual_num in nums:
@@ -955,9 +1008,14 @@ class OnlineLearner:
                     if preds[0] == actual:
                         top1_hits += 1
                 if counted:
+                    # 修复(20261116): 959 分母原按「有预测位数 counted」归一，与 pipeline
+                    # _calculate_algorithm_hits 的固定 5 位分母（L3710: len(hit_positions)/5.0）
+                    # 口径不一致，而两通道喂同一 AdaptiveWeightManager，会让同一算法在
+                    # 两个通道得到不可比的 hit_rate。现统一为固定 5 位分母 —— 口径依据
+                    # docs/hitrate_spec.md Top-1 真实口径（5 位累加），无预测位按未命中计。
                     out[algo] = {
-                        'hit_rate': cover_hits / counted,
-                        'top1_hit': top1_hits / counted,
+                        'hit_rate': cover_hits / 5.0,
+                        'top1_hit': top1_hits / 5.0,
                     }
             return out
 
@@ -1019,6 +1077,15 @@ class OnlineLearner:
                 'best_experts': [
                     e['expert_id'] for e in expert_tracking.get('best_performing_experts', [])[:3]
                 ],
+                # 修复(20261116): 1019 原看板只存专家 id 列表，下游 _evaluate_experts 拿不到
+                # 真实命中位数，被迫按「上榜即记 1 位」折算导致所有专家 rate 恒 0.2、
+                # best_expert 失真 —— 此处补存各专家真实命中位数(score×5)，与
+                # best_experts 一一对应，供专家评估按真实命中区分。
+                'best_expert_hit_positions': {
+                    e.get('expert_id', 'unknown'):
+                        max(0, int(round(float(e.get('score', 0)) * 5)))
+                    for e in expert_tracking.get('best_performing_experts', [])[:3]
+                },
                 'tracked_at': datetime.now().isoformat()
             }
             
@@ -1127,8 +1194,14 @@ class OnlineLearner:
         if not recent_issues or not self.redis:
             return result
 
-        expert_scores: Dict[str, List[float]] = defaultdict(list)
-        best_per_issue: List[float] = []
+        # 修复(20261116): 1130/1140-1141/1148 原实现按「进入 best_experts 即记 1.0 分」累计
+        # scores，rate = sum(scores)/(len(scores)*5) 恒等于 0.2 —— 所有专家同分，best_expert
+        # 失真。现改为累计各专家真实命中位数（数据源头 _store_tracking_in_redis 已补存
+        # best_expert_hit_positions），命中率 = 累计命中位数 / (上榜期数 × 5 位)，
+        # 口径对齐 docs/hitrate_spec.md Top-1 真实口径（5 位累加）；旧版看板无该字段时
+        # 按 1 位兼容折算（与旧行为等价）。
+        expert_hits: Dict[str, int] = defaultdict(int)    # 各专家累计真实命中位数
+        expert_issues: Dict[str, int] = defaultdict(int)  # 各专家上榜期数
 
         for issue in recent_issues:
             try:
@@ -1136,17 +1209,26 @@ class OnlineLearner:
                 val = self.redis.safe_hget(board_key, 'board_data')
                 if not val or not isinstance(val, dict):
                     continue
-                # 从 board_data 提取最佳专家得分（score=命中位置数/5）
-                for expert_id in val.get('best_experts', []):
-                    expert_scores[expert_id].append(1.0)  # 进入 best_experts 说明命中
+                hits_map = val.get('best_expert_hit_positions') or {}
+                if hits_map:
+                    for eid, h in hits_map.items():
+                        try:
+                            _h = max(0, int(h))
+                        except (TypeError, ValueError):
+                            continue
+                        expert_hits[eid] += _h
+                        expert_issues[eid] += 1
+                else:
+                    # 旧版看板兼容：只有 id 列表，按上榜即命中 1 位折算
+                    for expert_id in val.get('best_experts', []):
+                        expert_hits[expert_id] += 1
+                        expert_issues[expert_id] += 1
             except Exception:
                 continue
 
-        n = max(len(expert_scores), 1)
         avg_rates = {}
-        for eid, scores in expert_scores.items():
-            rate = round(sum(scores) / (len(scores) * 5), 4) if scores else 0.0
-            avg_rates[eid] = rate
+        for eid, issues_n in expert_issues.items():
+            avg_rates[eid] = round(expert_hits[eid] / (issues_n * 5), 4) if issues_n else 0.0
         result['expert_hit_rates'] = dict(avg_rates)
         result['total_evaluated'] = len(recent_issues)
 
@@ -1240,6 +1322,7 @@ class OnlineLearner:
                 if ws:
                     sorted_pos = sorted(ws.items(), key=lambda x: x[1], reverse=True)
                     result['recent_top_positions'] = {pos: round(score, 4) for pos, score in sorted_pos[:3]}
+        # 审计佐证(20261116): Redis 缺失/异常时看板字段跳过填充（缓存旁路设计，降级属预期）
         except Exception:
             pass
 
@@ -1248,6 +1331,7 @@ class OnlineLearner:
             trajectory_key = f'kpluckynumber:pl5:trend_knowledge:trajectory'
             keys = self.redis.client.hkeys(trajectory_key)
             result['trajectory_count'] = len(keys)
+        # 审计佐证(20261116): Redis 缺失/异常时轨迹计数跳过（缓存旁路设计，降级属预期）
         except Exception:
             pass
 
@@ -1271,52 +1355,67 @@ class OnlineLearner:
         try:
             from datetime import timedelta
             from modules.database import P5Database
-            
-            db = P5Database()
-            db.connect()
-            # 使用刚建立的本地连接(而非可能已超时的外部传入连接)
-            self.db = db
 
-            # 获取历史追踪数据
-            recent_issues = self._get_recent_issues(days)
-            
-            total_verified = len(recent_issues)
-            # 先计算模型表现和专家评估，供后续建议生成使用
-            model_perf = self._analyze_model_performance(recent_issues)
-            expert_eval = self._evaluate_experts(recent_issues)
+            # 修复(20261116): 1275-1317 原实现每次调用都新建 P5Database 连接并覆盖 self.db，
+            # 且异常路径不 disconnect 造成连接泄漏。现优先复用实例已有连接 self.db
+            # （pipeline 已持有，由其所有者管理生命周期，本方法不负责关闭）；仅当无可用
+            # 连接时才新建，并用 try/finally 保证新建连接在任何路径（含异常）下必被关闭。
+            _owns_db = False
+            if self.db and getattr(self.db, 'connection', None):
+                db = self.db  # 复用已有连接（不负责关闭）
+            else:
+                db = P5Database()
+                db.connect()
+                self.db = db
+                _owns_db = True
 
-            report = {
-                'report_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'statistics_period_days': days,
-                'total_issues_tracked': total_verified,
-                'total_verified': total_verified,
-                'model_performance': model_perf,
-                'expert_evaluation': expert_eval,
-                'improvement_suggestions': self._generate_suggestions(recent_issues, model_perf, expert_eval),
-                'trend_analysis': self._analyze_trends(recent_issues)
-            }
-
-            # 记录本次学习到p5_learning_history
-            # 注意: 必须在 db.disconnect() 之前使用本地刚建立的连接写入
             try:
-                if db.connection:
-                    db.cursor.execute('''
-                        INSERT INTO p5_learning_history
-                        (learning_type, issue, change_reason, impact_score)
-                        VALUES ('weight_update', %s, %s, %s)
-                    ''', (
-                        target_issue,
-                        f'生成学习报告: 基于{days}天,{total_verified}期数据,全中率{model_perf.get("full_match_rate", 0)*100:.1f}%',
-                        str(total_verified)
-                    ))
-                    db.connection.commit()
-                    logger.info(f'学习记录已写入p5_learning_history表: {target_issue}')
-            except Exception as e:
-                logger.warning(f'写入学习记录失败(不影响主流程): {e}')
+                # 获取历史追踪数据
+                recent_issues = self._get_recent_issues(days)
 
-            db.disconnect()
-            return report
-            
+                total_verified = len(recent_issues)
+                # 先计算模型表现和专家评估，供后续建议生成使用
+                model_perf = self._analyze_model_performance(recent_issues)
+                expert_eval = self._evaluate_experts(recent_issues)
+
+                report = {
+                    'report_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'statistics_period_days': days,
+                    'total_issues_tracked': total_verified,
+                    'total_verified': total_verified,
+                    'model_performance': model_perf,
+                    'expert_evaluation': expert_eval,
+                    'improvement_suggestions': self._generate_suggestions(recent_issues, model_perf, expert_eval),
+                    'trend_analysis': self._analyze_trends(recent_issues)
+                }
+
+                # 记录本次学习到p5_learning_history
+                # 注意: 必须在 db.disconnect() 之前写入（复用连接时同样要求连接可用）
+                try:
+                    if db.connection:
+                        db.cursor.execute('''
+                            INSERT INTO p5_learning_history
+                            (learning_type, issue, change_reason, impact_score)
+                            VALUES ('weight_update', %s, %s, %s)
+                        ''', (
+                            target_issue,
+                            f'生成学习报告: 基于{days}天,{total_verified}期数据,全中率{model_perf.get("full_match_rate", 0)*100:.1f}%',
+                            str(total_verified)
+                        ))
+                        db.connection.commit()
+                        logger.info(f'学习记录已写入p5_learning_history表: {target_issue}')
+                except Exception as e:
+                    logger.warning(f'写入学习记录失败(不影响主流程): {e}')
+
+                return report
+            finally:
+                # 仅新建的连接由本方法负责关闭；复用的 self.db 交还所有者
+                if _owns_db:
+                    try:
+                        db.disconnect()
+                    except Exception:
+                        pass
+
         except Exception as e:
             logger.error(f'生成学习报告失败: {e}', exc_info=True)
             return {'error': str(e)}

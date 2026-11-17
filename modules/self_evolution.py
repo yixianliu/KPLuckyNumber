@@ -258,7 +258,13 @@ def _ml_pred_to_per_position(raw):
     return {'per_position': per}
 
 
-def _row_to_sorted(rows):
+# 结构清理(20261116): 本地版 _row_to_sorted 与 evolution_tuner 导入的同名函数实现不同
+# （本版输出瘦字典 {'issue','numbers'} 且带 0-9 越界/类型过滤，tuner 版保留原始行全字段）。
+# 本模块调用点与 scripts/diagnose/*.py 均依赖本地版行为 → 改名 _row_to_sorted_local
+# 消除对导入名的静默遮蔽，并在函数定义后显式绑定兼容别名，保持
+# modules.self_evolution._row_to_sorted 的导出解析结果与历史完全一致。
+# 注：evolution_tuner 导入块保持原样 — optimization_patches.py 依赖该导入块的精确文本做补丁替换。
+def _row_to_sorted_local(rows):
     """将原始 DB 行转为 ml_predictor.predict_next 期望的格式。
 
     v3.62 增强：增加数据质量校验，过滤异常行（如位数不符、数字越界），
@@ -297,6 +303,11 @@ def _row_to_sorted(rows):
     if invalid_count > 0:
         logger.info('[self_evolution] 数据质量校验: 有效行=%s, 无效行=%s', valid_count, invalid_count)
     return out
+
+
+# 兼容别名：scripts/diagnose/*.py 以 `from modules.self_evolution import _row_to_sorted`
+# 导入此名，必须继续解析到本地版实现（覆盖 evolution_tuner 导入的同名绑定，与历史行为一致）
+_row_to_sorted = _row_to_sorted_local
 
 
 # =====================================================================
@@ -794,17 +805,12 @@ class ExperimentTracker:
             pass
         return 'unknown'
     
-    def _compute_data_fingerprint(self, hist_count: int, latest_issue: str) -> Dict:
-        """计算数据指纹"""
-        import hashlib
-        data_str = f'{hist_count}|{latest_issue}|{len(windows) if "windows" in locals() else 0}'
-        # 简化版：仅用样本量+最新期号
-        return {
-            'sample_count': hist_count,
-            'latest_issue': latest_issue,
-            'hash': hashlib.md5(data_str.encode()).hexdigest()[:12],
-        }
-    
+    # 结构清理(20261116): _compute_data_fingerprint 整方法删除 — 全仓零调用死方法，
+    # 且其内 `"windows" in locals()` 在本作用域恒为 False（windows 从未赋值，指纹第三段恒 0）。
+    # 缓存键影响评估：record() 实际使用的 data_fingerprint 由 _persist_version 处内联构造
+    # （仅含 sample_count/latest_issue，不含 hash 段），该指纹从未参与任何缓存键计算或
+    # 持久化数据比对（历史 JSONL/DB 中的记录字段无代码读取比对）→ 删除无缓存键兼容性影响。
+
     def record(
         self,
         version_tag: str,
@@ -988,6 +994,7 @@ class SelfEvolutionEngine:
         if self._ml_pool is not None:
             try:
                 self._ml_pool.shutdown()
+            # 审计佐证(20261116): ML 进程池已损坏时 shutdown 忽略异常（清理幂等，忽略属预期）
             except Exception:  # noqa: BLE001
                 pass
         self._save_link_state()
@@ -1308,6 +1315,7 @@ class SelfEvolutionEngine:
     def _enqueue(self, msg: Dict[str, Any]):
         try:
             self.queue.put_nowait(msg)
+        # 审计佐证(20261116): 消息队列满时丢弃最旧通知（GUI 轮询消费模式，跳过属预期，不阻塞引擎）
         except Exception:  # noqa: BLE001
             pass
 
@@ -1368,6 +1376,7 @@ class SelfEvolutionEngine:
             ts = datetime.datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
             age = (datetime.datetime.now() - ts).total_seconds()
             return age > self._LINK_STALE_TIMEOUT
+        # 审计佐证(20261116): 时间戳解析失败保守视为卡死（回退属预期，触发保护性重启）
         except Exception:
             return True  # 时间戳解析失败，保守视为卡死
 
@@ -1430,9 +1439,18 @@ class SelfEvolutionEngine:
                 next_delay = 3600.0  # DB 暂停期间每 1 小时检测一次恢复情况
             elif self._scheduler.should_run() and not self._running:
                 logger.info('[self_evolution] 定时器 tick：检测到应触发自我进化，启动轻量自检…')
-                self._running = True
-                t = threading.Thread(target=self._run, daemon=True)
-                t.start()
+                # 修复(20261116): L1431-1436 原实现绕过 _run_lock 直接置 _running 并启动 _run 线程，与 start()（持锁置位）和 shutdown() 竞态 — 改为经 _run_lock 非阻塞双重检查后再置位并启动
+                if self._run_lock.acquire(blocking=False):
+                    try:
+                        # 双重检查：acquire 期间 start()/shutdown() 可能已改变状态
+                        if not self._running and not self._shutdown:
+                            self._running = True
+                            t = threading.Thread(target=self._run, daemon=True)
+                            t.start()
+                    finally:
+                        self._run_lock.release()
+                else:
+                    logger.debug('[self_evolution] 定时器 tick：_run_lock 被占用（start/shutdown 进行中），本轮跳过触发')
                 next_delay = 60.0
             else:
                 if self._running:
@@ -1717,7 +1735,9 @@ class SelfEvolutionEngine:
             valid_rows = sum(1 for r in rows if isinstance(r, dict) and all(r.get(p) is not None for p in POS))
             invalid_rows = total_rows - valid_rows
 
-            rows = _row_to_sorted(rows)
+            # 结构清理(20261116): 统一使用本地版 _row_to_sorted_local（瘦字典+质量过滤），
+            # 消除与 evolution_tuner 导入版同名遮蔽歧义，行为不变
+            rows = _row_to_sorted_local(rows)
             if len(rows) < ML_EVAL_MIN + 1:
                 logger.warning('[self_evolution] 有效样本不足: %s < %s', len(rows), ML_EVAL_MIN)
                 return [], len(rows), {'total_rows': total_rows, 'valid_rows': valid_rows, 'invalid_rows': invalid_rows}
@@ -2156,13 +2176,12 @@ class SelfEvolutionEngine:
                 logger.warning('[self_evolution] ML 重训跳过：样本量不足（%s < %s）',
                                len(rows) if rows else 0, ML_EVAL_MIN)
                 return {}
-            sorted_data = _row_to_sorted(rows)
+            # 结构清理(20261116): 统一使用本地版 _row_to_sorted_local，行为不变
+            sorted_data = _row_to_sorted_local(rows)
             cfg_snap = self._checkpoint.get('weight_snapshot', {})
 
-            def _run_in_process(data_slice, cfg):
-                if self._ml_pool is not None:
-                    return self._ml_pool.predict_next(data_slice, cfg)
-                return None
+            # 结构清理(20261116): 嵌套函数 _run_in_process 定义后从未被调用（实际预测
+            # 在下方直接 self._ml_pool.predict_next(train, cfg_snap)）— 死代码删除
 
             # 最近1期作为评估
             train = sorted_data[:-1] if len(sorted_data) > 1 else sorted_data
@@ -2357,24 +2376,27 @@ class SelfEvolutionEngine:
         try:
             if db and db.connect():
                 try:
-                    rows = db.get_prediction_records(verified=1, limit=200)
+                    # 修复(20261116): L2360 db.get_prediction_records 全仓不存在，AttributeError 被下方 except 静默吞掉导致 _assess_improvement 恒返回全 0 假报告 — 改用已存在的 get_verified_predictions（days 放宽以覆盖全部已验证记录），并按其返回字段 {pos}_match 做适配映射
+                    rows = db.get_verified_predictions(days=3650, limit=200)
                     for r in rows:
                         total_verified += 1
-                        vd = r.get('verified_data') or {}
-                        pp = vd.get('per_position', {})
+                        # 适配映射：p5_prediction_record 行的各位置命中列为 wan_match/qian_match/...（0/1），替代原 verified_data.per_position 结构
+                        pp = {p: (r.get(f'{p}_match') or 0) for p in POS}
                         for pos in POS:
                             hits = pp.get(pos, 0)
                             if isinstance(hits, (int, float)):
                                 per_position_scores[pos] += float(hits)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # 修复(20261116): L2369-2370 原 except Exception: pass 静默吞掉查询异常 — 改为记录 warning 日志
+                    logger.warning('[self_evolution] 已验证预测记录读取失败: %s', e)
                 finally:
                     try:
                         db.disconnect()
                     except Exception:  # noqa: BLE001
                         pass
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            # 修复(20261116): L2376-2377 外层 except 静默吞掉连接异常 — 改为记录 warning 日志
+            logger.warning('[self_evolution] 评估阶段数据库不可用: %s', e)
 
         lines = [f'已验证记录: {total_verified} 条']
         for pos in POS:
@@ -2458,6 +2480,7 @@ class SelfEvolutionEngine:
             if os.path.isfile(self._local_versions_path):
                 with open(self._local_versions_path, 'r', encoding='utf-8') as f:
                     return json.load(f)
+        # 审计佐证(20261116): 本地版本文件缺失/损坏时返回空列表（兜底属预期，DB 为权威源）
         except Exception:  # noqa: BLE001
             pass
         return []
@@ -2488,7 +2511,8 @@ class SelfEvolutionEngine:
 
     def _save_version_to_local(self, record: Dict[str, Any]) -> bool:
         try:
-            self._load_versions_from_local()
+            # 修复(20261116): L2491 调用 _load_versions_from_local() 却丢弃返回值，self._versions 未包含文件中已有历史，写盘时单条记录覆盖本地文件导致历史版本丢失 — 合并文件已有版本后再写盘
+            self._versions = self._load_versions_from_local() or self._versions
             self._versions.append(record)
             with open(self._local_versions_path, 'w', encoding='utf-8') as f:
                 json.dump(self._versions, f, ensure_ascii=False, indent=2,

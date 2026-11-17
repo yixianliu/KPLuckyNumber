@@ -881,7 +881,8 @@ def extract_probs_from_backtest(backtest_result: Dict[str, Any]) -> List[float]:
     for rec in (records or []):
         for pos_info in (rec.get('position_accuracy') or []):
             p = pos_info.get('predicted_probability')
-            if isinstance(p, (int, float)) and p > 0:
+            # 修复(20261116): L884 原过滤 p>0 会剔除真实号概率为 0 的最差样本，造成校准拟合幸存者偏差 — 保留 p==0 样本（下游 apply_platt/NLL 已有 max(..., 1e-12) 钳制，无除零/log(0) 风险）
+            if isinstance(p, (int, float)) and not isinstance(p, bool):
                 probs.append(float(p))
 
     return probs

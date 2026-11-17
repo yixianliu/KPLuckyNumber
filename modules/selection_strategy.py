@@ -835,7 +835,8 @@ def format_strategy_comparison(comparison: Dict[str, Any]) -> str:
 
     for r in rows:
         cov = '/'.join(str(c) for c in r['position_coverage'])
-        mark = ' ' if r['strategy'] == comparison.get('best_by_coverage') else ' '
+        # 修复(20261116): L838 两分支同为 ' ' 导致最佳策略标记失效 — 最佳分支改为 '*'
+        mark = '*' if r['strategy'] == comparison.get('best_by_coverage') else ' '
         lines.append(f"{r['label']:<20}{cov:<20}"
                      f"{r['expected_covered_positions']:>11.3f}"
                      f"{r['diversity']:>10.3f}{mark}")
@@ -912,8 +913,9 @@ def run_strategy_ab_walk_forward(history: List[Dict],
 
     # 构造等频概率（前 prob_window 期的频率）
     def _freq_probs(start_idx: int) -> List[Dict[int, float]]:
-        s = max(0, start_idx - prob_window + 1)
-        window = history[s:start_idx + 1]
+        # 修复(20261116): L916 窗口 history[s:start_idx+1] 含当期开奖，预测第 i 期时已看到答案（前视泄漏） — 起点左移一期并去掉尾元素，窗口改为 history[s:start_idx]，仅使用严格早于当期的 prob_window 期数据
+        s = max(0, start_idx - prob_window)
+        window = history[s:start_idx]
         fused = []
         for pos in range(POSITIONS):
             counts = [0] * NUMBER_SPACE

@@ -572,6 +572,24 @@ class Backtester:
                 'top5_hit': top5_hit
             })
 
+        # 修复(20261116): L585 组合匹配循环直接索引 actual_numbers[i]（range(5)），号码不足5位时 IndexError — 循环前补长度防御，提前返回结构完整的空评估
+        if not actual_numbers or len(actual_numbers) < 5:
+            _t1 = sum(1 for p in position_accuracy if p['top1_hit'])
+            _t3 = sum(1 for p in position_accuracy if p['top3_hit'])
+            return {
+                'target_issue': target_issue,
+                'actual_numbers': actual_numbers,
+                'position_accuracy': position_accuracy,
+                'combination_hits': [],
+                'overall_score': round((_t1 * 40 + _t3 * 20) / 3, 2),
+                'top1_hit_count': _t1,
+                'top3_hit_count': _t3,
+                'top5_hit_count': sum(1 for p in position_accuracy if p['top5_hit']),
+                'calibration_score': 0.0,
+                'avg_brier_score': 1.0,
+                'brier_multiclass': None,
+            }
+
         # 组合匹配分析（仅评估推荐前 10 个组合，控制开销）
         combination_hits = []
         for combo in top_combinations[:10]:
@@ -593,26 +611,44 @@ class Backtester:
             })
 
         # 综合评分：Top-1 命中每位置 40 分，Top-3 命中每位置 20 分。
-        # 满分场景（5 位全 Top-1）= 200 分；除以 3 归一到百分制（600/3=200，仍合理上限）。
+        # 满分场景（5 位全 Top-1）= 5*40 + 5*20 = 300 分；除以 3 归一到百分制上限 100。
         # 历史版本除以 5 导致数值上限仅 60，显示"8.80/100"实为小数点后方失真，此处纠正归一分母。
         top1_hits = sum(1 for p in position_accuracy if p['top1_hit'])
         top3_hits = sum(1 for p in position_accuracy if p['top3_hit'])
         overall_score = round((top1_hits * 40 + top3_hits * 20) / 3, 2)
 
-        # 概率校准度（Brier Score）：真实号码命中记 1，与预测概率的平方误差
+        # 概率校准度（沿用历史口径，勿改：calibration_score 已被历史报告引用）
+        # 注意：此处只计算「中奖号那一类」的平方误差 (p_hit - 1)^2，
+        # 并未减去其余 9 类的概率质量，因此它不是统计学意义上的多分类 Brier 分数：
+        # 随机基线（每类 0.1）下其期望值≈0.81 而非 0，量纲随 top_n 变化，不可跨模型比较。
+        # 为不破坏既有展示口径，calibration_score 保持原样；另以 brier_multiclass
+        # 字段给出标准多分类 Brier（Σ_i (p_i - y_i)^2，随机基线 0.9），供横向对比使用。
         brier_scores = []
+        brier_multi = []
         for pos in range(5):
             if pos >= len(fused_probs):
+                break
+            # 防御：actual_numbers 长度不足 5 时跳过，避免 IndexError 中断整轮回测
+            if pos >= len(actual_numbers):
                 break
             pos_probs = fused_probs[pos]
             actual_num = actual_numbers[pos]
             prob_hit = pos_probs.get(actual_num, 0)
             brier = (prob_hit - 1) ** 2
             brier_scores.append(brier)
+            # 标准多分类 Brier：命中类 (1-p)^2 + 其余类 p^2 之和
+            total_p = sum(float(v) for v in pos_probs.values()) or 1.0
+            multi = 0.0
+            for _n, _p in pos_probs.items():
+                _pn = float(_p) / total_p
+                multi += (_pn - (1.0 if _n == actual_num else 0.0)) ** 2
+            brier_multi.append(multi)
 
         avg_brier = round(sum(brier_scores) / len(brier_scores), 6) if brier_scores else 1.0
         # 校准分：1 - 平均Brier，越接近100越准；max(0,...) 防止负值
         calibration_score = round(max(0, 1 - avg_brier) * 100, 2)
+        avg_brier_multi = (round(sum(brier_multi) / len(brier_multi), 6)
+                           if brier_multi else None)
 
         return {
             'target_issue': target_issue,
@@ -624,7 +660,8 @@ class Backtester:
             'top3_hit_count': top3_hits,
             'top5_hit_count': sum(1 for p in position_accuracy if p['top5_hit']),
             'calibration_score': calibration_score,
-            'avg_brier_score': avg_brier
+            'avg_brier_score': avg_brier,
+            'brier_multiclass': avg_brier_multi
         }
 
     def _calculate_overall_stats(self, backtest_results: List[Dict]) -> Dict[str, Any]:
@@ -675,8 +712,9 @@ class Backtester:
         full_match_rate = round(full_match_count / total * 100, 2)
 
         # 趋势分析（最近10期 vs 前10期）
-        recent_10 = backtest_results[:min(10, total)]
-        previous_10 = backtest_results[min(10, total):min(20, total)]
+        # 修复(20261116): L697-698 结果按期号升序追加，[:10] 取的是最旧10期导致 trend_direction 方向颠倒 — 改为取列表尾部（最新10期 / 再往前10期），空列表由下方 if 防御
+        recent_10 = backtest_results[-10:]
+        previous_10 = backtest_results[-20:-10]
 
         recent_avg = round(np.mean([r['overall_score'] for r in recent_10]), 2) if recent_10 else 0
         prev_avg = round(np.mean([r['overall_score'] for r in previous_10]), 2) if previous_10 else 0
@@ -784,6 +822,12 @@ class Backtester:
         stats = backtest_result.get('overall_stats', {})
         config = backtest_result.get('config', {})
 
+        # 修复(20261116): L892 原代码在持久化分支引用未定义变量 issue（NameError 被外层 except 吞掉，save_artifact 永不执行） — 函数开头先从 config.eval_issue_range 推导期号（对齐 generate_comparison_report L1057 的取法），再判空
+        issue = None
+        _report_issue_range = config.get('eval_issue_range')
+        if isinstance(_report_issue_range, (list, tuple)) and _report_issue_range:
+            issue = _report_issue_range[0]
+
         lines = []
         lines.append('=' * 80)
         lines.append('                    排列5 AI预测模型历史回测报告')
@@ -864,17 +908,24 @@ class Backtester:
 
         report_text = '\n'.join(lines)
 
+        # 修复(20261116): L884-907 原实现从未写入 output_path 且恒返回成功文案（GUI「报告已保存」为假） — 将报告 JSON 真实写入 output_path，写盘结果决定返回值
+        report_write_ok = False
+        try:
+            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump({'report_text': report_text, 'stats': stats, 'config': config},
+                          f, ensure_ascii=False, indent=2)
+            report_write_ok = True
+            logger.info(f'回测报告已写入文件: {output_path}')
+        except Exception as e:
+            logger.warning(f'回测报告写盘失败(非致命): {e}')
+
         # 持久化到数据库
         try:
             db = self._get_db()
             if getattr(db, 'connection', None) is None:
                 if not db.connect():
                     raise RuntimeError('数据库连接失败，跳过回测报告入库')
-            if not issue:
-                try:
-                    issue = stats.get('eval_issue_range', [None])[0] if isinstance(stats.get('eval_issue_range'), (list, tuple)) else None
-                except Exception:
-                    issue = None
             db.save_artifact(
                 artifact_type='backtest_report',
                 data={'report_text': report_text, 'stats': stats, 'config': config},
@@ -885,7 +936,10 @@ class Backtester:
         except Exception as e:
             logger.warning(f'回测报告入库失败(非致命): {e}')
 
-        return '数据库 p5_artifact(type=backtest_report)'
+        # 修复(20261116): L907 原恒返回成功文案 — 改为如实反映写盘结果（成功返回文件路径，失败返回明确失败说明）
+        if report_write_ok:
+            return output_path
+        return f'回测报告写盘失败，文件未生成: {output_path}'
 
     def generate_comparison_report(self, comparison_result: Dict[str, Any],
                                   output_path: Optional[str] = None) -> str:
@@ -1175,6 +1229,16 @@ if __name__ == '__main__':
         print(f'回测失败: {result.get("message")}')
 
 # ALG-05: 并行回测 worker 函数（供 scripts/tests/test_backtest_walkforward.py 锁定无前视语义）
+class _EvalContextShim:
+    """_evaluate_prediction 的最小实例状态桩（仅提供 position_names）。
+
+    并行 worker 无 Backtester 实例，通过该桩在类上直接复用统一的
+    评估口径（rank 口径 + 5 位累加，与 docs/hitrate_spec.md §3 一致）。
+    """
+
+    position_names = ['万位', '千位', '百位', '十位', '个位']
+
+
 def _parallel_backtest_worker(args: Tuple) -> List[Dict]:
     idx, i, history_data, eval_start, test_count, predictor, db = args
     target_issue = history_data[i]['issue']
@@ -1183,15 +1247,11 @@ def _parallel_backtest_worker(args: Tuple) -> List[Dict]:
     base_issue = history_data[i - 1]['issue'] if i > 0 else None
     try:
         prediction_result = predictor.predict(train_data, base_issue, target_issue=target_issue)
-        eval_result = {
-            'target_issue': target_issue,
-            'prediction_time': datetime.now().isoformat(),
-            'actual_numbers': actual_numbers,
-            'top1_hit': int(actual_numbers[0] == prediction_result.get('top1', None)),
-            'top3_hit': int(actual_numbers[0] in prediction_result.get('top3', [])),
-            'top5_hit': int(actual_numbers[0] in prediction_result.get('top5', [])),
-            'overall_score': prediction_result.get('overall_score', 0.0),
-        }
+        # 修复(20261116): L1209-1212 原实现直取 predict() 不存在的 top1/top3/top5/overall_score 键（恒0），且口径与 docs/hitrate_spec.md §3 冲突 — 改为复用模块内 _evaluate_prediction（经最小状态桩），worker 与串行回测口径完全一致
+        eval_result = Backtester._evaluate_prediction(
+            _EvalContextShim(), prediction_result, actual_numbers, target_issue
+        )
+        eval_result['prediction_time'] = datetime.now().isoformat()
         return [eval_result]
     except Exception as e:
         logger.warning(f'Parallel worker 期号{target_issue} 预测失败: {e}')

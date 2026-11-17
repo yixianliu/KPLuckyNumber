@@ -1,0 +1,29 @@
+{
+  "tag": "noai2",
+  "timestamp": "2026-11-16T21:12:21.201831",
+  "n_eval": 5,
+  "window": 60,
+  "trials": 25,
+  "top1_hits": 3,
+  "top1_rate": 0.12,
+  "top1_ci95": [
+    0.04166741357068093,
+    0.2995619218337349
+  ],
+  "top3_hits": 9,
+  "top3_rate": 0.36,
+  "top3_ci95": [
+    0.20247656431735636,
+    0.5548184539895337
+  ],
+  "random_baseline": {
+    "top1": 0.1,
+    "top3": 0.3
+  },
+  "significant_excess_top1": false,
+  "significant_excess_top3": false,
+  "time_mean_s": 12.267152419997728,
+  "time_median_s": 10.539190199997392,
+  "time_p95_s": 17.541848299997216,
+  "time_total_s": 61.33576209998864
+}
